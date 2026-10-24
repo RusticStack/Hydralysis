@@ -466,7 +466,21 @@ def _file_version(pe) -> str:
 
 
 def parse_rva(text: str, image_base: int = 0x140000000) -> int:
-    value = int(str(text), 0)
+    text = str(text).strip().lower()
+    prefix = ""
+    if ":" in text:
+        prefix, text = text.split(":", 1)
+        if prefix not in ("rva", "va"):
+            raise ValueError("address prefix must be rva: or va:")
+    value = int(text, 0)
+    if value < 0:
+        raise ValueError("address must be non-negative")
+    if prefix == "rva":
+        return value
+    if prefix == "va":
+        if value < image_base:
+            raise ValueError("VA is below this image's base")
+        return value - image_base
     if value >= image_base:
         return value - image_base
     return value

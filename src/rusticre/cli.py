@@ -22,7 +22,7 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("disasm", "inspect", "xrefs", "callers", "callees", "function", "bytes"):
         command = sub.add_parser(name)
         command.add_argument("--exe", required=True)
-        command.add_argument("address")
+        command.add_argument("address", help="rva:0x... or va:0x...; unprefixed addresses must be unambiguous")
         if name == "disasm":
             command.add_argument("--count", type=int, default=40)
         if name in ("xrefs", "callers", "callees"):
@@ -38,7 +38,7 @@ def main(argv: list[str] | None = None) -> int:
 
     prologue = sub.add_parser("prologue")
     prologue.add_argument("--exe", required=True)
-    prologue.add_argument("address")
+    prologue.add_argument("address", help="rva:0x... or va:0x...; unprefixed addresses must be unambiguous")
     prologue.add_argument("--expect", required=True)
 
     add = sub.add_parser("evidence-add")

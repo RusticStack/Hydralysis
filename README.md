@@ -18,6 +18,8 @@ Start with `inspect` for cheap PE facts. Use `ghidra-query` for decompiler text 
 
 ## Setup
 
+The PE tools work without Ghidra. Decompilation currently requires a Ghidra/JDK installation and a project imported and analysed separately. RusticRE does not yet provide the initial import/analysis workflow for a fresh binary.
+
 ```text
 uv venv --python 3.14 .venv
 .\.venv\Scripts\python.exe -m pip install -e .
@@ -36,7 +38,7 @@ rusticre ghidra-query --target sample --action status
 rusticre ghidra-query --target sample --action stop
 ```
 
-PE tools accept RVAs or VAs. Ghidra queries use numeric **VAs**; aliases do not trigger name enumeration. Copy `next_cursor` into the same query to continue a functions or xrefs page. Function searches examine at most 2,000 entries per page, even when no name matches. Xref cursors are hexadecimal row offsets; function cursors are addresses. `truncated`, `body_truncated` and `total_characters` disclose incomplete answers. Decompiler text is capped at 32,000 characters.
+PE tools accept `rva:0x...` or `va:0x...`; unprefixed addresses must have an unambiguous mapped interpretation. A PE32 RVA can exceed its image base, so its value alone cannot always identify the intended address. Ghidra queries use numeric **VAs**; aliases do not trigger name enumeration. Copy `next_cursor` into the same query to continue a functions or xrefs page. Function searches examine at most 2,000 entries per page, even when no name matches. Xref cursors are hexadecimal row offsets; function cursors are addresses. `truncated`, `body_truncated` and `total_characters` disclose incomplete answers. Decompiler text is capped at 32,000 characters.
 
 Close the master before taking or validating a snapshot. Only its named `.gpr` and `.rep` are copied, with source metadata recorded; an ordinary script refuses stale or unowned lanes. Query workers refresh into a new snapshot when the master changes. Workers share one request lock per target, so a simultaneous request reports busy promptly. The default allows two warm workers, each with a 6G maximum heap; idle workers exit after five minutes. `query_startup_s` (180 by default) is separate from the per-query `--timeout` (30 seconds; configurable up to 300). A failed or timed-out query retires its worker and the next call starts a new one. Snapshots and logs are retained for diagnosis; remove them only when you no longer need them.
 
