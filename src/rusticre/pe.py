@@ -1,6 +1,7 @@
-"""PE32+ reads: fingerprint, disassembly, direct callers, rip-relative xrefs.
+"""Reads for any PE you own. 32-bit and 64-bit.
 
-The output header is the build identity. Quote it with any address.
+The header line is the build. Quote it with every address.
+Nothing in here knows which game the file came from.
 """
 
 from __future__ import annotations
@@ -40,12 +41,6 @@ class Image:
             "sha256": hashlib.sha256(self.data).hexdigest(),
             "image_base": hex(self.base),
         }
-        table = self.path.parent / "cyberpunk2077_addresses.json"
-        if table.is_file():
-            head = table.read_bytes()[:400].decode("utf-8", "replace")
-            match = re.search(r'"Linker map timestamp":\s*"([^"]+)"', head)
-            if match:
-                info["linkerMap"] = match.group(1)
         version = _file_version(self.pe)
         if version:
             info["file_version"] = version
@@ -56,8 +51,6 @@ class Image:
         extra = ""
         if "file_version" in info:
             extra += " version " + info["file_version"]
-        if "linkerMap" in info:
-            extra += " linker " + info["linkerMap"]
         return "# exe %s size %d tds %s sha256 %s%s" % (
             info["exe"],
             info["size"],
@@ -197,16 +190,123 @@ class Image:
             lines.append("(no match)")
         return "\n".join(lines)
 
-    def function_of(self, rva: int) -> str:
-        """The pdata function that contains `rva`, plus its first 32 bytes."""
+    def _executable(self):
+        found = [section for section in self.sections if section.Characteristics & 0x20000000]
+        return found or list(self.sections[:1])
+
+    def sections_text(self) -> str:
+        lines = [self.header(), "bits %d" % self.bits]
+        for section in self.sections:
+            name = section.Name.rstrip(b"\0").decode("utf-8", "replace")
+            marks = ""
+            if section.Characteristics & 0x20000000:
+                marks += "x"
+            if section.Characteristics & 0x40000000:
+                marks += "r"
+            if section.Characteristics & 0x80000000:
+                marks += "w"
+            lines.append(
+                "%-8s rva=%#x vsize=%#x raw=%#x %s"
+                % (name, section.VirtualAddress, section.Misc_VirtualSize, section.SizeOfRawData, marks)
+            )
+        return "\n".join(lines)
+
+    def imports_text(self, limit: int = 80) -> str:
+        self.pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
+        lines = [self.header()]
+        count = 0
+        for entry in getattr(self.pe, "DIRECTORY_ENTRY_IMPORT", []) or []:
+            dll = entry.dll.decode("utf-8", "replace") if isinstance(entry.dll, bytes) else str(entry.dll)
+            for item in entry.imports:
+                if item.name:
+                    label = item.name.decode("utf-8", "replace") if isinstance(item.name, bytes) else str(item.name)
+                else:
+                    label = "ord:%s" % item.ordinal
+                lines.append("%s %s" % (dll, label))
+                count += 1
+                if count >= limit:
+                    return "\n".join(lines)
+        if count == 0:
+            lines.append("(no imports)")
+        return "\n".join(lines)
+
+    def exports_text(self, limit: int = 80) -> str:
+        self.pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_EXPORT"]])
+        lines = [self.header()]
+        symbols = getattr(self.pe, "DIRECTORY_ENTRY_EXPORT", None)
+        if symbols is None:
+            lines.append("(no exports)")
+            return "\n".join(lines)
+        count = 0
+        for item in symbols.symbols:
+            name = item.name.decode("utf-8", "replace") if item.name else "ord:%s" % item.ordinal
+            lines.append("%#x %s" % (item.address, name))
+            count += 1
+            if count >= limit:
+                break
+        if count == 0:
+            lines.append("(no exports)")
+        return "\n".join(lines)
+
+    def sigscan(self, pattern: str, limit: int = 20) -> str:
+        from rusticre.prologue import find_pattern, parse_expect
+
+        expect = parse_expect(pattern)
+        hits = []
+        for section in self._executable():
+            raw = self.data[section.PointerToRawData : section.PointerToRawData + section.SizeOfRawData]
+            for offset in find_pattern(raw, expect, limit - len(hits)):
+                hits.append("%#x" % (section.VirtualAddress + offset))
+                if len(hits) >= limit:
+                    break
+            if len(hits) >= limit:
+                break
+        lines = [self.header(), "%d hit(s) for %s" % (len(hits), pattern)]
+        lines.extend(hits)
+        return "\n".join(lines)
+
+    def callees(self, rva: int, limit: int = 30) -> str:
+        bounds = self._bounds(rva)
+        if bounds is None:
+            begin, end = rva, rva + 0x200
+            scope = "no pdata; scanned 0x200 bytes from %#x" % rva
+        else:
+            begin, end = bounds
+            scope = "function %#x-%#x" % bounds
+        blob = self.read_rva(begin, max(0, end - begin))
+        hits = []
+        for index in range(0, max(0, len(blob) - 5)):
+            if blob[index] != 0xE8:
+                continue
+            rel = int.from_bytes(blob[index + 1 : index + 5], "little", signed=True)
+            site = begin + index
+            hits.append("%#x call %#x" % (site, site + 5 + rel))
+            if len(hits) >= limit:
+                break
+        lines = [self.header(), scope, "%d direct call(s)" % len(hits)]
+        lines.extend(hits)
+        return "\n".join(lines)
+
+    def inspect(self, rva: int) -> str:
+        """One picture of a function: bounds, prologue, instructions, direct callers.
+
+        This is the local stand-in for REA's function dossier. It does not
+        start Ghidra. Ask ghidra_run when you need decompiler text.
+        """
+        return "\n".join((
+            self.function_of(rva) if self._bounds(rva) else self.header() + "\nno pdata function contains %#x" % rva,
+            self.disasm(rva, 16),
+            self.callers(rva, 12),
+        ))
+
+    def _bounds(self, rva: int) -> tuple[int, int] | None:
         directory = self.pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
         if directory.VirtualAddress == 0 or directory.Size < 12:
-            raise ValueError("this exe has no exception directory; funcof needs pdata")
+            return None
         blob = self.read_rva(directory.VirtualAddress, directory.Size)
         count = len(blob) // 12
         lo = 0
         hi = count
-        found = None
         while lo < hi:
             mid = (lo + hi) // 2
             begin, end, _unwind = _runtime_function(blob, mid)
@@ -215,10 +315,17 @@ class Image:
             elif rva >= end:
                 lo = mid + 1
             else:
-                found = (begin, end)
-                break
+                return begin, end
+        return None
+
+    def function_of(self, rva: int) -> str:
+        """The pdata function that contains `rva`, plus its first 32 bytes."""
+        found = self._bounds(rva)
         lines = [self.header()]
         if found is None:
+            directory = self.pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
+            if directory.VirtualAddress == 0 or directory.Size < 12:
+                raise ValueError("this exe has no exception directory; function bounds need pdata")
             lines.append("no pdata function contains %#x" % rva)
             return "\n".join(lines)
         begin, end = found

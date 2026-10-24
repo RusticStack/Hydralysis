@@ -1,14 +1,12 @@
 ---
 name: rusticre-evidence
-description: Record a reverse-engineering claim so it survives a Ghidra project refresh. Use when naming a function, citing an offset, or closing a system row.
+description: Record a reverse-engineering claim so it survives a Ghidra refresh or a new build of the binary.
 ---
 
 # Evidence
 
-A row is the record. The Ghidra project is a cache and is refreshed from the master.
+Required: target (any name you give this binary), build (the fingerprint line), kind, name, note, source. Source is a disassembly line, a script line, or a capture line. An empty source is refused.
 
-Required: game, build (the fingerprint line), kind, name, note, source. Source is a file and line, a disassembly line, or a capture line. If you do not have one, the claim stays unwritten and the status stays open.
+Put the prologue from `inspect` or `function` in `--prologue`. On the next build, `prologue` prints `PROLOGUE MISMATCH` when the bytes moved. Drop the old name.
 
-Store the prologue from `funcof` in `--prologue`. On the next game build, `prologue` prints `PROLOGUE MISMATCH` when the bytes moved. Do not keep the old name.
-
-Do not write renames into the Ghidra project. The lane is opened read-only on purpose. The next refresh would delete them.
+The Ghidra project is a cache. The row is the record.

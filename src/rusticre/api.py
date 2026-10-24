@@ -5,33 +5,37 @@ from __future__ import annotations
 from pathlib import Path
 
 from rusticre import __version__
-from rusticre.catalog import games_text, systems_text
 from rusticre.config import evidence_path, load
 from rusticre.evidence import add_claim, list_claims
 from rusticre.ghidra import GhidraRunner
 from rusticre.pe import Image, parse_rva
 from rusticre.prologue import compare
-from rusticre.red4ext import lookup_hashes, lookup_rvas
 
+# Chosen from what agents actually called, mapped onto generic operations.
+# REA's function dossier -> inspect. Ghidra decompile/xrefs/bytes -> the
+# matching tools plus ghidra_run. Hook work -> sigscan and prologue.
+# Android, browser, firmware and the rest of REA are not registered.
 TOOL_NAMES = (
     "fingerprint",
+    "sections",
+    "imports",
+    "exports",
     "disasm",
+    "inspect",
     "xrefs",
     "callers",
-    "funcof",
+    "callees",
+    "function",
     "bytes",
     "strings",
+    "sigscan",
     "prologue",
-    "hash",
-    "addr",
     "evidence_add",
     "evidence_list",
     "ghidra_run",
     "ghidra_scripts",
     "ghidra_lanes",
     "ghidra_jobs",
-    "systems",
-    "games",
 )
 
 # Names that must never appear. They are the REA surface this server exists to avoid.
@@ -60,51 +64,51 @@ def tool_table() -> list[dict]:
     string = {"type": "string"}
     integer = {"type": "integer"}
     return [
-        tool("fingerprint", "Build identity of an exe: size, timestamp, sha256, version.", {"exe": string}, ["exe"]),
-        tool("disasm", "Disassemble at an RVA or VA. Rip-relative operands show their target string.", {
+        tool("fingerprint", "Build identity of a PE: size, timestamp, sha256, version, image base.", {"exe": string}, ["exe"]),
+        tool("sections", "Section names, RVAs, sizes and execute/read/write flags.", {"exe": string}, ["exe"]),
+        tool("imports", "Imported DLL symbols.", {"exe": string, "limit": integer}, ["exe"]),
+        tool("exports", "Exported symbols and their RVAs.", {"exe": string, "limit": integer}, ["exe"]),
+        tool("disasm", "Disassemble at an RVA or VA. 64-bit rip-relative operands show their target.", {
             "exe": string, "address": string, "count": integer,
         }, ["exe", "address"]),
-        tool("xrefs", "Who points at an address. 64-bit rip-relative, 32-bit absolute.", {
-            "exe": string, "address": string, "limit": integer,
-        }, ["exe", "address"]),
-        tool("callers", "Direct E8/E9 sites that land on an address.", {
-            "exe": string, "address": string, "limit": integer,
-        }, ["exe", "address"]),
-        tool("funcof", "The pdata function that contains an address, and its first 32 bytes.", {
+        tool("inspect", "One function picture without Ghidra: pdata bounds, prologue, instructions, direct callers.", {
             "exe": string, "address": string,
         }, ["exe", "address"]),
-        tool("bytes", "Raw bytes at an address, for an expect prologue.", {
-            "exe": string, "address": string, "size": integer,
+        tool("xrefs", "References to an address. 64-bit rip-relative LEA/MOV, 32-bit absolute.", {
+            "exe": string, "address": string, "limit": integer,
         }, ["exe", "address"]),
-        tool("strings", "Printable strings in the exe matching a regular expression.", {
+        tool("callers", "Direct E8/E9 sites in executable code that land on an address.", {
+            "exe": string, "address": string, "limit": integer,
+        }, ["exe", "address"]),
+        tool("callees", "Direct E8 calls made from the function that contains an address.", {
+            "exe": string, "address": string, "limit": integer,
+        }, ["exe", "address"]),
+        tool("function", "The pdata function that contains an address, and its first 32 bytes.", {
+            "exe": string, "address": string,
+        }, ["exe", "address"]),
+        tool("bytes", "Raw bytes at an address.", {"exe": string, "address": string, "size": integer}, ["exe", "address"]),
+        tool("strings", "Printable strings matching a regular expression.", {
             "exe": string, "pattern": string, "limit": integer,
         }, ["exe", "pattern"]),
-        tool("prologue", "Compare bytes at an address with an expect prologue. ?? is a wildcard.", {
+        tool("sigscan", "Find a byte pattern in executable sections. ?? is a wildcard. Use this to locate a hook site.", {
+            "exe": string, "pattern": string, "limit": integer,
+        }, ["exe", "pattern"]),
+        tool("prologue", "Compare bytes at an address with an expect prologue. Refuse a hook when this mismatches.", {
             "exe": string, "address": string, "expect": string,
         }, ["exe", "address", "expect"]),
-        tool("hash", "RED4ext address-table hash to segment and RVA. Pass the json path or an exe whose folder contains it.", {
-            "table": string, "hashes": {"type": "array", "items": string},
-        }, ["hashes"]),
-        tool("addr", "RVA to RED4ext hash. Segment 0001 only.", {
-            "table": string, "addresses": {"type": "array", "items": string},
-        }, ["addresses"]),
-        tool("evidence_add", "Store one proved claim. note and source are required.", {
-            "game": string, "build": string, "kind": string, "name": string,
+        tool("evidence_add", "Store one proved claim. note and source are required. target is any name you give this binary.", {
+            "target": string, "build": string, "kind": string, "name": string,
             "note": string, "source": string, "address": string, "prologue": string, "db": string,
-        }, ["game", "build", "kind", "name", "note", "source"]),
-        tool("evidence_list", "List stored claims, newest first.", {
-            "game": string, "limit": integer, "db": string,
-        }),
-        tool("ghidra_run", "Run one Ghidra script on a read-only copy of an analysed project. Does not re-import the exe.", {
-            "game": string, "script": string,
+        }, ["target", "build", "kind", "name", "note", "source"]),
+        tool("evidence_list", "List stored claims, newest first.", {"target": string, "limit": integer, "db": string}),
+        tool("ghidra_run", "Run one Ghidra script on a read-only copy of an already analysed project. Does not re-import the binary.", {
+            "target": string, "script": string,
             "args": {"type": "array", "items": string},
             "timeout_s": integer, "lane": string,
-        }, ["game", "script"]),
-        tool("ghidra_scripts", "List Ghidra scripts configured for a game.", {"game": string, "filter": string}, ["game"]),
-        tool("ghidra_lanes", "List project copies for a game.", {"game": string}, ["game"]),
+        }, ["target", "script"]),
+        tool("ghidra_scripts", "List Ghidra scripts for a configured target.", {"target": string, "filter": string}, ["target"]),
+        tool("ghidra_lanes", "List project copies for a configured target.", {"target": string}, ["target"]),
         tool("ghidra_jobs", "Recent Ghidra script runs.", {"limit": integer}),
-        tool("systems", "Co-op systems and mod-compatibility targets.", {"game": string}),
-        tool("games", "The three games this toolkit is for.", {}),
     ]
 
 
@@ -114,40 +118,46 @@ def call(name: str, args: dict | None) -> str:
         raise ValueError("unknown tool %s" % name)
     if name == "fingerprint":
         return _image(args).header()
+    if name == "sections":
+        return _image(args).sections_text()
+    if name == "imports":
+        return _image(args).imports_text(int(args.get("limit") or 80))
+    if name == "exports":
+        return _image(args).exports_text(int(args.get("limit") or 80))
     if name == "disasm":
         image = _image(args)
         return image.disasm(_addr(image, args), int(args.get("count") or 40))
+    if name == "inspect":
+        image = _image(args)
+        return image.inspect(_addr(image, args))
     if name == "xrefs":
         image = _image(args)
         return image.xrefs(_addr(image, args), int(args.get("limit") or 40))
     if name == "callers":
         image = _image(args)
         return image.callers(_addr(image, args), int(args.get("limit") or 50))
-    if name == "funcof":
+    if name == "callees":
+        image = _image(args)
+        return image.callees(_addr(image, args), int(args.get("limit") or 30))
+    if name == "function":
         image = _image(args)
         return image.function_of(_addr(image, args))
     if name == "bytes":
         image = _image(args)
-        size = int(args.get("size") or 32)
-        data = image.read_rva(_addr(image, args), size)
+        data = image.read_rva(_addr(image, args), int(args.get("size") or 32))
         return image.header() + "\n" + " ".join("%02X" % byte for byte in data)
     if name == "strings":
         return _image(args).find_strings(str(args.get("pattern") or ""), int(args.get("limit") or 30))
+    if name == "sigscan":
+        return _image(args).sigscan(str(args.get("pattern") or ""), int(args.get("limit") or 20))
     if name == "prologue":
         image = _image(args)
         data = image.read_rva(_addr(image, args), 64)
         return image.header() + "\n" + compare(data, str(args["expect"]))
-    if name == "hash":
-        wanted = {int(str(item), 0) for item in _list(args.get("hashes"))}
-        return "\n".join(lookup_hashes(_table(args), wanted)) or "(no match)"
-    if name == "addr":
-        image_base = 0x140000000
-        rvas = {parse_rva(item, image_base) for item in _list(args.get("addresses"))}
-        return "\n".join(lookup_rvas(_table(args), rvas)) or "(no match)"
     if name == "evidence_add":
         return add_claim(
             evidence_path(str(args.get("db") or "")),
-            game=str(args.get("game") or ""),
+            game=str(args.get("target") or args.get("game") or ""),
             build=str(args.get("build") or ""),
             kind=str(args.get("kind") or ""),
             name=str(args.get("name") or ""),
@@ -157,34 +167,36 @@ def call(name: str, args: dict | None) -> str:
             prologue=str(args.get("prologue") or ""),
         )
     if name == "evidence_list":
-        return list_claims(evidence_path(str(args.get("db") or "")), str(args.get("game") or ""), int(args.get("limit") or 50))
+        return list_claims(
+            evidence_path(str(args.get("db") or "")),
+            str(args.get("target") or args.get("game") or ""),
+            int(args.get("limit") or 50),
+        )
+    target = str(args.get("target") or args.get("game") or "")
     if name == "ghidra_run":
         return _ghidra().run(
-            str(args.get("game") or ""),
+            target,
             str(args.get("script") or ""),
             [str(item) for item in _list(args.get("args"))],
             int(args.get("timeout_s") or 600),
             str(args.get("lane") or ""),
         )
     if name == "ghidra_scripts":
-        return _ghidra().list_scripts(str(args.get("game") or ""), str(args.get("filter") or ""))
+        return _ghidra().list_scripts(target, str(args.get("filter") or ""))
     if name == "ghidra_lanes":
-        return _ghidra().list_lanes(str(args.get("game") or ""))
+        return _ghidra().list_lanes(target)
     if name == "ghidra_jobs":
         return _ghidra().jobs(int(args.get("limit") or 10))
-    if name == "systems":
-        return systems_text(str(args.get("game") or ""))
-    if name == "games":
-        return games_text()
     raise ValueError("unknown tool %s" % name)
 
 
 def instructions() -> str:
     return (
-        "RusticRE %s. Eighteen tools for an exe you own: disassembly, xrefs, callers, "
-        "pdata, RED4ext hashes, an evidence ledger, and a read-only Ghidra script on a "
-        "copy of an analysed project. Do not re-import the binary. Store proved names "
-        "with evidence_add. systems lists the co-op and mod-compatibility targets."
+        "RusticRE %s. Twenty tools for any PE you own. inspect is the function "
+        "picture (bounds, prologue, instructions, callers) and does not start a JVM. "
+        "sigscan and prologue are how a hook site is found and checked. ghidra_run "
+        "executes one script on a read-only copy of a project you already analysed. "
+        "Do not re-import the binary. evidence_add stores a claim only with a source."
         % __version__
     )
 
@@ -216,19 +228,6 @@ def _list(value) -> list:
     if isinstance(value, str):
         return value.split()
     return list(value)
-
-
-def _table(args: dict) -> Path:
-    if args.get("table"):
-        path = Path(str(args["table"]))
-    else:
-        exe = args.get("exe") or os_exe()
-        if not exe:
-            raise ValueError("pass table, or exe next to cyberpunk2077_addresses.json")
-        path = Path(str(exe)).parent / "cyberpunk2077_addresses.json"
-    if not path.is_file():
-        raise ValueError("address table not found: %s" % path)
-    return path
 
 
 def _ghidra() -> GhidraRunner:

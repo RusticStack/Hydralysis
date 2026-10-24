@@ -33,6 +33,34 @@ def matches(data: bytes, expect: list[int | None]) -> bool:
     return all(want is None or data[index] == want for index, want in enumerate(expect))
 
 
+def find_pattern(haystack: bytes, pattern: list[int | None], limit: int) -> list[int]:
+    if not pattern or limit <= 0:
+        return []
+    hits = []
+    last = len(haystack) - len(pattern) + 1
+    for index in range(max(0, last)):
+        if matches(haystack[index : index + len(pattern)], pattern):
+            hits.append(index)
+            if len(hits) >= limit:
+                break
+    return hits
+
+
+def find_pattern(haystack: bytes, pattern: list[int | None], limit: int) -> list[int]:
+    """Offsets where `pattern` matches. `None` is a wildcard byte."""
+    if not pattern or limit <= 0:
+        return []
+    hits = []
+    last = len(haystack) - len(pattern) + 1
+    width = len(pattern)
+    for index in range(max(0, last)):
+        if matches(haystack[index : index + width], pattern):
+            hits.append(index)
+            if len(hits) >= limit:
+                break
+    return hits
+
+
 def compare(data: bytes, expect_text: str) -> str:
     expect = parse_expect(expect_text)
     got = data[: len(expect)]

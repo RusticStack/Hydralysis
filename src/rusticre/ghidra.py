@@ -185,14 +185,15 @@ class GhidraRunner:
             os.makedirs(directory, exist_ok=True)
         self._guard = threading.Lock()
 
-    def project(self, game: str) -> dict:
-        projects = self.settings.get("projects") or {}
-        if game not in projects:
-            raise ValueError("no ghidra project configured for %s" % game)
-        item = projects[game]
+    def project(self, target: str) -> dict:
+        projects = self.settings.get("targets") or self.settings.get("projects") or {}
+        if target not in projects:
+            known = ", ".join(sorted(projects)) or "(none)"
+            raise ValueError("no ghidra target %r; configured: %s" % (target, known))
+        item = projects[target]
         for key in ("dir", "name", "program", "scripts"):
             if not item.get(key):
-                raise ValueError("ghidra project %s is missing %s" % (game, key))
+                raise ValueError("ghidra target %s is missing %s" % (target, key))
         return item
 
     def list_scripts(self, game: str, name_filter: str = "") -> str:

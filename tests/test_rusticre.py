@@ -6,12 +6,11 @@ from contextlib import redirect_stdout
 from pathlib import Path
 
 from rusticre.api import REJECTED, TOOL_NAMES, call, tool_table
-from rusticre.catalog import GAMES, MODS, SYSTEMS
 from rusticre.cli import main
 from rusticre.evidence import add_claim
 from rusticre.ghidra import build_command, filter_script_output
 from rusticre.mcp import Server
-from rusticre.prologue import compare, matches, parse_expect
+from rusticre.prologue import compare, find_pattern, matches, parse_expect
 from rusticre.red4ext import iter_entries, lookup_hashes
 
 
@@ -91,16 +90,23 @@ class EvidenceTests(unittest.TestCase):
             self.assertIn("prologue matched", listed)
 
 
-class CatalogTests(unittest.TestCase):
-    def test_the_three_games_and_the_mod_rule(self):
-        self.assertEqual(set(GAMES), {"cyberpunk", "kotor", "swtor"})
-        text = call("systems", {"game": "cyberpunk"})
-        self.assertIn("new-game", text)
-        self.assertIn("world-streaming", text)
-        self.assertIn("codeware", text)
-        self.assertIn("replace", text)
-        self.assertTrue(any(row["id"] == "red4ext" and row["keep"] for row in MODS))
-        self.assertTrue(any(row["id"] == "new-game" and row["status"] == "open" for row in SYSTEMS))
+class SurfaceTests(unittest.TestCase):
+    def test_the_server_is_the_used_subset(self):
+        names = list(TOOL_NAMES)
+        self.assertLessEqual(len(names), 20)
+        for banned in ("hash", "addr", "systems", "games", "funcof"):
+            self.assertNotIn(banned, names)
+        self.assertIn("inspect", names)
+        self.assertIn("sigscan", names)
+        self.assertIn("prologue", names)
+        blob = json.dumps(tool_table()).lower()
+        for word in ("red4ext", "codeware", "cyberpunk", "swkotor", "android", "firmware"):
+            self.assertNotIn(word, blob)
+
+    def test_sigscan_wildcards(self):
+        pattern = parse_expect("48 8B ?? C3")
+        haystack = bytes.fromhex("90 48 8B 11 C3 48 8B 22 C3")
+        self.assertEqual(find_pattern(haystack, pattern, 10), [1, 5])
 
 
 class McpTests(unittest.TestCase):

@@ -1,7 +1,7 @@
 [project]
 name = "rusticre"
-version = "0.1.0"
-description = "Small reverse-engineering toolkit for games you own. One CLI and a short MCP server."
+version = "0.2.0"
+description = "Reverse-engineering tools for a PE you own: disassembly, cross-references, signatures, hooks, and a read-only Ghidra run."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"

@@ -1,18 +1,17 @@
 ---
 name: rusticre
-description: Use the RusticRE CLI or its eighteen-tool MCP server to inspect a game exe you own, record a proved claim, or run one read-only Ghidra script. Use when a session would otherwise call REA, GhidraMCP, analyzeHeadless, or a one-off disassembler.
+description: Inspect any PE you own with the RusticRE CLI or its twenty-tool MCP server. Use instead of REA, GhidraMCP, or analyzeHeadless.
 ---
 
 # RusticRE
 
-Call `rusticre`. Do not call `npx rea-agents`, LaurieWired's `ghidra-mcp`, or `analyzeHeadless` by hand.
+Call `rusticre`. Pass `--exe` every time. Quote the `# exe ... sha256` header with every address.
 
-1. `rusticre fingerprint --exe <path>` and quote the header on every address you report.
-2. Instructions, a string, a direct caller: `disasm`, `strings`, `xrefs`, `callers`. These do not start a JVM.
-3. The function that contains an address, and its prologue: `funcof`, then `prologue --expect "48 8B ?? ..."`.
-4. Cyberpunk hashes: `hash` and `addr` against `cyberpunk2077_addresses.json`. Only segment 0001 is an RVA.
-5. A decompile or a script such as `Recv.java`: `ghidra-run --game <cyberpunk|kotor|swtor> <Script.java>`. The project must already be analysed. The run is read-only.
-6. A proved name goes to `evidence-add` with the log line or the disassembly line in `--source`. A claim with an empty source is refused.
-7. What to work on next: `rusticre systems --game <name>`.
+1. `fingerprint` and `sections` before anything else, so the build is known.
+2. One function: `inspect <address>`. That is bounds, prologue, instructions and direct callers, with no JVM.
+3. A string, a caller, or a callee that `inspect` did not show: `strings`, `xrefs`, `callers`, `callees`.
+4. A hook: `sigscan "48 8B ?? 24 10"`, then `prologue <address> --expect "..."`. A mismatch means do not hook.
+5. Decompiler text: `ghidra-run --target <name> Script.java`. The project must already be analysed. The run is read-only.
+6. A proved name: `evidence-add` with the disassembly line or the script line in `--source`.
 
-`swkotor.exe` is 32-bit. The other two exes are 64-bit. Pass `--exe` every time so a stale path cannot answer for the wrong build.
+Do not call `npx rea-agents` or LaurieWired's `ghidra-mcp`. Do not pass `-import` to Ghidra.
