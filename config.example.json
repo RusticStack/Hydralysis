@@ -4,12 +4,16 @@
   "java_home": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot",
   "max_mem": "6G",
   "max_cpu": 6,
+  "query_workers": 2,
+  "query_startup_s": 180,
+  "query_idle_s": 300,
   "evidence": "F:/dev-cache/rusticre/evidence.db",
   "targets": {
     "sample": {
       "dir": "",
       "name": "",
       "program": "program.exe",
+      "exe": "F:/binaries/program.exe",
       "scripts": ""
     }
   }

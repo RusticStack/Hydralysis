@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from rusticre import __version__
@@ -10,6 +11,7 @@ from rusticre.evidence import add_claim, list_claims
 from rusticre.ghidra import GhidraRunner
 from rusticre.pe import Image, parse_rva
 from rusticre.prologue import compare
+from rusticre.query import QueryRunner
 
 # Chosen from what agents actually called, mapped onto generic operations.
 # REA's function dossier -> inspect. Ghidra decompile/xrefs/bytes -> the
@@ -34,7 +36,7 @@ TOOL_NAMES = (
     "evidence_list",
     "ghidra_run",
     "ghidra_scripts",
-    "ghidra_lanes",
+    "ghidra_query",
     "ghidra_jobs",
 )
 
@@ -71,7 +73,7 @@ def tool_table() -> list[dict]:
         tool("disasm", "Disassemble at an RVA or VA. 64-bit rip-relative operands show their target.", {
             "exe": string, "address": string, "count": integer,
         }, ["exe", "address"]),
-        tool("inspect", "One function picture without Ghidra: pdata bounds, prologue, instructions, direct callers.", {
+        tool("inspect", "Cheap PE inspection: x64 pdata bounds, instructions, candidate callers. For analysed bounds/decompile use ghidra_query.", {
             "exe": string, "address": string,
         }, ["exe", "address"]),
         tool("xrefs", "References to an address. 64-bit rip-relative LEA/MOV, 32-bit absolute.", {
@@ -107,7 +109,11 @@ def tool_table() -> list[dict]:
             "timeout_s": integer, "lane": string,
         }, ["target", "script"]),
         tool("ghidra_scripts", "List Ghidra scripts for a configured target.", {"target": string, "filter": string}, ["target"]),
-        tool("ghidra_lanes", "List project copies for a configured target.", {"target": string}, ["target"]),
+        tool("ghidra_query", "Decompile or query an already analysed read-only project in a reusable JVM. Numeric VAs only, no name enumeration. functions pages via next_cursor. status/stop manage the worker. Verify exe/sha256 in target config.", {
+            "target": string,
+            "action": {"type": "string", "enum": ["decompile", "function", "functions", "xrefs", "status", "stop"]},
+            "address": string, "limit": integer, "cursor": string, "contains": string, "timeout_s": integer,
+        }, ["target"]),
         tool("ghidra_jobs", "Recent Ghidra script runs.", {"limit": integer}),
     ]
 
@@ -116,8 +122,12 @@ def call(name: str, args: dict | None) -> str:
     args = args or {}
     if name not in TOOL_NAMES:
         raise ValueError("unknown tool %s" % name)
+    for key, maximum in (("limit", 200), ("count", 200), ("size", 65536)):
+        if key in args and (isinstance(args[key], bool) or not 1 <= int(args[key]) <= maximum):
+            raise ValueError("%s must be 1..%d" % (key, maximum))
     if name == "fingerprint":
-        return _image(args).header()
+        image = _image(args)
+        return image.header() + "\n" + json.dumps(image.fingerprint(), indent=2)
     if name == "sections":
         return _image(args).sections_text()
     if name == "imports":
@@ -151,9 +161,16 @@ def call(name: str, args: dict | None) -> str:
     if name == "sigscan":
         return _image(args).sigscan(str(args.get("pattern") or ""), int(args.get("limit") or 20))
     if name == "prologue":
+        from rusticre.prologue import parse_expect
         image = _image(args)
-        data = image.read_rva(_addr(image, args), 64)
-        return image.header() + "\n" + compare(data, str(args["expect"]))
+        expected = parse_expect(str(args["expect"]))
+        if len(expected) > 4096:
+            raise ValueError("expect must be at most 4096 bytes")
+        data = image.read_rva(_addr(image, args), len(expected))
+        result = image.header() + "\n" + compare(data, str(args["expect"]))
+        if "PROLOGUE MISMATCH" in result:
+            raise ValueError(result)
+        return result
     if name == "evidence_add":
         return add_claim(
             evidence_path(str(args.get("db") or "")),
@@ -173,6 +190,12 @@ def call(name: str, args: dict | None) -> str:
             int(args.get("limit") or 50),
         )
     target = str(args.get("target") or args.get("game") or "")
+    if name == "ghidra_query":
+        return QueryRunner(_settings()).query(
+            target, str(args.get("action") or "decompile"), str(args.get("address") or ""),
+            int(args.get("limit", 40)), str(args.get("cursor") or ""), str(args.get("contains") or ""),
+            int(args.get("timeout_s", 30)),
+        )
     if name == "ghidra_run":
         return _ghidra().run(
             target,
@@ -183,8 +206,6 @@ def call(name: str, args: dict | None) -> str:
         )
     if name == "ghidra_scripts":
         return _ghidra().list_scripts(target, str(args.get("filter") or ""))
-    if name == "ghidra_lanes":
-        return _ghidra().list_lanes(target)
     if name == "ghidra_jobs":
         return _ghidra().jobs(int(args.get("limit") or 10))
     raise ValueError("unknown tool %s" % name)
@@ -196,6 +217,8 @@ def instructions() -> str:
         "picture (bounds, prologue, instructions, callers) and does not start a JVM. "
         "sigscan and prologue are how a hook site is found and checked. ghidra_run "
         "executes one script on a read-only copy of a project you already analysed. "
+        "Prefer ghidra_query for bounded address-based decompilation and references; "
+        "its JVM stays warm across CLI and MCP calls. Addresses there are VAs. "
         "Do not re-import the binary. evidence_add stores a claim only with a source."
         % __version__
     )
@@ -231,7 +254,11 @@ def _list(value) -> list:
 
 
 def _ghidra() -> GhidraRunner:
+    return GhidraRunner(_settings())
+
+
+def _settings() -> dict:
     settings = load()
     if not settings.get("root") or not settings.get("ghidra_dir"):
         raise ValueError("set RUSTICRE_CONFIG to a json file with root and ghidra_dir")
-    return GhidraRunner(settings)
+    return settings

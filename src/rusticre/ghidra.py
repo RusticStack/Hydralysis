@@ -13,10 +13,12 @@ game. See THIRD_PARTY.md.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -40,6 +42,30 @@ LOG_LINE = re.compile(r"^(?:INFO|ERROR|WARN|DEBUG|SEVERE)\s")
 def headless_path(ghidra_dir: str) -> str:
     name = "analyzeHeadless.bat" if os.name == "nt" else "analyzeHeadless"
     return os.path.join(ghidra_dir, "support", name)
+
+
+def ghidra_environment(settings: dict) -> dict[str, str]:
+    """Keep JVM settings, caches and temporary files inside this server's root."""
+    env = dict(os.environ)
+    env["GHIDRA_MAXMEM"] = str(settings.get("max_mem", "6G"))
+    env["GHIDRA_HEADLESS_MAXMEM"] = env["GHIDRA_MAXMEM"]
+    if settings.get("java_home"):
+        env["JAVA_HOME"] = settings["java_home"]
+    runtime = Path(settings["root"]).resolve() / "runtime"
+    properties = {}
+    for folder, keys in (("settings", ("application.settingsdir",)),
+                         ("cache", ("application.cachedir",)),
+                         ("tmp", ("application.tempdir", "java.io.tmpdir"))):
+        directory = runtime / folder
+        directory.mkdir(parents=True, exist_ok=True)
+        properties.update({key: str(directory) for key in keys})
+    env["TEMP"] = env["TMP"] = env["TMPDIR"] = properties["java.io.tmpdir"]
+    extra = " ".join('"-D%s=%s"' % item for item in properties.items())
+    # The Windows launcher expands GHIDRA_HEADLESS_JAVA_OPTIONS inside a quoted
+    # batch argument. Let the JVM parse its own environment instead, including
+    # quoted paths with spaces, without changing the installed launch scripts.
+    env["JAVA_TOOL_OPTIONS"] = (env.get("JAVA_TOOL_OPTIONS", "") + " " + extra).strip()
+    return env
 
 
 def build_command(
@@ -72,8 +98,23 @@ def build_command(
         *script_args,
     ]
     if os.name == "nt":
+        for argument in args:
+            if re.search(r'[&|<>^%!"\r\n\x00]', argument):
+                raise ValueError("Windows headless arguments must not contain shell metacharacters")
         return ["cmd.exe", "/d", "/c", *args]
     return args
+
+
+def launch_command(command: list[str]) -> str | list[str]:
+    """Quote every batch argument, including semicolon-separated script paths.
+
+    list2cmdline only quotes whitespace. cmd's batch argument parser also splits
+    unquoted semicolons, so passing a normal subprocess list loses script paths.
+    build_command already rejects expansion and control characters on Windows.
+    """
+    if os.name != "nt":
+        return command
+    return 'cmd.exe /d /s /c "' + " ".join('"%s"' % value for value in command[3:]) + '"'
 
 
 def filter_script_output(stdout: str) -> str:
@@ -164,7 +205,7 @@ class LaneLock:
 
 
 def ghidra_locked(project_dir: str, project_name: str) -> bool:
-    return os.path.isfile(os.path.join(project_dir, project_name + ".lock"))
+    return any(os.path.exists(os.path.join(project_dir, project_name + suffix)) for suffix in (".lock", ".lock~"))
 
 
 def _safe_name(name: str) -> str:
@@ -172,6 +213,62 @@ def _safe_name(name: str) -> str:
     if not cleaned:
         raise ValueError("lane name is empty")
     return cleaned
+
+
+class GhidraJobError(RuntimeError):
+    """A failed run with durable diagnostics, including failures with exit code 0."""
+
+    def __init__(self, record: dict, record_path: str):
+        self.record = record
+        self.job_id = record["job_id"]
+        self.log_path = record["log_path"]
+        self.record_path = record_path
+        super().__init__("Ghidra job %s %s: %s; log=%s record=%s" % (
+            self.job_id, record["state"], record.get("error") or "script failed", self.log_path, record_path
+        ))
+
+
+def _snapshot_identity(project: dict) -> dict:
+    """Stat every source file so a saved lane cannot silently outlive its master."""
+    source = Path(project["dir"]).resolve()
+    name = project["name"]
+    if name != Path(name).name or name in ("", ".", "..") or "/" in name or "\\" in name:
+        raise ValueError("project name must be one file name")
+    marker, repository = source / (name + ".gpr"), source / (name + ".rep")
+    if not marker.is_file() or not repository.is_dir():
+        raise ValueError("analysed project is missing %s.gpr or %s.rep under %s" % (name, name, source))
+    if marker.is_symlink() or repository.is_symlink():
+        raise ValueError("project files must not be symbolic links")
+    entries = [marker, *sorted(repository.rglob("*"))]
+    stats = []
+    for path in entries:
+        if path.is_symlink():
+            raise ValueError("project contains a symbolic link: %s" % path)
+        if path.is_file():
+            stat = path.stat()
+            stats.append([path.relative_to(source).as_posix(), stat.st_size, stat.st_mtime_ns])
+    return {
+        "version": 1, "source": os.path.normcase(str(source)), "name": name,
+        "program": project["program"],
+        "source_stat_sha256": hashlib.sha256(json.dumps(stats, separators=(",", ":")).encode()).hexdigest(),
+    }
+
+
+def _script_failed(output: str) -> bool:
+    return bool(re.search(r"(?:^|\n)(?:\d{4}-\d\d-\d\d [\d:, .]+ )?(?:ERROR|SEVERE)\s|"
+                          r"Error running script|Unable to (?:find|load|run) script|SCRIPT ERROR", output, re.IGNORECASE))
+
+
+def _terminate_owned_tree(proc: subprocess.Popen) -> None:
+    """Do not release a lane while a child JVM can still hold its project lock."""
+    if os.name == "nt":
+        result = subprocess.run(["taskkill.exe", "/PID", str(proc.pid), "/T", "/F"],
+                                capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            raise RuntimeError("owned process tree cleanup failed: %s" % (result.stderr or result.stdout).strip())
+    else:
+        os.killpg(proc.pid, signal.SIGKILL)
+    proc.wait(timeout=30)
 
 
 class GhidraRunner:
@@ -185,13 +282,13 @@ class GhidraRunner:
             os.makedirs(directory, exist_ok=True)
         self._guard = threading.Lock()
 
-    def project(self, target: str) -> dict:
+    def project(self, target: str, require_scripts: bool = True) -> dict:
         projects = self.settings.get("targets") or self.settings.get("projects") or {}
         if target not in projects:
             known = ", ".join(sorted(projects)) or "(none)"
             raise ValueError("no ghidra target %r; configured: %s" % (target, known))
         item = projects[target]
-        for key in ("dir", "name", "program", "scripts"):
+        for key in (("dir", "name", "program", "scripts") if require_scripts else ("dir", "name", "program")):
             if not item.get(key):
                 raise ValueError("ghidra target %s is missing %s" % (target, key))
         return item
@@ -227,6 +324,31 @@ class GhidraRunner:
 
     def run(self, game: str, script: str, script_args: list[str], timeout_s: int = 600, lane: str = "") -> str:
         project = self.project(game)
+        from rusticre.query import _expected_hash
+
+        expected = _expected_hash(project)
+        script_name = script if script.endswith((".java", ".py")) else script + ".java"
+        if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\.(?:java|py)", script_name):
+            raise ValueError("script must be a simple .java or .py file name")
+        if not os.path.isfile(os.path.join(project["scripts"], script_name)):
+            raise ValueError("script is missing from configured scripts directory: %s" % script_name)
+        for argument in script_args:
+            if not isinstance(argument, str):
+                raise ValueError("script arguments must be strings")
+            if argument.startswith("-") and not re.fullmatch(r"-(?:0x[0-9a-fA-F]+|\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)", argument):
+                raise ValueError("headless options are forbidden in script arguments: %s" % argument)
+        builtin_scripts = str(Path(__file__).with_name("scripts"))
+        script_path = builtin_scripts + ";" + project["scripts"]
+        # Validate before reserving or copying a lane. The Windows batch launcher
+        # interprets shell metacharacters even though subprocess takes a list.
+        if os.name == "nt":
+            for argument in [headless_path(self.settings["ghidra_dir"]), project["dir"],
+                             project["name"], project["program"], script_path,
+                             self.settings["root"], *script_args]:
+                if re.search(r'[&|<>^%!"\r\n\x00]', argument):
+                    raise ValueError("Windows headless arguments must not contain shell metacharacters")
+        max_cpu = int(self.settings.get("max_cpu", 4))
+        env = ghidra_environment(self.settings)
         if not os.path.isfile(headless_path(self.settings["ghidra_dir"])):
             raise ValueError("Ghidra headless launcher is missing under %s" % self.settings["ghidra_dir"])
         if ghidra_locked(project["dir"], project["name"]):
@@ -234,49 +356,64 @@ class GhidraRunner:
         lane_dir = self._claim(game, project, lane)
         job_id = "job-%s" % uuid.uuid4().hex[:12]
         log_path = os.path.join(self.logs_dir, job_id + ".log")
-        script_name = script if script.endswith((".java", ".py")) else script + ".java"
         command = build_command(
             self.settings["ghidra_dir"],
             lane_dir,
             project["name"],
             project["program"],
-            project["scripts"],
+            script_path,
             script_name,
             script_args,
             log_path,
-            int(self.settings.get("max_cpu", 4)),
+            max_cpu,
         )
-        env = dict(os.environ)
-        env["GHIDRA_MAXMEM"] = str(self.settings.get("max_mem", "6G"))
-        env["GHIDRA_HEADLESS_MAXMEM"] = env["GHIDRA_MAXMEM"]
-        if self.settings.get("java_home"):
-            env["JAVA_HOME"] = self.settings["java_home"]
+        position = command.index("-postScript")
+        command[position:position] = ["-preScript", "RusticGuard.java", expected]
         started = time.time()
+        proc = None
+        release_lane = True
+        error = ""
+        stdout = stderr = ""
         try:
-            proc = subprocess.run(
-                command,
+            proc = subprocess.Popen(
+                launch_command(command),
                 env=env,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=timeout_s,
+                **({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}),
             )
+            stdout, stderr = proc.communicate(timeout=timeout_s)
             code = proc.returncode
-            stdout = proc.stdout
-            stderr = proc.stderr
-            state = "done" if code == 0 else "failed"
+            state = "done" if code == 0 and not _script_failed(stdout + "\n" + stderr) else "failed"
+            if state == "failed":
+                error = "headless exited %s or reported a script error" % code
         except subprocess.TimeoutExpired as exc:
             code = -1
-            stdout = exc.stdout or ""
-            stderr = exc.stderr or ""
-            if isinstance(stdout, bytes):
-                stdout = stdout.decode("utf-8", "replace")
-            if isinstance(stderr, bytes):
-                stderr = stderr.decode("utf-8", "replace")
             state = "timeout"
+            error = "exceeded %ss; the owned process tree was terminated" % timeout_s
+            try:
+                _terminate_owned_tree(proc)
+                stdout, stderr = proc.communicate(timeout=5)
+            except (OSError, RuntimeError, subprocess.SubprocessError) as cleanup_error:
+                state = "cleanup_failed"
+                release_lane = False
+                error = "timeout; lane retained because cleanup could not be confirmed: %s" % cleanup_error
+                stdout, stderr = exc.stdout or "", exc.stderr or ""
+        except OSError as exc:
+            code, state, error = -1, "failed", str(exc)
         finally:
-            _release(os.path.join(lane_dir, ".rusticre.lock"))
+            if release_lane:
+                _release(os.path.join(lane_dir, ".rusticre.lock"))
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", "replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", "replace")
+        transcript_path = os.path.join(self.logs_dir, job_id + ".stdout.log")
+        with open(transcript_path, "w", encoding="utf-8") as handle:
+            handle.write("--- stdout ---\n" + stdout + "\n--- stderr ---\n" + stderr)
         output = filter_script_output(stdout)
         record = {
             "job_id": job_id,
@@ -286,14 +423,21 @@ class GhidraRunner:
             "lane": os.path.basename(lane_dir),
             "state": state,
             "exit_code": code,
+            "started_at": started,
+            "finished_at": time.time(),
             "duration_s": round(time.time() - started, 2),
             "command": command,
             "output": output,
             "stderr_tail": (stderr or "")[-2000:],
+            "log_path": transcript_path,
+            "headless_log_path": log_path,
+            "error": error,
         }
         record_path = os.path.join(self.jobs_dir, job_id + ".json")
         with open(record_path, "w", encoding="utf-8") as handle:
             json.dump(record, handle, indent=2)
+        if state != "done":
+            raise GhidraJobError(record, record_path)
         return (
             "job=%s game=%s script=%s lane=%s state=%s exit=%s duration=%ss\n--- script output ---\n%s"
             % (job_id, game, script_name, record["lane"], state, code, record["duration_s"], output or "(no script output)")
@@ -308,7 +452,7 @@ class GhidraRunner:
                     records.append(json.load(handle))
             except (OSError, ValueError):
                 continue
-        records.sort(key=lambda item: item.get("job_id", ""), reverse=True)
+        records.sort(key=lambda item: item.get("started_at", 0), reverse=True)
         if not records:
             return "no jobs yet"
         lines = []
@@ -322,30 +466,62 @@ class GhidraRunner:
         with self._guard:
             if lane:
                 directory = os.path.join(self.lanes_dir, _safe_name(game) + "-" + _safe_name(lane))
-                self._ensure(directory, project)
+                os.makedirs(directory, exist_ok=True)
                 if not _acquire(os.path.join(directory, ".rusticre.lock")):
                     raise ValueError("lane %s is busy" % lane)
-                if ghidra_locked(directory, project["name"]):
+                try:
+                    if ghidra_locked(directory, project["name"]):
+                        raise ValueError("lane %s is open in Ghidra" % lane)
+                    self._ensure(directory, project)
+                except BaseException:
                     _release(os.path.join(directory, ".rusticre.lock"))
-                    raise ValueError("lane %s is open in Ghidra" % lane)
+                    raise
                 return directory
             for index in range(1, 9):
                 directory = os.path.join(self.lanes_dir, "%s-%d" % (_safe_name(game), index))
-                self._ensure(directory, project)
-                if ghidra_locked(directory, project["name"]):
+                os.makedirs(directory, exist_ok=True)
+                lock_path = os.path.join(directory, ".rusticre.lock")
+                if not _acquire(lock_path):
                     continue
-                if _acquire(os.path.join(directory, ".rusticre.lock")):
-                    return directory
+                try:
+                    if ghidra_locked(directory, project["name"]):
+                        _release(lock_path)
+                        continue
+                    self._ensure(directory, project)
+                except BaseException:
+                    _release(lock_path)
+                    raise
+                return directory
         raise ValueError("no free lane; eight copies are already in use")
 
+    def ensure_snapshot(self, directory: str, project: dict) -> None:
+        """Create/validate a snapshot while the caller holds an exclusive OS lock."""
+        self._ensure(directory, project)
+
     def _ensure(self, directory: str, project: dict) -> None:
-        marker = os.path.join(directory, project["name"] + ".gpr")
-        if os.path.isfile(marker):
+        if ghidra_locked(project["dir"], project["name"]):
+            raise ValueError("the master project is open; close it before copying a lane")
+        identity = _snapshot_identity(project)
+        destination = Path(directory)
+        destination.mkdir(parents=True, exist_ok=True)
+        metadata_path = destination / ".rusticre-snapshot.json"
+        marker = destination / (project["name"] + ".gpr")
+        repository = destination / (project["name"] + ".rep")
+        if metadata_path.is_file():
+            saved = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if saved != identity:
+                raise ValueError("stale lane: source project identity changed; choose a new lane or root")
+            if not marker.is_file() or not repository.is_dir():
+                raise ValueError("incomplete lane snapshot; choose a new lane or root")
             return
-        if os.path.isdir(directory):
-            shutil.rmtree(directory)
-        os.makedirs(os.path.dirname(directory), exist_ok=True)
-        shutil.copytree(project["dir"], directory)
+        unknown = set(path.name for path in destination.iterdir()) - {".rusticre.lock"}
+        if unknown:
+            raise ValueError("refusing to replace an existing unowned or incomplete lane: %s" % destination)
+        shutil.copy2(Path(project["dir"]) / marker.name, marker)
+        shutil.copytree(Path(project["dir"]) / repository.name, repository)
+        if ghidra_locked(project["dir"], project["name"]) or _snapshot_identity(project) != identity:
+            raise ValueError("source project changed while copying; snapshot refused; choose a new lane")
+        metadata_path.write_text(json.dumps(identity, indent=2), encoding="utf-8")
 
 
 _LOCKS: dict[str, LaneLock] = {}
