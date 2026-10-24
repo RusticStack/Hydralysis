@@ -65,30 +65,31 @@ def tool_table() -> list[dict]:
 
     string = {"type": "string"}
     integer = {"type": "integer"}
+    pe_address = {"type": "string", "description": "Use rva:0x... or va:0x...; ambiguous unprefixed addresses are refused."}
     return [
         tool("fingerprint", "Build identity of a PE: size, timestamp, sha256, version, image base.", {"exe": string}, ["exe"]),
         tool("sections", "Section names, RVAs, sizes and execute/read/write flags.", {"exe": string}, ["exe"]),
         tool("imports", "Imported DLL symbols.", {"exe": string, "limit": integer}, ["exe"]),
         tool("exports", "Exported symbols and their RVAs.", {"exe": string, "limit": integer}, ["exe"]),
         tool("disasm", "Disassemble at an RVA or VA. 64-bit rip-relative operands show their target.", {
-            "exe": string, "address": string, "count": integer,
+            "exe": string, "address": pe_address, "count": integer,
         }, ["exe", "address"]),
         tool("inspect", "Cheap PE inspection: x64 pdata bounds, instructions, candidate callers. For analysed bounds/decompile use ghidra_query.", {
-            "exe": string, "address": string,
+            "exe": string, "address": pe_address,
         }, ["exe", "address"]),
         tool("xrefs", "References to an address. 64-bit rip-relative LEA/MOV, 32-bit absolute.", {
-            "exe": string, "address": string, "limit": integer,
+            "exe": string, "address": pe_address, "limit": integer,
         }, ["exe", "address"]),
         tool("callers", "Direct E8/E9 sites in executable code that land on an address.", {
-            "exe": string, "address": string, "limit": integer,
+            "exe": string, "address": pe_address, "limit": integer,
         }, ["exe", "address"]),
         tool("callees", "Direct E8 calls made from the function that contains an address.", {
-            "exe": string, "address": string, "limit": integer,
+            "exe": string, "address": pe_address, "limit": integer,
         }, ["exe", "address"]),
         tool("function", "The pdata function that contains an address, and its first 32 bytes.", {
-            "exe": string, "address": string,
+            "exe": string, "address": pe_address,
         }, ["exe", "address"]),
-        tool("bytes", "Raw bytes at an address.", {"exe": string, "address": string, "size": integer}, ["exe", "address"]),
+        tool("bytes", "Raw bytes at an address.", {"exe": string, "address": pe_address, "size": integer}, ["exe", "address"]),
         tool("strings", "Printable strings matching a regular expression.", {
             "exe": string, "pattern": string, "limit": integer,
         }, ["exe", "pattern"]),
@@ -96,7 +97,7 @@ def tool_table() -> list[dict]:
             "exe": string, "pattern": string, "limit": integer,
         }, ["exe", "pattern"]),
         tool("prologue", "Compare bytes at an address with an expect prologue. Refuse a hook when this mismatches.", {
-            "exe": string, "address": string, "expect": string,
+            "exe": string, "address": pe_address, "expect": string,
         }, ["exe", "address", "expect"]),
         tool("evidence_add", "Store one proved claim. note and source are required. target is any name you give this binary.", {
             "target": string, "build": string, "kind": string, "name": string,
@@ -219,6 +220,7 @@ def instructions() -> str:
         "executes one script on a read-only copy of a project you already analysed. "
         "Prefer ghidra_query for bounded address-based decompilation and references; "
         "its JVM stays warm across CLI and MCP calls. Addresses there are VAs. "
+        "For PE addresses use rva:0x... or va:0x... when the interpretation is ambiguous. "
         "Do not re-import the binary. evidence_add stores a claim only with a source."
         % __version__
     )
@@ -242,7 +244,19 @@ def os_exe() -> str:
 def _addr(image: Image, args: dict) -> int:
     if "address" not in args:
         raise ValueError("address is required")
-    return parse_rva(str(args["address"]), image.base)
+    text = str(args["address"]).strip()
+    rva = parse_rva(text, image.base)
+    if ":" not in text:
+        value = int(text, 0)
+        if value >= image.base:
+            raw_mapped = image.rva_to_offset(value) is not None
+            va_mapped = image.rva_to_offset(rva) is not None
+            if raw_mapped and va_mapped:
+                raise ValueError("ambiguous address %s: RVA %#x and VA %#x (RVA %#x) both map to this image; use rva:%s or va:%s"
+                                 % (text, value, value, rva, text, text))
+            if raw_mapped:
+                return value
+    return rva
 
 
 def _list(value) -> list:

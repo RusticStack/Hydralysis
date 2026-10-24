@@ -5,7 +5,7 @@ description: Inspect any PE you own with the RusticRE CLI or its twenty-tool MCP
 
 # RusticRE
 
-Call `rusticre`. PE operations take `--exe`; Ghidra operations take a configured `--target`. Quote the full build SHA-256 with every address. PE tools accept RVA or VA; Ghidra queries require numeric VA.
+Call `rusticre`. PE operations take `--exe`; Ghidra operations take a configured `--target`. Quote the full build SHA-256 with every address. PE tools accept explicit `rva:0x...` or `va:0x...`; unprefixed ambiguous addresses are refused. Ghidra queries require numeric VA. A fresh binary needs a separately imported/analysed Ghidra project before decompilation; RusticRE does not yet bootstrap that project.
 
 1. `fingerprint` and `sections` before anything else, so the build is known.
 2. One function: `inspect --exe <path> <address>`. That is x64 unwind bounds, prologue, instructions and candidate callers, with no JVM. PE32 bounds and confirmed references need saved analysis.

@@ -8,7 +8,7 @@ with `-process -noanalysis -readOnly`. No game or runtime hook was launched.
 
 ## Tests and packaging
 
-`python -m unittest discover -s tests -v`: **56 tests passed**, exit 0.
+`python -m unittest discover -s tests -v`: **63 tests passed**, exit 0.
 Coverage includes real stdio subprocess exchanges, responsive MCP control
 messages during slow calls, queue/output limits, snapshots and locks, stale
 analysis, worker death/refusal/timeout recovery, file-backed reads, signature
@@ -21,7 +21,7 @@ F:/dev-cache/rusticre/audit-20261024/dist` built successfully. Both owned Java
 scripts are included in the wheel. `git diff --check` passed. This repository
 has no configured formatter/linter or CI workflow.
 
-The serialized `tool_table()` contains **20 tools**, **5,716 UTF-8 bytes** in
+The serialized `tool_table()` contains **20 tools**, **6,428 UTF-8 bytes** in
 total, and a largest individual input schema of **363 bytes**. Tests enforce
 20 tools, a catalog below 8 KiB and each schema below 1 KiB. These are byte
 counts, not token or billing claims. `ghidra_query` occupies the former
@@ -128,3 +128,40 @@ process cleanup was reviewed but not exercised on this Windows host. No
 Cyberpunk Ghidra worker was opened; the real saved-project tests covered SWTOR
 and KotOR. The [research report](research.md) explains where REA value-flow
 queries and direct Ghidra analysis/editing still earn a call.
+
+## Fresh KotOR II install
+
+The follow-up test used only the newly installed
+`E:\SteamLibrary\steamapps\common\Knights of the Old Republic II\swkotor2.exe`,
+with no analysis project prepared for it. It is a 6,588,416-byte PE32 x86,
+version 1.0.2, SHA-256
+`6a522e71631dcee93467bd2010f3b23d9145326e1e2e89305f13ab104dbbffef`.
+The native RusticRE MCP successfully returned its fingerprint, sections,
+imports, full strings, raw bytes, disassembly, candidate string references,
+signature hit and positive/negative prologue checks. No game was launched,
+hook installed or Ghidra import run. Packing triage reported no obvious
+indicators; that is not proof the file is unpacked.
+
+This test found a real address bug: the entry RVA `0x51d5a2` exceeds the image
+base `0x400000`. The old auto-detection subtracted the image base and inspected
+RVA `0x11d5a2`, which is also mapped. The corrected API rejects ambiguous
+unprefixed addresses and accepts explicit `rva:0x51d5a2` or `va:0x91d5a2`.
+Both returned the same bytes at file offset `0x51c9a2`, independently checked
+against pefile's entry-point mapping and the original file bytes. Seven new
+regression tests cover this overlap and shared CLI/MCP behavior. Fresh CLI and
+newline MCP subprocesses also passed the real-file address test with no backend
+configuration. The catalog grew by descriptions of address syntax, not tools.
+
+The decompile attempt through the registered MCP returned
+`no ghidra target 'kotor2-fresh-install'; configured: sample`. This is a real
+first-use gap, not successful decompilation: current RusticRE requires an
+existing analysed project and a Ghidra/JDK installation. Saved analysis is the
+prerequisite; functions do not have to have been decompiled previously. A
+generic explicit import/analyse-once job, durable status/failure reporting and
+target registration are still needed before claiming an end-to-end fresh-start
+workflow. Ghidra remains the backend decompiler, distinct from its MCP server.
+
+Local records: `kotor2-native-mcp.json` retains the original native calls and
+the wrong-address discovery; `kotor2-fresh-results.json` / `kotor2-fresh.log`
+record the corrected subprocess checks; `kotor2-tests.log` records the 63-test
+pass. Existing MCP processes need a reload to load this source update.
