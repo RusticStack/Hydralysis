@@ -1,0 +1,29 @@
+{
+  "root": "F:/dev-cache/rusticre",
+  "ghidra_dir": "F:/dev-cache/ghidra/ghidra_12.1.4_PUBLIC",
+  "java_home": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot",
+  "max_mem": "6G",
+  "max_cpu": 6,
+  "default_game": "swtor",
+  "evidence": "F:/dev-cache/rusticre/evidence.db",
+  "projects": {
+    "swtor": {
+      "dir": "F:/dev-cache/ghidra-projects/SWTOR-origins/client",
+      "name": "client",
+      "program": "swtor.exe",
+      "scripts": "F:/dev-cache/ghidra-projects/SWTOR-origins/scripts"
+    },
+    "cyberpunk": {
+      "dir": "",
+      "name": "NCT-2.31",
+      "program": "Cyberpunk2077.exe",
+      "scripts": ""
+    },
+    "kotor": {
+      "dir": "",
+      "name": "kotor",
+      "program": "swkotor.exe",
+      "scripts": ""
+    }
+  }
+}

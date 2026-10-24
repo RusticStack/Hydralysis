@@ -1,0 +1,25 @@
+[project]
+name = "rusticre"
+version = "0.1.0"
+description = "Small reverse-engineering toolkit for games you own. One CLI and a short MCP server."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "KelpHect", email = "kellhect@gmail.com" }]
+dependencies = [
+  "pefile>=2024.8.18",
+  "capstone>=5",
+]
+
+[project.scripts]
+rusticre = "rusticre.cli:main"
+
+[project.optional-dependencies]
+dev = []
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
