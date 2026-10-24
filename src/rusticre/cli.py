@@ -65,8 +65,14 @@ def main(argv: list[str] | None = None) -> int:
     gscripts.add_argument("--target", required=True)
     gscripts.add_argument("--filter", default="")
 
-    glanes = sub.add_parser("ghidra-lanes")
-    glanes.add_argument("--target", required=True)
+    query = sub.add_parser("ghidra-query", help="Warm read-only Ghidra query; numeric addresses are VAs")
+    query.add_argument("--target", required=True)
+    query.add_argument("address", nargs="?", default="")
+    query.add_argument("--action", choices=("decompile", "function", "functions", "xrefs", "status", "stop"), default="decompile")
+    query.add_argument("--limit", type=int, default=40)
+    query.add_argument("--cursor", default="")
+    query.add_argument("--contains", default="")
+    query.add_argument("--timeout", type=int, default=30)
 
     sub.add_parser("ghidra-jobs")
     sub.add_parser("tools")
@@ -85,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         print(call(*_pair(args)))
         return 0
-    except (ValueError, OSError, KeyError) as exc:
+    except (ValueError, OSError, KeyError, RuntimeError) as exc:
         print("%s: %s" % (type(exc).__name__, exc), file=sys.stderr)
         return 1
 
@@ -107,8 +113,10 @@ def _pair(args: argparse.Namespace) -> tuple[str, dict]:
         }
     if command == "ghidra_scripts":
         return command, {"target": args.target, "filter": args.filter}
-    if command == "ghidra_lanes":
-        return command, {"target": args.target}
+    if command == "ghidra_query":
+        return command, {"target": args.target, "action": args.action, "address": args.address,
+                         "limit": args.limit, "cursor": args.cursor, "contains": args.contains,
+                         "timeout_s": args.timeout}
     if command == "ghidra_jobs":
         return command, {}
     if command in ("fingerprint", "sections", "imports", "exports"):

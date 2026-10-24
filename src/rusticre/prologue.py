@@ -20,6 +20,8 @@ def parse_expect(text: str) -> list[int | None]:
         if not 0 <= value <= 0xFF:
             raise ValueError("prologue byte out of range: %s" % part)
         out.append(value)
+    if all(value is None for value in out):
+        raise ValueError("expect prologue must contain at least one concrete byte")
     return out
 
 
@@ -28,36 +30,42 @@ def format_bytes(data: bytes) -> str:
 
 
 def matches(data: bytes, expect: list[int | None]) -> bool:
-    if len(data) < len(expect):
+    if not expect or all(value is None for value in expect) or len(data) < len(expect):
         return False
     return all(want is None or data[index] == want for index, want in enumerate(expect))
 
 
 def find_pattern(haystack: bytes, pattern: list[int | None], limit: int) -> list[int]:
+    """Find a literal anchor in C, then check only the candidate windows."""
     if not pattern or limit <= 0:
         return []
+    if all(value is None for value in pattern):
+        raise ValueError("signature must contain at least one concrete byte")
+    anchor_start, anchor = 0, b""
+    run_start, run = 0, bytearray()
+    for index, value in enumerate(pattern + [None]):
+        if value is None:
+            if len(run) > len(anchor):
+                anchor_start, anchor = run_start, bytes(run)
+            run.clear()
+        else:
+            if not run:
+                run_start = index
+            run.append(value)
     hits = []
-    last = len(haystack) - len(pattern) + 1
-    for index in range(max(0, last)):
-        if matches(haystack[index : index + len(pattern)], pattern):
+    start = anchor_start
+    stop = len(haystack) - len(pattern) + anchor_start + len(anchor)
+    concrete = [(index, value) for index, value in enumerate(pattern) if value is not None]
+    while start <= stop - len(anchor):
+        found = haystack.find(anchor, start, stop)
+        if found < 0:
+            break
+        index = found - anchor_start
+        if all(haystack[index + offset] == value for offset, value in concrete):
             hits.append(index)
             if len(hits) >= limit:
                 break
-    return hits
-
-
-def find_pattern(haystack: bytes, pattern: list[int | None], limit: int) -> list[int]:
-    """Offsets where `pattern` matches. `None` is a wildcard byte."""
-    if not pattern or limit <= 0:
-        return []
-    hits = []
-    last = len(haystack) - len(pattern) + 1
-    width = len(pattern)
-    for index in range(max(0, last)):
-        if matches(haystack[index : index + width], pattern):
-            hits.append(index)
-            if len(hits) >= limit:
-                break
+        start = found + 1
     return hits
 
 

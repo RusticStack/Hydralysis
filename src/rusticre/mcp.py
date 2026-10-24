@@ -1,4 +1,4 @@
-"""Stdio MCP server. Speaks Content-Length frames and newline JSON.
+"""Stdio MCP server. Newline JSON by default; legacy framed input is echoed.
 
 The tool list is the dispatch table in api.py. Nothing else is registered.
 """
@@ -7,13 +7,18 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 
 from rusticre import __version__
 from rusticre.api import call, instructions, tool_table
 
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 SERVER_INFO = {"name": "rusticre", "version": __version__}
+MAX_OUTPUT_BYTES = 128 * 1024
+TOOL_WORKERS = 4
+MAX_OUTSTANDING = 8
 
 
 class Server:
@@ -43,10 +48,10 @@ class Server:
             name = params.get("name")
             try:
                 text = call(name, params.get("arguments") or {})
-                return _ok(msg_id, {"content": [{"type": "text", "text": text}], "isError": False})
+                return _tool_result(msg_id, text)
             except Exception as exc:
                 detail = "%s: %s" % (type(exc).__name__, exc)
-                return _ok(msg_id, {"content": [{"type": "text", "text": detail}], "isError": True})
+                return _tool_result(msg_id, detail, error=True)
         if method in ("resources/list", "resources/templates/list"):
             return _ok(msg_id, {"resources": []} if "templates" not in method else {"resourceTemplates": []})
         if method == "prompts/list":
@@ -55,13 +60,18 @@ class Server:
             return None
         return _err(msg_id, -32601, "method not found: %s" % method)
 
-    def serve(self) -> None:
-        stdin = sys.stdin.buffer
-        stdout = sys.stdout.buffer
-        while True:
-            message = _read_message(stdin)
-            if message is None:
-                return
+    def serve(self, stdin=None, stdout=None) -> None:
+        stdin = stdin if stdin is not None else sys.stdin.buffer
+        stdout = stdout if stdout is not None else sys.stdout.buffer
+        output_lock = threading.Lock()
+        slots = threading.BoundedSemaphore(MAX_OUTSTANDING)
+
+        def write(response, framed):
+            if response is not None:
+                with output_lock:
+                    _write_message(stdout, response, framed=framed)
+
+        def dispatch(message, framed):
             try:
                 response = self.handle(message)
             except Exception:
@@ -70,8 +80,44 @@ class Server:
                     response = _err(message["id"], -32603, "internal error")
                 else:
                     response = None
-            if response is not None:
-                _write_message(stdout, response)
+            write(response, framed)
+
+        def work(message, framed):
+            try:
+                dispatch(message, framed)
+            finally:
+                slots.release()
+
+        # Keep reading control messages while bounded workers run expensive tools.
+        # A queue bound matters: ThreadPoolExecutor's own queue is unbounded.
+        with ThreadPoolExecutor(max_workers=TOOL_WORKERS, thread_name_prefix="rusticre") as pool:
+            while True:
+                try:
+                    message, framed = _read_envelope(stdin)
+                except _ParseError as exc:
+                    write(_err(None, -32700, "parse error: %s" % exc), exc.framed)
+                    continue
+                if message is None:
+                    return
+                if not isinstance(message, dict) or not isinstance(message.get("method"), str):
+                    write(_err(None, -32600, "invalid request"), framed)
+                    continue
+                if "params" in message and not isinstance(message["params"], dict):
+                    write(_err(message.get("id"), -32602, "params must be an object"), framed)
+                    continue
+                if "id" not in message:
+                    # Notifications never receive replies or consume a tool slot.
+                    continue
+                if message["method"] == "tools/call":
+                    if slots.acquire(blocking=False):
+                        pool.submit(work, message, framed)
+                    else:
+                        write(_tool_result(message["id"],
+                            "Server busy: %d tool calls are outstanding. "
+                            "Wait for a result before retrying this call." % MAX_OUTSTANDING,
+                            error=True), framed)
+                else:
+                    dispatch(message, framed)
 
 
 def _ok(msg_id, result: dict) -> dict:
@@ -82,26 +128,66 @@ def _err(msg_id, code: int, message: str) -> dict:
     return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}}
 
 
+def _tool_result(msg_id, text: str, error: bool = False) -> dict:
+    encoded = str(text).encode("utf-8")
+    if len(encoded) > MAX_OUTPUT_BYTES:
+        marker = ("\n[OUTPUT TRUNCATED: original %d UTF-8 bytes; only the head and tail "
+                  "are shown within a %d-byte limit. Middle output was discarded. "
+                  "Narrow the query or use a smaller page.]\n" % (len(encoded), MAX_OUTPUT_BYTES)).encode("utf-8")
+        budget = MAX_OUTPUT_BYTES - len(marker)
+        head = encoded[:budget // 2].decode("utf-8", errors="ignore")
+        tail = encoded[-(budget - budget // 2):].decode("utf-8", errors="ignore")
+        text = head + marker.decode("utf-8") + tail
+        error = True
+    return _ok(msg_id, {"content": [{"type": "text", "text": str(text)}], "isError": error})
+
+
+class _ParseError(ValueError):
+    def __init__(self, detail: str, framed: bool):
+        super().__init__(detail)
+        self.framed = framed
+
+
 def _read_message(stdin) -> dict | None:
-    first = stdin.readline()
-    if not first:
-        return None
-    if first.lower().startswith(b"content-length:"):
-        length = int(first.split(b":", 1)[1].strip())
-        while True:
-            line = stdin.readline()
-            if line in (b"\r\n", b"\n", b""):
-                break
-        body = stdin.read(length)
-        return json.loads(body.decode("utf-8"))
-    text = first.strip()
-    if not text:
-        return _read_message(stdin)
-    return json.loads(text.decode("utf-8"))
+    return _read_envelope(stdin)[0]
 
 
-def _write_message(stdout, payload: dict) -> None:
-    body = json.dumps(payload).encode("utf-8")
-    stdout.write(b"Content-Length: %d\r\n\r\n" % len(body))
-    stdout.write(body)
+def _read_envelope(stdin) -> tuple[dict | None, bool]:
+    while True:
+        first = stdin.readline()
+        if not first:
+            return None, False
+        if first.strip():
+            break
+    framed = first.lower().startswith(b"content-length:")
+    try:
+        if framed:
+            length = int(first.split(b":", 1)[1].strip())
+            if length < 0:
+                raise ValueError("negative Content-Length")
+            while True:
+                line = stdin.readline()
+                if line in (b"\r\n", b"\n", b""):
+                    break
+            body = stdin.read(length)
+            if len(body) != length:
+                raise ValueError("incomplete Content-Length body")
+        else:
+            body = first.strip()
+        message = json.loads(body.decode("utf-8"))
+        # JSON null is not EOF; let the request validator reject it.
+        if message is None:
+            message = []
+        return message, framed
+    except (ValueError, UnicodeError) as exc:
+        raise _ParseError(str(exc), framed) from exc
+
+
+def _write_message(stdout, payload: dict, *, framed: bool = False) -> None:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    if framed:
+        stdout.write(b"Content-Length: %d\r\n\r\n" % len(body))
+        stdout.write(body)
+    else:
+        stdout.write(body + b"\n")
     stdout.flush()

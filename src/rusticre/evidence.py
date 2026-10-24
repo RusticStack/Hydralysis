@@ -83,7 +83,8 @@ def list_claims(path: Path, game: str = "", limit: int = 50) -> str:
         args.append(game)
     query += " ORDER BY id DESC LIMIT ?"
     args.append(int(limit))
-    db = connect(path)
+    db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    db.row_factory = sqlite3.Row
     try:
         rows = db.execute(query, args).fetchall()
     finally:

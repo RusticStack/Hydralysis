@@ -7,7 +7,9 @@ Nothing in here knows which game the file came from.
 from __future__ import annotations
 
 import hashlib
+import math
 import re
+from collections import Counter
 from pathlib import Path
 
 import capstone
@@ -23,59 +25,117 @@ class Image:
         self.pe = pefile.PE(data=self.data, fast_load=True)
         self.base = int(self.pe.OPTIONAL_HEADER.ImageBase)
         self.machine = int(self.pe.FILE_HEADER.Machine)
-        self.bits = 32 if self.machine == 0x14C else 64
+        self.bits = 32 if self.pe.OPTIONAL_HEADER.Magic == 0x10B else 64
+        self._fingerprint = None
         self.sections = []
         for section in self.pe.sections:
             name = section.Name.rstrip(b"\0").decode("utf-8", "replace")
             self.sections.append(section)
             if name == ".text":
                 self.text = section
+        if not self.sections:
+            raise ValueError("PE has no sections")
         if not hasattr(self, "text"):
             self.text = self.pe.sections[0]
 
     def fingerprint(self) -> dict:
+        if self._fingerprint is not None:
+            return dict(self._fingerprint)
         info = {
             "exe": self.path.name,
             "size": len(self.data),
             "timeDateStamp": hex(self.pe.FILE_HEADER.TimeDateStamp),
             "sha256": hashlib.sha256(self.data).hexdigest(),
             "image_base": hex(self.base),
+            "machine": hex(self.machine),
+            "bits": self.bits,
+            "entry_point_rva": hex(self.pe.OPTIONAL_HEADER.AddressOfEntryPoint),
         }
         version = _file_version(self.pe)
         if version:
             info["file_version"] = version
-        return info
+        warnings = []
+        entry = self.pe.OPTIONAL_HEADER.AddressOfEntryPoint
+        entry_section = None
+        for section in self.sections:
+            name = section.Name.rstrip(b"\0").decode("utf-8", "replace")
+            if section.VirtualAddress <= entry < section.VirtualAddress + max(section.Misc_VirtualSize, section.SizeOfRawData):
+                entry_section = section
+                info["entry_point_section"] = name
+            if name.lower() in (".bind", "upx0", "upx1", "upx2", ".aspack", ".adata", ".vmp0", ".vmp1", ".themida"):
+                warnings.append("section %s is a known wrapper/packer indicator" % name)
+        if entry_section is None:
+            warnings.append("entry point is outside the section table")
+        else:
+            if not entry_section.Characteristics & 0x20000000:
+                warnings.append("entry point is in a non-executable section")
+            raw = self._section_data(entry_section)[:65536]
+            if raw:
+                entropy = -sum((count / len(raw)) * math.log2(count / len(raw)) for count in Counter(raw).values())
+                if entropy >= 7.5:
+                    warnings.append("entry section entropy %.2f bits/byte in first %d raw bytes; compressed/encrypted data is possible" % (entropy, len(raw)))
+        info["analysis_warnings"] = warnings
+        info["packing_status"] = "suspected; indicators are not proof" if warnings else "no obvious indicators; not proof of unpacked code"
+        self._fingerprint = info
+        return dict(info)
 
     def header(self) -> str:
         info = self.fingerprint()
         extra = ""
         if "file_version" in info:
             extra += " version " + info["file_version"]
-        return "# exe %s size %d tds %s sha256 %s%s" % (
+        line = "# exe %s size %d tds %s sha256 %s%s" % (
             info["exe"],
             info["size"],
             info["timeDateStamp"],
-            info["sha256"][:16],
+            info["sha256"],
             extra,
         )
+        line += "\n# bits %d image_base %s entry_rva %s" % (info["bits"], info["image_base"], info["entry_point_rva"])
+        if info["analysis_warnings"]:
+            line += "\n# CAUTION: possible packed/wrapped or unusual image: " + "; ".join(info["analysis_warnings"])
+            line += ". Verify the analysed project's executable SHA-256 before trusting decompiler text."
+        return line
 
     def rva_to_offset(self, rva: int) -> int | None:
         for section in self.sections:
             start = section.VirtualAddress
-            size = max(section.Misc_VirtualSize, section.SizeOfRawData)
+            size = section.SizeOfRawData
             if start <= rva < start + size:
-                return rva - start + section.PointerToRawData
+                offset = rva - start + section.PointerToRawData
+                return offset if 0 <= offset < len(self.data) else None
         return None
 
+    def _available(self, rva: int) -> int:
+        for section in self.sections:
+            relative = rva - section.VirtualAddress
+            if 0 <= relative < section.SizeOfRawData:
+                return max(0, min(section.SizeOfRawData - relative, len(self.data) - section.PointerToRawData - relative))
+        return 0
+
+    def _section_data(self, section) -> bytes:
+        start = section.PointerToRawData
+        return self.data[start : start + section.SizeOfRawData]
+
+    def _decoder(self):
+        if self.machine not in (0x14C, 0x8664):
+            raise ValueError("instruction decoding supports x86/x64 only; PE machine is %#x" % self.machine)
+        mode = capstone.CS_MODE_32 if self.bits == 32 else capstone.CS_MODE_64
+        return capstone.Cs(capstone.CS_ARCH_X86, mode)
+
     def read_rva(self, rva: int, size: int) -> bytes:
+        if rva < 0 or size < 0:
+            raise ValueError("RVA and size must be non-negative")
         offset = self.rva_to_offset(rva)
         if offset is None:
             raise ValueError("rva %#x is not in a section of %s" % (rva, self.path.name))
+        if size > self._available(rva):
+            raise ValueError("read at rva %#x size %#x crosses the file-backed section boundary" % (rva, size))
         return self.data[offset : offset + size]
 
     def string_at(self, rva: int, limit: int = 80) -> str | None:
         try:
-            raw = self.read_rva(rva, limit)
+            raw = self.read_rva(rva, min(limit, self._available(rva)))
         except ValueError:
             return None
         end = raw.find(b"\0")
@@ -87,9 +147,10 @@ class Image:
         return text.decode("ascii")
 
     def disasm(self, rva: int, count: int = 40) -> str:
-        mode = capstone.CS_MODE_32 if self.bits == 32 else capstone.CS_MODE_64
-        md = capstone.Cs(capstone.CS_ARCH_X86, mode)
-        blob = self.read_rva(rva, count * 16)
+        md = self._decoder()
+        if count <= 0:
+            raise ValueError("instruction count must be positive")
+        blob = self.read_rva(rva, min(count * 16, self._available(rva)))
         lines = [self.header()]
         shown = 0
         for insn in md.disasm(blob, rva):
@@ -103,33 +164,36 @@ class Image:
         return "\n".join(lines)
 
     def callers(self, target: int, limit: int = 50) -> str:
-        """Direct E8/E9 call and jump sites whose displacement lands on `target`."""
+        """Byte candidates, not verified instruction boundaries or a complete call graph."""
+        self._decoder()
         hits = []
-        section = self.text
-        start = section.PointerToRawData
-        raw = self.data[start : start + section.SizeOfRawData]
-        base = section.VirtualAddress
-        for index in range(0, max(0, len(raw) - 5)):
-            opcode = raw[index]
-            if opcode not in (0xE8, 0xE9):
-                continue
-            rel = int.from_bytes(raw[index + 1 : index + 5], "little", signed=True)
-            site = base + index
-            dest = site + 5 + rel
-            if dest == target:
-                kind = "call" if opcode == 0xE8 else "jmp"
-                hits.append("%#x %s %#x" % (site, kind, dest))
-                if len(hits) >= limit:
-                    break
-        lines = [self.header(), "%d direct site(s) -> %#x" % (len(hits), target)]
+        for section in self._executable():
+            raw = self._section_data(section)
+            for match in re.finditer(b"[\xe8\xe9]", raw):
+                index = match.start()
+                if index + 5 > len(raw):
+                    continue
+                rel = int.from_bytes(raw[index + 1 : index + 5], "little", signed=True)
+                site = section.VirtualAddress + index
+                dest = site + 5 + rel
+                if dest == target:
+                    kind = "E8 call candidate" if raw[index] == 0xE8 else "E9 jump candidate"
+                    hits.append("%#x %s -> %#x" % (site, kind, dest))
+                    if len(hits) >= limit:
+                        break
+            if len(hits) >= limit:
+                break
+        lines = [self.header(), "%d byte candidate(s) -> %#x; instruction boundaries unverified; limit %d" % (len(hits), target, limit)]
         lines.extend(hits)
+        if len(hits) >= limit:
+            lines.append("[limit reached; results may be incomplete]")
         return "\n".join(lines)
 
     def xrefs(self, target: int, limit: int = 40) -> str:
         """References to `target`.
 
         64-bit: rip-relative LEA and MOV. 32-bit: the absolute address stored
-        little-endian in an executable section (KotOR's swkotor.exe).
+        little-endian in an executable section. These are byte candidates.
         """
         if self.bits == 32:
             return self._xrefs_abs(target, limit)
@@ -140,20 +204,23 @@ class Image:
             start = section.PointerToRawData
             raw = self.data[start : start + section.SizeOfRawData]
             base = section.VirtualAddress
-            index = 0
-            while index + 7 <= len(raw) and len(hits) < limit:
-                if raw[index] in (0x48, 0x4C) and raw[index + 1] in (0x8D, 0x8B) and (raw[index + 2] & 0xC7) == 0x05:
+            for match in re.finditer(b"[\x48\x4c][\x8d\x8b]", raw):
+                index = match.start()
+                if index + 7 <= len(raw) and (raw[index + 2] & 0xC7) == 0x05:
                     disp = int.from_bytes(raw[index + 3 : index + 7], "little", signed=True)
                     site = base + index
                     dest = site + 7 + disp
                     if dest == target:
                         hits.append("%#x -> %#x" % (site, dest))
-                    index += 7
-                    continue
-                index += 1
+                    if len(hits) >= limit:
+                        break
+            if len(hits) >= limit:
+                break
         text = self.string_at(target) or ""
-        lines = [self.header(), "%d rip-relative ref(s) -> %#x %s" % (len(hits), target, text)]
+        lines = [self.header(), "%d RIP-relative byte candidate(s) -> %#x %s; instruction boundaries unverified; limit %d" % (len(hits), target, text, limit)]
         lines.extend(hits)
+        if len(hits) >= limit:
+            lines.append("[limit reached; results may be incomplete]")
         return "\n".join(lines)
 
     def _xrefs_abs(self, target: int, limit: int) -> str:
@@ -170,22 +237,33 @@ class Image:
                     break
                 hits.append("%#x -> %#x" % (section.VirtualAddress + found, target))
                 start = found + 1
-        lines = [self.header(), "%d absolute ref(s) -> %#x" % (len(hits), target)]
+        lines = [self.header(), "%d absolute byte candidate(s) -> %#x; instruction boundaries unverified; limit %d" % (len(hits), target, limit)]
         lines.extend(hits)
+        if len(hits) >= limit:
+            lines.append("[limit reached; results may be incomplete]")
         return "\n".join(lines)
 
     def find_strings(self, pattern: str, limit: int = 30) -> str:
-        regex = re.compile(pattern.encode("utf-8"))
+        regex = re.compile(pattern)
         lines = [self.header()]
         count = 0
         for section in self.sections:
             raw = self.data[section.PointerToRawData : section.PointerToRawData + section.SizeOfRawData]
-            for match in regex.finditer(raw):
-                rva = section.VirtualAddress + match.start()
-                lines.append("%#x %s" % (rva, match.group().decode("utf-8", "replace")))
-                count += 1
-                if count >= limit:
-                    return "\n".join(lines)
+            for encoding, printable in (("ascii", rb"[\x20-\x7e]{4,}"),
+                                        ("utf-16le", rb"(?:[\x20-\x7e]\x00){4,}")):
+                for match in re.finditer(printable, raw):
+                    text = match.group().decode(encoding)
+                    if not regex.search(text):
+                        continue
+                    # Return the whole string's start, not the matching substring:
+                    # xrefs point to the string start even when a suffix matched.
+                    rva = section.VirtualAddress + match.start()
+                    clipped = text[:512] + (" [text truncated]" if len(text) > 512 else "")
+                    lines.append("%#x %s %s" % (rva, encoding, clipped))
+                    count += 1
+                    if count >= limit:
+                        lines.append("[limit reached; results may be incomplete]")
+                        return "\n".join(lines)
         if count == 0:
             lines.append("(no match)")
         return "\n".join(lines)
@@ -225,6 +303,7 @@ class Image:
                 lines.append("%s %s" % (dll, label))
                 count += 1
                 if count >= limit:
+                    lines.append("[limit reached; results may be incomplete]")
                     return "\n".join(lines)
         if count == 0:
             lines.append("(no imports)")
@@ -246,6 +325,8 @@ class Image:
                 break
         if count == 0:
             lines.append("(no exports)")
+        if count >= limit:
+            lines.append("[limit reached; results may be incomplete]")
         return "\n".join(lines)
 
     def sigscan(self, pattern: str, limit: int = 20) -> str:
@@ -263,28 +344,31 @@ class Image:
                 break
         lines = [self.header(), "%d hit(s) for %s" % (len(hits), pattern)]
         lines.extend(hits)
+        if len(hits) >= limit:
+            lines.append("[limit reached; results may be incomplete]")
         return "\n".join(lines)
 
     def callees(self, rva: int, limit: int = 30) -> str:
+        md = self._decoder()
+        md.detail = True
         bounds = self._bounds(rva)
         if bounds is None:
-            begin, end = rva, rva + 0x200
-            scope = "no pdata; scanned 0x200 bytes from %#x" % rva
+            begin, end = rva, rva + min(0x200, self._available(rva))
+            scope = "no pdata; linear decode from caller-supplied start %#x (unverified), at most 0x200 bytes" % rva
         else:
             begin, end = bounds
             scope = "function %#x-%#x" % bounds
         blob = self.read_rva(begin, max(0, end - begin))
         hits = []
-        for index in range(0, max(0, len(blob) - 5)):
-            if blob[index] != 0xE8:
-                continue
-            rel = int.from_bytes(blob[index + 1 : index + 5], "little", signed=True)
-            site = begin + index
-            hits.append("%#x call %#x" % (site, site + 5 + rel))
-            if len(hits) >= limit:
-                break
-        lines = [self.header(), scope, "%d direct call(s)" % len(hits)]
+        for insn in md.disasm(blob, begin):
+            if insn.id == capstone.x86.X86_INS_CALL and insn.operands and insn.operands[0].type == capstone.x86.X86_OP_IMM:
+                hits.append("%#x call %#x" % (insn.address, insn.operands[0].imm))
+                if len(hits) >= limit:
+                    break
+        lines = [self.header(), scope, "%d decoded direct call(s); linear decode is not a complete control-flow graph; limit %d" % (len(hits), limit)]
         lines.extend(hits)
+        if len(hits) >= limit:
+            lines.append("[limit reached; results may be incomplete]")
         return "\n".join(lines)
 
     def inspect(self, rva: int) -> str:
@@ -300,6 +384,8 @@ class Image:
         ))
 
     def _bounds(self, rva: int) -> tuple[int, int] | None:
+        if self.machine != 0x8664:
+            return None
         directory = self.pe.OPTIONAL_HEADER.DATA_DIRECTORY[3]
         if directory.VirtualAddress == 0 or directory.Size < 12:
             return None
@@ -329,7 +415,7 @@ class Image:
             lines.append("no pdata function contains %#x" % rva)
             return "\n".join(lines)
         begin, end = found
-        first = self.read_rva(begin, 32)
+        first = self.read_rva(begin, min(32, end - begin))
         lines.append("function %#x-%#x size %#x" % (begin, end, end - begin))
         lines.append("prologue %s" % " ".join("%02X" % byte for byte in first))
         return "\n".join(lines)
@@ -366,11 +452,16 @@ def _file_version(pe) -> str:
         return ""
     if not hasattr(pe, "FileInfo"):
         return ""
-    for entry in pe.FileInfo or []:
-        for item in getattr(entry, "StringTable", []) or []:
-            for key, value in item.entries.items():
-                if key.decode("utf-8", "replace").lower() in ("fileversion", "productversion"):
-                    return value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value)
+    versions = {}
+    for group in pe.FileInfo or []:
+        for entry in group if isinstance(group, (list, tuple)) else (group,):
+            for item in getattr(entry, "StringTable", []) or []:
+                for key, value in item.entries.items():
+                    name = key.decode("utf-8", "replace") if isinstance(key, bytes) else str(key)
+                    if name.lower() in ("fileversion", "productversion"):
+                        versions[name.lower()] = value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value)
+    if versions:
+        return versions.get("fileversion", versions.get("productversion", ""))
     return ""
 
 
