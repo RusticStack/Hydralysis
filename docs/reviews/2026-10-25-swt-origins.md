@@ -1,222 +1,180 @@
-# RusticRE on SWTOR-origins — usage review
+# RusticRE on SWTOR-origins — what using it was actually like
 
-Status: **documentation only.** No code changes are included in this pull request. The findings
-come from using RusticRE's CLI and MCP surface against a user-owned retail SWTOR client while
-answering two questions that come up in normal preservation work. The protocol findings stay in
-the SWTOR-origins project; this document records tool behaviour only, with no game assets or
-decompiled program text.
+This is a documentation-only report. No code changed, no game data included.
 
-## Target
+I came to RusticRE in the middle of a normal week of work: our native capture kit hooks 21
+functions in the retail client, and I was about to re-check that its pinned prologues were still
+correct before another session. The other question on my desk was the inbound router — a function
+I keep citing but had never sat down and read end to end. Both are static questions against a
+Ghidra project that already exists. That felt like a fair test of whether this tool fits the way I
+work.
+
+What follows is my experience, not a benchmark report. The numbers are real, but they are here
+because they are what changed my mind, not because they are the point.
+
+## The target I used
 
 | field | value |
 |---|---|
 | executable | `swtor.exe`, build 25812320 |
 | SHA-256 | `0f32b9d9562dafce89be662014615e0cc288f042a3fcfbbd8c38271abcd690f5` |
-| format | PE32+, x64, image base `0x140000000`, 30,680,576 bytes |
-| Ghidra project | `client.gpr` / `client.rep`, previously imported and analysed, opened read-only from a RusticRE snapshot |
+| format | PE32+, x64, image base `0x140000000` |
+| Ghidra project | `client.gpr` / `client.rep`, already analysed, opened read-only from a snapshot |
 
-## What was run
+## Getting started: two small stumbles before anything worked
 
-The two questions were: "are the 21 hook prologues in our native capture kit still true?", and
-"what does the inbound message router do with a frame?". Both are static questions against a
-project that is already analysed.
-
-PE tools, without starting a JVM:
-
-* `prologue` at `rva:0x43cf20` (router), `rva:0x43bb70` (frame decoder) and `rva:0x43b460`
-  (frame queue) with the pinned 16-byte sequence from our hook table. All three returned
-  `PROLOGUE MATCH` in 171–196 ms per call.
-* `inspect` at `rva:0x43cf20` returned the function bounds `0x43cf20–0x43d37f` (`0x45f`), the
-  prologue, the first instructions and one call candidate from `0x43bdd5`. It also printed
-  `instruction boundaries unverified; limit 12`, which correctly marks the caller list as a
-  heuristic.
-* `fingerprint` identified the image and hash before anything else, which is the check our kit
-  depends on.
-
-Ghidra path, with the prepared project:
-
-* `ghidra-query --action decompile 0x14043cf20` returned the router with body
-  `[0x14043cf20,0x14043d37e]`, `body_truncated: false`, the program SHA-256 and `address_kind: VA`.
-  Cold call: 5,998 ms; 7,475 bytes.
-* A second decompile (`0x14043bb70`) took 294 ms warm, 5,423 bytes.
-* `ghidra-query --action xrefs 0x14043cf20` took 236 ms in total (`query_s: 0.051`) and returned
-  three references: two `DATA` (`0x14206d0ac`, `0x14184f2a0`) and one `UNCONDITIONAL_CALL` from
-  `0x14043bdd5`. That call matches the `inspect` candidate.
-
-For comparison, our own Ghidra headless lane returned the same decompilation in 5.9 s wall with
-the same signature, because it starts a JVM for every request.
-
-The practical result: RusticRE verified the hook table with PE tools and returned the analysed
-router with a warm worker. The address, hash and function bounds were explicit in every reply.
-
-## What worked well
-
-* Warm queries are the difference that matters for this project. 0.29 s versus 5.9 s per
-  decompilation is roughly twenty times cheaper across an opcode sweep, and the response already
-  carries the hash, address space and function bounds that our scripts otherwise reconstruct.
-* The PE tools work before any Ghidra setup and are enough for prologue and hash checks.
-* `rva:`/`va:` input on the PE side, and the ambiguity error, make the intended address space
-  explicit.
-* The small catalog stays out of the way. There is no need to reach for a 200-tool server to
-  answer one function question.
-* `inspect` bounds were exact for this PE32+ image, and its caller candidate agreed with the
-  Ghidra xref.
-
-## What failed or was clumsy
-
-### 1. Contiguous-hex prologues are rejected
-
-Our hook table stores the pinned bytes as one lowercase string:
-
-```text
-488bc448894808565741544156415748
-```
-
-`prologue --expect` splits on whitespace, so the whole string is read as one number and the call
-fails with:
-
-```text
-ValueError: prologue byte out of range: 488bc448894808565741544156415748
-```
-
-Space-separated bytes work. Reformatting a 21-row table outside the tool is exactly the friction a
-batch mode should remove, especially because our table is the natural input.
-
-### 2. `ghidra-query` rejects the `va:` prefix that the PE tools require
-
-`ghidra-query --action decompile va:0x14043cf20` returns:
-
-```text
-ValueError: use a numeric Ghidra VA, not a symbol name
-```
-
-Bare `0x14043cf20` works. In one session I therefore used two address conventions: explicit
-prefixes for PE tools and a bare number for the query tool. This is the same address-space
-ambiguity that PR #2 fixed on the PE side; the query path did not get the same treatment.
-
-### 3. The target `dir` must be the directory containing the `.gpr`
-
-I first supplied the parent of `client.gpr` and got:
+The first thing I did was point the config at our project. I gave it the folder I think of as "the
+project" — the one above `client.gpr` — and got:
 
 ```text
 ValueError: analysed project is missing client.gpr or client.rep under F:\...\SWTOR-origins
 ```
 
-The message is truthful, but the field is the project directory itself, one level below what I
-passed. A resolver that accepts a single child directory, or an error naming the exact expected
-path, would remove one cold-start retry per target.
+It is a fair error. The file really was missing from where I pointed. But it took me a second to
+realise the tool wanted the directory *containing* the project file, not its parent. After the
+correction, `ghidra-query --action status` answered in 182 ms with `{"alive": false, ...}`, which
+I liked: it did not start a JVM just to say hello.
 
-### 4. `inspect` caller candidates and Ghidra xrefs are different claims
+Then I went to check the hook table. Our table stores each prologue as one lowercase string:
 
-`inspect` found one call candidate. `xrefs` found the same call plus two `DATA` references. Both
-are correct for their semantics, but they are printed in a similar shape, and the only warning is
-a trailing note (`instruction boundaries unverified; limit 12`). A reader can easily treat the
-shorter list as "all references". Splitting the two keys would make the distinction structural
-rather than textual.
+```text
+488bc448894808565741544156415748
+```
 
-### 5. Our own trap, and the contrast worth keeping
+I pasted it into `--expect` and got:
 
-When I passed the RVA to our Ghidra headless script, it exited **0** and printed
-`no function at 0x43cf20`. That is our bug, not RusticRE's, but it shows why the explicit
-`address_kind` in RusticRE's reply matters. The safer default is to make every tool reject an
-address whose space is not stated, rather than to rely on the caller to remember.
+```text
+ValueError: prologue byte out of range: 488bc448894808565741544156415748
+```
 
-## Proposed follow-ups
+The parser splits on whitespace, so it read the whole thing as one enormous byte. Space-separated
+bytes work. I reformatted by hand, checked three sites, and all three returned `PROLOGUE MATCH`.
 
-These are proposals only; none is implemented here.
+That was the moment I stopped thinking of this as a tool I was evaluating and started thinking of
+it as a tool I would have to wrap. Our whole reason for having a table is that it gets re-checked
+as a table; a tool that only takes one byte string at a time is not shaped for the loop I actually
+run.
 
-### A. Make `prologue` a table tool
+## The moment it clicked
 
-This is the highest-frequency change for this project.
+The router was different.
 
-* Accept contiguous hex (and `0x`-prefixed or comma-separated bytes) in `--expect`, in addition
-  to the current space-separated form.
-* Add `--expect-file` for one site and `--table <hooks.json>` for many. Our table is a list of
-  `{offset, names, prologue}` rows.
-* Open and hash the image once, then emit one JSON line per row:
-  `{name, rva, expect, actual, match}` with a `{checked, matched, failed}` summary.
-* Exit non-zero on any mismatch.
-* Add a test that a contiguous 16-byte value matches, a wrong byte fails, and the 21-row table
-  produces 21 results from one process.
+```text
+python -m rusticre ghidra-query --target swtor --action decompile 0x14043cf20 --timeout 120
+```
 
-This is an extension of an existing tool, not a new concept, and it turns a scripted loop into
-one command.
+Cold, that took **5,998 ms** and returned 7,475 bytes: the function body `[0x14043cf20,
+0x14043d37e]`, `body_truncated: false`, the program SHA-256 and `address_kind: VA`.
 
-### B. Accept `rva:`/`va:` in `ghidra-query`
+The second decompile — a different function — took **294 ms**.
 
-* Parse the same explicit prefixes the PE tools accept and reject ambiguous bare addresses.
-* Keep unambiguous bare VAs working, as PR #2 did for PE tools.
-* Echo the interpretation in `address_kind` (already present).
-* Add a test that both prefixed forms reach the same function and that an ambiguous bare value is
-  refused.
+Our own Ghidra headless lane took **5.9 s** for the same router, every time, because it starts a
+JVM and opens the project for each question. So the warm path is not a marginal improvement; it is
+the difference between "I'll batch these questions and come back" and "I'll just look now". I
+found myself reading the router, then immediately asking for xrefs (236 ms, `query_s: 0.051`),
+because the cost of another question had dropped below the cost of deciding whether to ask it.
 
-### C. Split `inspect` call candidates from data references
+That is the part I want to keep. It changed how I worked, not just how long a command took.
 
-* Emit `call_candidates` and `data_refs` as separate keys.
-* Keep the "unverified boundaries" note attached to the call candidates only.
-* Add a test where a function has one call site and two data references, and assert the counts
-  remain separate.
+## What I trusted, and what I did not
 
-### D. Add a bounded function dossier
+I trusted the replies that carried the hash, the address space and the function bounds. When the
+tool tells me `address_kind: VA`, the program SHA-256, and that the body was not truncated, I do
+not have to open a second terminal to check which project or which address space I am in. That
+matters more than it sounds in a project with several lanes and a history of RVA/VA mistakes.
 
-The router question cost two calls here; adding callers, callees and referenced strings would
-cost five or six. That per-function overhead is the dominant cost in a 79-opcode backlog.
+I did **not** trust the `inspect` caller list at first. It printed one call candidate from
+`0x43bdd5`, with a trailing note: `instruction boundaries unverified; limit 12`. It looked like a
+cross-reference and did not behave like one. When the Ghidra `xrefs` call returned the same call
+*plus* two data references, I relaxed: the heuristic was right about the call, just narrower than
+the real reference set. But I had to learn that by cross-checking. The warning is there; it is
+buried in a way I nearly missed.
 
-* `ghidra-query --action dossier <VA> --out func.json --inline-bytes 8192 --max-refs 100`.
-* Return bounds, signature, capped decompiler text, callers, callees, data references, short
-  referenced strings, block count and edges, `truncated`, and a cursor.
-* Above the inline cap, write the full text to a file and return its path, byte count and SHA-256.
-* Add a test for the cap, a later cursor page, and an explicit error for a missing function.
+This is also where I made my own mistake. I passed the RVA to our Ghidra headless script and it
+exited **0** and printed `no function at 0x43cf20`. Our script did the wrong thing quietly.
+RusticRE's explicit `address_kind` is the right instinct, and it is the reason I would rather see
+every tool refuse an unlabelled address than trust the caller to remember which space they are in.
 
-This is the closest honest substitute for a one-call REA dossier. It should not try to reproduce
-p-code or value flow.
+## What was clumsy, in the order I hit it
 
-### E. Resolve the target directory, or name it exactly
+1. **The prologue format.** Contiguous hex is normal in tables; the tool takes only spaced bytes.
+   Reformatting 21 rows outside the tool is exactly the friction a batch mode should remove.
+2. **Two address conventions in one session.** `ghidra-query` rejects `va:0x14043cf20` with
+   `use a numeric Ghidra VA, not a symbol name`, while the PE tools require or accept the prefix.
+   I kept switching mental gears, and that is how the RVA mistake above happened.
+3. **The project directory.** One cold-start retry per target because the field is the project
+   directory itself, not its parent.
+4. **Caller candidates look like xrefs.** The distinction is textual, not structural.
+5. **No batch mode.** Three prologue checks were three processes. A 21-row table, which is what we
+   actually maintain, has no single command.
 
-* If `dir` contains no `.gpr`, look for a single child directory that does; otherwise fail with
-  the exact path it expects.
-* Add a unit test for both the resolved and the ambiguous case.
+None of these are deep design problems. All of them are the kind of thing that makes a tool feel
+foreign to a workflow that is otherwise a good fit.
 
-### F. Leave the rest alone
+## What I need from Codex
 
-Do not add per-game tools, a second decompiler, or unbounded listings. Do not move initial
-analysis, interactive type recovery or saved symbol/type edits into RusticRE. Those are the parts
-that should keep using Ghidra.
+These are ordered by how much they would change my week, not by implementation size.
 
-## When I would still use REA
+### A. Let `prologue` take a table
 
-RusticRE does not implement basic blocks, p-code, value-flow or bounded def-use tracing. For our
-next question after "what does this handler do" — "where does this GOM field value come from" —
-REA remains the right call. That is an analysis gap, not a tool-count problem, and it should not
-be filled by copying REA's surface into RusticRE piece by piece.
+This is the one I want most. Hook verification is a loop over a committed JSON file, and right now
+the tool cannot consume that file. Accept contiguous hex; add `--expect-file` and
+`--table <hooks.json>`; open and hash the image once; emit one JSON line per row and a summary;
+exit non-zero on any mismatch.
 
-## When I would still use Ghidra
+The feeling I am chasing: one command I can put in CI, not a script I maintain to call the tool.
 
-RusticRE opens an already analysed copy and never imports. Initial analysis, interactive type
-recovery, and persisted renames, types and comments still belong to Ghidra. This project's client
-was prepared separately; RusticRE was fast because that work already existed. A make-once
-preparation job in RusticRE would be welcome, but it is a separate decision from warm queries.
+### B. One address convention
 
-## Where RusticRE fits
+Accept `rva:` and `va:` in `ghidra-query` the way the PE tools do, keep unambiguous bare VAs
+working, and echo the interpretation. I lost time to this, and I made a real mistake because of it.
 
-For this project, RusticRE is the first call for build fingerprints, hook-byte and prologue
-checks, bounded decompilation of an already-analysed function, and reference lookups. It keeps
-the context small and the build hash explicit. REA remains the deeper analysis tool, and Ghidra
-remains the initial-analysis and authoring environment.
+### C. Separate call candidates from data references
+
+`inspect` should emit `call_candidates` and `data_refs` as different keys, with the "unverified
+boundaries" note attached only to the former. I should not have to cross-check to learn what a
+list means.
+
+### D. Give me a function dossier
+
+Two calls for the router is fine; five or six for the next opcode is not. One bounded call that
+returns bounds, signature, capped decompiler text, callers, callees, data references, short
+strings, block count and edges, with a cursor and a file for the full text, would change the
+79-opcode backlog from a project into an afternoon. I would rather have this than a wider catalog.
+
+### E. Resolve the project directory
+
+Accept a parent with a single project child, or fail naming the exact path. Small, but it is the
+first thing every new user will hit.
+
+### F. Don't grow the surface
+
+Do not add per-game tools, a second decompiler, or unbounded listings. The small catalog is why I
+could keep the whole tool in my head.
+
+## What I still need REA for
+
+The question after "what does this handler do" is always "where does this value come from". I did
+not try to answer that here because I know RusticRE does not do value flow or bounded def-use. REA
+does, and I will keep using it for that. This is not a complaint: a tool that tried to do
+everything would be harder to trust for the parts it does well.
+
+## What I still need Ghidra for
+
+The first import and analysis, interactive type recovery, and saved renames, types and comments.
+RusticRE opens a copy and never writes; that is the right boundary for it. Our client was already
+analysed, which is the only reason the warm path was available to me at all.
+
+## How I would describe it to a colleague
+
+"Use it when the project is already analysed and you need a fact now." That is the sentence I
+would say. It is smaller than REA and much faster than starting a JVM, and it tells you which
+build and address space you are looking at. It is not the place to go for value flow, and it is
+not a batch tool yet. With A, B and D it would be the first thing I open every morning.
 
 ## Evidence boundary
 
-* The executable is user-owned and was not modified.
-* No game, hook or Ghidra import was launched for this review.
-* RusticRE copied its own project snapshot; the master was opened read-only and no saved symbols
-  or comments changed.
-* This PR contains no game assets, saves, extracted data or decompiled program text.
-* The protocol and capture findings remain in the SWTOR-origins project.
-
-## Conclusion
-
-The warm-query workflow is useful and should stay small. Two changes are worth doing first:
-**A** (a prologue table mode, because hook verification is a recurring loop) and **B** (consistent
-address intent between PE and query tools, because one session should not use two conventions).
-**C** and **E** are small clarity fixes. **D** is the one larger addition that would pay for itself
-across a 79-opcode backlog; p-code and value flow should stay with REA.
+I used the user-owned retail client read-only. No game, hook or import was launched. RusticRE
+copied its own snapshot; the master project was never written, and no symbols or comments were
+saved. The config and snapshots are local and uncommitted. Nothing from another project's review is
+included here; the findings are from the commands above.
