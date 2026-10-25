@@ -12,7 +12,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 from rusticre import __version__
-from rusticre.api import call, instructions, tool_table
+from rusticre.api import TOOL_NAMES, call, instructions, tool_table
 
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 SERVER_INFO = {"name": "rusticre", "version": __version__}
@@ -47,7 +47,9 @@ class Server:
         if method == "tools/call":
             name = params.get("name")
             try:
-                text = call(name, params.get("arguments") or {})
+                if name not in TOOL_NAMES:
+                    raise ValueError("unknown tool %s" % name)
+                text = call(name, params.get("arguments"))
                 return _tool_result(msg_id, text)
             except Exception as exc:
                 detail = "%s: %s" % (type(exc).__name__, exc)

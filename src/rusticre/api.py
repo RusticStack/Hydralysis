@@ -19,9 +19,7 @@ from rusticre.query import QueryRunner
 # Android, browser, firmware and the rest of REA are not registered.
 TOOL_NAMES = (
     "fingerprint",
-    "sections",
     "imports",
-    "exports",
     "disasm",
     "inspect",
     "xrefs",
@@ -35,10 +33,15 @@ TOOL_NAMES = (
     "evidence_add",
     "evidence_list",
     "ghidra_run",
-    "ghidra_scripts",
     "ghidra_query",
-    "ghidra_jobs",
+    "backend",
+    "prepare",
+    "job",
+    "runtime",
 )
+
+# Backward-compatible terminal commands; these are not extra MCP tools.
+CLI_ONLY = ("sections", "exports", "ghidra_scripts", "ghidra_jobs")
 
 # Names that must never appear. They are the REA surface this server exists to avoid.
 REJECTED = (
@@ -67,10 +70,8 @@ def tool_table() -> list[dict]:
     integer = {"type": "integer"}
     pe_address = {"type": "string", "description": "Use rva:0x... or va:0x...; ambiguous unprefixed addresses are refused."}
     return [
-        tool("fingerprint", "Build identity of a PE: size, timestamp, sha256, version, image base.", {"exe": string}, ["exe"]),
-        tool("sections", "Section names, RVAs, sizes and execute/read/write flags.", {"exe": string}, ["exe"]),
+        tool("fingerprint", "PE build identity and packing triage. detail=sections/exports returns those tables.", {"exe": string, "detail": {"type": "string", "enum": ["header", "sections", "exports"]}}, ["exe"]),
         tool("imports", "Imported DLL symbols.", {"exe": string, "limit": integer}, ["exe"]),
-        tool("exports", "Exported symbols and their RVAs.", {"exe": string, "limit": integer}, ["exe"]),
         tool("disasm", "Disassemble at an RVA or VA. 64-bit rip-relative operands show their target.", {
             "exe": string, "address": pe_address, "count": integer,
         }, ["exe", "address"]),
@@ -96,9 +97,11 @@ def tool_table() -> list[dict]:
         tool("sigscan", "Find a byte pattern in executable sections. ?? is a wildcard. Use this to locate a hook site.", {
             "exe": string, "pattern": string, "limit": integer,
         }, ["exe", "pattern"]),
-        tool("prologue", "Compare bytes at an address with an expect prologue. Refuse a hook when this mismatches.", {
+        tool("prologue", "Verify one prologue or checks[{address,expect,name?}] against one PE build. Any mismatch fails; no hook is installed.", {
             "exe": string, "address": pe_address, "expect": string,
-        }, ["exe", "address", "expect"]),
+            "checks": {"type": "array", "items": {"type": "object"}},
+            "sha256": string, "image_base": string,
+        }, ["exe"]),
         tool("evidence_add", "Store one proved claim. note and source are required. target is any name you give this binary.", {
             "target": string, "build": string, "kind": string, "name": string,
             "note": string, "source": string, "address": string, "prologue": string, "db": string,
@@ -109,26 +112,50 @@ def tool_table() -> list[dict]:
             "args": {"type": "array", "items": string},
             "timeout_s": integer, "lane": string,
         }, ["target", "script"]),
-        tool("ghidra_scripts", "List Ghidra scripts for a configured target.", {"target": string, "filter": string}, ["target"]),
-        tool("ghidra_query", "Decompile or query an already analysed read-only project in a reusable JVM. Numeric VAs only, no name enumeration. functions pages via next_cursor. status/stop manage the worker. Verify exe/sha256 in target config.", {
+        tool("ghidra_query", "Query saved analysis in a reusable read-only JVM. Numeric VA/rva:/va: addresses; bounded pages via next_cursor. export starts a durable file job. Use backend help for options.", {
             "target": string,
-            "action": {"type": "string", "enum": ["decompile", "function", "functions", "xrefs", "status", "stop"]},
+            "action": {"type": "string", "enum": ["decompile", "function", "functions", "xrefs", "types", "type", "data", "scan", "variables", "dossier", "blocks", "pcode", "trace", "type_edit", "export", "status", "stop"]},
             "address": string, "limit": integer, "cursor": string, "contains": string, "timeout_s": integer,
+            "options": {"type": "object"},
         }, ["target"]),
-        tool("ghidra_jobs", "Recent Ghidra script runs.", {"limit": integer}),
+        tool("backend", "Discover/install private analysis or runtime engines, never other MCPs. install returns a durable job. help gives operation options.", {
+            "action": {"type": "string", "enum": ["inspect", "install", "help"]},
+            "component": {"type": "string", "enum": ["analysis", "runtime"]},
+        }),
+        tool("prepare", "Explicitly import and analyse an owned executable once, then register its build for read-only queries. Returns a durable job immediately; identical builds reuse analysis.", {
+            "exe": string, "target": string, "timeout_s": integer, "install": {"type": "boolean"},
+            "action": {"type": "string", "enum": ["plan", "start"]},
+        }, ["exe"]),
+        tool("job", "Durable setup/analysis job status, bounded logs or cancellation. An empty id lists recent jobs.", {
+            "action": {"type": "string", "enum": ["status", "cancel"]}, "id": string, "limit": integer,
+        }),
+        tool("runtime", "Own-process debugging/instrumentation sessions: spawn/attach, modules, memory, verified probes/breakpoints, registers, continue and detach. Use backend help for options.", {
+            "action": string, "options": {"type": "object"},
+        }, ["action"]),
     ]
 
 
 def call(name: str, args: dict | None) -> str:
+    if args is not None and not isinstance(args, dict):
+        raise ValueError("tool arguments must be an object")
     args = args or {}
-    if name not in TOOL_NAMES:
+    if name not in TOOL_NAMES + CLI_ONLY:
         raise ValueError("unknown tool %s" % name)
     for key, maximum in (("limit", 200), ("count", 200), ("size", 65536)):
         if key in args and (isinstance(args[key], bool) or not 1 <= int(args[key]) <= maximum):
             raise ValueError("%s must be 1..%d" % (key, maximum))
     if name == "fingerprint":
         image = _image(args)
+        detail = args.get("detail", "header")
+        if detail == "sections":
+            return image.sections_text()
+        if detail == "exports":
+            return image.exports_text(200)
+        if detail != "header":
+            raise ValueError("fingerprint detail must be header, sections or exports")
         return image.header() + "\n" + json.dumps(image.fingerprint(), indent=2)
+    if name in ("backend", "prepare", "job", "runtime"):
+        return _workflow(name, args)
     if name == "sections":
         return _image(args).sections_text()
     if name == "imports":
@@ -162,8 +189,26 @@ def call(name: str, args: dict | None) -> str:
     if name == "sigscan":
         return _image(args).sigscan(str(args.get("pattern") or ""), int(args.get("limit") or 20))
     if name == "prologue":
-        from rusticre.prologue import parse_expect
+        from rusticre.prologue import compare_table, parse_expect
         image = _image(args)
+        if "sha256" in args:
+            import re
+            expected_hash = args["sha256"]
+            if not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash):
+                raise ValueError("sha256 must be a full hexadecimal build hash")
+            if expected_hash.lower() != image.fingerprint()["sha256"]:
+                raise ValueError("prologue table build SHA-256 mismatch; no rows verified")
+        if "image_base" in args and int(str(args["image_base"]), 0) != image.base:
+            raise ValueError("prologue table image base mismatch; no rows verified")
+        if "checks" in args:
+            if "address" in args or "expect" in args:
+                raise ValueError("use checks or a single address/expect pair")
+            result = compare_table(image, args["checks"], lambda text: _addr(image, {"address": text}))
+            if not result["matched"]:
+                raise ValueError("PROLOGUE TABLE MISMATCH\n" + json.dumps(result, indent=2))
+            return json.dumps(result, indent=2)
+        if not args.get("expect"):
+            raise ValueError("expect is required for a single prologue")
         expected = parse_expect(str(args["expect"]))
         if len(expected) > 4096:
             raise ValueError("expect must be at most 4096 bytes")
@@ -192,10 +237,14 @@ def call(name: str, args: dict | None) -> str:
         )
     target = str(args.get("target") or args.get("game") or "")
     if name == "ghidra_query":
+        if args.get("action") == "export":
+            from rusticre.exporting import start
+            return json.dumps(start(_settings(), target, args.get("options")), indent=2)
         return QueryRunner(_settings()).query(
             target, str(args.get("action") or "decompile"), str(args.get("address") or ""),
             int(args.get("limit", 40)), str(args.get("cursor") or ""), str(args.get("contains") or ""),
             int(args.get("timeout_s", 30)),
+            args.get("options"),
         )
     if name == "ghidra_run":
         return _ghidra().run(
@@ -214,16 +263,101 @@ def call(name: str, args: dict | None) -> str:
 
 def instructions() -> str:
     return (
-        "RusticRE %s. Twenty tools for any PE you own. inspect is the function "
+        "RusticRE %s. Twenty tools for any PE you own. prepare imports/analyses "
+        "a new executable exactly once as a durable job and registers its build; "
+        "backend discovers/installs the engines, never their MCPs. job reports progress. "
+        "runtime manages verified debugging/instrumentation sessions. inspect is the function "
         "picture (bounds, prologue, instructions, callers) and does not start a JVM. "
         "sigscan and prologue are how a hook site is found and checked. ghidra_run "
         "executes one script on a read-only copy of a project you already analysed. "
         "Prefer ghidra_query for bounded address-based decompilation and references; "
-        "its JVM stays warm across CLI and MCP calls. Addresses there are VAs. "
+        "its JVM stays warm across CLI and MCP calls; export writes bulk artifacts as a job. "
+        "Addresses there are VAs or explicit rva:/va:. "
         "For PE addresses use rva:0x... or va:0x... when the interpretation is ambiguous. "
         "Do not re-import the binary. evidence_add stores a claim only with a source."
         % __version__
     )
+
+
+def _workflow(name: str, args: dict) -> str:
+    settings = load()
+    if name == "backend":
+        action, component = args.get("action", "inspect"), args.get("component", "analysis")
+        if component not in ("analysis", "runtime"):
+            raise ValueError("component must be analysis or runtime")
+        if action == "help":
+            from rusticre.workflow_help import operation_help
+            return json.dumps(operation_help(component), indent=2)
+        if action == "install":
+            from rusticre.preparation import start_install
+            return json.dumps(start_install(settings, component), indent=2)
+        if action != "inspect":
+            raise ValueError("backend action must be inspect, install or help")
+        if component == "runtime":
+            from rusticre.runtime import inspect
+        else:
+            from rusticre.backends import inspect
+        return json.dumps(inspect(settings), indent=2)
+    if name == "prepare":
+        from rusticre.preparation import plan, prepare
+        action = args.get("action", "start")
+        if action not in ("plan", "start"):
+            raise ValueError("prepare action must be plan or start")
+        install = args.get("install", True)
+        if not isinstance(install, bool):
+            raise ValueError("install must be a boolean")
+        operation = plan if action == "plan" else prepare
+        return json.dumps(operation(settings, str(args.get("exe") or ""), str(args.get("target") or ""),
+                                  int(args.get("timeout_s", 3600)), install), indent=2)
+    if name == "job":
+        from rusticre.preparation import cancel, status
+        job_id = str(args.get("id") or "")
+        action = args.get("action", "status")
+        if action == "cancel":
+            if not job_id:
+                raise ValueError("job id is required for cancellation")
+            if job_id.startswith("export-"):
+                from rusticre.exporting import cancel as cancel_export
+                return json.dumps(cancel_export(settings, job_id), indent=2)
+            return json.dumps(cancel(settings, job_id), indent=2)
+        if action != "status":
+            raise ValueError("job action must be status or cancel")
+        if not job_id:
+            from rusticre.backends import read_json
+            from rusticre.exporting import status as export_status
+            limit = int(args.get("limit", 20))
+            if not 1 <= limit <= 100:
+                raise ValueError("job limit must be 1..100")
+            records = status(settings, limit=limit)["jobs"]
+            paths = sorted((Path(settings["root"]) / "exports").glob("export-*/job.json"),
+                           key=lambda item: item.stat().st_mtime_ns, reverse=True)[:limit]
+            records.extend(export_status(settings, item.parent.name) for item in paths)
+            scripts = sorted((Path(settings["root"]) / "jobs").glob("job-*.json"),
+                             key=lambda item: item.stat().st_mtime_ns, reverse=True)[:limit]
+            records.extend(read_json(item) for item in scripts)
+            records.sort(key=lambda item: item.get("created_at", item.get("started_at", 0)), reverse=True)
+            fields = ("id", "job_id", "kind", "component", "state", "stage", "target", "game", "script",
+                      "created_at", "started_at", "elapsed_s", "duration_s", "completed", "failed", "complete", "log_path")
+            return json.dumps({"jobs": [{key: item[key] for key in fields if key in item} for item in records[:limit]],
+                               "detail": "Pass an id to job status for bounded logs and full metadata."}, indent=2)
+        if job_id.startswith("export-"):
+            from rusticre.exporting import status as export_status
+            return json.dumps(export_status(settings, job_id), indent=2)
+        if job_id.startswith("job-"):
+            import re
+            if not re.fullmatch(r"job-[0-9a-f]{12}", job_id):
+                raise ValueError("invalid script job id")
+            from rusticre.backends import read_json
+            record = read_json(Path(settings["root"]) / "jobs" / (job_id + ".json"))
+            if not record:
+                raise ValueError("no script job %s" % job_id)
+            return json.dumps(record, indent=2)
+        return json.dumps(status(settings, job_id, int(args.get("limit", 20))), indent=2)
+    if args.get("action") == "setup":
+        from rusticre.preparation import start_install
+        return json.dumps(start_install(settings, "runtime"), indent=2)
+    from rusticre.runtime import runtime
+    return runtime(str(args.get("action") or ""), args.get("options") or {}, settings)
 
 
 def _image(args: dict) -> Image:
@@ -273,6 +407,10 @@ def _ghidra() -> GhidraRunner:
 
 def _settings() -> dict:
     settings = load()
-    if not settings.get("root") or not settings.get("ghidra_dir"):
-        raise ValueError("set RUSTICRE_CONFIG to a json file with root and ghidra_dir")
-    return settings
+    from rusticre.backends import inspect
+    report = inspect(settings)
+    if not report["ready"]:
+        raise ValueError("compatible analysis engines unavailable; run backend inspect, then backend install. "
+                         "Queries never install or import implicitly. Details: %s" % json.dumps(report))
+    return {**settings, "root": report["root"], "ghidra_dir": report["ghidra"]["path"],
+            "java_home": report["jdk"]["path"]}

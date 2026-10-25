@@ -7,6 +7,7 @@ import sys
 
 from rusticre.api import TOOL_NAMES, call
 from rusticre.mcp import Server
+from rusticre.analysis import ADVANCED_ACTIONS
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -18,6 +19,8 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--exe", required=True)
         if name in ("imports", "exports"):
             command.add_argument("--limit", type=int, default=80)
+        if name == "fingerprint":
+            command.add_argument("--detail", choices=("header", "sections", "exports"), default="header")
 
     for name in ("disasm", "inspect", "xrefs", "callers", "callees", "function", "bytes"):
         command = sub.add_parser(name)
@@ -38,8 +41,10 @@ def main(argv: list[str] | None = None) -> int:
 
     prologue = sub.add_parser("prologue")
     prologue.add_argument("--exe", required=True)
-    prologue.add_argument("address", help="rva:0x... or va:0x...; unprefixed addresses must be unambiguous")
-    prologue.add_argument("--expect", required=True)
+    prologue.add_argument("address", nargs="?", help="rva:0x... or va:0x...; unprefixed addresses must be unambiguous")
+    prologue.add_argument("--expect")
+    prologue.add_argument("--checks-file", help="JSON array of address/expect/name rows or offset/prologue/names rows")
+    prologue.add_argument("--offset-kind", choices=("rva", "va"), help="Explicit interpretation for legacy table offsets")
 
     add = sub.add_parser("evidence-add")
     add.add_argument("--target", required=True)
@@ -68,11 +73,32 @@ def main(argv: list[str] | None = None) -> int:
     query = sub.add_parser("ghidra-query", help="Warm read-only Ghidra query; numeric addresses are VAs")
     query.add_argument("--target", required=True)
     query.add_argument("address", nargs="?", default="")
-    query.add_argument("--action", choices=("decompile", "function", "functions", "xrefs", "status", "stop"), default="decompile")
+    query.add_argument("--action", choices=sorted({"decompile", "function", "functions", "xrefs", "status", "stop", "export"} | ADVANCED_ACTIONS), default="decompile")
     query.add_argument("--limit", type=int, default=40)
     query.add_argument("--cursor", default="")
     query.add_argument("--contains", default="")
     query.add_argument("--timeout", type=int, default=30)
+    _options_arguments(query)
+
+    backend = sub.add_parser("backend", help="Discover or privately install analysis/runtime engines")
+    backend.add_argument("action", nargs="?", choices=("inspect", "install", "help"), default="inspect")
+    backend.add_argument("--component", choices=("analysis", "runtime"), default="analysis")
+
+    prepare = sub.add_parser("prepare", help="Import/analyse once as a durable background job")
+    prepare.add_argument("--exe", required=True)
+    prepare.add_argument("--target", default="")
+    prepare.add_argument("--timeout", type=int, default=3600)
+    prepare.add_argument("--no-install", action="store_true")
+    prepare.add_argument("--plan", action="store_true", help="Inspect the proposed setup/analysis without creating a job or importing")
+
+    job = sub.add_parser("job", help="Durable setup/analysis status or cancellation")
+    job.add_argument("id", nargs="?", default="")
+    job.add_argument("--action", choices=("status", "cancel"), default="status")
+    job.add_argument("--limit", type=int, default=20)
+
+    runtime = sub.add_parser("runtime", help="Generic runtime debugging/instrumentation; backend help documents options")
+    runtime.add_argument("action")
+    _options_arguments(runtime)
 
     sub.add_parser("ghidra-jobs")
     sub.add_parser("tools")
@@ -98,6 +124,15 @@ def main(argv: list[str] | None = None) -> int:
 
 def _pair(args: argparse.Namespace) -> tuple[str, dict]:
     command = args.command.replace("-", "_")
+    if command == "backend":
+        return command, {"action": args.action, "component": args.component}
+    if command == "prepare":
+        return command, {"exe": args.exe, "target": args.target, "timeout_s": args.timeout, "install": not args.no_install,
+                         "action": "plan" if args.plan else "start"}
+    if command == "job":
+        return command, {"action": args.action, "id": args.id, "limit": args.limit}
+    if command == "runtime":
+        return command, {"action": args.action, "options": _options(args)}
     if command == "evidence_add":
         return command, {
             "target": args.target, "build": args.build, "kind": args.kind, "name": args.name,
@@ -116,17 +151,25 @@ def _pair(args: argparse.Namespace) -> tuple[str, dict]:
     if command == "ghidra_query":
         return command, {"target": args.target, "action": args.action, "address": args.address,
                          "limit": args.limit, "cursor": args.cursor, "contains": args.contains,
-                         "timeout_s": args.timeout}
+                         "timeout_s": args.timeout, "options": _options(args)}
     if command == "ghidra_jobs":
         return command, {}
     if command in ("fingerprint", "sections", "imports", "exports"):
         payload = {"exe": args.exe}
         if hasattr(args, "limit"):
             payload["limit"] = args.limit
+        if command == "fingerprint":
+            payload["detail"] = args.detail
         return command, payload
     if command in ("strings", "sigscan"):
         return command, {"exe": args.exe, "pattern": args.pattern, "limit": args.limit}
     if command == "prologue":
+        if args.checks_file:
+            if args.address or args.expect:
+                raise ValueError("use --checks-file or a single address/--expect pair")
+            return command, {"exe": args.exe, **_checks_file(args.checks_file, args.offset_kind)}
+        if not args.address or not args.expect:
+            raise ValueError("prologue needs an address/--expect pair or --checks-file")
         return command, {"exe": args.exe, "address": args.address, "expect": args.expect}
     payload = {"exe": args.exe, "address": args.address}
     if hasattr(args, "count"):
@@ -136,3 +179,76 @@ def _pair(args: argparse.Namespace) -> tuple[str, dict]:
     if hasattr(args, "size"):
         payload["size"] = args.size
     return command, payload
+
+
+def _json_options(value: str) -> dict:
+    import json
+
+    try:
+        result = json.loads(value)
+        if not isinstance(result, dict):
+            raise ValueError("options must be a JSON object")
+        return result
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _options_arguments(parser: argparse.ArgumentParser) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--options", type=_json_options, default={})
+    group.add_argument("--options-file", help="UTF-8 JSON object; avoids shell quoting and command length limits")
+
+
+def _options(args: argparse.Namespace) -> dict:
+    if not args.options_file:
+        return args.options
+    from pathlib import Path
+    path = Path(args.options_file)
+    if path.stat().st_size > 256 * 1024:
+        raise ValueError("options file must be at most 256 KiB")
+    try:
+        return _json_options(path.read_text(encoding="utf-8-sig"))
+    except argparse.ArgumentTypeError as exc:
+        raise ValueError(str(exc)) from exc
+
+
+def _checks_file(filename: str, offset_kind: str | None) -> dict:
+    import json
+    from pathlib import Path
+    path = Path(filename)
+    if path.stat().st_size > 1024 * 1024:
+        raise ValueError("checks file must be at most 1 MiB")
+    rows = json.loads(path.read_text(encoding="utf-8-sig"))
+    envelope = {}
+    if isinstance(rows, dict):
+        envelope, rows = rows, rows.get("checks", rows.get("hooks"))
+    if not isinstance(rows, list):
+        raise ValueError("checks file must contain a JSON array or an object with checks[]/hooks[]")
+    normalized = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("each check must be an object")
+        if "offset" not in row:
+            normalized.append({key: row[key] for key in ("address", "expect", "name") if key in row})
+            continue
+        offset = row["offset"]
+        if isinstance(offset, int) and not isinstance(offset, bool):
+            offset = hex(offset)
+        if not isinstance(offset, str):
+            raise ValueError("offset must be a number or address string")
+        if not offset.startswith(("rva:", "va:")):
+            if not offset_kind:
+                raise ValueError("legacy offsets need --offset-kind rva or va")
+            offset = offset_kind + ":" + offset
+        names = row.get("names", row.get("name", ""))
+        if isinstance(names, list) and all(isinstance(name, str) for name in names):
+            names = ", ".join(names)
+        normalized.append({"address": offset, "expect": row.get("prologue"), "name": names})
+    payload = {"checks": normalized}
+    if "build_sha256" in envelope:
+        payload["sha256"] = envelope["build_sha256"]
+    elif "sha256" in envelope:
+        payload["sha256"] = envelope["sha256"]
+    if "image_base" in envelope:
+        payload["image_base"] = envelope["image_base"]
+    return payload

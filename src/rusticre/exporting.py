@@ -1,0 +1,211 @@
+"""Durable, resumable file exports from already analysed projects.
+
+MCP returns job metadata. Function bodies and recovered types are streamed to
+owned JSONL files, never forced through a tool reply or a repeated import.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+from rusticre.analysis import load_overlays
+from rusticre.backends import read_json, root_path, write_json
+from rusticre.ghidra import GhidraRunner, LaneLock, _held
+from rusticre.preparation import locked, process_start_ms
+from rusticre.query import _expected_hash, _source_stamp
+
+ACTIVE = ("queued", "running", "cancelling")
+MAX_OUTPUT_BYTES = 1024 * 1024 * 1024
+MAX_ROW_BYTES = 16 * 1024 * 1024
+
+
+def job_path(settings: dict, job_id: str) -> Path:
+    if not re.fullmatch(r"export-[0-9a-f]{12}", job_id):
+        raise ValueError("invalid export job id")
+    return root_path(settings) / "exports" / job_id / "job.json"
+
+
+def update(path: Path, **changes) -> dict:
+    with locked(path.with_suffix(".meta.lock")):
+        record = read_json(path)
+        record.update(changes, updated_at=time.time())
+        write_json(path, record)
+        return record
+
+
+def normalized(options: dict | None) -> dict:
+    if options is not None and not isinstance(options, dict):
+        raise ValueError("export options must be an object")
+    options = dict(options or {})
+    unknown = set(options) - {"mode", "limit", "contains", "timeout_s", "resume"}
+    if unknown:
+        raise ValueError("unknown export options: " + ", ".join(sorted(unknown)))
+    mode = options.get("mode", "decompile")
+    if mode not in ("decompile", "functions", "types"):
+        raise ValueError("export mode must be decompile, functions or types")
+    count, timeout = options.get("limit", 100000), options.get("timeout_s", 30)
+    if isinstance(count, bool) or not isinstance(count, int) or not 1 <= count <= 100000:
+        raise ValueError("export limit must be an integer in 1..100000")
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 300:
+        raise ValueError("export timeout_s must be an integer in 1..300")
+    contains = options.get("contains", "")
+    if not isinstance(contains, str) or len(contains) > 256 or "\0" in contains:
+        raise ValueError("export contains must be text of at most 256 characters")
+    return {"mode": mode, "limit": count, "contains": contains, "timeout_s": timeout}
+
+
+def code_sha256() -> str:
+    package = Path(__file__).parent
+    code = hashlib.sha256()
+    for name in ("query.py", "analysis.py", "exporting.py", "export_worker.py", "runtime_ipc.py", "localio.py", "scripts/RusticQuery.java"):
+        code.update(name.encode())
+        code.update((package / name).read_bytes())
+    return code.hexdigest()
+
+
+def provenance(settings: dict, target: str) -> tuple[dict, dict]:
+    project = dict(GhidraRunner(settings).project(target, require_scripts=False))
+    expected = _expected_hash(project)
+    key = hashlib.sha256((str(Path(project["dir"]).resolve()) + "\n" + project["name"] + "\n" + project["program"]).encode()).hexdigest()[:16]
+    overlays = load_overlays(settings["root"], key, expected)
+    ghidra = Path(settings["ghidra_dir"]).resolve()
+    application = ghidra / "Ghidra" / "application.properties"
+    result = {"version": 1, "source": str(Path(project["dir"]).resolve()), "name": project["name"],
+              "program": project["program"], "sha256": expected, "source_stat_sha256": _source_stamp(project),
+              "code_sha256": code_sha256(), "overlay_sha256": hashlib.sha256(json.dumps(overlays, sort_keys=True).encode()).hexdigest(),
+              "ghidra_dir": str(ghidra), "ghidra_application_sha256": hashlib.sha256(application.read_bytes()).hexdigest() if application.is_file() else None,
+              "query_key": key}
+    if project.get("exe"):
+        stat = Path(project["exe"]).stat()
+        result["exe_stat"] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    return project, result
+
+
+def worker_settings(settings: dict, target: str, project: dict) -> dict:
+    fields = ("root", "ghidra_dir", "java_home", "max_mem", "max_cpu", "query_workers", "query_idle_s", "query_startup_s")
+    result = {name: settings[name] for name in fields if name in settings}
+    result["root"] = str(root_path(settings))
+    result["targets"] = {target: project}
+    return result
+
+
+def _launch(path: Path, record: dict, settings: dict) -> dict:
+    generation = uuid.uuid4().hex
+    record = update(path, state="queued", stage="starting", generation=generation, cancel_requested=False,
+                    worker_pid=0, worker_started_ms=0, error="", queued_at=time.time())
+    env = dict(os.environ)
+    temp = root_path(settings) / "exports" / "tmp"
+    temp.mkdir(parents=True, exist_ok=True)
+    env["TEMP"] = env["TMP"] = env["TMPDIR"] = str(temp)
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+    env["PYTHONNOUSERSITE"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    command = [sys.executable, "-m", "rusticre.export_worker", str(path), generation]
+    try:
+        with Path(record["log_path"]).open("ab") as output:
+            process = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+                                       **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {"start_new_session": True}))
+    except OSError as exc:
+        update(path, state="failed", stage="launch", error=str(exc))
+        raise
+    # A venv launcher may spawn the real Python process. The child replaces
+    # this provisional identity immediately after acquiring its run lock.
+    with locked(path.with_suffix(".meta.lock")):
+        current = read_json(path)
+        if current.get("generation") == generation and current.get("state") == "queued":
+            current.update(worker_pid=process.pid, worker_started_ms=process_start_ms(process.pid), updated_at=time.time())
+            write_json(path, current)
+    return status(settings, record["id"])
+
+
+def start(settings: dict, target: str, options: dict | None = None) -> dict:
+    if options is not None and not isinstance(options, dict):
+        raise ValueError("export options must be an object")
+    options = dict(options or {})
+    resume = str(options.get("resume") or "")
+    if resume:
+        path = job_path(settings, resume)
+        with locked(path.parent / ".control.lock"):
+            record = status(settings, resume)
+            if record["target"] != target:
+                raise ValueError("export resume target differs from the recorded target")
+            if record.get("state") in ACTIVE or _held(str(path.parent / ".run.lock")):
+                raise ValueError("export is already running; no duplicate worker was launched")
+            supplied = {key: value for key, value in options.items() if key != "resume"}
+            if any(key not in record["options"] or record["options"][key] != value for key, value in supplied.items()):
+                raise ValueError("resume cannot change the recorded export mode, filter, limit or timeout")
+            project, observed = provenance(settings, target)
+            if observed != record["provenance"]:
+                raise ValueError("export source/build/code/overlays changed; resume refused; old output preserved")
+            from rusticre.export_worker import replay, validate_completed
+            if record.get("state") == "done":
+                validate_completed(path, record)
+                return {**record, "reused": True}
+            replay(path, record)
+            return _launch(path, record, settings)
+    selected = normalized(options)
+    project, identity = provenance(settings, target)
+    directory = root_path(settings) / "exports"
+    with locked(directory / ".start.lock"):
+        for existing in sorted(directory.glob("export-*/job.json"), key=lambda item: item.stat().st_mtime_ns, reverse=True)[:200]:
+            previous = read_json(existing)
+            if (previous.get("target") == target and previous.get("options") == selected
+                    and previous.get("provenance") == identity and previous.get("state") in (*ACTIVE, "done")):
+                observed = status(settings, previous["id"])
+                if observed["state"] in (*ACTIVE, "done"):
+                    if observed["state"] == "done":
+                        from rusticre.export_worker import validate_completed
+                        validate_completed(existing, observed)
+                    return {**observed, "reused": True}
+        return _new(settings, target, project, identity, selected)
+
+
+def _new(settings: dict, target: str, project: dict, identity: dict, selected: dict) -> dict:
+    job_id = "export-" + uuid.uuid4().hex[:12]
+    path = job_path(settings, job_id)
+    path.parent.mkdir(parents=True, exist_ok=False)
+    record = {"version": 1, "id": job_id, "target": target, "created_at": time.time(), "updated_at": time.time(),
+              "options": selected, "provenance": identity, "settings": worker_settings(settings, target, project),
+              "state": "queued", "stage": "starting", "cursor": "", "completed": 0, "succeeded": 0,
+              "failed": 0, "truncated": 0, "output_bytes": 0, "cancel_requested": False,
+              "output_path": str(path.parent / (selected["mode"] + ".jsonl")),
+              "imports_path": str(path.parent / "imports.json"), "log_path": str(path.parent / "worker.log")}
+    write_json(path, record)
+    with locked(path.parent / ".control.lock"):
+        return _launch(path, record, settings)
+
+
+def status(settings: dict, job_id: str) -> dict:
+    path = job_path(settings, job_id)
+    record = read_json(path)
+    if not record:
+        raise ValueError("no export job %s" % job_id)
+    if record.get("state") in ACTIVE and time.time() - record.get("queued_at", record["created_at"]) > 5:
+        pid, created = int(record.get("worker_pid", 0)), int(record.get("worker_started_ms", 0))
+        alive = pid > 0 and created > 0 and process_start_ms(pid) == created
+        if not alive and not _held(str(path.parent / ".run.lock")):
+            record = update(path, state="interrupted", stage="interrupted", error="export worker exited; output preserved; resume this id to continue")
+    # Worker settings are internal configuration, not part of every MCP reply.
+    result = {key: value for key, value in record.items() if key != "settings"}
+    log = Path(record["log_path"])
+    if log.is_file():
+        with log.open("rb") as handle:
+            handle.seek(max(0, log.stat().st_size - 2000))
+            result["log_tail"] = handle.read(2000).decode("utf-8", "replace")
+    return result
+
+
+def cancel(settings: dict, job_id: str) -> dict:
+    path = job_path(settings, job_id)
+    record = status(settings, job_id)
+    if record.get("state") in ACTIVE:
+        update(path, cancel_requested=True, state="cancelling", stage="waiting for the current bounded query")
+    return status(settings, job_id)

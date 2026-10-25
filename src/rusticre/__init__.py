@@ -1,3 +1,3 @@
-"""RusticRE: a short reverse-engineering toolkit for games you own."""
+"""RusticRE: a small reverse-engineering server for programs you own."""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

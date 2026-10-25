@@ -39,6 +39,15 @@ SCRIPT_END = re.compile(r"\(GhidraScript\)\s*$")
 LOG_LINE = re.compile(r"^(?:INFO|ERROR|WARN|DEBUG|SEVERE)\s")
 
 
+def validate_project_path(directory: str | Path) -> Path:
+    """Fail before a JVM launch: Ghidra rejects dot-prefixed path components."""
+    path = Path(directory).expanduser().resolve()
+    if any(part.startswith(".") for part in path.parts):
+        raise ValueError("Ghidra project paths cannot contain dot-prefixed directories: %s; "
+                         "choose a dot-free data root/project directory" % path)
+    return path
+
+
 def headless_path(ghidra_dir: str) -> str:
     name = "analyzeHeadless.bat" if os.name == "nt" else "analyzeHeadless"
     return os.path.join(ghidra_dir, "support", name)
@@ -274,6 +283,7 @@ def _terminate_owned_tree(proc: subprocess.Popen) -> None:
 class GhidraRunner:
     def __init__(self, settings: dict):
         self.settings = settings
+        validate_project_path(settings["root"])
         self.root = settings["root"]
         self.lanes_dir = os.path.join(self.root, "lanes")
         self.logs_dir = os.path.join(self.root, "logs")
@@ -291,6 +301,7 @@ class GhidraRunner:
         for key in (("dir", "name", "program", "scripts") if require_scripts else ("dir", "name", "program")):
             if not item.get(key):
                 raise ValueError("ghidra target %s is missing %s" % (target, key))
+        validate_project_path(item["dir"])
         return item
 
     def list_scripts(self, game: str, name_filter: str = "") -> str:

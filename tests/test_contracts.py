@@ -1,10 +1,13 @@
 import io
 import json
+import os
+import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
 from unittest.mock import Mock, patch
 
-from rusticre.api import call, tool_table
+from rusticre.api import _settings, call, tool_table
 from rusticre.cli import main
 from rusticre.mcp import Server
 
@@ -40,6 +43,110 @@ class AgentContracts(unittest.TestCase):
                 with self.subTest(args=args), self.assertRaises(ValueError):
                     call("bytes", args)
             image.assert_not_called()
+
+    def test_discovered_backend_replaces_stale_config_without_installing(self):
+        configured = {"root": "data", "ghidra_dir": "obsolete", "java_home": "obsolete-jdk", "targets": {"owned": {}}}
+        report = {"ready": True, "root": "resolved-data", "ghidra": {"path": "verified-engine"},
+                  "jdk": {"path": "verified-jdk"}}
+        with patch("rusticre.api.load", return_value=configured), \
+                patch("rusticre.backends.inspect", return_value=report), patch("rusticre.backends.ensure") as install:
+            selected = _settings()
+        self.assertEqual(selected["ghidra_dir"], "verified-engine")
+        self.assertEqual(selected["java_home"], "verified-jdk")
+        self.assertEqual(selected["targets"], configured["targets"])
+        install.assert_not_called()
+
+    def test_missing_engines_report_setup_without_installing_implicitly(self):
+        with patch("rusticre.api.load", return_value={}), \
+                patch("rusticre.backends.inspect", return_value={"ready": False}), \
+                patch("rusticre.backends.ensure") as install:
+            with self.assertRaisesRegex(ValueError, "backend install"):
+                _settings()
+        install.assert_not_called()
+
+    def test_runtime_setup_returns_background_job_through_cli_and_mcp(self):
+        with patch("rusticre.api.load", return_value={"root": "data"}), \
+                patch("rusticre.preparation.start_install", return_value={"job_id": "setup-0123456789ab"}) as launch:
+            reply = Server().handle({"id": 1, "method": "tools/call", "params": {
+                "name": "runtime", "arguments": {"action": "setup"}}})
+            self.assertFalse(reply["result"]["isError"])
+            self.assertIn("setup-0123456789ab", reply["result"]["content"][0]["text"])
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["runtime", "setup"]), 0)
+        self.assertEqual(launch.call_count, 2)
+        launch.assert_called_with({"root": "data"}, "runtime")
+
+    def test_prepare_refuses_non_boolean_install_before_creating_job(self):
+        with patch("rusticre.api.load", return_value={}), patch("rusticre.preparation.prepare") as prepare:
+            for value in ("false", 0, None):
+                with self.subTest(value=value), self.assertRaisesRegex(ValueError, "boolean"):
+                    call("prepare", {"exe": "owned.exe", "install": value})
+        prepare.assert_not_called()
+
+    def test_cli_options_file_preserves_json_and_rejects_arrays(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "options.json"
+            expected = {"kind": "comment", "source": "fixture:1", "comment": "quoted \"value\"\nsecond line"}
+            path.write_text(json.dumps(expected), encoding="utf-8-sig")
+            with patch("rusticre.cli.call", return_value="ok") as dispatch, redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["ghidra-query", "--target", "owned", "0x401000", "--action", "type_edit",
+                                       "--options-file", str(path)]), 0)
+            self.assertEqual(dispatch.call_args.args[1]["options"], expected)
+            path.write_text("[]", encoding="utf-8")
+            with patch("rusticre.cli.call") as dispatch, redirect_stderr(io.StringIO()):
+                self.assertEqual(main(["runtime", "status", "--options-file", str(path)]), 1)
+            dispatch.assert_not_called()
+
+    def test_prepared_registry_and_installed_paths_load_without_config_edits(self):
+        from rusticre.config import load
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            config = root / "local.json"
+            config.write_text(json.dumps({"targets": {"manual": {"program": "manual.exe"}}}))
+            (root / "backend.json").write_text(json.dumps({"ghidra_dir": "installed-engine", "java_home": "installed-jdk"}))
+            (root / "targets.json").write_text(json.dumps({"targets": {"prepared": {"program": "prepared.exe"}}}))
+            with patch.dict(os.environ, {"RUSTICRE_ROOT": str(root), "RUSTICRE_CONFIG": str(config)}):
+                settings = load()
+            self.assertEqual(set(settings["targets"]), {"prepared", "manual"})
+            self.assertEqual(settings["ghidra_dir"], "installed-engine")
+
+    def test_example_config_is_never_loaded_as_a_live_target(self):
+        from rusticre.config import config_path
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "config.example.json").write_text('{"targets":{"sample":{"exe":"missing.exe"}}}')
+            with patch.dict(os.environ, {}, clear=True), patch("rusticre.config.Path.cwd", return_value=root):
+                self.assertIsNone(config_path())
+
+    def test_default_evidence_follows_selected_data_root(self):
+        from rusticre.config import evidence_path
+        with patch.dict(os.environ, {}, clear=True), patch("rusticre.config.load", return_value={"root": "selected-data"}):
+            self.assertEqual(evidence_path(), Path("selected-data/evidence.db"))
+
+    def test_hook_manifest_normalizes_real_table_shape_and_checks_build(self):
+        from test_pe import image
+        pe = image()
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "hooks.json"
+            envelope = {"schema": "owned-hooks/1", "module": "fixture.exe", "build_id": "fixture",
+                        "build_sha256": pe.fingerprint()["sha256"], "image_base": hex(pe.base),
+                        "hooks": [{"offset": "0x1000", "prologue": "90909090", "names": ["first", "alias"],
+                                   "instrumented": True, "required": False} for _ in range(21)]}
+            path.write_text(json.dumps(envelope))
+            output = io.StringIO()
+            with patch("rusticre.api._image", return_value=pe) as opened, redirect_stdout(output):
+                self.assertEqual(main(["prologue", "--exe", "fixture.exe", "--checks-file", str(path), "--offset-kind", "rva"]), 0)
+            opened.assert_called_once()
+            self.assertEqual(json.loads(output.getvalue())["summary"], {"checked": 21, "matched": 21, "failed": 0})
+            envelope["hooks"][-1]["prologue"] = "CC"
+            path.write_text(json.dumps(envelope))
+            with patch("rusticre.api._image", return_value=pe), redirect_stderr(io.StringIO()):
+                self.assertEqual(main(["prologue", "--exe", "fixture.exe", "--checks-file", str(path), "--offset-kind", "rva"]), 1)
+            envelope["build_sha256"] = "f" * 64
+            path.write_text(json.dumps(envelope))
+            with patch("rusticre.api._image", return_value=pe), patch.object(pe, "read_rva") as read, redirect_stderr(io.StringIO()):
+                self.assertEqual(main(["prologue", "--exe", "fixture.exe", "--checks-file", str(path), "--offset-kind", "rva"]), 1)
+            read.assert_not_called()
 
 
 if __name__ == "__main__":

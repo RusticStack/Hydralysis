@@ -92,6 +92,7 @@ class Image:
             extra,
         )
         line += "\n# bits %d image_base %s entry_rva %s" % (info["bits"], info["image_base"], info["entry_point_rva"])
+        line += "\n# instruction/reference/string addresses are RVAs; pass them as rva:0x... to any RusticRE tool"
         if info["analysis_warnings"]:
             line += "\n# CAUTION: possible packed/wrapped or unusual image: " + "; ".join(info["analysis_warnings"])
             line += ". Verify the analysed project's executable SHA-256 before trusting decompiler text."
@@ -155,7 +156,7 @@ class Image:
         shown = 0
         for insn in md.disasm(blob, rva):
             note = _rip_note(self, insn)
-            lines.append("%#010x: %s %s%s" % (insn.address, insn.mnemonic, insn.op_str, note))
+            lines.append("rva:%#010x: %s %s%s" % (insn.address, insn.mnemonic, insn.op_str, note))
             shown += 1
             if shown >= count:
                 break
@@ -178,7 +179,7 @@ class Image:
                 dest = site + 5 + rel
                 if dest == target:
                     kind = "E8 call candidate" if raw[index] == 0xE8 else "E9 jump candidate"
-                    hits.append("%#x %s -> %#x" % (site, kind, dest))
+                    hits.append("rva:%#x %s -> rva:%#x" % (site, kind, dest))
                     if len(hits) >= limit:
                         break
             if len(hits) >= limit:
@@ -211,7 +212,7 @@ class Image:
                     site = base + index
                     dest = site + 7 + disp
                     if dest == target:
-                        hits.append("%#x -> %#x" % (site, dest))
+                        hits.append("rva:%#x -> rva:%#x" % (site, dest))
                     if len(hits) >= limit:
                         break
             if len(hits) >= limit:
@@ -235,7 +236,7 @@ class Image:
                 found = raw.find(needle, start)
                 if found < 0:
                     break
-                hits.append("%#x -> %#x" % (section.VirtualAddress + found, target))
+                hits.append("rva:%#x -> rva:%#x" % (section.VirtualAddress + found, target))
                 start = found + 1
         lines = [self.header(), "%d absolute byte candidate(s) -> %#x; instruction boundaries unverified; limit %d" % (len(hits), target, limit)]
         lines.extend(hits)
@@ -259,7 +260,7 @@ class Image:
                     # xrefs point to the string start even when a suffix matched.
                     rva = section.VirtualAddress + match.start()
                     clipped = text[:512] + (" [text truncated]" if len(text) > 512 else "")
-                    lines.append("%#x %s %s" % (rva, encoding, clipped))
+                    lines.append("rva:%#x %s %s" % (rva, encoding, clipped))
                     count += 1
                     if count >= limit:
                         lines.append("[limit reached; results may be incomplete]")
@@ -319,7 +320,7 @@ class Image:
         count = 0
         for item in symbols.symbols:
             name = item.name.decode("utf-8", "replace") if item.name else "ord:%s" % item.ordinal
-            lines.append("%#x %s" % (item.address, name))
+            lines.append("rva:%#x %s" % (item.address, name))
             count += 1
             if count >= limit:
                 break
@@ -337,7 +338,7 @@ class Image:
         for section in self._executable():
             raw = self.data[section.PointerToRawData : section.PointerToRawData + section.SizeOfRawData]
             for offset in find_pattern(raw, expect, limit - len(hits)):
-                hits.append("%#x" % (section.VirtualAddress + offset))
+                hits.append("rva:%#x" % (section.VirtualAddress + offset))
                 if len(hits) >= limit:
                     break
             if len(hits) >= limit:
@@ -362,7 +363,7 @@ class Image:
         hits = []
         for insn in md.disasm(blob, begin):
             if insn.id == capstone.x86.X86_INS_CALL and insn.operands and insn.operands[0].type == capstone.x86.X86_OP_IMM:
-                hits.append("%#x call %#x" % (insn.address, insn.operands[0].imm))
+                hits.append("rva:%#x call rva:%#x" % (insn.address, insn.operands[0].imm))
                 if len(hits) >= limit:
                     break
         lines = [self.header(), scope, "%d decoded direct call(s); linear decode is not a complete control-flow graph; limit %d" % (len(hits), limit)]
@@ -378,7 +379,7 @@ class Image:
         start Ghidra. Ask ghidra_run when you need decompiler text.
         """
         return "\n".join((
-            self.function_of(rva) if self._bounds(rva) else self.header() + "\nno pdata function contains %#x" % rva,
+            self.function_of(rva) if self._bounds(rva) else self.header() + "\nno pdata function contains rva:%#x; use ghidra_query action=function for analysed bounds" % rva,
             self.disasm(rva, 16),
             self.callers(rva, 12),
         ))
@@ -439,7 +440,7 @@ def _rip_note(image: Image, insn) -> str:
         return ""
     dest = insn.address + insn.size + disp
     text = image.string_at(dest)
-    note = "  ; -> %#x" % dest
+    note = "  ; -> rva:%#x" % dest
     if text:
         note += ' "%s"' % text
     return note

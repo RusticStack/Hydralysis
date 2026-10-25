@@ -97,7 +97,7 @@ class TransportTests(unittest.TestCase):
                 raise RuntimeError("test did not release worker")
             return "finished"
 
-        messages = [request(index, "tools/call", {"name": "slow", "arguments": {"number": index}})
+        messages = [request(index, "tools/call", {"name": "inspect", "arguments": {"number": index}})
                     for index in range(MAX_OUTSTANDING + 1)]
         messages.append(request("list", "tools/list"))
         messages.append(request("ping", "ping"))
@@ -124,7 +124,7 @@ class TransportTests(unittest.TestCase):
     def test_large_unicode_tool_result_is_bounded_and_reports_loss(self):
         value = "HEAD" + "\U0001f680" * MAX_OUTPUT_BYTES + "TAIL"
         with patch("rusticre.mcp.call", return_value=value):
-            response = Server().handle(request(1, "tools/call", {"name": "large"}))
+            response = Server().handle(request(1, "tools/call", {"name": "fingerprint"}))
         result = response["result"]
         text = result["content"][0]["text"]
         self.assertTrue(result["isError"])

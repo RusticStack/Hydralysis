@@ -6,9 +6,13 @@ build changed, so a stored name must not be applied.
 
 from __future__ import annotations
 
+import re
+
 
 def parse_expect(text: str) -> list[int | None]:
-    parts = text.replace(",", " ").split()
+    if not isinstance(text, str):
+        raise ValueError("expect prologue must be a hexadecimal string")
+    parts = text.replace(",", " ").replace("\\x", " ").replace("\\X", " ").split()
     if not parts:
         raise ValueError("expect prologue is empty")
     out: list[int | None] = []
@@ -16,13 +20,66 @@ def parse_expect(text: str) -> list[int | None]:
         if part in ("?", "??"):
             out.append(None)
             continue
-        value = int(part, 16)
-        if not 0 <= value <= 0xFF:
-            raise ValueError("prologue byte out of range: %s" % part)
-        out.append(value)
+        part = re.sub(r"^0[xX]", "", part)
+        if len(part) <= 2 and re.fullmatch(r"[0-9a-fA-F]{1,2}", part):
+            out.append(int(part, 16))
+            continue
+        if not part or len(part) % 2 or not re.fullmatch(r"(?:[0-9a-fA-F]{2}|\?\?)+", part):
+            raise ValueError("prologue requires whole hexadecimal bytes or ?? wildcards: %s" % part)
+        out.extend(None if part[index:index + 2] == "??" else int(part[index:index + 2], 16)
+                   for index in range(0, len(part), 2))
     if all(value is None for value in out):
         raise ValueError("expect prologue must contain at least one concrete byte")
     return out
+
+
+def compare_table(image, rows: list[dict], resolve_address) -> dict:
+    """Verify bounded rows against one already-open PE; never modify its bytes.
+
+    The address resolver shares the caller's RVA/VA policy. Validate the entire
+    request before reading any prologue, so a malformed last row cannot produce
+    a misleading partial verification result.
+    """
+    if not isinstance(rows, list) or not 1 <= len(rows) <= 200:
+        raise ValueError("prologue table needs 1..200 rows")
+    prepared = []
+    total = 0
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict) or set(row) - {"address", "expect", "name"}:
+            raise ValueError("prologue row %d accepts address, expect and optional name only" % index)
+        address, expect, name = row.get("address"), row.get("expect"), row.get("name", "")
+        if not isinstance(address, str) or not address.strip() or len(address) > 128:
+            raise ValueError("prologue row %d needs an address string" % index)
+        if not isinstance(expect, str) or len(expect) > 32768:
+            raise ValueError("prologue row %d needs a bounded expect string" % index)
+        if not isinstance(name, str) or len(name) > 256:
+            raise ValueError("prologue row %d name must be at most 256 characters" % index)
+        pattern = parse_expect(expect)
+        if len(pattern) > 4096:
+            raise ValueError("prologue row %d exceeds 4096 bytes" % index)
+        total += len(pattern)
+        if total > 65536:
+            raise ValueError("prologue table exceeds 65536 total bytes")
+        rva = resolve_address(address)
+        if not isinstance(rva, int) or isinstance(rva, bool) or rva < 0:
+            raise ValueError("prologue row %d resolved to an invalid RVA" % index)
+        if image.rva_to_offset(rva) is None or len(pattern) > image._available(rva):
+            raise ValueError("prologue row %d is outside a file-backed section" % index)
+        prepared.append((name, address, rva, pattern))
+    fingerprint = image.fingerprint()
+    results = []
+    matched = 0
+    for name, address, rva, pattern in prepared:
+        actual = image.read_rva(rva, len(pattern))
+        match = matches(actual, pattern)
+        matched += int(match)
+        results.append({"name": name, "input_address": address,
+                        "rva": "rva:%#x" % rva, "va": "va:%#x" % (image.base + rva),
+                        "expect": " ".join("??" if value is None else "%02X" % value for value in pattern),
+                        "actual": format_bytes(actual), "match": match})
+    return {"fingerprint": fingerprint, "rows": results,
+            "summary": {"checked": len(results), "matched": matched, "failed": len(results) - matched},
+            "matched": matched == len(results)}
 
 
 def format_bytes(data: bytes) -> str:

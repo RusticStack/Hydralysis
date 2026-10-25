@@ -1,63 +1,103 @@
 # RusticRE
 
-Twenty reverse-engineering tools for a PE you own. One command, `rusticre`. One MCP server.
+Twenty reverse-engineering tools for programs you own. One CLI, `rusticre`, and one small MCP server. Ghidra and an optional runtime engine run behind it; REA and GhidraMCP are not dependencies.
 
-Start with `inspect` for cheap PE facts. Use `ghidra-query` for decompiler text and analysed references: it keeps a JVM warm across CLI and MCP calls, opens a copy of saved analysis read-only, and verifies its executable SHA-256. It never imports or analyses a binary.
+Give RusticRE an executable, inspect the proposed work, explicitly prepare its analysis once, then query the saved project read-only. Setup and analysis return durable jobs immediately. Subsequent queries share a warm JVM. A lookup miss preserves the worker; a decompiler failure or timeout retires it with diagnostic paths.
 
-| Tool | Operation |
-| --- | --- |
-| `fingerprint`, `sections`, `imports`, `exports` | What this binary is |
-| `inspect` | x64 unwind bounds, prologue, instructions, candidate callers |
-| `disasm`, `xrefs`, `callers`, `callees`, `function`, `bytes`, `strings` | One question each |
-| `sigscan`, `prologue` | Find a hook site, then check the bytes before hooking |
-| `evidence-add` | Store a claim only if it has a source |
-| `ghidra-query` | Address-based decompile, function ranges, paged functions and references; worker status/stop |
-| `ghidra-run`, `ghidra-scripts`, `ghidra-jobs` | Deliberate scripts on saved analysis, discovery and diagnostic history |
+## Start from an executable
 
-`target` is a name you pick in the config for a Ghidra project. It is not a list of games.
-
-## Setup
-
-The PE tools work without Ghidra. Decompilation currently requires a Ghidra/JDK installation and a project imported and analysed separately. RusticRE does not yet provide the initial import/analysis workflow for a fresh binary.
+Install this package in a virtual environment on your development drive:
 
 ```text
-uv venv --python 3.14 .venv
-.\.venv\Scripts\python.exe -m pip install -e .
-.\.venv\Scripts\rusticre.exe tools
+uv venv .venv
+.venv/Scripts/python.exe -m pip install -e .
+.venv/Scripts/rusticre.exe tools
 ```
 
-Copy `config.example.json` to `rusticre.local.json` or set `RUSTICRE_CONFIG` for Ghidra operations. Set a target's existing project directory, project name, program name and `exe` (or full `sha256`). The PE tools need only `--exe`. Keep projects, caches and `root` on your development drive.
+Select a data directory with no dot-prefixed path components using `RUSTICRE_ROOT`, or set `root` in `rusticre.local.json`. Windows defaults to `F:/dev-cache/rusticre`; other hosts default to `~/rusticre-workspace`. Existing compatible Ghidra/JDK installations are discovered. Explicit `backend install` can privately install verified portable engines on Windows x64, without administrator privileges or machine configuration changes. Other hosts need configured existing engines. This release supports Ghidra **12.1.4**.
 
 ```text
-rusticre inspect --exe F:/binaries/sample.exe 0x1000
-rusticre ghidra-query --target sample 0x140001000
-rusticre ghidra-query --target sample --action xrefs 0x140001000 --limit 20
+rusticre fingerprint --exe F:/binaries/sample.exe
+rusticre prepare --exe F:/binaries/sample.exe --target sample --plan
+rusticre backend inspect
+rusticre backend install
+rusticre job <setup-id>
+rusticre prepare --exe F:/binaries/sample.exe --target sample
+rusticre job <prepare-id>
+rusticre job <prepare-id> --action cancel
+```
+
+`--plan` performs no import, download or job creation. `prepare` alone starts the initial import/analysis; it reports stages, logs, failure, timeout and cancellation. Identical builds reuse one job/result. A manually configured existing target is retained for querying rather than imported again. Only successfully analysed, hash-verified saved projects are registered. Known wrapper sections such as `.bind` and UPX block preparation with `needs_unwrapped_artifact`. Select an appropriate unwrapped artifact; RusticRE does not launch or unpack the game for you. Entropy alone is a warning, not a packing verdict.
+
+Existing analysed projects can still be configured through `targets` as shown in [config.example.json](config.example.json). Point `dir` directly at the directory containing the named `.gpr` and `.rep`, and supply `exe` or its full `sha256`. Close the canonical project before snapshotting it. No import occurs when answering a query.
+
+## Ask bounded questions
+
+```text
+rusticre inspect --exe F:/binaries/sample.exe rva:0x1000
+rusticre ghidra-query --target sample rva:0x1000
+rusticre ghidra-query --target sample va:0x140001000 --action dossier
 rusticre ghidra-query --target sample --action functions --contains Render --limit 20
 rusticre ghidra-query --target sample --action functions --cursor <next_cursor>
-rusticre ghidra-query --target sample --action status
-rusticre ghidra-query --target sample --action stop
+rusticre ghidra-query --target sample --action variables 0x140001000
+rusticre ghidra-query --target sample --action pcode 0x140001000
+rusticre ghidra-query --target sample --action trace 0x140001000 --options-file trace.json
+rusticre backend help
 ```
 
-PE tools accept `rva:0x...` or `va:0x...`; unprefixed addresses must have an unambiguous mapped interpretation. A PE32 RVA can exceed its image base, so its value alone cannot always identify the intended address. Ghidra queries use numeric **VAs**; aliases do not trigger name enumeration. Copy `next_cursor` into the same query to continue a functions or xrefs page. Function searches examine at most 2,000 entries per page, even when no name matches. Xref cursors are hexadecimal row offsets; function cursors are addresses. `truncated`, `body_truncated` and `total_characters` disclose incomplete answers. Decompiler text is capped at 32,000 characters.
+PE tools accept `rva:` or `va:` prefixes; ambiguous bare addresses are refused. Saved-analysis queries accept the same prefixes and interpret bare addresses as VAs. Their replies include the analysed image base and full executable hash. Function boundaries for PE32 require saved analysis. Cheap byte-based callers/xrefs remain candidates; Ghidra queries use its decoded listing and references.
 
-Close the master before taking or validating a snapshot. Only its named `.gpr` and `.rep` are copied, with source metadata recorded; an ordinary script refuses stale or unowned lanes. Query workers refresh into a new snapshot when the master changes. Workers share one request lock per target, so a simultaneous request reports busy promptly. The default allows two warm workers, each with a 6G maximum heap; idle workers exit after five minutes. `query_startup_s` (180 by default) is separate from the per-query `--timeout` (30 seconds; configurable up to 300). A failed or timed-out query retires its worker and the next call starts a new one. Snapshots and logs are retained for diagnosis; remove them only when you no longer need them.
+Query actions include decompilation, function ranges, paged functions/xrefs/types, type layouts, recovered variables, function dossiers, basic blocks, high p-code and bounded value-flow traces. Traces cite instruction/operation identities and report unknown aliasing, indirect calls and runtime reachability. They do not prove original source types or feasible execution paths.
 
-For a custom batch script, set the target's `scripts` directory and use `ghidra-run --target sample Script.java <arguments> --timeout 600`. A pre-script checks the analysed flag and build hash before the selected script runs with `-process -noanalysis -readOnly`. This path starts a JVM per run. Failures include log and job paths and return a nonzero CLI exit or MCP `isError`. Headless control options cannot be smuggled through script arguments. Custom scripts are trusted local code: read-only project opening prevents saved project edits, not filesystem writes by arbitrary Java/Python.
+Use `type_edit` for cited structures, prototypes, local types, names, comments, data definitions and exact-byte-checked function definition corrections. Batches accept up to 200 edits, including a JSON file input. They roll back as a unit. Edits persist as build-bound sidecars and replay in worker memory; the canonical project stays unchanged. `--options-file` avoids shell quoting and Windows command length limits. [The protocol](docs/upstream-analysis.md) and on-demand `backend help` describe the options.
 
-## Why these twenty
+Function/xref/type pages and scans disclose truncation and continuation. Default decompiler output is capped at 32,000 characters. Use a file export for bulk work rather than flooding an MCP reply. Workers serialize requests per target, use isolated read-only snapshots, default to two JVMs with 6G maximum heap each, and expire after five idle minutes. Startup has its own 180-second deadline; individual queries have a 30-second default, capped at 300. Logs and failed snapshots are retained.
 
-[The research report](docs/research.md) cites the three project repositories, successful calls, oversized answers, dead sessions, lock failures and adoption problems. [Verification](docs/verification.md) separates new measurements from historical reports. The query tool replaces the former lane-listing MCP slot; the count remains twenty. Individual schemas and the combined catalog have regression budgets.
+`ghidra-query --target sample --action export --options-file export.json` writes a durable JSONL artifact. Use `job <export-id>` for status/cancel and `{"resume":"<export-id>"}` to continue the same selection. Progress, hashes and explicit failure/truncation counts survive interruption. Resume refuses changed builds, source analysis, implementation or overlays. See [export options and limits](docs/exports.md); `complete` describes the selected filter, and a count cap does not establish whole-program coverage.
 
-PE `callers` and `xrefs` are byte-pattern **candidates**, not proof of instruction boundaries or a complete call graph. Prefer analysed `ghidra-query --action xrefs` when those distinctions matter. PE32 function boundaries need saved analysis. Packing indicators are warnings; a build-hash mismatch refuses Ghidra output. `prologue` rejects all-wildcard patterns and returns failure on a mismatch. An offline byte match does not install or validate a runtime hook.
-
-REA still earns a call for p-code, basic blocks, full function dossiers and bounded value-flow tracing. Use Ghidra directly for initial analysis, type recovery and saved symbol/comment edits. Other binary formats and live runtime introspection remain outside the default PE server.
-
-`src/rusticre/red4ext.py` parses one vendor's address-table JSON. It is not an MCP tool. A format that belongs to one program stays out of the server until a second program needs the same parser.
-
-## Tests
+## Verify runtime evidence
 
 ```text
-.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+rusticre prologue --exe F:/binaries/sample.exe rva:0x1000 --expect "48895C2408"
+rusticre prologue --exe F:/binaries/sample.exe --checks-file hooks.json
+rusticre backend install --component runtime
+rusticre job <setup-id>
+rusticre backend help --component runtime
+rusticre runtime attach --options-file attach.json
+rusticre runtime modules --options-file session.json
 ```
 
-The tests cover protocol exchanges, worker recovery, snapshot ownership, bounded signatures and file-backed reads. They do not launch Ghidra or a game. There is no configured formatter or lint command; `git diff --check` checks patch whitespace.
+A prologue table opens one PE and reports all rows; any mismatch fails the CLI/MCP result. Compact, spaced, comma-separated and escaped hexadecimal forms are accepted. Legacy `offset/prologue/names` rows require explicit `--offset-kind rva|va` unless already prefixed.
+
+The optional pinned Frida backend supports verified attach/spawn, modules/threads, bounded module or absolute memory reads, observations and cooperative breakpoints with registers, arguments, return values and backtraces. Hooks require the module's full hash and **matching exact live bytes** before installation. Wildcards and unrestricted injected scripts cannot bypass that gate. Continue, unload and detach release instrumentation; abandoned breakpoint pauses have a watchdog. This backend does not supply CPU instruction stepping or data watchpoints. See [runtime evidence and semantics](docs/upstream-runtime.md).
+
+## Small catalog
+
+| MCP tools | Purpose |
+| --- | --- |
+| `fingerprint`, `imports` | Identity, packing triage and tables; fingerprint `detail=sections|exports` |
+| `inspect`, `disasm`, `function`, `bytes`, `strings`, `xrefs`, `callers`, `callees` | Cheap PE evidence |
+| `sigscan`, `prologue` | Locate candidates and verify bytes/tables |
+| `evidence_add`, `evidence_list` | Claims with mandatory sources |
+| `backend`, `prepare`, `job` | Setup, explicit analysis once, progress and recovery |
+| `ghidra_query`, `ghidra_run` | Saved analysis, overlays, exports and deliberate scripts |
+| `runtime` | Controlled local runtime sessions |
+
+The CLI retains `sections`, `exports`, `ghidra-scripts` and `ghidra-jobs` aliases. They are not advertised as additional MCP tools. The catalog has regression budgets for tool count, total JSON bytes and individual schemas. [Client setup](docs/clients.md) explains registration and the equivalent CLI path for Qoder. No client configuration or other MCP registration is changed automatically.
+
+`ghidra-run` remains an escape hatch for deliberate trusted local scripts, using `-process -noanalysis -readOnly` on an isolated copy. It starts a JVM per call. Project read-only mode does not prevent arbitrary scripts from writing other filesystem files. Use the warm query actions for routine work.
+
+## Evidence and limits
+
+[Original usage research](docs/research.md), [upstream setup](docs/upstream-setup.md), [analysis research](docs/upstream-analysis.md), and the [KotOR/SWTOR PR review](docs/open-pr-insights.md) explain why these operations earned a place. [Verification](docs/verification-complete-workflow.md) distinguishes actual fixture/corpus results from historical reports and untested scenarios.
+
+RusticRE covers native PE inspection and Ghidra-backed saved analysis. It is not a replacement for every upstream Android/browser/firmware feature. Runtime stepping/watchpoints, graphics debugging, automatic unpacking and universal type recovery remain outside the implemented contract. [KotOR](docs/capabilities-kotor.md) and [Night City Together](docs/capabilities-nct.md) still require their own engine/protocol/resource/framework implementations; those do not become game-specific server tools. No finite test corpus establishes that a remaster or multiplayer framework can be completed automatically.
+
+## Development
+
+```text
+.venv/Scripts/python.exe -m unittest discover -s tests -v
+git diff --check
+```
+
+Unit tests run without launching Ghidra or games. The separately documented native fixture verifies real backend integration. There is no configured formatter or lint command. Only `pefile` and `capstone` are mandatory Python dependencies; engines are discovered or explicitly installed separately.
