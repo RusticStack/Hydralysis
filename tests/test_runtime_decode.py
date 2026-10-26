@@ -40,6 +40,23 @@ class Decoding(unittest.TestCase):
         self.assertEqual([row.get("value") for row in rows[:3]], [-3, "0x140000000", 2.0])
         self.assertEqual(rows[3]["bytes"], "FD FF FF FF")
 
+    def test_a_register_capture_replaces_arg(self):
+        spec = decode.normalize([{"reg": "ecx", "as": "pointer", "label": "this"}])[0]
+        self.assertEqual((spec["reg"], spec["arg"], spec["value_only"]), ("ecx", None, True))
+        row = decode.decode_event([spec], [{"pointer": "0x1234", "hex": "3412000000000000"}])[0]
+        self.assertEqual((row["reg"], row["value"]), ("ecx", "0x1234"))
+        for bad in ({"reg": "ecx", "arg": 0}, {"reg": "e cx"}, {"reg": 3}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                decode.normalize([{**bad, "as": "u32"}])
+
+    def test_the_probe_carries_its_calling_convention(self):
+        from rusticre.runtime_worker import _probe_source
+        captures = decode.normalize([{"arg": 0, "as": "pointer"}])
+        source = _probe_source({"path": "x.exe", "base": "0x400000"}, 0x1000, [0x55, 0x8B, 0xEC, 0x83, 0xEC], "a" * 32,
+                               5, False, captures, None, "thiscall")
+        self.assertIn('"convention": "thiscall"', source)
+        self.assertIn("context.ecx", source)
+
     def test_enum_fields_read_as_value_and_member(self):
         names = {"0": "ECCTV_All", "2": "ECCTV_OnlyOnscreen"}
         rows = decode.layout_values([{"name": "target", "offset": 0, "type": "u8", "enum": "ECustomCameraTarget", "names": names},

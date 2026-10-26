@@ -4,13 +4,14 @@ A probe only copies bounded bytes (an argument, or what it points to through a
 chain of pointer reads, each checked against a readable range); everything
 here runs in the worker, so a bad layout can never fault the target.
 
-capture spec: {"arg": 0..7, "deref": [offsets]?, "size": 1..4096?, "as": decoder, "names": {hash: name}?}
+capture spec: {"arg": 0..7 | "reg": register name, "deref": [offsets]?, "size": 1..4096?, "as": decoder, "names": {hash: name}?}
 decoders: utf8, utf16 (NUL-terminated, bounded by size), hex, i8..u64, f32, f64, pointer,
 struct (with "fields": [{name, offset, type, size?}] of the same scalar types).
 """
 
 from __future__ import annotations
 
+import re
 import struct
 
 SCALARS = {"i8": ("<b", 1), "u8": ("<B", 1), "i16": ("<h", 2), "u16": ("<H", 2), "i32": ("<i", 4),
@@ -41,11 +42,16 @@ def normalize(captures) -> list[dict]:
         raise ValueError("capture must be a list of at most %d argument captures" % MAX_CAPTURES)
     clean = []
     for index, item in enumerate(captures):
-        if not isinstance(item, dict) or set(item) - {"arg", "deref", "size", "as", "fields", "names", "label"}:
-            raise ValueError("capture %d accepts arg, deref, size, as, fields, names, label" % index)
-        arg = item.get("arg")
-        if isinstance(arg, bool) or not isinstance(arg, int) or not 0 <= arg <= 7:
-            raise ValueError("capture %d needs arg 0..7" % index)
+        if not isinstance(item, dict) or set(item) - {"arg", "reg", "deref", "size", "as", "fields", "names", "label"}:
+            raise ValueError("capture %d accepts arg or reg, deref, size, as, fields, names, label" % index)
+        arg, reg = item.get("arg"), item.get("reg")
+        if reg is not None:
+            # A register by name (ecx for a 32-bit thiscall `this`, rax, ...); the probe refuses a name
+            # the target's architecture does not have.
+            if arg is not None or not isinstance(reg, str) or not re.fullmatch(r"[a-z][a-z0-9]{1,4}", reg):
+                raise ValueError("capture %d: reg is one register name (e.g. ecx, rdx), instead of arg" % index)
+        elif isinstance(arg, bool) or not isinstance(arg, int) or not 0 <= arg <= 7:
+            raise ValueError("capture %d needs arg 0..7 or reg" % index)
         deref = item.get("deref", [])
         if not isinstance(deref, list) or len(deref) > 4 or any(isinstance(x, bool) or not isinstance(x, int) or not 0 <= x < 1 << 20 for x in deref):
             raise ValueError("capture %d deref is up to 4 offsets: read a pointer at each" % index)
@@ -72,7 +78,7 @@ def normalize(captures) -> list[dict]:
         names = item.get("names") or {}
         if not isinstance(names, dict) or len(names) > 100000:
             raise ValueError("capture %d names maps values to names" % index)
-        clean.append({"arg": arg, "deref": deref, "size": size, "as": kind, "fields": fields,
+        clean.append({"arg": arg, "reg": reg, "deref": deref, "size": size, "as": kind, "fields": fields,
                       "names": {str(int(str(key), 0)): str(value) for key, value in names.items()},
                       "label": str(item.get("label", ""))[:64], "value_only": not deref and kind in SCALARS and size <= 8})
     return clean
@@ -107,7 +113,8 @@ def decode(spec: dict, data: bytes):
 def decode_event(specs: list[dict], captures: list) -> list[dict]:
     out = []
     for spec, captured in zip(specs, captures or []):
-        row = {"arg": spec["arg"], **({"label": spec["label"]} if spec["label"] else {})}
+        row = {**({"reg": spec["reg"]} if spec.get("reg") else {"arg": spec["arg"]}),
+               **({"label": spec["label"]} if spec["label"] else {})}
         if not isinstance(captured, dict) or captured.get("error"):
             row["error"] = (captured or {}).get("error", "not captured")
         else:

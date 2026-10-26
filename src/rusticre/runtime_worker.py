@@ -177,12 +177,12 @@ def _expect(text: str) -> list[int]:
 
 
 def _probe_source(module: dict, rva: int, expected: list[int], hook_id: str, limit: int, pause: bool,
-                  captures: list | None = None, sample: dict | None = None) -> str:
+                  captures: list | None = None, sample: dict | None = None, convention: str = "native") -> str:
     parameters = json.dumps({"module": module["path"], "base": module["base"], "rva": rva,
                              "expect": expected, "id": hook_id, "limit": limit, "pause": pause,
-                             "captures": [{"arg": c["arg"], "deref": c["deref"], "size": c["size"], "value_only": c["value_only"]}
-                                          for c in (captures or [])],
-                             "sample": sample})
+                             "captures": [{"arg": c["arg"], "reg": c.get("reg"), "deref": c["deref"], "size": c["size"],
+                                           "value_only": c["value_only"]} for c in (captures or [])],
+                             "sample": sample, "convention": convention})
     return CONTEXT_HELPER + MEMORY_HELPER + r"""const p=PARAMETERS;
 const all=Process.enumerateModules().filter(m=>m.path===p.module);
 if(all.length!==1||all[0].base.toString()!==p.base)throw new Error('module mapping changed before probe installation');
@@ -192,7 +192,17 @@ if(got.some((b,i)=>b!==p.expect[i]))throw new Error('PROLOGUE MISMATCH; probe re
 let hits=0;
 // Bounded copies of what arguments point to; every read is checked against a readable range.
 function readable(q,n){const r=Process.findRangeByAddress(q);return r!==null&&r.protection.indexOf('r')>=0&&q.add(n).compare(r.base.add(r.size))<=0;}
-function captureArgs(args){return p.captures.map(c=>{try{let q=args[c.arg];
+// Argument i under the probe's calling convention. Native: what Frida reads for this ABI (x64
+// registers then stack; ia32 stack slots). 32-bit thiscall: `this` in ecx, the rest on the stack;
+// fastcall: ecx, edx, then the stack.
+if(p.convention!=='native'&&Process.arch!=='ia32')throw new Error('convention '+p.convention+' is for 32-bit x86 targets');
+function argAt(context,args,i){
+  if(p.convention==='thiscall')return i===0?context.ecx:args[i-1];
+  if(p.convention==='fastcall')return i===0?context.ecx:i===1?context.edx:args[i-2];
+  return args[i];}
+function captureArgs(args,context){return p.captures.map(c=>{try{
+  if(c.reg!==null&&context[c.reg]===undefined)return {error:'no register '+c.reg+' on '+Process.arch};
+  let q=c.reg!==null?context[c.reg]:argAt(context,args,c.arg);
   if(c.value_only)return {pointer:q.toString(),hex:Array.from({length:c.size},(_,i)=>q.shr(8*i).and(255).toInt32().toString(16).padStart(2,'0')).join('')};
   for(const off of c.deref){if(!readable(q.add(off),8))return {error:'unreadable pointer at '+q.add(off)};q=q.add(off).readPointer();}
   if(!readable(q,c.size))return {pointer:q.toString(),error:'unreadable '+c.size+' bytes'};
@@ -207,7 +217,7 @@ function sampleValue(hexed){const b=new Uint8Array(hexed.match(/../g).map(x=>par
    case 'u32':return v.getUint32(0,true);case 'i16':return v.getInt16(0,true);case 'u16':return v.getUint16(0,true);case 'u8':return v.getUint8(0);default:return Number(v.getBigUint64(0,true));}}
 const listener=Interceptor.attach(site,{
  onEnter(args){
-  if(p.sample){agg.count++;const c=captureArgs(args)[p.sample.capture];
+  if(p.sample){agg.count++;const c=captureArgs(args,this.context)[p.sample.capture];
    if(c&&c.hex){const x=sampleValue(c.hex);agg.last=x;agg.min=agg.min===null||x<agg.min?x:agg.min;agg.max=agg.max===null||x>agg.max?x:agg.max;}return;}
   this.capture=hits++<p.limit;
   if(!this.capture)return;
@@ -215,7 +225,7 @@ const listener=Interceptor.attach(site,{
   let backtrace=[];try{backtrace=Thread.backtrace(this.context,Backtracer.ACCURATE).slice(0,16).map(a=>a.toString());}catch(e){}
   send({event:p.pause?'break':'enter',hook_id:p.id,hit:hits,thread:this.threadId,
     address:site.toString(),return_address:this.returnAddress.toString(),context,
-    arguments:Array.from({length:8},(_,i)=>args[i].toString()),backtrace,captures:captureArgs(args)});
+    arguments:Array.from({length:8},(_,i)=>String(argAt(this.context,args,i))),backtrace,captures:captureArgs(args,this.context)});
   if(p.pause)recv('continue:'+p.id,()=>{}).wait();
  },
  onLeave(retval){if(this.capture)send({event:'return',hook_id:p.id,thread:this.threadId,value:retval.toString()});}
@@ -534,10 +544,14 @@ class RuntimeAgent:
                 if not 1 <= window <= 300 or not 0 <= index < len(captures) or captures[index]["as"] not in SCALARS:
                     raise ValueError("sample needs window_s 1..300 and a capture index whose decoder is a number")
                 sample = {"window_s": window, "capture": index, "as": captures[index]["as"]}
+            convention = str(args.get("convention") or "native")
+            if convention not in ("native", "thiscall", "fastcall"):
+                raise ValueError("convention is native, thiscall or fastcall (the last two for 32-bit x86)")
             hook_id = uuid.uuid4().hex
-            source = _probe_source(module, rva, expected, hook_id, limit, action == "break", captures, sample)
+            source = _probe_source(module, rva, expected, hook_id, limit, action == "break", captures, sample, convention)
             handle = self._load(hook_id, source, {"kind": action, "module": module, "rva": hex(rva), "expected_bytes": expected,
-                                                  "captures": captures, "sample": sample})
+                                                  "captures": captures, "sample": sample,
+                                                  "convention": convention})
             return {"hook_id": hook_id, "verified": True, "module": module, "rva": hex(rva),
                     "address": address, "script_sha256": handle["source_sha256"], "pause_deadline_s": 30 if action == "break" else None,
                     **({"past_patch": patch} if patch else {})}
