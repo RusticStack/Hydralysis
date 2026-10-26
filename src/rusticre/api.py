@@ -273,15 +273,15 @@ def call(name: str, args: dict | None) -> str:
 
 def instructions() -> str:
     return (
-        "RusticRE %s. Twenty tools for any PE you own. prepare imports/analyses "
-        "a new executable exactly once as a durable job and registers its build; "
+        "RusticRE %s. Twenty tools for any PE you own. prepare adopts an analysed project in place, "
+        "or imports/analyses a new executable exactly once as a durable job, and registers its build; "
         "backend discovers/installs the engines, never their MCPs. job reports progress. "
         "runtime manages verified debugging/instrumentation sessions. inspect is the function "
         "picture (bounds, prologue, instructions, callers) and does not start a JVM. "
         "sigscan and prologue are how a hook site is found and checked. ghidra_run "
-        "executes one script on a read-only copy of a project you already analysed. "
+        "runs one of your scripts contained, so it cannot change the project. "
         "Prefer ghidra_query for bounded address-based decompilation and references; "
-        "its JVM stays warm across CLI and MCP calls; export writes bulk artifacts as a job. "
+        "one warm engine serves CLI, MCP and script clients; export writes bulk artifacts as a job. "
         "Addresses there are VAs or explicit rva:/va:. "
         "For PE addresses use rva:0x... or va:0x... when the interpretation is ambiguous. "
         "Do not re-import the binary. evidence_add stores a claim only with a source."
