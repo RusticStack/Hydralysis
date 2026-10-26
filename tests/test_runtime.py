@@ -308,20 +308,30 @@ class HostRuntimeContracts(RuntimeCase):
 
     def test_setup_passes_hashes_and_explicit_target_without_global_install(self):
         settings = {"root": str(self.root / "runtime-root")}
-        responses = [SimpleNamespace(returncode=1, stdout="", stderr="missing"),
-                     SimpleNamespace(returncode=0),
-                     SimpleNamespace(returncode=0, stdout=json.dumps({"version": runtime.FRIDA_VERSION}), stderr="")]
+        site = self.root / "runtime-root" / "runtime-backend" / ("frida-" + runtime.FRIDA_VERSION)
+        responses = [SimpleNamespace(returncode=0),
+                     SimpleNamespace(returncode=0, stdout=json.dumps({"version": runtime.FRIDA_VERSION,
+                                                                      "path": str(site / "frida" / "__init__.py")}), stderr="")]
         metadata = {"urls": [{"packagetype": "bdist_wheel", "digests": {"sha256": "a" * 64}}]}
         from io import BytesIO
         with patch("rusticre.runtime.proc.run", side_effect=responses) as run, patch("rusticre.runtime.urllib.request.urlopen", return_value=BytesIO(json.dumps(metadata).encode())):
             result = runtime.setup(settings)
         self.assertEqual(result["state"], "ready")
-        command = run.call_args_list[1].args[0]
+        self.assertFalse(result["reused"])
+        command = run.call_args_list[0].args[0]
         self.assertIn("--require-hashes", command)
         self.assertIn("--target", command)
         self.assertIn("--isolated", command)
         self.assertIn("--no-deps", command)
         self.assertTrue(str(self.root) in command[command.index("--target") + 1])
+
+    def test_a_frida_beside_the_dependencies_is_not_an_install(self):
+        settings = {"root": str(self.root / "runtime-root2")}
+        site = self.root / "runtime-root2" / "runtime-backend" / ("frida-" + runtime.FRIDA_VERSION)
+        site.mkdir(parents=True)
+        elsewhere = json.dumps({"version": runtime.FRIDA_VERSION, "path": str(self.root / "site-packages" / "frida" / "__init__.py")})
+        with patch("rusticre.runtime.proc.run", return_value=SimpleNamespace(returncode=0, stdout=elsewhere, stderr="")),                 self.assertRaisesRegex(RuntimeError, "incomplete"):
+            runtime.setup(settings)
 
     def test_invalid_sessions_and_target_builds_do_not_launch_worker(self):
         runner = runtime.RuntimeRunner({"root": str(self.root / "sessions")})

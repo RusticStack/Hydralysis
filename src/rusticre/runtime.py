@@ -120,6 +120,13 @@ def inspect(settings: dict) -> dict:
             "expected_version": FRIDA_VERSION}
 
 
+def _inside(path: str, folder: Path) -> bool:
+    try:
+        return Path(path).resolve().is_relative_to(folder.resolve())
+    except (OSError, ValueError):
+        return False
+
+
 def setup(settings: dict) -> dict:
     """Explicit, hash-verified optional backend installation under root."""
     root = _root(settings) / "runtime-backend"
@@ -130,9 +137,11 @@ def setup(settings: dict) -> dict:
     try:
         site = root / ("frida-" + FRIDA_VERSION)
         env = _environment(settings)
-        probe = [sys.executable, "-c", "import frida,json; print(json.dumps({'version':frida.__version__}))"]
-        result = proc.run(probe, capture_output=True, text=True, env=env, timeout=15)
-        if result.returncode == 0:
+        probe = [sys.executable, "-c", "import frida,json; print(json.dumps({'version':frida.__version__,'path':frida.__file__}))"]
+        result = proc.run(probe, capture_output=True, text=True, env=env, timeout=15) if site.exists() else None
+        # Only a frida loaded from this folder is ours: the worker's path also holds RusticRE's
+        # dependencies, and a frida installed beside them would otherwise pass for an install.
+        if result is not None and result.returncode == 0 and _inside(json.loads(result.stdout)["path"], site):
             version = json.loads(result.stdout)["version"]
             if version != FRIDA_VERSION:
                 raise RuntimeError("runtime backend version differs from the pinned version: %s" % version)
@@ -157,7 +166,8 @@ def setup(settings: dict) -> dict:
         if result.returncode:
             raise RuntimeError("runtime backend installation failed, exit=%s; log=%s" % (result.returncode, log))
         verify = proc.run(probe, capture_output=True, text=True, env=env, timeout=15)
-        if verify.returncode or json.loads(verify.stdout).get("version") != FRIDA_VERSION:
+        if verify.returncode or json.loads(verify.stdout).get("version") != FRIDA_VERSION \
+                or not _inside(json.loads(verify.stdout).get("path", ""), site):
             raise RuntimeError("runtime backend import verification failed; log=%s; %s" % (log, verify.stderr[-1000:]))
         manifest = {"state": "ready", "version": FRIDA_VERSION, "path": str(site), "reused": False,
                     "source": url, "wheel_sha256": hashes, "log": str(log)}
