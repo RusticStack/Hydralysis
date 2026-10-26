@@ -410,6 +410,20 @@ public class RusticQuery extends GhidraScript {
         final JsonArray unresolved = new JsonArray();
         boolean truncated = false;
         int functionCount = 0;
+        int memoryEdges = 0;
+        int fieldKeys = 0;
+        final Map<String, String> kinds = new HashMap<>();
+        void memoryEdge(String from, String to, String kind, long delta) {
+            if (edges.size() >= 24000) { truncated = true; return; }
+            backward.computeIfAbsent(to, key -> new LinkedHashSet<>()).add(from);
+            forward.computeIfAbsent(from, key -> new LinkedHashSet<>()).add(to);
+            kinds.put(from + ">" + to, kind);
+            JsonObject row = new JsonObject();
+            row.addProperty("from", from); row.addProperty("to", to); row.addProperty("kind", kind);
+            if (delta != 0) row.addProperty("offset_delta", "0x" + Long.toHexString(delta));
+            edges.add(row);
+            memoryEdges++;
+        }
         void edge(String from, String to, String kind, int input) {
             if (edges.size() >= 24000) { truncated = true; return; }
             backward.computeIfAbsent(to, key -> new LinkedHashSet<>()).add(from);
@@ -490,7 +504,140 @@ public class RusticQuery extends GhidraScript {
                 }
             }
         }
+        memoryEdges(model, functions, deadline);
         return model;
+    }
+
+    // ---- values that travel through memory ---------------------------------------------------
+    // Def-use stops where a value is written to memory and read back, or where only the
+    // address of a stack local is passed on. These edges connect a write with the read (or
+    // the address-of) of the same stack slot, and a store to base+offset with a load of the
+    // same field, where base is one variable, or a parameter bound to the caller's argument.
+    // They follow recovered addresses, not proven aliasing; each edge says what it matched.
+
+    private boolean isStackBase(Varnode node) {
+        var pointer = currentProgram.getCompilerSpec().getStackPointer();
+        return node != null && node.isRegister() && pointer != null && node.getAddress().equals(pointer.getAddress());
+    }
+
+    private Long stackOffset(Varnode address) {
+        PcodeOp definition = address.getDef();
+        long extra = 0;
+        for (int guard = 0; definition != null && guard < 8; guard++) {
+            int code = definition.getOpcode();
+            if (code == PcodeOp.PTRSUB && isStackBase(definition.getInput(0)) && definition.getInput(1).isConstant())
+                return definition.getInput(1).getOffset() + extra;
+            if ((code == PcodeOp.INT_ADD || code == PcodeOp.PTRSUB) && definition.getInput(1).isConstant()) {
+                extra += definition.getInput(1).getOffset();
+                definition = definition.getInput(0).getDef();
+            } else if (code == PcodeOp.CAST || code == PcodeOp.COPY) definition = definition.getInput(0).getDef();
+            else return null;
+        }
+        return null;
+    }
+
+    private String identity(Function function, Varnode node, Map<String, String> aliases) {
+        HighVariable high = node.getHigh();
+        String key;
+        if (high instanceof HighParam parameter) key = "param:" + function.getEntryPoint() + ":" + parameter.getSlot();
+        else if (high != null && high.getRepresentative() != null) key = "var:" + varId(function, high.getRepresentative());
+        else key = "node:" + varId(function, node);
+        for (int guard = 0; aliases.containsKey(key) && guard < 8; guard++) key = aliases.get(key);
+        return key;
+    }
+
+    // base+offset of an address expression, or null.
+    private String fieldKey(Function function, Varnode address, Map<String, String> aliases) {
+        long offset = 0;
+        Varnode base = address;
+        for (int guard = 0; guard < 8; guard++) {
+            PcodeOp definition = base.getDef();
+            if (definition == null) break;
+            int code = definition.getOpcode();
+            if ((code == PcodeOp.PTRSUB || code == PcodeOp.INT_ADD) && definition.getInput(1).isConstant()) {
+                offset += definition.getInput(1).getOffset();
+                base = definition.getInput(0);
+            } else if (code == PcodeOp.CAST || code == PcodeOp.COPY) base = definition.getInput(0);
+            else break;
+        }
+        if (base.isConstant() || isStackBase(base)) return null;
+        return identity(function, base, aliases) + "+0x" + Long.toHexString(offset);
+    }
+
+    // Within one function, a write at a later instruction than its use is only reached
+    // through a loop or not at all; the edge says so instead of guessing.
+    private String order(FlowModel model, String write, String use) {
+        FlowOperation from = model.operations.get(write), to = model.operations.get(use);
+        if (!from.function.equals(to.function)) return "";
+        return from.operation.getSeqnum().getTarget().compareTo(to.operation.getSeqnum().getTarget()) <= 0 ? "" : "(after_use)";
+    }
+
+    private void memoryEdges(FlowModel model, Map<Address, List<FlowOperation>> functions, long deadline) {
+        // A callee parameter is the caller's argument, for field identity across a call.
+        Map<String, String> aliases = new HashMap<>();
+        for (FlowOperation node : model.operations.values()) {
+            PcodeOpAST operation = node.operation;
+            if (operation.getOpcode() != PcodeOp.CALL) continue;
+            Function callee = currentProgram.getFunctionManager().getFunctionAt(operation.getInput(0).getAddress());
+            if (callee == null || !functions.containsKey(callee.getEntryPoint()) || callee.equals(node.function)) continue;
+            for (int i = 1; i < operation.getNumInputs() && i < 16; i++) {
+                String parameter = "param:" + callee.getEntryPoint() + ":" + (i - 1);
+                if (!aliases.containsKey(parameter)) aliases.put(parameter, identity(node.function, operation.getInput(i), aliases));
+            }
+        }
+        record Slot(String id, Function function, long offset, int size) {}
+        Map<Address, List<Slot>> writes = new HashMap<>();
+        Map<String, List<String>> fieldStores = new HashMap<>();
+        List<Slot> addressOf = new ArrayList<>(), stackLoads = new ArrayList<>();
+        Map<String, List<String>> fieldLoads = new HashMap<>();
+        for (Map.Entry<String, FlowOperation> entry : model.operations.entrySet()) {
+            if (System.nanoTime() >= deadline) { model.truncated = true; return; }
+            FlowOperation node = entry.getValue();
+            PcodeOpAST operation = node.operation;
+            Address function = node.function.getEntryPoint();
+            Varnode output = operation.getOutput();
+            int code = operation.getOpcode();
+            if (output != null && output.getAddress().isStackAddress() && code != PcodeOp.INDIRECT)
+                writes.computeIfAbsent(function, key -> new ArrayList<>()).add(new Slot(entry.getKey(), node.function, output.getOffset(), output.getSize()));
+            if (code == PcodeOp.PTRSUB && isStackBase(operation.getInput(0)) && operation.getInput(1).isConstant())
+                addressOf.add(new Slot(entry.getKey(), node.function, operation.getInput(1).getOffset(), 0));
+            if (code == PcodeOp.STORE && operation.getNumInputs() >= 3) {
+                Long slot = stackOffset(operation.getInput(1));
+                if (slot != null) writes.computeIfAbsent(function, key -> new ArrayList<>()).add(new Slot(entry.getKey(), node.function, slot, operation.getInput(2).getSize()));
+                else {
+                    String key = fieldKey(node.function, operation.getInput(1), aliases);
+                    if (key != null) fieldStores.computeIfAbsent(key, item -> new ArrayList<>()).add(entry.getKey());
+                }
+            }
+            if (code == PcodeOp.LOAD && operation.getNumInputs() >= 2) {
+                Long slot = stackOffset(operation.getInput(1));
+                if (slot != null) stackLoads.add(new Slot(entry.getKey(), node.function, slot, output == null ? 1 : output.getSize()));
+                else {
+                    String key = fieldKey(node.function, operation.getInput(1), aliases);
+                    if (key != null) fieldLoads.computeIfAbsent(key, item -> new ArrayList<>()).add(entry.getKey());
+                }
+            }
+        }
+        // The address of a stack local stands for what is stored in it (a struct passed by
+        // pointer): writes from that offset up to 0x40 bytes beyond count.
+        for (Slot pointer : addressOf) {
+            for (Slot write : writes.getOrDefault(pointer.function().getEntryPoint(), List.of())) {
+                long delta = write.offset() - pointer.offset();
+                if (delta >= 0 && delta < 0x40 && !write.id().equals(pointer.id()))
+                    model.memoryEdge(write.id(), pointer.id(), "stack_pointee" + order(model, write.id(), pointer.id()), delta);
+            }
+        }
+        for (Slot load : stackLoads) {
+            for (Slot write : writes.getOrDefault(load.function().getEntryPoint(), List.of())) {
+                if (write.offset() < load.offset() + load.size() && load.offset() < write.offset() + write.size())
+                    model.memoryEdge(write.id(), load.id(), "stack_store" + order(model, write.id(), load.id()), write.offset() - load.offset());
+            }
+        }
+        for (Map.Entry<String, List<String>> loads : fieldLoads.entrySet()) {
+            for (String store : fieldStores.getOrDefault(loads.getKey(), List.of()))
+                for (String load : loads.getValue()) if (!store.equals(load)) model.memoryEdge(store, load, "field_store" + order(model, store, load), 0);
+        }
+        model.fieldKeys = fieldLoads.size() + fieldStores.size();
     }
 
     private void flow(JsonObject req, Function function, JsonObject out, boolean trace, long deadline) throws Exception {
@@ -522,25 +669,103 @@ public class RusticQuery extends GhidraScript {
                 }
             }
             if (seeds.isEmpty()) throw new IllegalArgumentException("trace seed not found; request pcode and pass an operation or varnode id");
+            boolean backward = !text(opts, "direction").equals("forward");
+            // argument=n follows one argument of the call at the address, not every input.
+            if (opts.has("argument")) {
+                int argument = number(opts, "argument", 0);
+                List<String> narrowed = new ArrayList<>();
+                for (String id : seeds) {
+                    PcodeOpAST call = model.operations.get(id).operation;
+                    if ((call.getOpcode() == PcodeOp.CALL || call.getOpcode() == PcodeOp.CALLIND) && argument + 1 < call.getNumInputs()) {
+                        PcodeOp definition = call.getInput(argument + 1).getDef();
+                        String from = definition == null ? null : opId(model.operations.get(id).function, definition);
+                        if (from != null && model.operations.containsKey(from)) narrowed.add(from);
+                        out.add("seed_argument", varnode(model.operations.get(id).function, call.getInput(argument + 1)));
+                    }
+                }
+                if (narrowed.isEmpty()) throw new IllegalArgumentException("no call at this address has argument " + argument + " defined by recovered p-code");
+                seeds = narrowed;
+            }
             ArrayDeque<String> queue = new ArrayDeque<>();
             Map<String, Integer> depths = new HashMap<>();
+            Map<String, String> parents = new HashMap<>();
             for (String id : seeds) { queue.add(id); depths.put(id, 0); }
-            Map<String, Set<String>> links = text(opts, "direction").equals("forward") ? model.forward : model.backward;
+            Map<String, Set<String>> links = backward ? model.backward : model.forward;
             int depth = number(opts, "depth", 5);
+            JsonArray stops = new JsonArray();
             while (!queue.isEmpty() && selected.size() < maximum && System.nanoTime() < deadline) {
                 String id = queue.removeFirst();
                 if (!selected.add(id)) continue;
                 int level = depths.get(id);
-                if (level >= depth) { if (!links.getOrDefault(id, Set.of()).isEmpty()) limited = true; continue; }
-                for (String next : links.getOrDefault(id, Set.of())) if (!depths.containsKey(next)) { depths.put(next, level + 1); queue.add(next); }
+                Set<String> next = links.getOrDefault(id, Set.of());
+                if (level >= depth) { if (!next.isEmpty()) { limited = true; stop(stops, model, id, "depth limit"); } continue; }
+                if (next.isEmpty() && backward) stop(stops, model, id, null);
+                for (String item : next) if (!depths.containsKey(item)) { depths.put(item, level + 1); parents.put(item, id); queue.add(item); }
             }
             limited |= !queue.isEmpty();
-            out.addProperty("direction", text(opts, "direction").isEmpty() ? "backward" : text(opts, "direction"));
+            out.addProperty("direction", backward ? "backward" : "forward");
+            // The constants the trace reached, each with its shortest path back to the seed.
+            JsonArray constants = new JsonArray();
+            for (String id : selected) {
+                PcodeOpAST operation = model.operations.get(id).operation;
+                int code = operation.getOpcode();
+                if (code == PcodeOp.PTRSUB || code == PcodeOp.INDIRECT || code == PcodeOp.CALL || code == PcodeOp.CALLIND) continue;
+                for (int i = 0; i < operation.getNumInputs() && i < 16; i++) {
+                    Varnode input = operation.getInput(i);
+                    // Structural operands are not values: a space id, a SUBPIECE byte offset, a
+                    // PTRADD element size, or the offset of address arithmetic.
+                    if (!input.isConstant() || ((code == PcodeOp.LOAD || code == PcodeOp.STORE) && i == 0)
+                            || (code == PcodeOp.SUBPIECE && i == 1) || (code == PcodeOp.PTRADD && i == 2)
+                            || (code == PcodeOp.INT_ADD && i == 1 && isAddressArithmetic(operation))) continue;
+                    if (constants.size() >= 32) break;
+                    JsonObject row = new JsonObject();
+                    row.addProperty("operation", id);
+                    row.addProperty("address", "0x" + operation.getSeqnum().getTarget());
+                    row.addProperty("opcode", operation.getMnemonic());
+                    row.addProperty("input", i);
+                    row.addProperty("value", "0x" + Long.toUnsignedString(input.getOffset(), 16));
+                    row.addProperty("decimal", Long.toString(input.getOffset()));
+                    row.addProperty("size", input.getSize());
+                    if (code == PcodeOp.PIECE) row.addProperty("part", i == 0 ? "high bytes" : "low bytes");
+                    JsonArray path = new JsonArray();
+                    String step = id;
+                    for (int guard = 0; step != null && guard < 64; guard++) {
+                        JsonObject hop = new JsonObject();
+                        hop.addProperty("operation", step);
+                        String parent = parents.get(step);
+                        if (parent != null) {
+                            String kind = backward ? model.kinds.get(step + ">" + parent) : model.kinds.get(parent + ">" + step);
+                            hop.addProperty("via", kind == null ? "def_use" : kind);
+                        }
+                        path.add(hop);
+                        step = parent;
+                    }
+                    row.add("path_to_seed", path);
+                    row.addProperty("after_use", path.toString().contains("(after_use)"));
+                    constants.add(row);
+                }
+            }
+            // Answers written before their use come first.
+            List<JsonElement> ranked = new ArrayList<>(constants.asList());
+            ranked.sort(Comparator.comparing((JsonElement item) -> item.getAsJsonObject().get("after_use").getAsBoolean())
+                .thenComparing(item -> item.getAsJsonObject().getAsJsonArray("path_to_seed").size()));
+            JsonArray sorted = new JsonArray();
+            ranked.forEach(sorted::add);
+            out.add("constants", sorted);
+            out.add("stops", stops);
+            // Only the calls this trace passed through, not every call in the function.
+            JsonArray relevant = new JsonArray();
+            for (JsonElement element : model.unresolved)
+                if (selected.contains(text(element.getAsJsonObject(), "operation"))) relevant.add(element);
+            while (model.unresolved.size() > 0) model.unresolved.remove(0);
+            model.unresolved.addAll(relevant);
         }
         JsonArray operations = new JsonArray(), edges = new JsonArray();
         Set<String> retained = new HashSet<>();
         int payloadBytes = 0;
-        for (String id : selected) {
+        boolean brief = trace && opts.has("brief") && opts.get("brief").getAsBoolean();
+        out.addProperty("selected_operations", selected.size());
+        if (!brief) for (String id : selected) {
             FlowOperation node = model.operations.get(id);
             JsonObject row = operation(node.function, node.operation);
             int bytes = json.toJson(row).getBytes(StandardCharsets.UTF_8).length;
@@ -558,12 +783,50 @@ public class RusticQuery extends GhidraScript {
         if (!trace && pageOffset + operations.size() < model.operations.size()) out.addProperty("next_cursor", "0x" + Integer.toHexString(pageOffset + operations.size()));
         out.add("operations", operations); out.add("edges", edges); out.add("unresolved_calls", model.unresolved);
         out.addProperty("functions_decompiled", model.functionCount);
+        out.addProperty("memory_edges", model.memoryEdges);
         out.addProperty("captured_operations", model.operations.size());
         out.addProperty("payload_utf8_bytes", payloadBytes);
         out.addProperty("truncated", limited || edges.size() >= 800);
         out.addProperty("provenance", "Ghidra decompiler HighFunction p-code; operation IDs cite function, instruction and sequence");
         out.addProperty("runtime_observed", false);
-        out.addProperty("limitations", "Def-use and recovered direct-call bindings only; memory aliases, indirect calls, call side effects and runtime path feasibility remain unknown. Parameter/return bindings follow recovered prototypes, not original source authority.");
+        out.addProperty("limitations", "Def-use, direct-call bindings and memory edges: stack_pointee (a write into a stack local whose address is passed on), stack_store (a write to and a read from one stack slot) and field_store (a store and a load of the same base+offset, base followed into callers through parameters). Memory edges match recovered addresses, ignore instruction order and do not prove aliasing; indirect calls, call side effects on memory and runtime path feasibility remain unknown.");
+    }
+
+    private boolean isAddressArithmetic(PcodeOpAST operation) {
+        Varnode output = operation.getOutput();
+        if (output == null) return false;
+        for (var iterator = output.getDescendants(); iterator.hasNext(); ) {
+            PcodeOp use = iterator.next();
+            if ((use.getOpcode() == PcodeOp.LOAD || use.getOpcode() == PcodeOp.STORE) && use.getInput(1) == output) return true;
+        }
+        return false;
+    }
+
+    private void stop(JsonArray stops, FlowModel model, String id, String reason) {
+        if (stops.size() >= 32) return;
+        PcodeOpAST operation = model.operations.get(id).operation;
+        if (reason == null) {
+            int code = operation.getOpcode();
+            boolean constantsOnly = true;
+            for (int i = 0; i < operation.getNumInputs(); i++) if (!operation.getInput(i).isConstant()) constantsOnly = false;
+            if (constantsOnly) return;  // a constant is an answer, not a stop
+            String parameter = null;
+            for (int i = 0; i < operation.getNumInputs(); i++)
+                if (operation.getInput(i).getHigh() instanceof HighParam high) parameter = "parameter " + high.getSlot() + " of " + model.operations.get(id).function.getName();
+            if (parameter != null) reason = parameter + " (callers outside the trace's function budget)";
+            else if (code == PcodeOp.LOAD) reason = "load from memory with no matching store in the traced functions";
+            else if (code == PcodeOp.CALL) reason = "result of a call outside the function budget";
+            else if (code == PcodeOp.CALLIND) reason = "result of an indirect call";
+            else if (code == PcodeOp.INDIRECT) reason = "value a call may have changed";
+            else if (code == PcodeOp.PTRSUB) reason = "address of a stack local with no write to it in the function";
+            else reason = "inputs have no recovered definition (registers or globals on entry)";
+        }
+        JsonObject row = new JsonObject();
+        row.addProperty("operation", id);
+        row.addProperty("address", "0x" + operation.getSeqnum().getTarget());
+        row.addProperty("opcode", operation.getMnemonic());
+        row.addProperty("reason", reason);
+        stops.add(row);
     }
 
     private void dossier(Function function, JsonObject out, int limit, long deadline) throws Exception {

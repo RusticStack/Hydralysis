@@ -80,6 +80,10 @@ class EngineIntegration(unittest.TestCase):
                 answer = self.ask(action, address)
                 self.assertTrue(answer["ok"])
                 self.assertEqual(answer["engine"]["mode"], "contained")
+        traced = self.ask("trace", address, options={"brief": True, "depth": 4})
+        for key in ("constants", "stops", "memory_edges", "selected_operations"):
+            self.assertIn(key, traced)
+        self.assertNotIn("result", traced)
         warm = [self.ask("decompile", address)["query_s"] for _ in range(3)]
         self.assertLess(min(warm), 1.0)
 

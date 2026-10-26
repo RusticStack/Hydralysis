@@ -48,7 +48,7 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
         "decompile": {"max_characters"}, "data": {"table"}, "scan": {"end", "mnemonic", "operand"},
         "types": set(), "type": {"path"}, "variables": set(), "dossier": set(),
         "blocks": set(), "pcode": {"nodes"},
-        "trace": {"seed", "direction", "depth", "nodes", "functions"},
+        "trace": {"seed", "direction", "depth", "nodes", "functions", "argument", "brief"},
         "type_edit": {"kind", "source", "path", "size", "fields", "prototype", "variable", "type", "name", "comment", "expect", "ranges", "edits", "file", "expect_revision", "ids"} | (_BATCH_PROVENANCE if _record else set()),
     }
     if action not in allowed:
@@ -85,6 +85,10 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
             out["direction"] = direction
             out["depth"] = _integer(out.get("depth", 5), "depth", 1, 12)
             out["functions"] = _integer(out.get("functions", 1), "functions", 1, 4)
+            if "argument" in out:
+                out["argument"] = _integer(out["argument"], "argument", 0, 15)
+            if "brief" in out and not isinstance(out["brief"], bool):
+                raise ValueError("brief must be a boolean")
     elif action == "type_edit":
         kind = out.get("kind")
         if "expect_revision" in out:
