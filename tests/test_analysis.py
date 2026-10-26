@@ -12,9 +12,10 @@ from support import workdir
 class AdvancedBudgets(unittest.TestCase):
     def test_trace_limits_are_bounded_and_reject_boolean_or_unknown_knobs(self):
         value = validate_options("trace", {})
-        self.assertEqual(value, {"seed": "", "direction": "backward", "depth": 5, "nodes": 80, "functions": 1})
-        for options in ({"nodes": 201}, {"nodes": True}, {"functions": 5}, {"depth": 13},
-                        {"direction": "both"}, {"unlimited": True}):
+        self.assertEqual(value, {"seed": "", "direction": "backward", "depth": 5, "nodes": 80, "functions": 1, "callers": 0})
+        self.assertEqual(validate_options("trace", {"argument": 1, "brief": True, "callers": 2})["argument"], 1)
+        for options in ({"nodes": 201}, {"nodes": True}, {"functions": 9}, {"depth": 33}, {"callers": 5},
+                        {"argument": 16}, {"brief": "yes"}, {"direction": "both"}, {"unlimited": True}):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 validate_options("trace", options)
         self.assertEqual(validate_options("decompile", {"max_characters": 2097152}), {"max_characters": 2097152})

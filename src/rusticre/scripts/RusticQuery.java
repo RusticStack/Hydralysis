@@ -411,13 +411,21 @@ public class RusticQuery extends GhidraScript {
         boolean truncated = false;
         int functionCount = 0;
         int memoryEdges = 0;
+        int callerCount = 0;
+        final List<String> diagnostics = new ArrayList<>();
+        final Map<String, String> loadKeys = new HashMap<>();
+        // INDIRECTs at calls that were not given the slot's address: the value passes through.
+        final Set<String> passThrough = new HashSet<>();
         int fieldKeys = 0;
         final Map<String, String> kinds = new HashMap<>();
+        final Map<String, Integer> costs = new HashMap<>();
         void memoryEdge(String from, String to, String kind, long delta) {
             if (edges.size() >= 24000) { truncated = true; return; }
             backward.computeIfAbsent(to, key -> new LinkedHashSet<>()).add(from);
             forward.computeIfAbsent(from, key -> new LinkedHashSet<>()).add(to);
             kinds.put(from + ">" + to, kind);
+            // Exact-offset hops are cheap; offset into a struct and writes after the use cost more.
+            costs.merge(from + ">" + to, 1 + (delta != 0 ? 2 : 0) + (kind.endsWith("(after_use)") ? 4 : 0), Math::min);
             JsonObject row = new JsonObject();
             row.addProperty("from", from); row.addProperty("to", to); row.addProperty("kind", kind);
             if (delta != 0) row.addProperty("offset_delta", "0x" + Long.toHexString(delta));
@@ -440,13 +448,31 @@ public class RusticQuery extends GhidraScript {
     }
 
     private FlowModel flowModel(Function start, int maximumFunctions, long deadline) throws Exception {
+        return flowModel(start, maximumFunctions, 0, deadline);
+    }
+
+    // The start function, up to `callers` of its direct callers (so a parameter meets the
+    // argument it was given), then direct callees breadth first, within maximumFunctions.
+    private FlowModel flowModel(Function start, int maximumFunctions, int callers, long deadline) throws Exception {
         FlowModel model = new FlowModel();
         LinkedHashMap<Address, List<FlowOperation>> functions = new LinkedHashMap<>();
         Set<Address> attempted = new HashSet<>();
         ArrayDeque<Function> pending = new ArrayDeque<>();
-        pending.add(start);
-        while (!pending.isEmpty() && attempted.size() < maximumFunctions && System.nanoTime() < deadline) {
-            Function function = pending.removeFirst();
+        ArrayDeque<Function> head = new ArrayDeque<>(), priority = new ArrayDeque<>();
+        head.add(start);
+        if (callers > 0) {
+            Set<Address> seen = new LinkedHashSet<>();
+            for (var reference : currentProgram.getReferenceManager().getReferencesTo(start.getEntryPoint())) {
+                if (!reference.getReferenceType().isCall()) continue;
+                Function caller = currentProgram.getFunctionManager().getFunctionContaining(reference.getFromAddress());
+                if (caller != null && !caller.equals(start) && seen.add(caller.getEntryPoint())) head.add(caller);
+                if (seen.size() >= callers) break;
+            }
+            model.callerCount = seen.size();
+        }
+        // The start and its callers first, then callees given a stack address, then the rest.
+        while ((!head.isEmpty() || !priority.isEmpty() || !pending.isEmpty()) && attempted.size() < maximumFunctions && System.nanoTime() < deadline) {
+            Function function = !head.isEmpty() ? head.removeFirst() : !priority.isEmpty() ? priority.removeFirst() : pending.removeFirst();
             if (!attempted.add(function.getEntryPoint())) continue;
             List<FlowOperation> captured = new ArrayList<>();
             HighFunction high;
@@ -465,14 +491,21 @@ public class RusticQuery extends GhidraScript {
             }
             if (iterator.hasNext()) model.truncated = true;
             functions.put(function.getEntryPoint(), captured);
+            // Callees given the address of a stack local (out-parameters) are where values in
+            // memory come from, so they come before other callees in the function budget.
             if (maximumFunctions > 1) for (FlowOperation node : captured) {
                 PcodeOpAST operation = node.operation;
                 if (operation.getOpcode() != PcodeOp.CALL || operation.getNumInputs() == 0) continue;
                 Function callee = currentProgram.getFunctionManager().getFunctionAt(operation.getInput(0).getAddress());
-                if (callee != null && !callee.isExternal() && !attempted.contains(callee.getEntryPoint()) && pending.size() < 16) pending.add(callee);
+                if (callee == null || callee.isExternal() || attempted.contains(callee.getEntryPoint()) || pending.contains(callee)
+                        || priority.contains(callee) || head.contains(callee)) continue;
+                boolean outParameter = false;
+                for (int i = 1; i < operation.getNumInputs(); i++) outParameter |= stackOffset(operation.getInput(i)) != null;
+                if (outParameter && priority.size() < 16) priority.add(callee);
+                else if (pending.size() < 16) pending.add(callee);
             }
         }
-        if (!pending.isEmpty()) model.truncated = true;
+        if (!pending.isEmpty() || !priority.isEmpty() || !head.isEmpty()) model.truncated = true;
         model.functionCount = functions.size();
         for (Map.Entry<String, FlowOperation> entry : model.operations.entrySet()) {
             monitor.checkCancelled();
@@ -536,7 +569,28 @@ public class RusticQuery extends GhidraScript {
         return null;
     }
 
+    // How far past a stack address a callee's or caller's struct may extend (engine structs passed
+    // by pointer are often a few hundred bytes).
+    private static final long STRUCT_WINDOW = 0x200;
+
+    // Callees (in the model) that return one of their parameters, by entry: slot.
+    private final Map<Address, Integer> returnsParameter = new HashMap<>();
+
     private String identity(Function function, Varnode node, Map<String, String> aliases) {
+        // A copy, a cast, or the result of a call that returns its own parameter is the same pointer.
+        for (int guard = 0; guard < 8; guard++) {
+            PcodeOp definition = node.getDef();
+            if (definition == null) break;
+            if (definition.getOpcode() == PcodeOp.CAST || definition.getOpcode() == PcodeOp.COPY) { node = definition.getInput(0); continue; }
+            if (definition.getOpcode() == PcodeOp.CALL) {
+                Integer slot = returnsParameter.get(definition.getInput(0).getAddress());
+                if (slot != null && slot + 1 < definition.getNumInputs()) { node = definition.getInput(slot + 1); continue; }
+            }
+            break;
+        }
+        // Every address of one stack local is one identity, whichever PTRSUB formed it.
+        Long local = stackOffset(node);
+        if (local != null) return "stackaddr:" + function.getEntryPoint() + ":" + Long.toHexString(local);
         HighVariable high = node.getHigh();
         String key;
         if (high instanceof HighParam parameter) key = "param:" + function.getEntryPoint() + ":" + parameter.getSlot();
@@ -557,6 +611,9 @@ public class RusticQuery extends GhidraScript {
             if ((code == PcodeOp.PTRSUB || code == PcodeOp.INT_ADD) && definition.getInput(1).isConstant()) {
                 offset += definition.getInput(1).getOffset();
                 base = definition.getInput(0);
+            } else if (code == PcodeOp.PTRADD && definition.getInput(1).isConstant() && definition.getInput(2).isConstant()) {
+                offset += definition.getInput(1).getOffset() * definition.getInput(2).getOffset();
+                base = definition.getInput(0);
             } else if (code == PcodeOp.CAST || code == PcodeOp.COPY) base = definition.getInput(0);
             else break;
         }
@@ -569,10 +626,33 @@ public class RusticQuery extends GhidraScript {
     private String order(FlowModel model, String write, String use) {
         FlowOperation from = model.operations.get(write), to = model.operations.get(use);
         if (!from.function.equals(to.function)) return "";
-        return from.operation.getSeqnum().getTarget().compareTo(to.operation.getSeqnum().getTarget()) <= 0 ? "" : "(after_use)";
+        Address used = to.operation.getSeqnum().getTarget();
+        if (to.operation.getOpcode() == PcodeOp.PTRSUB && to.operation.getOutput() != null) {
+            // An address of a local is used where it is consumed (the latest such site).
+            for (var iterator = to.operation.getOutput().getDescendants(); iterator.hasNext(); ) {
+                Address site = iterator.next().getSeqnum().getTarget();
+                if (site.compareTo(used) > 0) used = site;
+            }
+        }
+        return from.operation.getSeqnum().getTarget().compareTo(used) <= 0 ? "" : "(after_use)";
     }
 
     private void memoryEdges(FlowModel model, Map<Address, List<FlowOperation>> functions, long deadline) {
+        returnsParameter.clear();
+        for (Map.Entry<Address, List<FlowOperation>> function : functions.entrySet()) {
+            Integer slot = null;
+            boolean consistent = true;
+            for (FlowOperation node : function.getValue()) {
+                if (node.operation.getOpcode() != PcodeOp.RETURN || node.operation.getNumInputs() < 2) continue;
+                Varnode value = node.operation.getInput(1);
+                while (value.getDef() != null && (value.getDef().getOpcode() == PcodeOp.CAST || value.getDef().getOpcode() == PcodeOp.COPY))
+                    value = value.getDef().getInput(0);
+                Integer returned = value.getHigh() instanceof HighParam parameter ? parameter.getSlot() : null;
+                if (returned == null || (slot != null && !slot.equals(returned))) consistent = false;
+                slot = returned;
+            }
+            if (consistent && slot != null) returnsParameter.put(function.getKey(), slot);
+        }
         // A callee parameter is the caller's argument, for field identity across a call.
         Map<String, String> aliases = new HashMap<>();
         for (FlowOperation node : model.operations.values()) {
@@ -590,6 +670,15 @@ public class RusticQuery extends GhidraScript {
         Map<String, List<String>> fieldStores = new HashMap<>();
         List<Slot> addressOf = new ArrayList<>(), stackLoads = new ArrayList<>();
         Map<String, List<String>> fieldLoads = new HashMap<>();
+        Map<String, List<Long>> escaped = new HashMap<>();
+        for (FlowOperation node : model.operations.values()) {
+            PcodeOpAST call = node.operation;
+            if (call.getOpcode() != PcodeOp.CALL && call.getOpcode() != PcodeOp.CALLIND) continue;
+            for (int i = 1; i < call.getNumInputs(); i++) {
+                Long local = stackOffset(call.getInput(i));
+                if (local != null) escaped.computeIfAbsent(node.function.getEntryPoint() + "@" + call.getSeqnum().getTarget(), key -> new ArrayList<>()).add(local);
+            }
+        }
         for (Map.Entry<String, FlowOperation> entry : model.operations.entrySet()) {
             if (System.nanoTime() >= deadline) { model.truncated = true; return; }
             FlowOperation node = entry.getValue();
@@ -597,8 +686,16 @@ public class RusticQuery extends GhidraScript {
             Address function = node.function.getEntryPoint();
             Varnode output = operation.getOutput();
             int code = operation.getOpcode();
-            if (output != null && output.getAddress().isStackAddress() && code != PcodeOp.INDIRECT)
+            boolean write = output != null && output.getAddress().isStackAddress();
+            if (write && code == PcodeOp.INDIRECT) {
+                // A call writes a stack slot only if it was given an address at or below it.
+                write = false;
+                for (Long local : escaped.getOrDefault(function + "@" + operation.getSeqnum().getTarget(), List.of()))
+                    write |= output.getOffset() >= local && output.getOffset() < local + STRUCT_WINDOW;
+            }
+            if (write)
                 writes.computeIfAbsent(function, key -> new ArrayList<>()).add(new Slot(entry.getKey(), node.function, output.getOffset(), output.getSize()));
+            else if (code == PcodeOp.INDIRECT) model.passThrough.add(entry.getKey());
             if (code == PcodeOp.PTRSUB && isStackBase(operation.getInput(0)) && operation.getInput(1).isConstant())
                 addressOf.add(new Slot(entry.getKey(), node.function, operation.getInput(1).getOffset(), 0));
             if (code == PcodeOp.STORE && operation.getNumInputs() >= 3) {
@@ -614,16 +711,16 @@ public class RusticQuery extends GhidraScript {
                 if (slot != null) stackLoads.add(new Slot(entry.getKey(), node.function, slot, output == null ? 1 : output.getSize()));
                 else {
                     String key = fieldKey(node.function, operation.getInput(1), aliases);
-                    if (key != null) fieldLoads.computeIfAbsent(key, item -> new ArrayList<>()).add(entry.getKey());
+                    if (key != null) { fieldLoads.computeIfAbsent(key, item -> new ArrayList<>()).add(entry.getKey()); model.loadKeys.put(entry.getKey(), key); }
                 }
             }
         }
         // The address of a stack local stands for what is stored in it (a struct passed by
-        // pointer): writes from that offset up to 0x40 bytes beyond count.
+        // pointer): writes from that offset up to STRUCT_WINDOW bytes beyond count.
         for (Slot pointer : addressOf) {
             for (Slot write : writes.getOrDefault(pointer.function().getEntryPoint(), List.of())) {
                 long delta = write.offset() - pointer.offset();
-                if (delta >= 0 && delta < 0x40 && !write.id().equals(pointer.id()))
+                if (delta >= 0 && delta < STRUCT_WINDOW && !write.id().equals(pointer.id()))
                     model.memoryEdge(write.id(), pointer.id(), "stack_pointee" + order(model, write.id(), pointer.id()), delta);
             }
         }
@@ -637,13 +734,53 @@ public class RusticQuery extends GhidraScript {
             for (String store : fieldStores.getOrDefault(loads.getKey(), List.of()))
                 for (String load : loads.getValue()) if (!store.equals(load)) model.memoryEdge(store, load, "field_store" + order(model, store, load), 0);
         }
+        // A callee that stores through a pointer parameter writes the caller's stack local whose
+        // address was the argument: link the store to the caller's INDIRECT on that slot.
+        Map<String, List<Slot>> indirects = new HashMap<>();
+        for (Map.Entry<String, FlowOperation> entry : model.operations.entrySet()) {
+            PcodeOpAST operation = entry.getValue().operation;
+            Varnode output = operation.getOutput();
+            if (operation.getOpcode() == PcodeOp.INDIRECT && output != null && output.getAddress().isStackAddress())
+                indirects.computeIfAbsent(entry.getValue().function.getEntryPoint() + "@" + operation.getSeqnum().getTarget(),
+                    key -> new ArrayList<>()).add(new Slot(entry.getKey(), entry.getValue().function, output.getOffset(), output.getSize()));
+        }
+        for (Map.Entry<String, FlowOperation> entry : model.operations.entrySet()) {
+            FlowOperation node = entry.getValue();
+            PcodeOpAST call = node.operation;
+            if (call.getOpcode() != PcodeOp.CALL) continue;
+            Function callee = currentProgram.getFunctionManager().getFunctionAt(call.getInput(0).getAddress());
+            if (callee == null || !functions.containsKey(callee.getEntryPoint()) || callee.equals(node.function)) continue;
+            List<Slot> touched = indirects.getOrDefault(node.function.getEntryPoint() + "@" + call.getSeqnum().getTarget(), List.of());
+            model.diagnostics.add("call " + call.getSeqnum().getTarget() + " -> " + callee.getEntryPoint() + " indirect stack slots " + touched.size());
+            if (touched.isEmpty()) continue;
+            for (int i = 1; i < call.getNumInputs() && i < 16; i++) {
+                Long local = stackOffset(call.getInput(i));
+                if (local == null) continue;
+                String prefix = identity(node.function, call.getInput(i), aliases) + "+0x";
+                model.diagnostics.add("  arg " + (i - 1) + " stack " + Long.toHexString(local) + " prefix " + prefix + " slots " + touched.stream().map(x -> Long.toHexString(x.offset()) + "/" + x.size()).toList());
+                for (Map.Entry<String, List<String>> stores : fieldStores.entrySet()) {
+                    if (!stores.getKey().startsWith(prefix)) continue;
+                    long offset = Long.parseUnsignedLong(stores.getKey().substring(prefix.length()), 16);
+                    for (Slot slot : touched) {
+                        for (String store : stores.getValue()) {
+                            PcodeOpAST write = model.operations.get(store).operation;
+                            long start = local + offset, end = start + write.getInput(2).getSize();
+                            // The callee's store overlaps the caller's slot.
+                            if (start < slot.offset() + slot.size() && slot.offset() < end && model.operations.get(store).function.equals(callee))
+                                model.memoryEdge(store, slot.id(), "out_param", offset);
+                        }
+                    }
+                }
+            }
+        }
         model.fieldKeys = fieldLoads.size() + fieldStores.size();
+        for (String key : fieldStores.keySet()) if (model.diagnostics.size() < 80) model.diagnostics.add("store key " + key);
     }
 
     private void flow(JsonObject req, Function function, JsonObject out, boolean trace, long deadline) throws Exception {
         JsonObject opts = options(req);
         int maximum = number(opts, "nodes", 80);
-        FlowModel model = flowModel(function, trace ? number(opts, "functions", 1) : 1, deadline);
+        FlowModel model = flowModel(function, trace ? number(opts, "functions", 1) : 1, trace ? number(opts, "callers", 0) : 0, deadline);
         Set<String> selected = new LinkedHashSet<>();
         boolean limited = model.truncated;
         int pageOffset = 0;
@@ -686,21 +823,36 @@ public class RusticQuery extends GhidraScript {
                 if (narrowed.isEmpty()) throw new IllegalArgumentException("no call at this address has argument " + argument + " defined by recovered p-code");
                 seeds = narrowed;
             }
-            ArrayDeque<String> queue = new ArrayDeque<>();
-            Map<String, Integer> depths = new HashMap<>();
+            // Cheapest first (def-use 1, pass-through 0, memory hops by how direct they are),
+            // so the node budget goes to the likeliest sources.
+            PriorityQueue<Object[]> queue = new PriorityQueue<>(Comparator.comparingInt((Object[] item) -> (Integer) item[0]).thenComparingLong(item -> (Long) item[1]));
+            long order = 0;
+            Map<String, Integer> depths = new HashMap<>(), best = new HashMap<>();
             Map<String, String> parents = new HashMap<>();
-            for (String id : seeds) { queue.add(id); depths.put(id, 0); }
+            for (String id : seeds) { queue.add(new Object[] {0, order++, id}); depths.put(id, 0); best.put(id, 0); }
             Map<String, Set<String>> links = backward ? model.backward : model.forward;
             int depth = number(opts, "depth", 5);
             JsonArray stops = new JsonArray();
             while (!queue.isEmpty() && selected.size() < maximum && System.nanoTime() < deadline) {
-                String id = queue.removeFirst();
+                Object[] head = queue.poll();
+                String id = (String) head[2];
+                int cost = (Integer) head[0];
                 if (!selected.add(id)) continue;
                 int level = depths.get(id);
                 Set<String> next = links.getOrDefault(id, Set.of());
                 if (level >= depth) { if (!next.isEmpty()) { limited = true; stop(stops, model, id, "depth limit"); } continue; }
                 if (next.isEmpty() && backward) stop(stops, model, id, null);
-                for (String item : next) if (!depths.containsKey(item)) { depths.put(item, level + 1); parents.put(item, id); queue.add(item); }
+                // A call that cannot write the slot passes its value through at no depth cost.
+                for (String item : next) {
+                    if (selected.contains(item)) continue;
+                    boolean free = model.passThrough.contains(item) || model.passThrough.contains(id);
+                    String key = backward ? item + ">" + id : id + ">" + item;
+                    int step = free ? 0 : model.costs.getOrDefault(key, 1);
+                    if (best.containsKey(item) && best.get(item) <= cost + step) continue;
+                    best.put(item, cost + step);
+                    depths.put(item, free ? level : level + 1); parents.put(item, id);
+                    queue.add(new Object[] {cost + step, order++, item});
+                }
             }
             limited |= !queue.isEmpty();
             out.addProperty("direction", backward ? "backward" : "forward");
@@ -784,6 +936,7 @@ public class RusticQuery extends GhidraScript {
         out.add("operations", operations); out.add("edges", edges); out.add("unresolved_calls", model.unresolved);
         out.addProperty("functions_decompiled", model.functionCount);
         out.addProperty("memory_edges", model.memoryEdges);
+        if (opts.has("debug")) { JsonArray d = new JsonArray(); model.diagnostics.forEach(d::add); out.add("diagnostics", d); }
         out.addProperty("captured_operations", model.operations.size());
         out.addProperty("payload_utf8_bytes", payloadBytes);
         out.addProperty("truncated", limited || edges.size() >= 800);
@@ -814,10 +967,10 @@ public class RusticQuery extends GhidraScript {
             for (int i = 0; i < operation.getNumInputs(); i++)
                 if (operation.getInput(i).getHigh() instanceof HighParam high) parameter = "parameter " + high.getSlot() + " of " + model.operations.get(id).function.getName();
             if (parameter != null) reason = parameter + " (callers outside the trace's function budget)";
-            else if (code == PcodeOp.LOAD) reason = "load from memory with no matching store in the traced functions";
+            else if (code == PcodeOp.LOAD) reason = "load of " + model.loadKeys.getOrDefault(id, "memory") + " with no matching store in the traced functions";
             else if (code == PcodeOp.CALL) reason = "result of a call outside the function budget";
             else if (code == PcodeOp.CALLIND) reason = "result of an indirect call";
-            else if (code == PcodeOp.INDIRECT) reason = "value a call may have changed";
+            else if (code == PcodeOp.INDIRECT) reason = "value the call at 0x" + operation.getSeqnum().getTarget() + " may have changed";
             else if (code == PcodeOp.PTRSUB) reason = "address of a stack local with no write to it in the function";
             else reason = "inputs have no recovered definition (registers or globals on entry)";
         }
