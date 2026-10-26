@@ -64,7 +64,6 @@ def main(argv: list[str] | None = None) -> int:
     grun.add_argument("script")
     grun.add_argument("script_args", nargs="*")
     grun.add_argument("--timeout", type=int, default=600)
-    grun.add_argument("--lane", default="")
 
     gscripts = sub.add_parser("ghidra-scripts")
     gscripts.add_argument("--target", required=True)
@@ -81,11 +80,14 @@ def main(argv: list[str] | None = None) -> int:
     _options_arguments(query)
 
     backend = sub.add_parser("backend", help="Discover or privately install analysis/runtime engines")
-    backend.add_argument("action", nargs="?", choices=("inspect", "install", "help"), default="inspect")
+    backend.add_argument("action", nargs="?", choices=("inspect", "install", "status", "stop", "help"), default="inspect")
     backend.add_argument("--component", choices=("analysis", "runtime"), default="analysis")
 
-    prepare = sub.add_parser("prepare", help="Import/analyse once as a durable background job")
-    prepare.add_argument("--exe", required=True)
+    prepare = sub.add_parser("prepare", help="Adopt an analysed project in place, or import/analyse once as a background job")
+    prepare.add_argument("--exe", default="")
+    prepare.add_argument("--adopt", metavar="PATH", help="Register an analysed project (.gpr, its folder or a parent) without importing or copying it")
+    prepare.add_argument("--sha256", default="", help="With --adopt: the build hash, when the executable is not at hand")
+    prepare.add_argument("--program", default="", help="With --adopt: the program path when the project holds several")
     prepare.add_argument("--target", default="")
     prepare.add_argument("--timeout", type=int, default=3600)
     prepare.add_argument("--install", action="store_true", help="Also download and install missing engines (about 700 MB); off by default")
@@ -127,6 +129,11 @@ def _pair(args: argparse.Namespace) -> tuple[str, dict]:
     if command == "backend":
         return command, {"action": args.action, "component": args.component}
     if command == "prepare":
+        if args.adopt:
+            return command, {"action": "adopt", "path": args.adopt, "exe": args.exe, "sha256": args.sha256,
+                             "program": args.program, "target": args.target}
+        if not args.exe:
+            raise ValueError("prepare needs --exe (a fresh analysis) or --adopt PATH (an analysed project)")
         return command, {"exe": args.exe, "target": args.target, "timeout_s": args.timeout, "install": args.install,
                          "action": "plan" if args.plan else "start"}
     if command == "job":
@@ -144,7 +151,7 @@ def _pair(args: argparse.Namespace) -> tuple[str, dict]:
     if command == "ghidra_run":
         return "ghidra_run", {
             "target": args.target, "script": args.script, "args": args.script_args,
-            "timeout_s": args.timeout, "lane": args.lane,
+            "timeout_s": args.timeout,
         }
     if command == "ghidra_scripts":
         return command, {"target": args.target, "filter": args.filter}

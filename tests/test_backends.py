@@ -17,25 +17,35 @@ class BackendSetupTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
 
-    def installed(self):
-        ghidra, java = self.root / "existing-ghidra", self.root / "existing-jdk"
-        launcher = Path(backends.headless_path(str(ghidra)))
-        launcher.parent.mkdir(parents=True)
-        launcher.write_text("existing launcher")
-        native = ghidra / "Ghidra/Features/Decompiler/os" / ("win_x86_64" if os.name == "nt" else "linux_x86_64") / ("decompile.exe" if os.name == "nt" else "decompile")
+    def installed(self, release="12.3-hydra.2", client_release="12.3-hydra.2"):
+        engine, java = self.root / "hydra-engine", self.root / "existing-jdk"
+        native = engine / "Ghidra/Features/Decompiler/os" / ("win_x86_64" if os.name == "nt" else "linux_x86_64") / ("decompile.exe" if os.name == "nt" else "decompile")
         native.parent.mkdir(parents=True)
         if os.name == "nt":
             executable = b"MZ" + b"\0" * 58 + (64).to_bytes(4, "little") + b"PE\0\0\x64\x86"
         else:
             executable = b"\x7fELF\x02" + b"\0" * 13 + b"\x3e\x00" + b"\0" * 44
         native.write_bytes(executable)
-        (ghidra / "Ghidra/application.properties").write_text("application.version=12.1.4\napplication.java.min=21\napplication.java.max=25\n")
+        (engine / "Ghidra/application.properties").write_text("application.version=12.3\napplication.java.min=25\n")
+        lib = engine / "Ghidra/Features/HeadlessSession/lib"
+        lib.mkdir(parents=True)
+        if release:
+            with zipfile.ZipFile(lib / "HeadlessSession.jar", "w") as jar:
+                jar.writestr("hydra.properties", "hydra.version=%s\n" % release)
+        client = self.root / "client" / "ghidra_session.py"
+        client.parent.mkdir()
+        client.write_text('PROTOCOL = 2\nCLIENT_VERSION = "1.0.0"\nHYDRA_RELEASE = "%s"\n' % client_release)
         (java / "bin").mkdir(parents=True)
         extension = ".exe" if os.name == "nt" else ""
         for name in ("java", "javac"):
             (java / "bin" / (name + extension)).write_bytes(executable)
         (java / "release").write_text('JAVA_VERSION="25.0.4.1"\n')
-        return {"root": str(self.root / "data"), "ghidra_dir": str(ghidra), "java_home": str(java)}
+        return {"root": str(self.root / "data"), "hydra_dir": str(engine), "hydra_client": str(client), "java_home": str(java)}
+
+    def inspect(self, settings):
+        with patch.dict(os.environ, {}, clear=True), patch("rusticre.backends._children", return_value=[]), \
+                patch("rusticre.backends.shutil.which", return_value=None):
+            return backends.inspect(settings)
 
     def test_reuses_existing_backend_without_download_or_machine_environment_change(self):
         settings = self.installed()
@@ -43,9 +53,36 @@ class BackendSetupTests(unittest.TestCase):
         with patch("rusticre.backends._download") as download:
             observed = backends.ensure(settings, install=True)
         download.assert_not_called()
-        self.assertEqual(observed["ghidra_dir"], settings["ghidra_dir"])
+        self.assertEqual(observed["hydra_dir"], str(Path(settings["hydra_dir"]).resolve()))
         self.assertEqual(dict(os.environ), before)
-        self.assertEqual(backends.read_json(Path(settings["root"]) / "backend.json")["java_home"], settings["java_home"])
+        self.assertEqual(backends.read_json(Path(settings["root"]) / "backend.json")["java_home"], str(Path(settings["java_home"]).resolve()))
+
+    def test_stock_ghidra_is_reported_not_used(self):
+        report = self.inspect(self.installed(release=None))
+        self.assertFalse(report["ready"])
+        self.assertIsNone(report["engine"])
+        self.assertTrue(any("stock Ghidra" in item.get("reason", "") for item in report["checks"]))
+
+    def test_unpinned_hydra_release_is_refused_unless_allowed(self):
+        settings = self.installed(release="12.4-hydra.1", client_release="12.4-hydra.1")
+        report = self.inspect(settings)
+        self.assertFalse(report["ready"])
+        self.assertTrue(any("pins 12.3-hydra.2" in item.get("reason", "") for item in report["checks"]))
+        self.assertTrue(self.inspect({**settings, "hydra_allow_unpinned": True})["engine"]["ready"])
+
+    def test_client_of_another_release_is_refused(self):
+        report = self.inspect(self.installed(client_release="dev"))
+        self.assertIsNone(report["client"])
+        self.assertTrue(any(item.get("component") == "client" for item in report["checks"]))
+
+    def test_resolved_names_what_is_missing_and_never_installs(self):
+        settings = self.installed()
+        settings["java_home"] = str(self.root / "missing-jdk")
+        with patch.dict(os.environ, {}, clear=True), patch("rusticre.backends._children", return_value=[]), \
+                patch("rusticre.backends.shutil.which", return_value=None), patch("rusticre.backends._download") as download:
+            with self.assertRaisesRegex(ValueError, "jdk missing"):
+                backends.resolved(settings)
+        download.assert_not_called()
 
     def test_install_is_required_when_discovery_is_not_ready(self):
         report = {"ready": False, "root": str(self.root), "portable_install_supported": True}
@@ -58,16 +95,6 @@ class BackendSetupTests(unittest.TestCase):
         native = self.root / "decompile.exe"
         native.write_bytes(b"MZ" + b"\0" * 200)
         self.assertFalse(backends._native_compatible(native))
-
-    def test_unknown_ghidra_release_is_not_admitted_by_valid_paths(self):
-        settings = self.installed()
-        properties = Path(settings["ghidra_dir"]) / "Ghidra/application.properties"
-        properties.write_text("application.version=12.2\napplication.java.min=21\napplication.java.max=25\n")
-        with patch.dict(os.environ, {}, clear=True), patch("rusticre.backends._children", return_value=[]), patch("rusticre.backends.shutil.which", return_value=None):
-            report = backends.inspect(settings)
-        self.assertFalse(report["ready"])
-        self.assertIsNone(report["ghidra"])
-        self.assertTrue(any("unsupported Ghidra 12.2" in item["reason"] for item in report["checks"]))
 
     def test_download_checks_digest_before_archive_can_be_used(self):
         body = b"not a matching backend archive"

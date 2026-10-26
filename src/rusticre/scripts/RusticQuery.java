@@ -1,14 +1,17 @@
-// Address-based, bounded queries on a program opened by -process -noanalysis -readOnly.
-// Saved projects are never imported, analysed or saved by this worker. Cited type
-// overlays may change its in-memory view; canonical project files stay untouched.
+// Address-based, bounded queries, one per run, through Hydra Engine's `script` command.
+// Queries run contained (the engine rolls back an outer transaction), so they cannot
+// change what other clients see or what is saved. Only `apply_overlays`, sent on a
+// working copy this client owns, keeps its changes; the canonical project is never written.
 import ghidra.app.script.GhidraScript;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.cmd.function.ApplyFunctionSignatureCmd;
 import ghidra.app.util.parser.FunctionSignatureParser;
+import ghidra.framework.options.Options;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.Program;
 import ghidra.program.model.block.BasicBlockModel;
 import ghidra.program.model.data.*;
 import ghidra.program.model.pcode.*;
@@ -19,20 +22,68 @@ import com.google.gson.*;
 import com.google.gson.stream.JsonReader;
 import com.google.gson.stream.JsonToken;
 import java.io.*;
-import java.net.*;
-import java.nio.ByteBuffer;
 import java.nio.file.*;
 import java.nio.charset.StandardCharsets;
-import java.nio.charset.CodingErrorAction;
-import java.security.MessageDigest;
-import java.security.SecureRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.*;
 
 public class RusticQuery extends GhidraScript {
     private final Gson json = new Gson();
     private DecompInterface decompiler;
-    private final Set<String> appliedOverlays = new HashSet<>();
+
+    // Decompilers outlive one run: the engine reuses this class while its source is
+    // unchanged, so a warm query skips the native decompiler's start (about 250 ms).
+    // One pool per program object; a change to the program flushes a borrowed
+    // decompiler's cache, and closing the program disposes its pool.
+    private static final Object POOL_LOCK = new Object();
+    private static final Map<Program, ArrayDeque<DecompInterface>> POOLS = new IdentityHashMap<>();
+    private static final Map<DecompInterface, Long> SEEN = new IdentityHashMap<>();
+    private static final int POOL_SIZE = 4;
+
+    private static DecompInterface borrow(Program program) {
+        DecompInterface found = null;
+        synchronized (POOL_LOCK) {
+            ArrayDeque<DecompInterface> pool = POOLS.get(program);
+            if (pool == null) {
+                pool = new ArrayDeque<>();
+                POOLS.put(program, pool);
+                program.addCloseListener(closed -> {
+                    synchronized (POOL_LOCK) {
+                        ArrayDeque<DecompInterface> gone = POOLS.remove(program);
+                        if (gone != null) for (DecompInterface d : gone) { SEEN.remove(d); d.dispose(); }
+                    }
+                });
+            }
+            found = pool.pollFirst();
+        }
+        if (found == null) {
+            found = new DecompInterface();
+            if (!found.openProgram(program)) {
+                String message = found.getLastMessage();
+                found.dispose();
+                throw new IllegalStateException(message);
+            }
+        }
+        else {
+            Long seen;
+            synchronized (POOL_LOCK) { seen = SEEN.get(found); }
+            if (seen == null || seen != program.getModificationNumber()) found.flushCache();
+        }
+        return found;
+    }
+
+    private static void giveBack(Program program, DecompInterface decompiler, boolean healthy) {
+        synchronized (POOL_LOCK) {
+            ArrayDeque<DecompInterface> pool = POOLS.get(program);
+            if (healthy && pool != null && pool.size() < POOL_SIZE && !program.isClosed()) {
+                SEEN.put(decompiler, program.getModificationNumber());
+                pool.addFirst(decompiler);
+                return;
+            }
+            SEEN.remove(decompiler);
+        }
+        decompiler.dispose();
+    }
 
     private String clip(String value, int maximum) {
         return value == null ? "" : value.substring(0, Math.min(value.length(), maximum));
@@ -53,10 +104,7 @@ public class RusticQuery extends GhidraScript {
     private DecompileResults decompile(Function function, long deadline) throws Exception {
         monitor.checkCancelled();
         if (System.nanoTime() >= deadline) throw new IllegalStateException("analysis query deadline reached");
-        if (decompiler == null) {
-            decompiler = new DecompInterface();
-            if (!decompiler.openProgram(currentProgram)) throw new IllegalStateException(decompiler.getLastMessage());
-        }
+        if (decompiler == null) decompiler = borrow(currentProgram);
         DecompileResults result = decompiler.decompileFunction(function, remaining(deadline), monitor);
         if (!result.decompileCompleted() || result.getHighFunction() == null)
             throw new IllegalStateException("decompile refused: " + result.getErrorMessage());
@@ -721,73 +769,54 @@ public class RusticQuery extends GhidraScript {
             success = true;
         } finally {
             currentProgram.endTransaction(transaction, success);
-            if (decompiler != null) { decompiler.dispose(); decompiler = null; }
+            if (decompiler != null) decompiler.flushCache();
         }
     }
 
-    private void overlays(JsonObject req, long deadline) throws Exception {
-        if (!req.has("overlays")) return;
-        JsonArray records = req.getAsJsonArray("overlays");
-        if (records.size() > 4096) throw new IllegalArgumentException("overlay replay exceeds 4096 records");
-        int index = 0;
-        for (JsonElement element : records) {
-            index++;
-            JsonObject edit = element.getAsJsonObject();
-            String id = text(edit, "id");
-            if (appliedOverlays.contains(id)) continue;
-            if (System.nanoTime() >= deadline) throw new IllegalStateException("overlay replay incomplete at " + index + "/" + records.size() + "; query refused until replay can complete within its deadline");
-            try { typeEdit(text(edit, "address"), edit.getAsJsonObject("options"), deadline); }
-            catch (Exception error) {
-                throw new IllegalStateException("overlay replay refused at " + index + "/" + records.size() +
-                    "; pending records " + (records.size() - index + 1) + "; query not executed: " + error.toString(), error);
+    private static final String STATE_OPTION = "overlay_state";
+
+    private String overlayState() {
+        return currentProgram.getOptions("RusticRE").getString(STATE_OPTION, "");
+    }
+
+    // Applies cited overlay records to a working copy this client owns, in order, and
+    // records which state the program now holds. The caller saves the program; a
+    // failure rolls back the record that failed and stops, naming it.
+    private void applyOverlays(JsonObject req, JsonObject out, long deadline) throws Exception {
+        String file = text(req, "edits_file");
+        if (file.isEmpty()) throw new IllegalArgumentException("apply_overlays needs edits_file");
+        JsonObject batch = JsonParser.parseString(Files.readString(Path.of(file), StandardCharsets.UTF_8)).getAsJsonObject();
+        JsonArray records = batch.getAsJsonArray("edits");
+        monitor.initialize(records.size());
+        // One outer transaction: a record that fails rolls back the whole call, so the
+        // working copy is either at the new state or unchanged.
+        int transaction = currentProgram.startTransaction("RusticRE overlays");
+        boolean success = false;
+        try {
+            int index = 0;
+            for (JsonElement element : records) {
+                index++;
+                monitor.checkCancelled();
+                if (System.nanoTime() >= deadline) throw new IllegalStateException("overlay apply incomplete at " + index + "/" + records.size() + "; deadline reached; nothing applied");
+                JsonObject edit = element.getAsJsonObject();
+                try { typeEdit(text(edit, "address"), edit.getAsJsonObject("options"), deadline); }
+                catch (Exception error) {
+                    throw new IllegalArgumentException("overlay record " + index + "/" + records.size() + " (" + text(edit, "id") + ") refused, nothing applied: " + error.getMessage(), error);
+                }
+                if (index % 64 == 0) { monitor.setMessage("overlays " + index + "/" + records.size()); monitor.setProgress(index); }
             }
-            appliedOverlays.add(id);
-        }
+            Options options = currentProgram.getOptions("RusticRE");
+            options.setString(STATE_OPTION, json.toJson(batch.getAsJsonObject("state")));
+            success = true;
+        } finally { currentProgram.endTransaction(transaction, success); }
+        out.addProperty("applied", records.size());
+        out.addProperty("overlay_state", overlayState());
     }
 
     private void write(Path path, JsonObject body) throws Exception {
         Path temp = path.resolveSibling(path.getFileName() + ".tmp");
         Files.writeString(temp, json.toJson(body), StandardCharsets.UTF_8);
         Files.move(temp, path, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-    }
-
-    private byte[] readExact(Socket connection, InputStream input, int length, long deadline) throws Exception {
-        byte[] bytes = new byte[length];
-        int offset = 0;
-        while (offset < length) {
-            long remaining = deadline - System.nanoTime();
-            if (remaining <= 0) throw new SocketTimeoutException("local query frame admission deadline reached");
-            connection.setSoTimeout((int) Math.max(1, TimeUnit.NANOSECONDS.toMillis(remaining)));
-            int count = input.read(bytes, offset, length - offset);
-            if (count < 0) throw new EOFException("local query peer closed an incomplete frame");
-            offset += count;
-        }
-        return bytes;
-    }
-
-    private JsonObject readFrame(Socket connection) throws Exception {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
-        InputStream input = connection.getInputStream();
-        int length = ByteBuffer.wrap(readExact(connection, input, 4, deadline)).getInt();
-        if (length < 1 || length > 32 * 1024 * 1024) throw new IOException("local query request frame must be 1..33554432 bytes");
-        byte[] bytes = readExact(connection, input, length, deadline);
-        String payload = StandardCharsets.UTF_8.newDecoder().onMalformedInput(CodingErrorAction.REPORT)
-            .onUnmappableCharacter(CodingErrorAction.REPORT).decode(ByteBuffer.wrap(bytes)).toString();
-        try (JsonReader reader = new JsonReader(new StringReader(payload))) {
-            reader.setStrictness(Strictness.STRICT);
-            JsonElement element = JsonParser.parseReader(reader);
-            if (!element.isJsonObject() || reader.peek() != JsonToken.END_DOCUMENT) throw new IOException("local query frame must contain exactly one JSON object");
-            return element.getAsJsonObject();
-        }
-    }
-
-    private void writeFrame(Socket connection, JsonObject response) throws Exception {
-        byte[] bytes = json.toJson(response).getBytes(StandardCharsets.UTF_8);
-        if (bytes.length < 1 || bytes.length > 16 * 1024 * 1024) throw new IOException("local query response exceeds 16777216 bytes");
-        DataOutputStream output = new DataOutputStream(connection.getOutputStream());
-        output.writeInt(bytes.length);
-        output.write(bytes);
-        output.flush();
     }
 
     private JsonObject queryError(String id, Exception error) {
@@ -805,7 +834,7 @@ public class RusticQuery extends GhidraScript {
             String message = error.getMessage() == null ? "" : error.getMessage().toLowerCase(Locale.ROOT);
             response.addProperty("error_kind", message.startsWith("no ") || message.contains("not found") || message.startsWith("unknown type:") ? "not_found" : "invalid_request");
         } else response.addProperty("error_kind", "backend_failure");
-        if (!recoverable && decompiler != null) { decompiler.dispose(); decompiler = null; }
+        if (!recoverable && decompiler != null) { giveBack(currentProgram, decompiler, false); decompiler = null; }
         return response;
     }
 
@@ -813,8 +842,17 @@ public class RusticQuery extends GhidraScript {
         return req.has(key) ? req.get(key).getAsString() : "";
     }
 
+    // VA by default; rva:/va: say which. An RVA is relative to the program's image base.
     private Address address(String value) {
-        return toAddr(value.startsWith("0x") ? value.substring(2) : value);
+        String text = value.trim();
+        if (text.startsWith("rva:")) {
+            long offset = Long.parseUnsignedLong(text.substring(4).replaceFirst("^0[xX]", ""), 16);
+            return currentProgram.getImageBase().add(offset);
+        }
+        if (text.startsWith("va:")) text = text.substring(3);
+        Address result = toAddr(text.replaceFirst("^0[xX]", ""));
+        if (result == null) throw new IllegalArgumentException("not an address in this program: " + value);
+        return result;
     }
 
     private JsonObject function(Function f) {
@@ -843,8 +881,16 @@ public class RusticQuery extends GhidraScript {
         int limit = req.get("limit").getAsInt();
         int seconds = req.get("timeout_s").getAsInt();
         long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(seconds);
-        overlays(req, deadline);
-        out.addProperty("overlay_count", appliedOverlays.size());
+        String expected = text(req, "expected_sha256");
+        if (!expected.isEmpty() && !expected.equalsIgnoreCase(currentProgram.getExecutableSHA256()))
+            throw new IllegalStateException("program SHA-256 " + currentProgram.getExecutableSHA256() + " differs from the target build " + expected);
+        out.addProperty("overlay_state", overlayState());
+        if (action.equals("overlay_state")) {
+            out.addProperty("changed", currentProgram.isChanged()); out.addProperty("ok", true); return out;
+        }
+        if (action.equals("apply_overlays")) {
+            applyOverlays(req, out, deadline); out.addProperty("ok", true); return out;
+        }
         if (action.equals("types")) {
             types(req, out, deadline); out.addProperty("ok", true); return out;
         }
@@ -858,12 +904,10 @@ public class RusticQuery extends GhidraScript {
             scan(req, out, deadline); out.addProperty("ok", true); return out;
         }
         if (action.equals("type_edit")) {
+            // Run contained, this is a dry run: the engine rolls the edit back afterwards.
             typeEdit(text(req, "address"), options(req), deadline);
-            appliedOverlays.add(text(req, "id"));
-            out.addProperty("overlay_count", appliedOverlays.size());
-            out.addProperty("edit_applied", true);
+            out.addProperty("edit_validated", true);
             out.addProperty("edits_applied", text(options(req), "kind").equals("batch") ? options(req).getAsJsonArray("edits").size() : 1);
-            out.addProperty("persistence", "in-memory overlay; caller records source-bound edit after success; master is not saved");
             out.addProperty("ok", true); return out;
         }
         if (Set.of("variables", "dossier", "blocks", "pcode", "trace").contains(action)) {
@@ -924,10 +968,7 @@ public class RusticQuery extends GhidraScript {
                 if (f == null) throw new IllegalArgumentException("no analysed function contains " + addr);
                 out.add("function", function(f));
                 if (action.equals("decompile")) {
-                    if (decompiler == null) {
-                        decompiler = new DecompInterface();
-                        if (!decompiler.openProgram(currentProgram)) throw new IllegalStateException(decompiler.getLastMessage());
-                    }
+                    if (decompiler == null) decompiler = borrow(currentProgram);
                     var result = decompiler.decompileFunction(f, seconds, monitor);
                     if (!result.decompileCompleted()) throw new IllegalStateException("decompile refused: " + result.getErrorMessage());
                     String c = result.getDecompiledFunction().getC();
@@ -943,71 +984,32 @@ public class RusticQuery extends GhidraScript {
         return out;
     }
 
+    // One request per run: args[0] is the request as JSON, or @<file> holding it.
+    // The answer is printed as a single JSON line; the engine returns it as `output`.
     @Override
     public void run() throws Exception {
         String[] args = getScriptArgs();
-        Path directory = Path.of(args[0]);
-        JsonObject ready = new JsonObject();
-        ready.addProperty("pid", ProcessHandle.current().pid());
-        ready.addProperty("started_ms", ProcessHandle.current().info().startInstant().get().toEpochMilli());
-        ready.addProperty("program", currentProgram.getName());
-        ready.addProperty("image_base", "0x" + currentProgram.getImageBase());
-        ready.addProperty("sha256", currentProgram.getExecutableSHA256());
+        if (args.length != 1) throw new IllegalArgumentException("RusticQuery takes one argument: a JSON request or @file");
+        String body = args[0].startsWith("@") ? Files.readString(Path.of(args[0].substring(1)), StandardCharsets.UTF_8) : args[0];
+        JsonObject req;
+        try (JsonReader reader = new JsonReader(new StringReader(body))) {
+            reader.setStrictness(Strictness.STRICT);
+            JsonElement element = JsonParser.parseReader(reader);
+            if (!element.isJsonObject() || reader.peek() != JsonToken.END_DOCUMENT) throw new IllegalArgumentException("request must be one JSON object");
+            req = element.getAsJsonObject();
+        }
+        if (currentProgram == null) throw new IllegalArgumentException("RusticQuery needs an open program");
+        JsonObject response;
+        boolean healthy = true;
         try {
-            if (!GhidraProgramUtilities.isAnalyzed(currentProgram)) throw new IllegalStateException("program has not been analysed; prepare it separately first");
-            if (!args[1].equalsIgnoreCase(currentProgram.getExecutableSHA256())) throw new IllegalStateException("project SHA256 differs from target binary; stale or packed analysis project");
-            ready.addProperty("ok", true);
-        } catch (Exception e) {
-            ready.addProperty("ok", false);
-            ready.addProperty("error", e.toString());
-            write(directory.resolve("ready.json"), ready);
-            return;
-        }
-        long idle = TimeUnit.SECONDS.toNanos(Integer.parseInt(args[2]));
-        long touched = System.nanoTime();
-        byte[] random = new byte[32]; new SecureRandom().nextBytes(random);
-        String token = HexFormat.of().formatHex(random);
-        try (ServerSocket server = new ServerSocket()) {
-            server.setReuseAddress(false);
-            server.bind(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), 0), 4);
-            server.setSoTimeout(250);
-            JsonObject endpoint = new JsonObject(); endpoint.addProperty("port", server.getLocalPort()); endpoint.addProperty("token", token);
-            endpoint.addProperty("protocol", "rustic-framed-json-1");
-            ready.add("ipc", endpoint);
-            write(directory.resolve("ready.json"), ready);
-            while (!monitor.isCancelled() && System.nanoTime() - touched < idle) {
-                Socket accepted;
-                try { accepted = server.accept(); }
-                catch (SocketTimeoutException idleWait) { continue; }
-                try (Socket connection = accepted) {
-                    if (!connection.getInetAddress().isLoopbackAddress()) throw new IOException("local query rejects non-loopback peers");
-                    connection.setSoTimeout(2000);
-                    JsonObject req = readFrame(connection);
-                    String supplied = text(req, "token");
-                    if (!supplied.matches("[0-9a-f]{64}") || !MessageDigest.isEqual(supplied.getBytes(StandardCharsets.US_ASCII), token.getBytes(StandardCharsets.US_ASCII))) throw new IOException("local query authentication failed");
-                    String id = text(req, "id");
-                    if (!id.matches("[0-9a-f]{32}")) throw new IOException("local query request id must be 32 lowercase hexadecimal characters");
-                    if (!req.has("timeout_s") || !req.get("timeout_s").isJsonPrimitive() || !req.getAsJsonPrimitive("timeout_s").isNumber()) throw new IOException("local query requires a numeric deadline");
-                    if (!req.get("timeout_s").getAsString().matches("[1-9][0-9]{0,2}")) throw new IOException("local query deadline must be an integer");
-                    int seconds = req.get("timeout_s").getAsInt();
-                    if (seconds < 1 || seconds > 300) throw new IOException("local query deadline must be 1..300 seconds");
-                    connection.setSoTimeout((seconds + 2) * 1000);
-                    req.remove("token");
-                    touched = System.nanoTime();
-                    JsonObject response;
-                    try { response = query(req); }
-                    catch (Exception error) { response = queryError(id, error); }
-                    writeFrame(connection, response);
-                    touched = System.nanoTime();
-                } catch (Exception error) {
-                    // Bad frames/authentication or a disconnected caller do not
-                    // grant a request or extend idle lifetime. The owning caller
-                    // retires a worker after its own transport/deadline failure.
-                    printerr("Local query RPC connection rejected/failed: " + clip(error.toString().replace(token, "[redacted]"), 1024));
-                }
-            }
+            if (!GhidraProgramUtilities.isAnalyzed(currentProgram)) throw new IllegalStateException("program has not been analysed; prepare it first");
+            response = query(req);
+        } catch (Exception error) {
+            response = queryError(text(req, "id"), error);
+            healthy = response.get("recoverable").getAsBoolean();
         } finally {
-            if (decompiler != null) decompiler.dispose();
+            if (decompiler != null) { giveBack(currentProgram, decompiler, healthy); decompiler = null; }
         }
+        println(json.toJson(response));
     }
 }

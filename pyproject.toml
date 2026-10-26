@@ -1,6 +1,6 @@
 [project]
 name = "rusticre"
-version = "0.3.0"
+version = "0.4.0"
 description = "Small reverse-engineering server: PE evidence, analysis setup, reusable saved-project queries and verified runtime sessions."
 readme = "README.md"
 requires-python = ">=3.11"

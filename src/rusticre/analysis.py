@@ -49,7 +49,7 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
         "types": set(), "type": {"path"}, "variables": set(), "dossier": set(),
         "blocks": set(), "pcode": {"nodes"},
         "trace": {"seed", "direction", "depth", "nodes", "functions"},
-        "type_edit": {"kind", "source", "path", "size", "fields", "prototype", "variable", "type", "name", "comment", "expect", "ranges", "edits", "file"} | (_BATCH_PROVENANCE if _record else set()),
+        "type_edit": {"kind", "source", "path", "size", "fields", "prototype", "variable", "type", "name", "comment", "expect", "ranges", "edits", "file", "expect_revision", "ids"} | (_BATCH_PROVENANCE if _record else set()),
     }
     if action not in allowed:
         if options:
@@ -87,6 +87,16 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
             out["functions"] = _integer(out.get("functions", 1), "functions", 1, 4)
     elif action == "type_edit":
         kind = out.get("kind")
+        if "expect_revision" in out:
+            _integer(out["expect_revision"], "expect_revision", 0, 2**31)
+        if kind == "revert":
+            if set(out) - {"kind", "ids", "expect_revision", "source"}:
+                raise ValueError("revert takes ids (overlay or batch ids) and optional expect_revision")
+            ids = out.get("ids")
+            if not isinstance(ids, list) or not 1 <= len(ids) <= MAX_OVERLAYS or any(
+                    not isinstance(item, str) or not re.fullmatch(r"[0-9a-f]{32}", item) for item in ids):
+                raise ValueError("revert ids must be 1..%d overlay or batch ids" % MAX_OVERLAYS)
+            return json.loads(json.dumps(out))
         if kind not in _TYPE_KINDS:
             raise ValueError("unknown type_edit kind")
         kind_fields = {
@@ -98,7 +108,7 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
             "function_delete": {"expect"},
             "batch": {"edits", "file"} | (_BATCH_PROVENANCE if _record else set()),
         }[kind]
-        if set(out) - {"kind", "source"} - kind_fields:
+        if set(out) - {"kind", "source", "expect_revision"} - kind_fields:
             raise ValueError("options do not belong to type_edit kind %s" % kind)
         out["source"] = _text(out.get("source", ""), "source", 4096, True)
         if kind == "batch":

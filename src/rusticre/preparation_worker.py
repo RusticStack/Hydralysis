@@ -1,41 +1,102 @@
-"""Owned background worker for setup and the one initial Ghidra analysis."""
+"""Background worker for setup and the one initial analysis of a fresh executable.
+
+The import runs inside the engine (one long request on this worker's own
+connection). Cancelling the job cancels that request; if this worker dies, the
+engine cancels it, and a cancelled import leaves no program in the project.
+"""
 
 from __future__ import annotations
 
-import json
 import os
-import re
 import shutil
-import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
-from rusticre import proc
-from rusticre.backends import ensure, read_json, root_path, sha256
-from rusticre.ghidra import LaneLock, _terminate_owned_tree, ghidra_environment, headless_path, launch_command
+from rusticre import hydra
+from rusticre.backends import ensure, read_json, resolved, root_path, sha256
 from rusticre.preparation import locked, process_start_ms, register, update_job
 
 
-def build_analysis_command(settings: dict, directory: Path, binary: Path, verification: Path, timeout_s: int) -> list[str]:
-    scripts = Path(__file__).with_name("scripts")
-    args = [headless_path(settings["ghidra_dir"]), str(directory), "analysis", "-import", str(binary),
-            "-max-cpu", str(int(settings.get("max_cpu", 4))), "-analysisTimeoutPerFile", str(timeout_s),
-            "-scriptPath", str(scripts), "-log", str(verification.parent / "ghidra.log"),
-            "-scriptlog", str(verification.parent / "script.log"), "-postScript", "RusticPrepare.java",
-            sha256(binary), str(verification)]
-    if os.name == "nt":
-        if any(re.search(r'[&|<>^%!"\r\n\x00]', arg) for arg in args):
-            raise ValueError("Windows analysis arguments must not contain shell metacharacters")
-        return ["cmd.exe", "/d", "/c", *args]
-    return args
+def _log(path: Path, line: str) -> None:
+    with Path(read_json(path)["log_path"]).open("a", encoding="utf-8") as output:
+        output.write(time.strftime("%H:%M:%S ") + line.rstrip() + "\n")
+
+
+def _prepare(path: Path, record: dict, settings: dict, cancelled) -> None:
+    settings = resolved(settings)
+    engine = hydra.Engine(settings, role="prepare")
+    lease_path = root_path(settings) / "preparation" / "build-locks" / (record["sha256"] + ".lock")
+    with locked(lease_path, timeout_s=10):
+        source = Path(record["exe"])
+        if sha256(source) != record["sha256"]:
+            raise ValueError("binary changed before analysis; no import started")
+        directory = root_path(settings) / "projects" / record["sha256"][:16] / record["job_id"]
+        directory.mkdir(parents=True)
+        binary = directory / source.name
+        shutil.copy2(source, binary)
+        if sha256(binary) != record["sha256"]:
+            raise ValueError("binary changed during snapshot; no import started")
+        created = engine.call("script", script="RusticSetup.java", program=None,
+                              args=[str(directory / "project"), "analysis"], timeout=120)
+        gpr = directory / "project" / "analysis.gpr"
+        if not gpr.is_file():
+            raise RuntimeError("project creation did not produce %s: %s" % (gpr, created.get("output")))
+        opened = engine.call("open_project", path=str(gpr), writable=True)
+        update_job(path, stage="analysing", project_dir=str(directory), analysis_started_at=time.time())
+        engine.on_event(lambda event: _log(path, "%s %s/%s" % (event.get("message", ""), event.get("progress", ""),
+                                                                event.get("maximum", ""))))
+        request = engine.send("import", file=str(binary), project=opened["id"], analyze=True,
+                              timeout=int(record["timeout_s"]))
+        update_job(path, engine_request=request)
+        outcome: dict = {}
+
+        def wait():
+            try:
+                outcome["result"] = engine.wait(request, "import")
+            except Exception as exc:  # carried to the main thread
+                outcome["error"] = exc
+
+        waiter = threading.Thread(target=wait, daemon=True)
+        waiter.start()
+        while waiter.is_alive():
+            if cancelled():
+                engine.cancel(request)
+                waiter.join(60)
+                raise InterruptedError("analysis cancelled; the engine discarded the unsaved import")
+            waiter.join(0.5)
+        if "error" in outcome:
+            raise outcome["error"]
+        result = outcome["result"]
+        if not result.get("imported"):
+            raise RuntimeError("engine did not import the file: %s" % result)
+        program = result["path"]
+        info = engine.call("info", program=result["key"])
+        if str(info.get("sha256", "")).lower() != record["sha256"] or not info.get("analyzed"):
+            raise RuntimeError("analysis did not verify: sha256=%s analyzed=%s" % (info.get("sha256"), info.get("analyzed")))
+        if result.get("analysis", {}).get("cancelled"):
+            raise RuntimeError("analysis was cancelled or timed out inside the engine: %s" % result.get("analysis"))
+        if sha256(source) != record["sha256"]:
+            raise ValueError("original binary changed during analysis; project retained but target not registered")
+        engine.call("close_project", project=opened["id"])
+        update_job(path, stage="registering", verification={"sha256": info.get("sha256"), "functions": info.get("functions"),
+                                                             "analyzed": info.get("analyzed"), "program": program})
+        project = {"gpr": str(gpr), "program": program, "exe": str(source), "sha256": record["sha256"],
+                   "prepared_job": record["job_id"], "functions": info.get("functions"), "engine": "hydra"}
+        with locked(root_path(settings) / ".preparation.lock"):
+            if cancelled():
+                raise InterruptedError("cancelled before target registration")
+            latest = read_json(path)
+            register(settings, latest.get("aliases", [record["target"]]), project)
+            update_job(path, state="done", stage="ready", project=project, finished_at=time.time(),
+                       analysis=result.get("analysis"), import_seconds=result.get("importSeconds"))
 
 
 def run(path: Path) -> None:
     settings = read_json(path.parent / "settings.json")
     record = read_json(path)
     cancelled = lambda: (path.parent / "cancel.request").exists()
-    process = None
     update_job(path, worker_pid=os.getpid(), worker_started_ms=process_start_ms(os.getpid()), state="running", stage="setup")
     try:
         if cancelled():
@@ -48,81 +109,14 @@ def run(path: Path) -> None:
             update_job(path, state="done", stage="ready", backend=observed, finished_at=time.time())
             return
         settings = ensure(settings, bool(record.get("install")), cancelled)
-        if cancelled():
-            raise InterruptedError("setup cancelled")
         if record["kind"] == "install":
-            update_job(path, state="done", stage="ready", backend={key: settings[key] for key in ("ghidra_dir", "java_home")}, finished_at=time.time())
+            update_job(path, state="done", stage="ready", finished_at=time.time(),
+                       backend={key: settings[key] for key in ("hydra_dir", "hydra_client", "java_home")})
             return
-        lease_path = root_path(settings) / "preparation" / "build-locks" / (record["sha256"] + ".lock")
-        with locked(lease_path):
-            source = Path(record["exe"])
-            if sha256(source) != record["sha256"]:
-                raise ValueError("binary changed before analysis; no import started")
-            directory = root_path(settings) / "projects" / record["sha256"] / record["job_id"]
-            directory.mkdir(parents=True)
-            binary = directory / source.name
-            shutil.copy2(source, binary)
-            if sha256(binary) != record["sha256"]:
-                raise ValueError("binary changed during snapshot; no import started")
-            verification = path.parent / "verified.json"
-            command = build_analysis_command(settings, directory, binary, verification, record["timeout_s"])
-            update_job(path, stage="analysing", command=command, project_dir=str(directory), analysis_started_at=time.time())
-            options = {"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
-            with Path(record["log_path"]).open("wb") as output:
-                process = proc.popen(launch_command(command), stdin=subprocess.DEVNULL, stdout=output, stderr=output,
-                                           env=ghidra_environment(settings), **options)
-            update_job(path, headless_pid=process.pid, headless_started_ms=process_start_ms(process.pid), headless_group_id=process.pid)
-            started = time.monotonic()
-            while process.poll() is None:
-                if cancelled() or time.monotonic() - started >= record["timeout_s"]:
-                    reason = "cancelled" if cancelled() else "timeout"
-                    try:
-                        _terminate_owned_tree(process)
-                    except Exception as exc:
-                        update_job(path, state="cleanup_failed", stage=reason, error=str(exc), finished_at=time.time())
-                        # Do not register or reuse this partially analysed project.
-                        return
-                    update_job(path, state=reason, stage=reason, exit_code=process.returncode, finished_at=time.time())
-                    return
-                time.sleep(0.2)
-            observed = read_json(verification)
-            if cancelled():
-                raise InterruptedError("analysis finished after cancellation; project retained without registration")
-            failed_line = ""
-            with Path(record["log_path"]).open(encoding="utf-8", errors="replace") as log:
-                for line in log:
-                    if re.match(r"^(?:ERROR|SEVERE)\s", line):
-                        failed_line = line.strip()[:1000]
-            if process.returncode != 0 or failed_line or not observed.get("analysed") or observed.get("sha256") != record["sha256"]:
-                raise RuntimeError("analysis did not verify: exit=%s %s verification=%s; inspect %s" % (process.returncode, failed_line, observed, record["log_path"]))
-            if not (directory / "analysis.gpr").is_file() or not (directory / "analysis.rep").is_dir():
-                raise RuntimeError("headless did not save the analysed project")
-            if sha256(source) != record["sha256"]:
-                raise ValueError("original binary changed during analysis; project retained but target not registered")
-            update_job(path, stage="registering", verification=observed)
-            project = {"dir": str(directory), "name": "analysis", "program": observed["program"], "exe": str(source),
-                       "sha256": record["sha256"], "prepared_job": record["job_id"]}
-            # The global prepare lock makes alias additions and final registration atomic.
-            with locked(root_path(settings) / ".preparation.lock"):
-                if cancelled():
-                    raise InterruptedError("cancelled before target registration")
-                latest = read_json(path)
-                register(settings, latest.get("aliases", [record["target"]]), project)
-                update_job(path, state="done", stage="ready", project=project, exit_code=process.returncode, finished_at=time.time())
+        _prepare(path, record, settings, cancelled)
     except InterruptedError as exc:
         update_job(path, state="cancelled", stage="cancelled", error=str(exc), finished_at=time.time())
     except Exception as exc:
-        # Metadata/logging failures after Popen must not orphan a live JVM and
-        # make this build appear retryable while it still owns a project lock.
-        if process is not None and process.poll() is None:
-            try:
-                _terminate_owned_tree(process)
-            except Exception as cleanup:
-                update_job(path, state="cleanup_failed", stage="cleanup", headless_pid=process.pid,
-                           headless_started_ms=process_start_ms(process.pid), headless_group_id=process.pid,
-                           error="%s: %s; owned headless cleanup failed: %s" % (type(exc).__name__, exc, cleanup),
-                           finished_at=time.time())
-                return
         update_job(path, state="failed", stage="failed", error="%s: %s" % (type(exc).__name__, exc), finished_at=time.time())
         print("Preparation failed:", repr(exc), flush=True)
 

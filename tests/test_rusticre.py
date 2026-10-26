@@ -7,7 +7,6 @@ from pathlib import Path
 from rusticre.api import REJECTED, TOOL_NAMES, call, tool_table
 from rusticre.cli import main
 from rusticre.evidence import add_claim
-from rusticre.ghidra import build_command, filter_script_output
 from rusticre.mcp import Server
 from rusticre.prologue import compare, find_pattern, matches, parse_expect
 from rusticre.red4ext import iter_entries, lookup_hashes
@@ -46,34 +45,6 @@ class AddressTableTests(unittest.TestCase):
             text = "\n".join(lookup_hashes(path, {10}, chunk_size=24, overlap=16))
         self.assertIn("0x2000", text)
         self.assertIn("Alpha", text)
-
-
-class GhidraCommandTests(unittest.TestCase):
-    def test_command_reuses_the_project(self):
-        command = build_command(
-            "G", "lane", "client", "swtor.exe", "scripts", "Recv.java", ["FN", "0x1"], "job.log", 4
-        )
-        text = " ".join(command)
-        self.assertIn("-noanalysis", command)
-        self.assertIn("-readOnly", command)
-        self.assertIn("-process", command)
-        self.assertNotIn("-import", text)
-        self.assertIn("Recv.java", command)
-
-    def test_script_output_drops_the_ghidra_log(self):
-        stdout = "\n".join([
-            "INFO  Analyzing... something (HeadlessAnalyzer)",
-            "INFO  Recv.java> === FUNCTION FUN_1 === (GhidraScript)",
-            "INFO  Recv.java> void FUN_1(void)",
-            "more of the body",
-            "(GhidraScript)",
-            "INFO  REPORT: done",
-        ])
-        text = filter_script_output(stdout)
-        self.assertIn("=== FUNCTION FUN_1 ===", text)
-        self.assertIn("void FUN_1(void)", text)
-        self.assertNotIn("HeadlessAnalyzer", text)
-        self.assertNotIn("REPORT", text)
 
 
 class EvidenceTests(unittest.TestCase):

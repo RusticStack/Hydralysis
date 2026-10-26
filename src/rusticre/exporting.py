@@ -10,18 +10,15 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
 
-from rusticre import proc
-from rusticre.analysis import load_overlays
+from rusticre import hydra, proc, targets, workcopy
 from rusticre.backends import read_json, root_path, write_json
-from rusticre.ghidra import GhidraRunner, LaneLock, _held
+from rusticre.locks import held as _held
 from rusticre.preparation import locked, process_start_ms
-from rusticre.query import _expected_hash, _source_stamp
 
 ACTIVE = ("queued", "running", "cancelling")
 MAX_OUTPUT_BYTES = 1024 * 1024 * 1024
@@ -46,7 +43,7 @@ def normalized(options: dict | None) -> dict:
     if options is not None and not isinstance(options, dict):
         raise ValueError("export options must be an object")
     options = dict(options or {})
-    unknown = set(options) - {"mode", "limit", "contains", "timeout_s", "resume"}
+    unknown = set(options) - {"mode", "limit", "contains", "timeout_s", "resume", "out", "start", "end", "regex"}
     if unknown:
         raise ValueError("unknown export options: " + ", ".join(sorted(unknown)))
     mode = options.get("mode", "decompile")
@@ -60,30 +57,62 @@ def normalized(options: dict | None) -> dict:
     contains = options.get("contains", "")
     if not isinstance(contains, str) or len(contains) > 256 or "\0" in contains:
         raise ValueError("export contains must be text of at most 256 characters")
-    return {"mode": mode, "limit": count, "contains": contains, "timeout_s": timeout}
+    result = {"mode": mode, "limit": count, "contains": contains, "timeout_s": timeout}
+    for name in ("start", "end"):
+        if name in options:
+            value = options[name]
+            if not isinstance(value, str) or not re.fullmatch(r"(?:va:)?(?:0x)?[0-9a-fA-F]{1,16}", value):
+                raise ValueError("export %s must be a numeric VA such as 0x140001000" % name)
+            if mode == "types":
+                raise ValueError("export start/end select functions; types are filtered by contains/regex")
+            result[name] = hex(int(value.removeprefix("va:"), 16))
+    if "start" in result and "end" in result and int(result["end"], 16) < int(result["start"], 16):
+        raise ValueError("export end precedes start")
+    if "regex" in options:
+        pattern = options["regex"]
+        if not isinstance(pattern, str) or not 0 < len(pattern) <= 512:
+            raise ValueError("export regex must be a pattern of at most 512 characters")
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ValueError("export regex does not compile: %s" % exc) from exc
+        result["regex"] = pattern
+    if "out" in options:
+        out = options["out"]
+        if not isinstance(out, str) or not Path(out).is_absolute() or not out.endswith(".jsonl"):
+            raise ValueError("export out must be an absolute path ending in .jsonl")
+        destination = Path(out).resolve()
+        if not destination.parent.is_dir():
+            raise ValueError("export out folder does not exist: %s" % destination.parent)
+        if any(part.endswith(".rep") for part in destination.parts):
+            raise ValueError("export out must not be inside a Ghidra project")
+        result["out"] = str(destination)
+    return result
 
 
 def code_sha256() -> str:
     package = Path(__file__).parent
     code = hashlib.sha256()
-    for name in ("query.py", "analysis.py", "exporting.py", "export_worker.py", "runtime_ipc.py", "localio.py", "scripts/RusticQuery.java"):
+    for name in ("query.py", "analysis.py", "exporting.py", "export_worker.py", "workcopy.py", "hydra.py", "targets.py",
+                 "scripts/RusticQuery.java"):
         code.update(name.encode())
         code.update((package / name).read_bytes())
     return code.hexdigest()
 
 
+def master_revision(settings: dict, selected: dict) -> str | None:
+    """The saved state the export reads: the master's revision as the engine computes it."""
+    opened = hydra.Engine(settings).call("open_project", path=selected["gpr"])
+    return opened.get("revision")
+
+
 def provenance(settings: dict, target: str) -> tuple[dict, dict]:
-    project = dict(GhidraRunner(settings).project(target, require_scripts=False))
-    expected = _expected_hash(project)
-    key = hashlib.sha256((str(Path(project["dir"]).resolve()) + "\n" + project["name"] + "\n" + project["program"]).encode()).hexdigest()[:16]
-    overlays = load_overlays(settings["root"], key, expected)
-    ghidra = Path(settings["ghidra_dir"]).resolve()
-    application = ghidra / "Ghidra" / "application.properties"
-    result = {"version": 1, "source": str(Path(project["dir"]).resolve()), "name": project["name"],
-              "program": project["program"], "sha256": expected, "source_stat_sha256": _source_stamp(project),
-              "code_sha256": code_sha256(), "overlay_sha256": hashlib.sha256(json.dumps(overlays, sort_keys=True).encode()).hexdigest(),
-              "ghidra_dir": str(ghidra), "ghidra_application_sha256": hashlib.sha256(application.read_bytes()).hexdigest() if application.is_file() else None,
-              "query_key": key}
+    selected = targets.resolve(settings, target)
+    project = dict(targets.configured(settings)[target])
+    result = {"version": 2, "gpr": str(Path(selected["gpr"]).resolve()), "program": selected["program"],
+              "sha256": selected["sha256"], "master_revision": master_revision(settings, selected),
+              "code_sha256": code_sha256(), "overlay_state": workcopy.expected_state(settings, selected),
+              "engine_release": hydra.RELEASE, "query_key": selected["key"]}
     if project.get("exe"):
         stat = Path(project["exe"]).stat()
         result["exe_stat"] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
@@ -91,7 +120,8 @@ def provenance(settings: dict, target: str) -> tuple[dict, dict]:
 
 
 def worker_settings(settings: dict, target: str, project: dict) -> dict:
-    fields = ("root", "ghidra_dir", "java_home", "max_mem", "max_cpu", "query_workers", "query_idle_s", "query_startup_s")
+    fields = ("root", "hydra_dir", "hydra_client", "java_home", "hydra_idle_s", "hydra_keep_warm_s", "hydra_max_heap",
+              "hydra_allow_unpinned", "hydra", "fork_mode", "forbidden_drives")
     result = {name: settings[name] for name in fields if name in settings}
     result["root"] = str(root_path(settings))
     result["targets"] = {target: project}
@@ -103,17 +133,15 @@ def _launch(path: Path, record: dict, settings: dict) -> dict:
     record = update(path, state="queued", stage="starting", generation=generation, cancel_requested=False,
                     worker_pid=0, worker_started_ms=0, error="", queued_at=time.time())
     env = dict(os.environ)
-    temp = root_path(settings) / "exports" / "tmp"
-    temp.mkdir(parents=True, exist_ok=True)
-    env["TEMP"] = env["TMP"] = env["TMPDIR"] = str(temp)
     env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+    env["RUSTICRE_HARNESS"] = hydra.identity()["harness"]
     env["PYTHONNOUSERSITE"] = "1"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     command = [sys.executable, "-m", "rusticre.export_worker", str(path), generation]
     try:
         with Path(record["log_path"]).open("ab") as output:
-            process = proc.popen(command, env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=output,
-                                       **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {"start_new_session": True}))
+            process = proc.popen(command, env=env, stdout=output, stderr=output,
+                                 **({} if os.name == "nt" else {"start_new_session": True}))
     except OSError as exc:
         update(path, state="failed", stage="launch", error=str(exc))
         raise
@@ -177,7 +205,7 @@ def _new(settings: dict, target: str, project: dict, identity: dict, selected: d
               "options": selected, "provenance": identity, "settings": worker_settings(settings, target, project),
               "state": "queued", "stage": "starting", "cursor": "", "completed": 0, "succeeded": 0,
               "failed": 0, "truncated": 0, "output_bytes": 0, "cancel_requested": False,
-              "output_path": str(path.parent / (selected["mode"] + ".jsonl")),
+              "output_path": selected.get("out") or str(path.parent / (selected["mode"] + ".jsonl")),
               "imports_path": str(path.parent / "imports.json"), "log_path": str(path.parent / "worker.log")}
     write_json(path, record)
     with locked(path.parent / ".control.lock"):

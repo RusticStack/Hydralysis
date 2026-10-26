@@ -17,9 +17,10 @@ import uuid
 from pathlib import Path
 
 from rusticre import proc
-from rusticre.ghidra import LaneLock
+from rusticre.locks import LaneLock
 from rusticre.paths import root_path
-from rusticre.query import _identity, _json as _query_json, _stop, _write
+from rusticre.proc import identity as _identity, stop as _stop
+from rusticre.localio import read_text as local_read_text
 from rusticre.runtime_ipc import request as ipc_request
 
 FRIDA_VERSION = "17.24.3"
@@ -27,9 +28,18 @@ ACTION_NAMES = ("setup", "processes", "spawn", "attach", "status", "modules", "t
                 "observe", "break", "continue", "unload", "resume", "detach")
 
 
+def _write(path: Path, value: dict) -> None:
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(value), encoding="utf-8")
+    temporary.replace(path)
+
+
 def _json(path: Path) -> dict:
     try:
-        return _query_json(path)
+        try:
+            return json.loads(local_read_text(path))
+        except (FileNotFoundError, ValueError):
+            return {}
     except OSError as exc:
         raise RuntimeError("runtime mailbox read failed: errno=%s winerror=%s path=%s: %s"
                            % (exc.errno, getattr(exc, "winerror", None), path, exc)) from exc
@@ -278,8 +288,7 @@ class RuntimeRunner:
         if ready:
             _stop(ready)
         else:
-            from rusticre.ghidra import _terminate_owned_tree
-            _terminate_owned_tree(process)
+            proc.terminate_tree(process)
         raise TimeoutError("runtime startup timed out; target state unknown; inspect %s" % (directory / "worker.log"))
 
 

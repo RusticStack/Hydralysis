@@ -6,6 +6,7 @@ The tool list is the dispatch table in api.py. Nothing else is registered.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import traceback
@@ -32,6 +33,12 @@ class Server:
         if method == "initialize":
             want = params.get("protocolVersion")
             self.protocol = want if want in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0]
+            # The client's own name labels every engine request, overlay and claim, so
+            # several harnesses sharing one engine can tell who holds what.
+            client = params.get("clientInfo") if isinstance(params.get("clientInfo"), dict) else {}
+            if client.get("name") and not os.environ.get("RUSTICRE_HARNESS"):
+                from rusticre import hydra
+                hydra.set_harness(str(client["name"]))
             return _ok(msg_id, {
                 "protocolVersion": self.protocol,
                 "capabilities": {"tools": {"listChanged": False}},

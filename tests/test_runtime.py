@@ -249,7 +249,7 @@ class HostRuntimeContracts(RuntimeCase):
     def test_permission_errors_report_exact_details_instead_of_missing_mailbox(self):
         error = PermissionError(13, "access denied", str(self.root / "response.json"))
         error.winerror = 5
-        with patch("rusticre.runtime._query_json", side_effect=error), self.assertRaisesRegex(RuntimeError, "errno=13 winerror=5"):
+        with patch("rusticre.runtime.local_read_text", side_effect=error), self.assertRaisesRegex(RuntimeError, "errno=13 winerror=5"):
             runtime._json(self.root / "response.json")
         with patch("rusticre.runtime_worker.local_read_text", side_effect=error), self.assertRaisesRegex(RuntimeError, "errno=13 winerror=5"):
             _read(self.root / "request.json")

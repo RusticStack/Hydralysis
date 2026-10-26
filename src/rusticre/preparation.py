@@ -1,37 +1,30 @@
-"""Durable explicit import/analyse-once jobs and the prepared-target registry."""
+"""Durable setup and analyse-once jobs, adopting analysed projects, and the target registry.
+
+A fresh executable is imported and analysed once by the engine, in a project of
+RusticRE's own, as a background job that outlives the tool call. A build that is
+already analysed somewhere is adopted instead: its project opens in place,
+read-only, and is named after its program's recorded SHA-256 matches. Engines
+are installed only on request (backend install, or install=true).
+"""
 
 from __future__ import annotations
 
-import json
 import os
 import re
-import subprocess
 import sys
 import time
 import uuid
-from contextlib import contextmanager
 from pathlib import Path
 
-from rusticre import proc
-from rusticre.backends import ensure, inspect, read_json, root_path, sha256, write_json
-from rusticre.ghidra import LaneLock
+from rusticre import proc, targets
+from rusticre.backends import inspect, read_json, root_path, sha256, write_json
+from rusticre.locks import locked as _locked
 
 ACTIVE = ("queued", "running", "cancelling")
 
 
-@contextmanager
-def locked(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lease = LaneLock(str(path))
-    deadline = time.monotonic() + 5
-    while not lease.acquire():
-        if time.monotonic() >= deadline:
-            raise ValueError("job/target registry is busy; retry shortly")
-        time.sleep(0.05)
-    try:
-        yield
-    finally:
-        lease.release()
+def locked(path: Path, timeout_s: float = 5):
+    return _locked(path, timeout_s, "job/target registry")
 
 
 def process_start_ms(pid: int) -> int:
@@ -83,44 +76,11 @@ def update_job(path: Path, **changes) -> dict:
 
 
 def registry(settings: dict) -> dict:
-    return read_json(root_path(settings) / "targets.json").get("targets", {})
+    return targets.registry(settings)
 
 
 def register(settings: dict, names: list[str], project: dict) -> None:
-    root = root_path(settings)
-    with locked(root / ".targets.lock"):
-        data = read_json(root / "targets.json") or {"version": 1, "targets": {}}
-        for name in names:
-            existing = data["targets"].get(name)
-            if existing and existing.get("sha256") != project["sha256"]:
-                raise ValueError("target %s already names another build; choose a new target" % name)
-        for name in names:
-            data["targets"][name] = project
-        write_json(root / "targets.json", data)
-
-
-def _cancel_owned_headless(record: dict) -> None:
-    """Retry cleanup only for the recorded launcher with its original identity."""
-    pid = int(record.get("headless_pid") or 0)
-    started = int(record.get("headless_started_ms") or 0)
-    if not pid or not started or process_start_ms(pid) != started:
-        raise RuntimeError("cannot verify the original owned headless process; no process was signalled and the build reservation remains")
-    if os.name == "nt":
-        result = proc.run(["taskkill.exe", "/PID", str(pid), "/T", "/F"],
-                                capture_output=True, text=True, timeout=15)
-        if result.returncode != 0:
-            raise RuntimeError("owned process-tree cleanup was not confirmed: %s" % (result.stderr or result.stdout)[-1000:])
-    else:
-        import signal
-        group = int(record.get("headless_group_id") or pid)
-        if os.getpgid(pid) != group:
-            raise RuntimeError("owned headless process group changed; no group was signalled")
-        os.killpg(group, signal.SIGKILL)
-    deadline = time.monotonic() + 10
-    while process_start_ms(pid) == started and time.monotonic() < deadline:
-        time.sleep(0.05)
-    if process_start_ms(pid) == started:
-        raise RuntimeError("owned headless process has not exited; the build reservation remains")
+    targets.register(settings, names, project)
 
 
 def status(settings: dict, job_id: str = "", limit: int = 20) -> dict:
@@ -137,13 +97,10 @@ def status(settings: dict, job_id: str = "", limit: int = 20) -> dict:
     if record.get("state") in ACTIVE and time.time() - record.get("created_at", 0) > 5:
         pid, started = record.get("worker_pid", 0), record.get("worker_started_ms", 0)
         if not pid or not started or process_start_ms(pid) != started:
-            if record.get("headless_pid"):
-                headless_started = record.get("headless_started_ms") or 0
-                alive = bool(headless_started and process_start_ms(record["headless_pid"]) == headless_started)
-                detail = "the owned headless process is still live" if alive else "headless tree exit was not confirmed"
-                record = update_job(path, state="cleanup_failed", stage="cleanup", error="preparation worker exited and %s; build reservation retained. Retry job cancel only for the verified owned process; inspect the retained log." % detail)
-            else:
-                record = update_job(path, state="interrupted", stage="failed", error="preparation worker exited before a terminal result; inspect the retained log")
+            # The engine cancels a request whose client went away; nothing is left running.
+            record = update_job(path, state="interrupted", stage="failed",
+                                error="preparation worker exited before a terminal result; the engine cancelled its "
+                                      "request; inspect the retained log, then prepare again")
     log = Path(record["log_path"])
     if log.is_file():
         with log.open("rb") as handle:
@@ -156,22 +113,6 @@ def status(settings: dict, job_id: str = "", limit: int = 20) -> dict:
 
 def cancel(settings: dict, job_id: str) -> dict:
     record = status(settings, job_id)
-    if record["state"] == "cleanup_failed":
-        path = job_path(settings, job_id)
-        with locked(path.with_suffix(".lock")):
-            current = read_json(path)
-            if current.get("state") != "cleanup_failed":
-                return current
-            (path.parent / "cancel.request").write_text("cleanup retry requested\n", encoding="utf-8")
-            try:
-                _cancel_owned_headless(current)
-            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-                current.update(state="cleanup_failed", stage="cleanup", error="%s; reservation retained; log=%s" % (exc, current["log_path"]), updated_at=time.time())
-                write_json(path, current)
-                raise RuntimeError(current["error"]) from exc
-            current.update(state="cancelled", stage="cancelled", cleanup_confirmed=True, previous_error=current.get("error", ""), error="", finished_at=time.time(), updated_at=time.time())
-            write_json(path, current)
-        return status(settings, job_id)
     if record["state"] not in ACTIVE:
         return record
     path = job_path(settings, job_id)
@@ -189,19 +130,21 @@ def _launch(settings: dict, record: dict) -> dict:
     path = job_path(settings, record["job_id"])
     path.parent.mkdir(parents=True)
     write_json(path, record)
-    runtime = {key: settings[key] for key in ("root", "ghidra_dir", "java_home", "max_mem", "max_cpu") if key in settings}
+    keys = ("root", "hydra_dir", "hydra_client", "java_home", "hydra_idle_s", "hydra_keep_warm_s", "hydra_max_heap",
+            "hydra_allow_unpinned", "hydra", "fork_mode", "forbidden_drives")
+    runtime = {key: settings[key] for key in keys if key in settings}
     runtime["root"] = str(root_path(settings))
     write_json(path.parent / "settings.json", runtime)
     env = dict(os.environ)
-    temporary = root_path(settings) / "runtime" / "tmp"
-    temporary.mkdir(parents=True, exist_ok=True)
-    env["TEMP"] = env["TMP"] = env["TMPDIR"] = str(temporary)
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    options = {"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+    from rusticre import hydra
+    env["RUSTICRE_HARNESS"] = hydra.identity()["harness"]
+    options = {} if os.name == "nt" else {"start_new_session": True}
     try:
         with (path.parent / "worker.log").open("wb") as output:
             process = proc.popen([sys.executable, "-m", "rusticre.preparation_worker", str(path)],
-                                       stdin=subprocess.DEVNULL, stdout=output, stderr=output, env=env, **options)
+                                 stdout=output, stderr=output, env=env, **options)
         # A Windows venv launcher can spawn the real Python worker. Do not
         # overwrite the child's published identity if it reached running first.
         with locked(path.with_suffix(".lock")):
@@ -225,9 +168,13 @@ def start_install(settings: dict, component: str = "analysis") -> dict:
             if record.get("state") in ACTIVE and record.get("component", "analysis") == component:
                 return record
         job_id = "setup-" + uuid.uuid4().hex[:12]
-        record = {"job_id": job_id, "kind": "install", "component": component, "state": "queued", "stage": "setup", "created_at": time.time(),
-                  "install": True, "log_path": str(job_path(settings, job_id).parent / "worker.log")}
+        record = {"job_id": job_id, "kind": "install", "component": component, "state": "queued", "stage": "setup",
+                  "created_at": time.time(), "install": True,
+                  "log_path": str(job_path(settings, job_id).parent / "worker.log")}
         return _launch(settings, record)
+
+
+_WRAPPERS = (b".bind", b"upx0", b"upx1", b"upx2", b".aspack", b".adata", b".vmp0", b".vmp1", b".themida")
 
 
 def _subject(exe: str, target: str, timeout_s: int) -> tuple:
@@ -242,12 +189,13 @@ def _subject(exe: str, target: str, timeout_s: int) -> tuple:
     if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
         raise ValueError("binary changed while hashing; use a stable build")
     if not target:
-        target = re.sub(r"[^A-Za-z0-9._-]", "-", source.stem).strip("-._")[:45] + "-" + digest[:12]
+        target = targets.default_name(source.stem, digest)
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", target):
         raise ValueError("target must be a simple 1..64 character name")
-    preflight = {"format": "backend-detected", "warnings": []}
+    preflight = {"format": "engine-detected", "warnings": []}
     with source.open("rb") as handle:
         pe_header = handle.read(2) == b"MZ"
+    wrappers = []
     if pe_header:
         from rusticre.pe import Image
         image = Image(source)
@@ -255,58 +203,59 @@ def _subject(exe: str, target: str, timeout_s: int) -> tuple:
         if observed["sha256"] != digest:
             raise ValueError("binary changed during preflight; use a stable build")
         wrappers = [section.Name.rstrip(b"\0").decode("ascii", "replace") for section in image.sections
-                    if section.Name.rstrip(b"\0").lower() in (b".bind", b"upx0", b"upx1", b"upx2", b".aspack", b".adata", b".vmp0", b".vmp1", b".themida")]
+                    if section.Name.rstrip(b"\0").lower() in _WRAPPERS]
         preflight = {"format": "PE", "bits": image.bits, "packing_status": observed["packing_status"],
                      "warnings": observed["analysis_warnings"], "wrapper_sections": wrappers}
-    else:
-        wrappers = []
     return source, digest, after, target, preflight, wrappers
 
 
-def _configured_match(settings: dict, source: Path, digest: str) -> tuple[str, dict] | None:
-    for name, item in (settings.get("targets") or settings.get("projects") or {}).items():
+def _known(settings: dict, source: Path, digest: str) -> tuple[str, dict] | None:
+    """A registered or configured target that already names this build."""
+    for name, item in targets.configured(settings).items():
         expected = str(item.get("sha256") or "").lower()
         same_path = bool(item.get("exe") and Path(item["exe"]).expanduser().resolve() == source)
-        if expected == digest or same_path and not expected:
+        if expected == digest or (same_path and not expected):
             return name, item
     return None
 
 
-def plan(settings: dict, exe: str, target: str = "", timeout_s: int = 3600, install: bool = True) -> dict:
-    """Read-only first-use preflight: no job, import, download or target launch."""
+def plan(settings: dict, exe: str, target: str = "", timeout_s: int = 3600, install: bool = False) -> dict:
+    """Read-only first-use preflight: no job, import, download or launch."""
     source, digest, stat, target, preflight, wrappers = _subject(exe, target, timeout_s)
     backend = inspect(settings)
-    existing = next((name for name, item in registry(settings).items() if item.get("sha256") == digest), None)
-    configured = (settings.get("targets") or settings.get("projects") or {}).get(target)
-    matching = _configured_match(settings, source, digest)
+    known = _known(settings, source, digest)
+    configured = targets.configured(settings).get(target)
     return {"kind": "prepare_plan", "state": "blocked" if wrappers else "planned", "target": target,
             "exe": str(source), "sha256": digest, "size": stat.st_size, "timeout_s": timeout_s,
             "preflight": preflight, "backend_ready": backend["ready"], "backend": backend,
-            "matching_prepared_target": existing, "configured_target": bool(configured),
-            "matching_configured_target": matching[0] if matching else None,
-            "would_import": not wrappers and not existing and not configured and not matching,
-            "would_install": bool(not backend["ready"] and install and not wrappers and not configured and not matching), "started": False,
-            "reason": "needs_unwrapped_artifact" if wrappers else "analysis already configured; query the matching existing target" if configured or matching else "explicit prepare is required to start analysis"}
+            "matching_target": known[0] if known else None, "configured_target": bool(configured),
+            "would_import": not wrappers and not known and not configured,
+            "would_install": bool(not backend["ready"] and install and not wrappers and not known), "started": False,
+            "reason": "needs_unwrapped_artifact" if wrappers
+            else "this build already has a target; query it" if known or configured
+            else "if this build is already analysed in a Ghidra project, adopt it (prepare action=adopt path=<.gpr or "
+                 "folder> exe=...) instead of importing again; otherwise an explicit prepare starts the analysis"}
 
 
-def prepare(settings: dict, exe: str, target: str = "", timeout_s: int = 3600, install: bool = True) -> dict:
+def prepare(settings: dict, exe: str, target: str = "", timeout_s: int = 3600, install: bool = False) -> dict:
     source, digest, after, target, preflight, wrappers = _subject(exe, target, timeout_s)
     root = root_path(settings)
     with locked(root / ".preparation.lock"):
-        configured = {**registry(settings), **(settings.get("targets") or settings.get("projects") or {})}
-        existing = configured.get(target)
-        existing_hash = str(existing.get("sha256") or "").lower() if existing else None
-        if existing and not existing_hash and existing.get("exe"):
-            existing_hash = sha256(Path(existing["exe"]))
-        if existing and existing_hash != digest:
-            raise ValueError("target %s already exists; choose a new build-specific target" % target)
+        existing = targets.configured(settings).get(target)
+        if existing:
+            existing_hash = str(existing.get("sha256") or "").lower()
+            if not existing_hash and existing.get("exe"):
+                existing_hash = targets.exe_sha256(settings, existing["exe"])
+            if existing_hash != digest:
+                raise ValueError("target %s already exists for another build; choose a new build-specific target" % target)
+            return {"kind": "prepare", "state": "configured", "started": False, "reused": True,
+                    "target": target, "sha256": digest, "project": existing,
+                    "reason": "target already names this build; queries verify the saved program before answering"}
         index_path = root / "preparation" / "index.json"
         index = read_json(index_path)
         if digest in index:
             previous = status(settings, index[digest])
-            if previous.get("state") == "cleanup_failed":
-                raise ValueError("analysis cleanup is unconfirmed for job %s; refusing another import of this build. Use job cancel to retry verified owned-tree cleanup and inspect %s" % (previous["job_id"], previous["log_path"]))
-            if previous.get("state") == "done" and Path(previous["project"]["dir"], previous["project"]["name"] + ".gpr").is_file() and Path(previous["project"]["dir"], previous["project"]["name"] + ".rep").is_dir():
+            if previous.get("state") == "done" and previous.get("project") and Path(previous["project"]["gpr"]).is_file():
                 register(settings, [target], previous["project"])
                 return {**previous, "reused": True, "target": target}
             if previous.get("state") in ACTIVE:
@@ -315,28 +264,22 @@ def prepare(settings: dict, exe: str, target: str = "", timeout_s: int = 3600, i
                 return {**previous, "reused": True}
             if previous.get("state") == "blocked" and wrappers:
                 return {**previous, "reused": True}
-        if existing:
-            # Manually configured analysis predates this job index. Never
-            # replace it with an implicit fresh import or pretend it verified.
+        known = _known(settings, source, digest)
+        if known:
             return {"kind": "prepare", "state": "configured", "started": False, "reused": True,
-                    "target": target, "sha256": digest, "project": existing,
-                    "reason": "target already configured; ghidra_query verifies its saved analysis before serving results"}
-        matching = _configured_match(settings, source, digest)
-        if matching:
-            return {"kind": "prepare", "state": "configured", "started": False, "reused": True,
-                    "target": matching[0], "requested_target": target, "sha256": digest, "project": matching[1],
-                    "reason": "this build already has configured analysis; query the returned target to verify it. No alias or import was created."}
+                    "target": known[0], "requested_target": target, "sha256": digest, "project": known[1],
+                    "reason": "this build already has a target; query the returned one. No alias or import was created."}
         if not wrappers and not install and not inspect(settings)["ready"]:
-            raise ValueError("analysis backend is missing; use install=true or backend install")
+            raise ValueError("analysis engine is missing; run backend install (or prepare with install=true)")
         job_id = "prepare-" + uuid.uuid4().hex[:12]
         record = {"job_id": job_id, "kind": "prepare", "state": "queued", "stage": "setup", "created_at": time.time(),
                   "target": target, "aliases": [target], "exe": str(source), "sha256": digest, "size": after.st_size,
-                  "timeout_s": timeout_s, "install": bool(install),
-                  "preflight": preflight,
-                  "log_path": str(job_path(settings, job_id).parent / "headless.log")}
+                  "timeout_s": timeout_s, "install": bool(install), "preflight": preflight,
+                  "log_path": str(job_path(settings, job_id).parent / "worker.log")}
         if wrappers:
             record.update(state="blocked", stage="preflight", finished_at=time.time(),
-                          error="needs_unwrapped_artifact: known wrapper/packer sections %s; select a legitimate unwrapped artifact. No unpacking, launch or import was attempted." % ", ".join(wrappers))
+                          error="needs_unwrapped_artifact: known wrapper/packer sections %s; select a legitimate unwrapped "
+                                "artifact. No unpacking, launch or import was attempted." % ", ".join(wrappers))
             path = job_path(settings, job_id)
             write_json(path, record)
             index[digest] = job_id
@@ -346,3 +289,11 @@ def prepare(settings: dict, exe: str, target: str = "", timeout_s: int = 3600, i
         index[digest] = job_id
         write_json(index_path, index)
         return result
+
+
+def adopt(settings: dict, path: str, exe: str = "", sha256_value: str = "", program: str = "", target: str = "") -> dict:
+    """Register an analysed project in place. Fast and synchronous: nothing is imported or copied."""
+    from rusticre import hydra
+    from rusticre.backends import resolved
+    ready = resolved(settings)
+    return targets.adopt(ready, hydra.Engine(ready), path, exe=exe, expected=sha256_value, program=program, target=target)

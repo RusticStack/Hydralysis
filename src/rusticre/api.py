@@ -8,7 +8,6 @@ from pathlib import Path
 from rusticre import __version__
 from rusticre.config import evidence_path, load
 from rusticre.evidence import add_claim, list_claims
-from rusticre.ghidra import GhidraRunner
 from rusticre.pe import Image, parse_rva
 from rusticre.prologue import compare
 from rusticre.query import QueryRunner
@@ -107,25 +106,26 @@ def tool_table() -> list[dict]:
             "note": string, "source": string, "address": string, "prologue": string, "db": string,
         }, ["target", "build", "kind", "name", "note", "source"]),
         tool("evidence_list", "List stored claims, newest first.", {"target": string, "limit": integer, "db": string}),
-        tool("ghidra_run", "Run one Ghidra script on a read-only copy of an already analysed project. Does not re-import the binary.", {
+        tool("ghidra_run", "Run one of your Ghidra scripts on a target's saved analysis, contained (rolled back). No import, no copy.", {
             "target": string, "script": string,
             "args": {"type": "array", "items": string},
-            "timeout_s": integer, "lane": string,
+            "timeout_s": integer,
         }, ["target", "script"]),
-        tool("ghidra_query", "Query saved analysis in a reusable read-only JVM. Numeric VA/rva:/va: addresses; bounded pages via next_cursor. export starts a durable file job. Use backend help for options.", {
+        tool("ghidra_query", "Query saved analysis through the shared warm engine. Numeric VA/rva:/va: addresses; bounded pages via next_cursor. export starts a durable file job. Use backend help for options.", {
             "target": string,
             "action": {"type": "string", "enum": ["decompile", "function", "functions", "xrefs", "types", "type", "data", "scan", "variables", "dossier", "blocks", "pcode", "trace", "type_edit", "export", "status", "stop"]},
             "address": string, "limit": integer, "cursor": string, "contains": string, "timeout_s": integer,
             "options": {"type": "object"},
         }, ["target"]),
-        tool("backend", "Discover/install private analysis or runtime engines, never other MCPs. install returns a durable job. help gives operation options.", {
-            "action": {"type": "string", "enum": ["inspect", "install", "help"]},
+        tool("backend", "Discover/install private analysis or runtime engines, never other MCPs. install returns a durable job. status/stop the shared engine. help gives operation options.", {
+            "action": {"type": "string", "enum": ["inspect", "install", "status", "stop", "help"]},
             "component": {"type": "string", "enum": ["analysis", "runtime"]},
         }),
-        tool("prepare", "Explicitly import and analyse an owned executable once, then register its build for read-only queries. Returns a durable job immediately; identical builds reuse analysis.", {
+        tool("prepare", "Register a build: adopt an analysed project in place (path=.gpr or folder; hash-checked, no copy), or start a one-time import/analysis job. plan is read-only.", {
             "exe": string, "target": string, "timeout_s": integer, "install": {"type": "boolean"},
-            "action": {"type": "string", "enum": ["plan", "start"]},
-        }, ["exe"]),
+            "action": {"type": "string", "enum": ["plan", "start", "adopt"]},
+            "path": string, "sha256": string, "program": string,
+        }),
         tool("job", "Durable setup/analysis job status, bounded logs or cancellation. An empty id lists recent jobs.", {
             "action": {"type": "string", "enum": ["status", "cancel"]}, "id": string, "limit": integer,
         }),
@@ -247,17 +247,14 @@ def call(name: str, args: dict | None) -> str:
             args.get("options"),
         )
     if name == "ghidra_run":
-        return _ghidra().run(
-            target,
-            str(args.get("script") or ""),
-            [str(item) for item in _list(args.get("args"))],
-            int(args.get("timeout_s") or 600),
-            str(args.get("lane") or ""),
-        )
+        from rusticre.userscripts import run
+        return run(_settings(), target, str(args.get("script") or ""),
+                   [str(item) for item in _list(args.get("args"))], int(args.get("timeout_s") or 600))
     if name == "ghidra_scripts":
-        return _ghidra().list_scripts(target, str(args.get("filter") or ""))
+        from rusticre.userscripts import list_scripts
+        return list_scripts(load(), target, str(args.get("filter") or ""))
     if name == "ghidra_jobs":
-        return _ghidra().jobs(int(args.get("limit") or 10))
+        return _workflow("job", {"limit": int(args.get("limit") or 20)})
     raise ValueError("unknown tool %s" % name)
 
 
@@ -291,18 +288,42 @@ def _workflow(name: str, args: dict) -> str:
         if action == "install":
             from rusticre.preparation import start_install
             return json.dumps(start_install(settings, component), indent=2)
+        if action in ("status", "stop"):
+            if component != "analysis":
+                raise ValueError("status/stop apply to the shared analysis engine")
+            from rusticre import hydra
+            engine = hydra.Engine(_settings())
+            if action == "stop":
+                return json.dumps(engine.stop(force=bool(args.get("force"))), indent=2)
+            status = engine.call("status")
+            keep = ("protocol", "hydraVersion", "ghidraVersion", "installId", "pid", "startedAt", "memory", "youAre")
+            summary = {key: status.get(key) for key in keep if key in status}
+            summary["projects"] = [{key: item.get(key) for key in ("id", "name", "gpr", "writable", "revision", "stale", "users")}
+                                   for item in status.get("projects", [])][:20]
+            summary["programs"] = [{key: item.get(key) for key in ("key", "mode", "owner", "users", "busy")}
+                                   for item in status.get("programs", [])][:40]
+            summary["clients"] = [{key: item.get(key) for key in ("id", "name", "harness")}
+                                  for item in status.get("clients", [])][:40]
+            summary["imports"] = status.get("imports")
+            return json.dumps(summary, indent=2, default=str)
         if action != "inspect":
-            raise ValueError("backend action must be inspect, install or help")
+            raise ValueError("backend action must be inspect, install, status, stop or help")
         if component == "runtime":
             from rusticre.runtime import inspect
         else:
             from rusticre.backends import inspect
         return json.dumps(inspect(settings), indent=2)
     if name == "prepare":
-        from rusticre.preparation import plan, prepare
+        from rusticre.preparation import adopt, plan, prepare
         action = args.get("action", "start")
-        if action not in ("plan", "start"):
-            raise ValueError("prepare action must be plan or start")
+        if action not in ("plan", "start", "adopt"):
+            raise ValueError("prepare action must be plan, start or adopt")
+        if action == "adopt":
+            return json.dumps(adopt(settings, str(args.get("path") or ""), str(args.get("exe") or ""),
+                                    str(args.get("sha256") or ""), str(args.get("program") or ""),
+                                    str(args.get("target") or "")), indent=2)
+        if not args.get("exe"):
+            raise ValueError("prepare %s requires exe" % action)
         install = args.get("install", False)
         if not isinstance(install, bool):
             raise ValueError("install must be a boolean")
@@ -401,16 +422,6 @@ def _list(value) -> list:
     return list(value)
 
 
-def _ghidra() -> GhidraRunner:
-    return GhidraRunner(_settings())
-
-
 def _settings() -> dict:
-    settings = load()
-    from rusticre.backends import inspect
-    report = inspect(settings)
-    if not report["ready"]:
-        raise ValueError("compatible analysis engines unavailable; run backend inspect, then backend install. "
-                         "Queries never install or import implicitly. Details: %s" % json.dumps(report))
-    return {**settings, "root": report["root"], "ghidra_dir": report["ghidra"]["path"],
-            "java_home": report["jdk"]["path"]}
+    from rusticre.backends import resolved
+    return resolved(load())

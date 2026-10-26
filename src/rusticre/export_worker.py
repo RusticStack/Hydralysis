@@ -11,13 +11,13 @@ import sys
 import time
 from pathlib import Path
 
-from rusticre.analysis import load_overlays
+from rusticre import targets, workcopy
 from rusticre.backends import read_json, write_json
-from rusticre.exporting import MAX_OUTPUT_BYTES, MAX_ROW_BYTES, code_sha256, provenance, update
-from rusticre.ghidra import LaneLock
+from rusticre.exporting import MAX_OUTPUT_BYTES, MAX_ROW_BYTES, code_sha256, master_revision, provenance, update
+from rusticre.locks import LaneLock
 from rusticre.pe import Image
 from rusticre.preparation import process_start_ms
-from rusticre.query import QueryRunner, _source_stamp
+from rusticre.query import QueryRunner
 
 
 class Paused(RuntimeError):
@@ -25,9 +25,11 @@ class Paused(RuntimeError):
 
 
 def output_path(path: Path, record: dict) -> Path:
-    expected = path.parent / (record["options"]["mode"] + ".jsonl")
+    """The job's own file, or the caller's absolute path recorded when the job started."""
+    chosen = record["options"].get("out")
+    expected = Path(chosen) if chosen else path.parent / (record["options"]["mode"] + ".jsonl")
     if Path(record["output_path"]).resolve() != expected.resolve():
-        raise ValueError("export output path differs from the owned job path")
+        raise ValueError("export output path differs from the path recorded for this job")
     return expected
 
 
@@ -122,10 +124,10 @@ def frozen(record: dict):
     project = settings["targets"][target]
     if code_sha256() != identity["code_sha256"]:
         raise Paused("query/export implementation changed during export; old output preserved")
-    if _source_stamp(project) != identity["source_stat_sha256"]:
-        raise Paused("master project changed during export; old output preserved")
-    overlays = load_overlays(settings["root"], identity["query_key"], identity["sha256"])
-    if hashlib.sha256(json.dumps(overlays, sort_keys=True).encode()).hexdigest() != identity["overlay_sha256"]:
+    selected = targets.resolve(settings, target)
+    if master_revision(settings, selected) != identity["master_revision"]:
+        raise Paused("master project was saved during export; old output preserved")
+    if workcopy.expected_state(settings, selected) != identity["overlay_state"]:
         raise Paused("type overlays changed during export; old output preserved")
     if project.get("exe"):
         stat = Path(project["exe"]).stat()
@@ -271,7 +273,9 @@ def run(path: Path, generation: str, runner_factory=QueryRunner):
         query_project["sha256"] = record["provenance"]["sha256"]
         runner = runner_factory(query_settings)
         selected = record["options"]
-        cursor = str(record.get("cursor") or "")
+        cursor = str(record.get("cursor") or selected.get("start") or "")
+        pattern = re.compile(selected["regex"]) if selected.get("regex") else None
+        end = int(selected["end"], 16) if selected.get("end") else None
         output = output_path(path, record)
         exhausted = False
         with output.open("a", encoding="utf-8", newline="\n") as handle:
@@ -286,6 +290,14 @@ def run(path: Path, generation: str, runner_factory=QueryRunner):
                 items = page.get("types" if page_action == "types" else "functions")
                 if not isinstance(items, list):
                     raise Paused("query returned no enumeration rows")
+                if end is not None and page_action == "functions":
+                    beyond = [item for item in items if int(str(item.get("address", "0")), 16) > end]
+                    if beyond:
+                        items = [item for item in items if item not in beyond]
+                        page = {**page, "truncated": False}
+                if pattern is not None:
+                    items = [item for item in items
+                             if pattern.search(str(item.get("path") if selected["mode"] == "types" else item.get("name") or ""))]
                 for item in items:
                     key = str(item.get("path") if selected["mode"] == "types" else item.get("address") or "")
                     if not key:

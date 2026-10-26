@@ -56,7 +56,13 @@ class ExportTests(unittest.TestCase):
         exe = self.root / "owned.exe"
         exe.write_bytes(b"a tiny test owned executable")
         self.project = {"dir": str(master), "name": "owned", "program": "owned.exe", "exe": str(exe)}
-        self.settings = {"root": str(self.root / "root"), "ghidra_dir": str(self.root / "ghidra"), "targets": {"fixture": self.project}}
+        self.settings = {"root": str(self.root / "root"), "hydra_dir": str(self.root / "hydra"), "targets": {"fixture": self.project}}
+        # The engine computes the master's revision; a save there changes it.
+        self.revision = "rev-1"
+        for name in ("rusticre.exporting.master_revision", "rusticre.export_worker.master_revision"):
+            patcher = patch(name, side_effect=lambda settings, selected: self.revision)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def make(self, **options):
         with patch("rusticre.exporting._launch", side_effect=lambda path, record, settings: record):
@@ -145,6 +151,26 @@ class ExportTests(unittest.TestCase):
         decompiled = [options["address"] for action, options in runner.calls if action == "decompile"]
         self.assertEqual(decompiled, ["0x401010"])
 
+    def test_caller_chosen_output_path(self):
+        chosen = self.root / "chosen" / "functions.jsonl"
+        chosen.parent.mkdir()
+        path = self.make(out=str(chosen))
+        record, _ = self.run_job(path)
+        self.assertEqual(record["state"], "done")
+        self.assertEqual(len(chosen.read_text().splitlines()), 2)
+        with self.assertRaisesRegex(ValueError, "absolute"):
+            exporting.normalized({"out": "relative.jsonl"})
+
+    def test_regex_and_address_range_filters(self):
+        record, runner = self.run_job(self.make(regex="^sec"))
+        self.assertEqual([row["key"] for row in self.rows(exporting.job_path(self.settings, record["id"]))], ["0x401010"])
+        record, runner = self.run_job(self.make(start="0x401000", end="0x401008"))
+        self.assertEqual([row["key"] for row in self.rows(exporting.job_path(self.settings, record["id"]))], ["0x401000"])
+        self.assertTrue(record["complete"])
+        self.assertEqual(runner.calls[0][1]["cursor"], "0x401000")
+        with self.assertRaisesRegex(ValueError, "end precedes"):
+            exporting.normalized({"start": "0x2000", "end": "0x1000"})
+
     def test_cancel_is_observed_between_functions(self):
         path = self.make()
         actual_update = exporting.update
@@ -165,6 +191,7 @@ class ExportTests(unittest.TestCase):
         output = Path(record["output_path"])
         before = output.read_bytes()
         self.analysis.write_bytes(b"new saved analysis")
+        self.revision = "rev-2"
         with patch("rusticre.exporting._launch") as launch, self.assertRaisesRegex(ValueError, "changed"):
             exporting.start(self.settings, "fixture", {"resume": record["id"]})
         launch.assert_not_called()

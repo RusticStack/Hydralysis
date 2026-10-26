@@ -1,4 +1,9 @@
-"""Discover or privately install the engines RusticRE uses, never their MCPs."""
+"""Discover or privately install the engines RusticRE uses, never their MCPs.
+
+Analysis runs on Hydra Engine (pinned release, see hydra.py) with a full JDK.
+A stock Ghidra install is reported, not used: RusticRE no longer drives
+analyzeHeadless or copies projects into snapshots.
+"""
 
 from __future__ import annotations
 
@@ -15,20 +20,14 @@ import uuid
 import zipfile
 from pathlib import Path
 
-from rusticre.ghidra import LaneLock, headless_path
+from rusticre import hydra
 from rusticre.localio import read_text as local_read_text
+from rusticre.locks import LaneLock
 from rusticre.paths import root_path
 
-SUPPORTED_GHIDRA_VERSION = "12.1.4"
-
-# Official release-asset digests, observed 2026-10-24. No executable installer,
-# PATH edits, administrator operation, upstream bridge or upstream MCP package.
+# Official release-asset digests. No executable installer, PATH edits,
+# administrator operation, upstream bridge or upstream MCP package.
 ASSETS = {
-    "ghidra": {
-        "url": "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.1.4_build/ghidra_12.1.4_PUBLIC_20260921.zip",
-        "sha256": "ddac49f903da9d5bac833e5cc79395098b9c33cfd3279be5f31bd00387d2d4db",
-        "size": 569649598,
-    },
     "jdk": {
         "url": "https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.4.1%2B1/OpenJDK25U-jdk_x64_windows_hotspot_25.0.4.1_1.zip",
         "sha256": "00c847d804f4a78e9f04f2683faf14fed898535b177b7fc704486cb0284e9283",
@@ -88,35 +87,56 @@ def _native_compatible(path: Path) -> bool:
             handle.seek(int.from_bytes(header[60:64], "little"))
             signature = handle.read(6)
             return signature[:4] == b"PE\0\0" and signature[4:6] == b"\x64\x86"
-        return len(header) >= 20 and header[:5] == b"\x7fELF\x02" and header[18:20] == b"\x3e\x00"
+        if header[:4] == b"\xcf\xfa\xed\xfe":
+            return True  # Mach-O 64-bit
+        return len(header) >= 20 and header[:5] == b"\x7fELF\x02"
+
+
+def _engine_candidates(settings: dict, root: Path, saved: dict) -> list:
+    candidates = [settings.get("hydra_dir"), os.environ.get("RUSTICRE_HYDRA_DIR"), saved.get("hydra_dir")]
+    candidates += _children(root / "backends", "hydra-[0-9]*")
+    # An older config's ghidra_dir is still examined, so its report says what it is.
+    candidates += [settings.get("ghidra_dir"), os.environ.get("GHIDRA_INSTALL_DIR")]
+    return candidates
+
+
+def _client_candidates(settings: dict, root: Path, saved: dict, engine: str | None) -> list:
+    candidates = [settings.get("hydra_client"), saved.get("hydra_client"),
+                  root / "backends" / ("hydra-client-" + hydra.RELEASE) / "ghidra_session.py"]
+    if engine and settings.get("hydra_allow_unpinned"):
+        candidates.append(Path(engine) / hydra.SESSION_MODULE / "support" / "ghidra_session.py")
+    return candidates
 
 
 def inspect(settings: dict) -> dict:
     root = root_path(settings)
     saved = read_json(root / "backend.json")
-    ghidra_candidates = [settings.get("ghidra_dir"), os.environ.get("GHIDRA_INSTALL_DIR"), saved.get("ghidra_dir")]
-    ghidra_candidates += _children(root / "backends", "ghidra_*")
-    launcher = shutil.which("analyzeHeadless.bat" if os.name == "nt" else "analyzeHeadless")
-    if launcher:
-        ghidra_candidates.append(Path(launcher).resolve().parent.parent)
-    ghidra = None
-    checks = []
-    for candidate in ghidra_candidates:
+    allow = bool(settings.get("hydra_allow_unpinned"))
+    engine, checks, seen = None, [], set()
+    for candidate in _engine_candidates(settings, root, saved):
         if not candidate:
             continue
         path = Path(candidate).expanduser().resolve()
-        props = _properties(path / "Ghidra" / "application.properties")
-        version = props.get("application.version")
-        if version and version != SUPPORTED_GHIDRA_VERSION:
-            checks.append({"component": "ghidra", "path": str(path), "version": version, "ready": False,
-                           "reason": "unsupported Ghidra %s; this RusticRE build requires %s" % (version, SUPPORTED_GHIDRA_VERSION)})
+        if path in seen:
             continue
-        native = path / "Ghidra" / "Features" / "Decompiler" / "os" / ("win_x86_64" if os.name == "nt" else "linux_x86_64") / ("decompile.exe" if os.name == "nt" else "decompile")
-        if Path(headless_path(str(path))).is_file() and _native_compatible(native) and props.get("application.version"):
-            ghidra = {"path": str(path), "version": props["application.version"], "java_min": int(props.get("application.java.min") or 21),
-                      "java_max": int(props["application.java.max"]) if props.get("application.java.max") else None}
+        seen.add(path)
+        report = hydra.inspect_engine(path, allow)
+        if report["ready"]:
+            engine = report
             break
-        checks.append({"component": "ghidra", "path": str(path), "ready": False, "reason": "launcher, native decompiler or application properties missing"})
+        checks.append(report)
+    client = None
+    for candidate in _client_candidates(settings, root, saved, engine["path"] if engine else None):
+        if not candidate:
+            continue
+        path = Path(candidate).expanduser().resolve()
+        try:
+            hydra.load_client(path, allow)
+        except (ValueError, OSError) as exc:
+            checks.append({"component": "client", "path": str(path), "ready": False, "reason": str(exc)})
+            continue
+        client = {"path": str(path), "release": hydra.RELEASE}
+        break
     java_candidates = [settings.get("java_home"), os.environ.get("JAVA_HOME"), saved.get("java_home")]
     java_candidates += _children(root / "backends", "jdk*")
     javac = shutil.which("javac.exe" if os.name == "nt" else "javac")
@@ -125,8 +145,8 @@ def inspect(settings: dict) -> dict:
     if os.name == "nt":
         java_candidates += _children(Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Eclipse Adoptium", "jdk*")
     java = None
-    minimum = ghidra["java_min"] if ghidra else 21
-    maximum = ghidra["java_max"] if ghidra else None
+    minimum = engine["java_min"] if engine else 25
+    maximum = engine["java_max"] if engine else None
     for candidate in java_candidates:
         if not candidate:
             continue
@@ -135,13 +155,26 @@ def inspect(settings: dict) -> dict:
         match = re.match(r"(\d+)", release.get("JAVA_VERSION", ""))
         major = int(match.group(1)) if match else 0
         extension = ".exe" if os.name == "nt" else ""
-        if _native_compatible(path / "bin" / ("java" + extension)) and _native_compatible(path / "bin" / ("javac" + extension)) and major >= minimum and (maximum is None or major <= maximum):
+        if _native_compatible(path / "bin" / ("java" + extension)) and _native_compatible(path / "bin" / ("javac" + extension)) \
+                and major >= minimum and (maximum is None or major <= maximum):
             java = {"path": str(path), "version": release.get("JAVA_VERSION"), "major": major}
             break
-        checks.append({"component": "jdk", "path": str(path), "ready": False, "reason": "full JDK missing or outside installation's Java bounds"})
-    return {"root": str(root), "ready": bool(ghidra and java), "ghidra": ghidra, "jdk": java, "checks": checks,
-            "supported_ghidra_version": SUPPORTED_GHIDRA_VERSION,
+        checks.append({"component": "jdk", "path": str(path), "ready": False,
+                       "reason": "full JDK missing or outside the engine's Java bounds (%s+)" % minimum})
+    return {"root": str(root), "ready": bool(engine and client and java), "engine": engine, "client": client, "jdk": java,
+            "checks": checks[:12], "pinned_release": hydra.RELEASE, "protocol": hydra.PROTOCOL,
             "portable_install_supported": os.name == "nt" and platform.machine().lower() in ("amd64", "x86_64")}
+
+
+def resolved(settings: dict) -> dict:
+    """Settings with verified engine paths, or a clear error. Never installs."""
+    report = inspect(settings)
+    if not report["ready"]:
+        missing = [name for name in ("engine", "client", "jdk") if not report[name]]
+        raise ValueError("analysis engine unavailable (%s missing); run backend inspect, then backend install. "
+                         "Queries never install or import implicitly. Details: %s" % (", ".join(missing), json.dumps(report)))
+    return {**settings, "root": report["root"], "hydra_dir": report["engine"]["path"],
+            "hydra_client": report["client"]["path"], "java_home": report["jdk"]["path"]}
 
 
 def _download(asset: dict, directory: Path, cancelled=lambda: False) -> Path:
@@ -200,6 +233,7 @@ def _extract(archive: Path, directory: Path, cancelled=lambda: False) -> Path:
     if destination.exists():
         raise ValueError("refusing to replace existing backend directory: %s" % destination)
     extracted.rename(destination)
+    temporary.rmdir()
     return destination
 
 
@@ -213,22 +247,27 @@ def ensure(settings: dict, install: bool = False, cancelled=lambda: False) -> di
     try:
         if not report["ready"]:
             if not install:
-                raise ValueError("Ghidra and a compatible full JDK are required; run backend install or prepare with install enabled")
+                raise ValueError("Hydra Engine %s, its client and a full JDK 25+ are required; run backend install"
+                                 % hydra.RELEASE)
             if not report["portable_install_supported"]:
-                raise ValueError("portable backend installation currently supports Windows x64; configure existing Ghidra/JDK paths on this host")
-            for component, key in (("ghidra", "ghidra_dir"), ("jdk", "java_home")):
-                if report[component]:
-                    continue
+                raise ValueError("portable installation supports Windows x64 (the only released Hydra build); "
+                                 "configure hydra_dir, hydra_client and java_home on this host")
+            if not (report["engine"] and report["client"]):
                 if cancelled():
                     raise InterruptedError("backend setup cancelled")
-                archive = _download(ASSETS[component], root / "downloads", cancelled)
-                path = _extract(archive, root / "backends", cancelled)
-                settings = {**settings, key: str(path)}
+                settings = {**settings, **hydra.install(settings, _download, _extract, cancelled)}
+                report = inspect(settings)
+            if not report["jdk"]:
+                if cancelled():
+                    raise InterruptedError("backend setup cancelled")
+                archive = _download(ASSETS["jdk"], root / "downloads", cancelled)
+                settings = {**settings, "java_home": str(_extract(archive, root / "backends", cancelled))}
                 report = inspect(settings)
             if not report["ready"]:
                 raise ValueError("installed backends did not satisfy validation: %s" % report)
-        result = {**settings, "root": str(root), "ghidra_dir": report["ghidra"]["path"], "java_home": report["jdk"]["path"]}
-        write_json(root / "backend.json", {key: result[key] for key in ("ghidra_dir", "java_home")})
+        result = {**settings, "root": str(root), "hydra_dir": report["engine"]["path"],
+                  "hydra_client": report["client"]["path"], "java_home": report["jdk"]["path"]}
+        write_json(root / "backend.json", {key: result[key] for key in ("hydra_dir", "hydra_client", "java_home")})
         return result
     finally:
         lock.release()

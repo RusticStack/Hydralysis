@@ -46,20 +46,21 @@ class AgentContracts(unittest.TestCase):
             image.assert_not_called()
 
     def test_discovered_backend_replaces_stale_config_without_installing(self):
-        configured = {"root": "data", "ghidra_dir": "obsolete", "java_home": "obsolete-jdk", "targets": {"owned": {}}}
-        report = {"ready": True, "root": "resolved-data", "ghidra": {"path": "verified-engine"},
-                  "jdk": {"path": "verified-jdk"}}
+        configured = {"root": "data", "hydra_dir": "obsolete", "java_home": "obsolete-jdk", "targets": {"owned": {}}}
+        report = {"ready": True, "root": "resolved-data", "engine": {"path": "verified-engine"},
+                  "client": {"path": "verified-client"}, "jdk": {"path": "verified-jdk"}}
         with patch("rusticre.api.load", return_value=configured), \
                 patch("rusticre.backends.inspect", return_value=report), patch("rusticre.backends.ensure") as install:
             selected = _settings()
-        self.assertEqual(selected["ghidra_dir"], "verified-engine")
+        self.assertEqual(selected["hydra_dir"], "verified-engine")
+        self.assertEqual(selected["hydra_client"], "verified-client")
         self.assertEqual(selected["java_home"], "verified-jdk")
         self.assertEqual(selected["targets"], configured["targets"])
         install.assert_not_called()
 
     def test_missing_engines_report_setup_without_installing_implicitly(self):
         with patch("rusticre.api.load", return_value={}), \
-                patch("rusticre.backends.inspect", return_value={"ready": False}), \
+                patch("rusticre.backends.inspect", return_value={"ready": False, "engine": None, "client": None, "jdk": None}), \
                 patch("rusticre.backends.ensure") as install:
             with self.assertRaisesRegex(ValueError, "backend install"):
                 _settings()
@@ -104,12 +105,12 @@ class AgentContracts(unittest.TestCase):
             root = Path(folder)
             config = root / "local.json"
             config.write_text(json.dumps({"targets": {"manual": {"program": "manual.exe"}}}))
-            (root / "backend.json").write_text(json.dumps({"ghidra_dir": "installed-engine", "java_home": "installed-jdk"}))
+            (root / "backend.json").write_text(json.dumps({"hydra_dir": "installed-engine", "java_home": "installed-jdk"}))
             (root / "targets.json").write_text(json.dumps({"targets": {"prepared": {"program": "prepared.exe"}}}))
             with patch.dict(os.environ, {"RUSTICRE_ROOT": str(root), "RUSTICRE_CONFIG": str(config)}):
                 settings = load()
             self.assertEqual(set(settings["targets"]), {"prepared", "manual"})
-            self.assertEqual(settings["ghidra_dir"], "installed-engine")
+            self.assertEqual(settings["hydra_dir"], "installed-engine")
 
     def test_example_config_is_never_loaded_as_a_live_target(self):
         from rusticre.config import config_path
