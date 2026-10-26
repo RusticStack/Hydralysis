@@ -244,13 +244,18 @@ def _checks_file(filename: str, offset_kind: str | None) -> dict:
         if not isinstance(offset, str):
             raise ValueError("offset must be a number or address string")
         if not offset.startswith(("rva:", "va:")):
-            if not offset_kind:
-                raise ValueError("legacy offsets need --offset-kind rva or va")
-            offset = offset_kind + ":" + offset
+            kind = offset_kind
+            if not kind and "image_base" in envelope:
+                # An offset below the declared image base cannot be a VA of that image.
+                kind = "rva" if int(offset, 0) < int(str(envelope["image_base"]), 0) else "va"
+            if not kind:
+                raise ValueError("legacy offsets need --offset-kind rva or va (or an envelope image_base)")
+            offset = kind + ":" + offset
         names = row.get("names", row.get("name", ""))
         if isinstance(names, list) and all(isinstance(name, str) for name in names):
             names = ", ".join(names)
-        normalized.append({"address": offset, "expect": row.get("prologue"), "name": names})
+        expect = row.get("prologues") or row.get("prologue") or row.get("expect")
+        normalized.append({"address": offset, "expect": expect, "name": names})
     payload = {"checks": normalized}
     if "build_sha256" in envelope:
         payload["sha256"] = envelope["build_sha256"]

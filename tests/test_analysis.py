@@ -22,7 +22,7 @@ class AdvancedBudgets(unittest.TestCase):
         self.assertEqual(validate_options("data", {"table": True}), {"table": True})
         self.assertEqual(validate_options("scan", {"end": "0x401100", "mnemonic": "call", "operand": "rax"})["mnemonic"], "call")
         for action, options in (("decompile", {"max_characters": 2097153}), ("data", {"table": "true"}),
-                                ("scan", {"end": "rva:0x1000"}), ("scan", {"regex": ".*"})):
+                                ("scan", {"end": "rva:0x1000"}), ("scan", {"regex": "("}), ("scan", {"regex": "x" * 257})):
             with self.subTest(action=action, options=options), self.assertRaises(ValueError):
                 validate_options(action, options)
 

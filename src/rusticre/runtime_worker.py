@@ -150,6 +150,25 @@ def _same_path(a: str, b: str) -> bool:
     return os.path.normcase(str(Path(a).resolve())) == os.path.normcase(str(Path(b).resolve()))
 
 
+def decode_detour(data: bytes, address: int) -> dict | None:
+    """The jump a hooking library writes over a function's first bytes, if it is one."""
+    if len(data) >= 5 and data[0] == 0xE9:
+        return {"kind": "jmp rel32", "length": 5, "target": address + 5 + int.from_bytes(data[1:5], "little", signed=True)}
+    if len(data) >= 14 and data[:6] == bytes.fromhex("ff2500000000"):
+        return {"kind": "jmp [rip+0] abs64", "length": 14, "target": int.from_bytes(data[6:14], "little")}
+    if len(data) >= 12 and data[:2] == bytes.fromhex("48b8") and data[10:12] == bytes.fromhex("ffe0"):
+        return {"kind": "mov rax, imm64; jmp rax", "length": 12, "target": int.from_bytes(data[2:10], "little")}
+    if len(data) >= 13 and data[:2] == bytes.fromhex("49bb") and data[10:13] == bytes.fromhex("41ffe3"):
+        return {"kind": "mov r11, imm64; jmp r11", "length": 13, "target": int.from_bytes(data[2:10], "little")}
+    return None
+
+
+def file_bytes(path: str, rva: int, size: int) -> bytes:
+    """What the module's file on disk holds at an RVA: the original, whatever is patched live."""
+    from rusticre.pe import Image
+    return Image(Path(path)).read_rva(rva, size)
+
+
 def _expect(text: str) -> list[int]:
     words = str(text).split()
     if not 5 <= len(words) <= 64 or any(not re.fullmatch("[0-9A-Fa-f]{2}", word) for word in words):
@@ -318,6 +337,50 @@ class RuntimeAgent:
                              "(for the main executable, the same hash as spawn/attach)")
         return module, rva, hex(int(module["base"], 16) + rva)
 
+    def _patcher(self, address: int) -> dict | None:
+        """Follow a live detour (through a relay page if needed) to the module that installed it."""
+        data = bytes(self.control.exports_sync.read(hex(address), 16))
+        detour = decode_detour(data, address)
+        hops = []
+        for _ in range(3):
+            if detour is None:
+                break
+            located = self.control.exports_sync.locate(hex(detour["target"]))
+            hop = {**detour, "target": hex(detour["target"]), "module": (located.get("module") or {}).get("name"),
+                   "module_path": (located.get("module") or {}).get("path")}
+            if located.get("module"):
+                hop["target_rva"] = hex(detour["target"] - int(located["module"]["base"], 16))
+            hops.append(hop)
+            if located.get("module") or not located.get("range"):
+                break
+            # A trampoline relay outside any module (MinHook-style): read where it jumps.
+            detour = decode_detour(bytes(self.control.exports_sync.read(hex(detour["target"]), 16)), detour["target"])
+        if not hops:
+            return None
+        return {"jump": hops[0]["kind"], "hops": hops, "patcher_module": hops[-1].get("module"),
+                "patcher_path": hops[-1].get("module_path"), "detour": hops[-1]["target"]}
+
+    def patches(self, args: dict) -> dict:
+        rows = args.get("rows")
+        if not isinstance(rows, list) or not 1 <= len(rows) <= 200:
+            raise ValueError("patches needs rows=[{module, rva, size?}], 1..200")
+        results, patched = [], 0
+        for row in rows:
+            module, rva, address = self._site({**row, "sha256": row.get("sha256", args.get("sha256"))})
+            size = int(row.get("size", 16))
+            if not 1 <= size <= 64 or rva + size > module["size"]:
+                raise ValueError("patch check size must be 1..64 bytes inside the module")
+            live = bytes(self.control.exports_sync.read(address, size))
+            original = file_bytes(module["path"], rva, size)
+            item = {"name": row.get("name", ""), "module": module["name"], "rva": hex(rva), "address": address,
+                    "file_bytes": original.hex(" ").upper(), "live_bytes": live.hex(" ").upper(), "patched": live != original}
+            if item["patched"]:
+                patched += 1
+                item["patch"] = self._patcher(int(address, 16))
+            results.append(item)
+        return {"rows": results, "checked": len(results), "patched": patched,
+                "provenance": "file bytes from the module's file on disk; live bytes read now; detours decoded, not executed"}
+
     def _continue(self, hook_id: str):
         entry = self.scripts.get(hook_id)
         if entry is not None:
@@ -409,8 +472,20 @@ class RuntimeAgent:
             if rva + len(expected) > module["size"]:
                 raise ValueError("expected bytes extend outside selected module")
             actual = self.control.exports_sync.read(address, len(expected))
+            patch = None
             if list(actual) != expected:
-                raise ValueError("PROLOGUE MISMATCH; hook refused: got " + " ".join("%02X" % x for x in actual))
+                patch = self._patcher(int(address, 16))
+                # accept_patch: expect is the original prologue; the live bytes may differ only by a
+                # detour another tool wrote, and the module's file must still hold expect exactly.
+                if not args.get("accept_patch") or patch is None:
+                    raise ValueError("PROLOGUE MISMATCH; hook refused: got " + " ".join("%02X" % x for x in actual)
+                                     + ("; live detour %s to %s (%s); pass accept_patch=true with the original prologue to probe past it"
+                                        % (patch["jump"], patch["detour"], patch["patcher_module"] or "no module") if patch else ""))
+                original = list(file_bytes(module["path"], rva, len(expected)))
+                if original != expected:
+                    raise ValueError("accept_patch needs expect to be the module file's original prologue; the file holds "
+                                     + " ".join("%02X" % x for x in original))
+                expected = list(actual)
             limit = int(args.get("limit", 20))
             if not 1 <= limit <= 200:
                 raise ValueError("probe limit must be 1..200")
@@ -418,7 +493,10 @@ class RuntimeAgent:
             source = _probe_source(module, rva, expected, hook_id, limit, action == "break")
             handle = self._load(hook_id, source, {"kind": action, "module": module, "rva": hex(rva), "expected_bytes": expected})
             return {"hook_id": hook_id, "verified": True, "module": module, "rva": hex(rva),
-                    "address": address, "script_sha256": handle["source_sha256"], "pause_deadline_s": 30 if action == "break" else None}
+                    "address": address, "script_sha256": handle["source_sha256"], "pause_deadline_s": 30 if action == "break" else None,
+                    **({"past_patch": patch} if patch else {})}
+        if action == "patches":
+            return self.patches(args)
         if action == "unload":
             script_id = str(args.get("script_id") or args.get("hook_id") or "")
             if script_id not in self.scripts:

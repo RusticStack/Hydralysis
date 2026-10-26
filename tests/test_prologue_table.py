@@ -54,6 +54,29 @@ class PrologueTables(unittest.TestCase):
         self.assertEqual(result["summary"], {"checked": 3, "matched": 2, "failed": 1})
         self.assertEqual(result["rows"][1]["actual"], "90")
 
+    def test_a_row_may_accept_several_prologues_and_names_the_one_that_matched(self):
+        image = fixture_image()
+        result = compare_table(image, [{"address": "x", "expect": ["48 8B", "90 90"]},
+                                       {"address": "x", "expect": ["48", "49"]}], lambda value: 0x1000)
+        self.assertEqual([row["match"] for row in result["rows"]], [True, False])
+        self.assertEqual(result["rows"][0]["matched_alternative"], 1)
+        self.assertIsNone(result["rows"][1]["matched_alternative"])
+        with self.assertRaises(ValueError):
+            compare_table(image, [{"address": "x", "expect": []}], lambda value: 0x1000)
+
+    def test_envelope_image_base_makes_legacy_offsets_unambiguous(self):
+        import json
+        from rusticre.cli import _checks_file
+        from support import workdir
+        with workdir() as folder:
+            path = __import__("pathlib").Path(folder) / "table.json"
+            path.write_text(json.dumps({"image_base": "0x140000000", "build_sha256": "a" * 64,
+                                        "hooks": [{"offset": "0x43cf20", "prologue": "48 8B", "names": ["router"]},
+                                                  {"offset": "0x14043cf20", "prologues": ["48", "49"]}]}))
+            rows = _checks_file(str(path), None)["checks"]
+        self.assertEqual([row["address"] for row in rows], ["rva:0x43cf20", "va:0x14043cf20"])
+        self.assertEqual(rows[1]["expect"], ["48", "49"])
+
     def test_all_rows_validate_before_any_bytes_are_read(self):
         for bad in ({"address": "x", "expect": "??"},
                     {"address": "x", "expect": "90", "guess": True},

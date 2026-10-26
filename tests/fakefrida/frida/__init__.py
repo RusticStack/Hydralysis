@@ -112,8 +112,23 @@ class Session:
         return {"name": Path(path).name, "path": path, "base": hex(BASE), "size": Path(path).stat().st_size}
 
     def read(self, address: int, size: int) -> list[int]:
-        data = Path(self.exe).read_bytes()[address - BASE:address - BASE + size]
-        return list(data.ljust(size, b"\0"))
+        # The module as loaded: RVAs map through the PE section table, like the real loader.
+        from rusticre.pe import Image
+        rva = address - BASE
+        try:
+            chunk = bytearray(Image(Path(self.exe)).read_rva(rva, size))
+        except Exception:
+            chunk = bytearray(Path(self.exe).read_bytes()[rva:rva + size])
+        # RUSTICRE_FAKE_PATCH="0x1000=E9 FB FF FF FF": a detour another tool wrote, live only (RVA).
+        patch = os.environ.get("RUSTICRE_FAKE_PATCH", "")
+        if patch:
+            offset, text = patch.split("=", 1)
+            data = bytes.fromhex(text)
+            for index, value in enumerate(data):
+                position = int(offset, 16) + index - rva
+                if 0 <= position < len(chunk):
+                    chunk[position] = value
+        return list(bytes(chunk).ljust(size, b"\0"))
 
     def on(self, event, callback):
         self.callbacks.append(callback)

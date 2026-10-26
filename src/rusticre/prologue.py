@@ -36,9 +36,11 @@ def parse_expect(text: str) -> list[int | None]:
 def compare_table(image, rows: list[dict], resolve_address) -> dict:
     """Verify bounded rows against one already-open PE; never modify its bytes.
 
-    The address resolver shares the caller's RVA/VA policy. Validate the entire
-    request before reading any prologue, so a malformed last row cannot produce
-    a misleading partial verification result.
+    `expect` is one prologue or a list of accepted alternatives (a table that knows
+    several prologues for one function); a row matches when any alternative does, and
+    the result names which. The address resolver shares the caller's RVA/VA policy.
+    Validate the entire request before reading any prologue, so a malformed last row
+    cannot produce a misleading partial verification result.
     """
     if not isinstance(rows, list) or not 1 <= len(rows) <= 200:
         raise ValueError("prologue table needs 1..200 rows")
@@ -50,33 +52,37 @@ def compare_table(image, rows: list[dict], resolve_address) -> dict:
         address, expect, name = row.get("address"), row.get("expect"), row.get("name", "")
         if not isinstance(address, str) or not address.strip() or len(address) > 128:
             raise ValueError("prologue row %d needs an address string" % index)
-        if not isinstance(expect, str) or len(expect) > 32768:
-            raise ValueError("prologue row %d needs a bounded expect string" % index)
+        alternatives = expect if isinstance(expect, list) else [expect]
+        if not 1 <= len(alternatives) <= 16 or any(not isinstance(item, str) or len(item) > 32768 for item in alternatives):
+            raise ValueError("prologue row %d needs an expect string or a list of 1..16 accepted alternatives" % index)
         if not isinstance(name, str) or len(name) > 256:
             raise ValueError("prologue row %d name must be at most 256 characters" % index)
-        pattern = parse_expect(expect)
-        if len(pattern) > 4096:
+        patterns = [parse_expect(item) for item in alternatives]
+        if max(len(pattern) for pattern in patterns) > 4096:
             raise ValueError("prologue row %d exceeds 4096 bytes" % index)
-        total += len(pattern)
+        total += sum(len(pattern) for pattern in patterns)
         if total > 65536:
             raise ValueError("prologue table exceeds 65536 total bytes")
         rva = resolve_address(address)
         if not isinstance(rva, int) or isinstance(rva, bool) or rva < 0:
             raise ValueError("prologue row %d resolved to an invalid RVA" % index)
-        if image.rva_to_offset(rva) is None or len(pattern) > image._available(rva):
+        if image.rva_to_offset(rva) is None or max(len(pattern) for pattern in patterns) > image._available(rva):
             raise ValueError("prologue row %d is outside a file-backed section" % index)
-        prepared.append((name, address, rva, pattern))
+        prepared.append((name, address, rva, patterns))
     fingerprint = image.fingerprint()
     results = []
     matched = 0
-    for name, address, rva, pattern in prepared:
-        actual = image.read_rva(rva, len(pattern))
-        match = matches(actual, pattern)
-        matched += int(match)
-        results.append({"name": name, "input_address": address,
-                        "rva": "rva:%#x" % rva, "va": "va:%#x" % (image.base + rva),
-                        "expect": " ".join("??" if value is None else "%02X" % value for value in pattern),
-                        "actual": format_bytes(actual), "match": match})
+    for name, address, rva, patterns in prepared:
+        actual = image.read_rva(rva, max(len(pattern) for pattern in patterns))
+        which = next((index for index, pattern in enumerate(patterns) if matches(actual, pattern)), None)
+        matched += int(which is not None)
+        row = {"name": name, "input_address": address, "rva": "rva:%#x" % rva, "va": "va:%#x" % (image.base + rva),
+               "expect": [" ".join("??" if value is None else "%02X" % value for value in pattern) for pattern in patterns]
+               if len(patterns) > 1 else " ".join("??" if value is None else "%02X" % value for value in patterns[0]),
+               "actual": format_bytes(actual), "match": which is not None}
+        if len(patterns) > 1:
+            row["matched_alternative"] = which
+        results.append(row)
     return {"fingerprint": fingerprint, "rows": results,
             "summary": {"checked": len(results), "matched": matched, "failed": len(results) - matched},
             "matched": matched == len(results)}

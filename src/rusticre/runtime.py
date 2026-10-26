@@ -24,7 +24,7 @@ from rusticre.localio import read_text as local_read_text
 from rusticre.runtime_ipc import request as ipc_request
 
 FRIDA_VERSION = "17.24.3"
-ACTION_NAMES = ("setup", "processes", "spawn", "attach", "status", "modules", "threads", "read",
+ACTION_NAMES = ("setup", "processes", "spawn", "attach", "status", "modules", "threads", "read", "patches",
                 "observe", "break", "continue", "unload", "resume", "detach")
 
 
@@ -86,7 +86,13 @@ def _environment(settings: dict, create: bool = True) -> dict:
     env["RUSTICRE_TARGET_ENV_RESTORE"] = json.dumps({key: os.environ.get(key) for key in WORKER_ONLY})
     env["TEMP"] = env["TMP"] = env["TMPDIR"] = str(temp)
     package_root = str(Path(__file__).resolve().parent.parent)
-    env["PYTHONPATH"] = os.pathsep.join([str(site), package_root])
+    # The worker ignores the user site (so no other frida shadows the pinned one), but it
+    # needs RusticRE's own dependencies from wherever this process found them.
+    import capstone
+    import pefile
+    dependencies = sorted({str(Path(module.__file__).resolve().parent.parent) if module.__name__ == "capstone"
+                           else str(Path(module.__file__).resolve().parent) for module in (capstone, pefile)})
+    env["PYTHONPATH"] = os.pathsep.join([str(site), package_root, *dependencies])
     env["PYTHONNOUSERSITE"] = "1"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env

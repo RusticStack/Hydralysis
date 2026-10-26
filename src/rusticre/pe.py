@@ -378,10 +378,15 @@ class Image:
         This is the local stand-in for REA's function dossier. It does not
         start Ghidra. Ask ghidra_run when you need decompiler text.
         """
+        # Two different claims, kept apart: E8/E9 byte matches (call candidates, boundaries
+        # unverified) and references to the address from instruction operands (data refs).
         return "\n".join((
             self.function_of(rva) if self._bounds(rva) else self.header() + "\nno pdata function contains rva:%#x; use ghidra_query action=function for analysed bounds" % rva,
             self.disasm(rva, 16),
-            self.callers(rva, 12),
+            "--- call candidates ---",
+            _body(self.callers(rva, 12)),
+            "--- data references ---",
+            _body(self.xrefs(rva, 12)),
         ))
 
     def _bounds(self, rva: int) -> tuple[int, int] | None:
@@ -485,3 +490,8 @@ def parse_rva(text: str, image_base: int = 0x140000000) -> int:
     if value >= image_base:
         return value - image_base
     return value
+
+
+def _body(text: str) -> str:
+    """A section of a combined answer, without the repeated image header."""
+    return chr(10).join(line for line in text.splitlines() if not line.startswith("#"))

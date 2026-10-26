@@ -27,8 +27,8 @@ BUDGET_S = 10
 
 
 class Server:
-    def __init__(self, root: Path):
-        env = dict(os.environ, RUSTICRE_ROOT=str(root), PYTHONPATH=str(REPOSITORY / "src"))
+    def __init__(self, root: Path, **extra):
+        env = dict(os.environ, RUSTICRE_ROOT=str(root), PYTHONPATH=str(REPOSITORY / "src"), **extra)
         env.pop("RUSTICRE_CONFIG", None)
         self.process = subprocess.Popen([sys.executable, "-m", "rusticre", "mcp"], stdin=subprocess.PIPE,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=str(root))
@@ -162,6 +162,66 @@ class RuntimeOverMCP(unittest.TestCase):
     def test_attach_requires_the_build_hash(self):
         text = self.call("runtime", {"action": "attach", "options": {"exe": self.exe, "pid": os.getpid()}}, error=True)
         self.assertIn("options.sha256", text)
+
+
+class PatchedFunctionOverMCP(RuntimeOverMCP):
+    """A function another tool detoured: reported with its patcher, and probed past on request."""
+
+    @classmethod
+    def setUpClass(cls):
+        import pefile
+        exe = Path(sys.executable).resolve()
+        pe = pefile.PE(str(exe), fast_load=True)
+        text = next(section for section in pe.sections if section.Characteristics & 0x20000000)
+        cls.site = text.VirtualAddress + 0x10
+        cls.original = " ".join("%02X" % byte for byte in pe.get_data(cls.site, 5))
+        pe.close()
+        cls.work = workdir("mcp-patch")
+        cls.root = Path(cls.work.name)
+        shutil.copytree(FAKE_FRIDA, cls.root / "runtime-backend" / "frida-17.24.3" / "frida")
+        cls.exe = str(exe)
+        cls.digest = hashlib.sha256(exe.read_bytes()).hexdigest()
+        cls.head = " ".join("%02X" % byte for byte in exe.read_bytes()[:5])
+        cls.server = Server(cls.root, RUSTICRE_FAKE_PATCH="%#x=E9 FB FF FF FF" % cls.site)
+        cls.children = []
+
+    def attached(self):
+        target = subprocess.Popen([self.exe, "-c", "import time;time.sleep(60)"], stdin=subprocess.DEVNULL)
+        self.children.append(target.pid)
+        return self.runtime("attach", exe=self.exe, sha256=self.digest, pid=target.pid)["session"]
+
+    def test_live_patch_is_reported_with_the_file_bytes_and_its_patcher(self):
+        session = self.attached()
+        found = self.runtime("patches", session=session, sha256=self.digest,
+                             rows=[{"module": Path(self.exe).name, "rva": hex(self.site), "size": 5}])
+        row = found["rows"][0]
+        self.assertTrue(row["patched"])
+        self.assertEqual(row["file_bytes"], self.original)
+        self.assertEqual(row["live_bytes"], "E9 FB FF FF FF")
+        self.assertEqual(row["patch"]["jump"], "jmp rel32")
+        self.assertEqual(row["patch"]["patcher_module"], Path(self.exe).name)
+        table = json.loads(self.call("prologue", {"exe": self.exe, "session": session,
+                                                  "checks": [{"address": "rva:%#x" % self.site, "expect": self.original}]}))
+        self.assertTrue(table["matched"])
+        self.assertTrue(table["rows"][0]["live_patched"])
+        self.runtime("detach", session=session)
+
+    def test_probe_past_a_detour_only_with_accept_patch_and_the_original_bytes(self):
+        session = self.attached()
+        site = {"session": session, "module": Path(self.exe).name, "rva": hex(self.site), "sha256": self.digest}
+        refused = self.call("runtime", {"action": "observe", "options": {**site, "expect": self.original}}, error=True)
+        self.assertIn("live detour jmp rel32", refused)
+        wrong = self.call("runtime", {"action": "observe", "options": {**site, "expect": "90 90 90 90 90", "accept_patch": True}}, error=True)
+        self.assertIn("original prologue", wrong)
+        probe = self.runtime("observe", **site, expect=self.original, accept_patch=True)
+        self.assertTrue(probe["verified"])
+        self.assertEqual(probe["past_patch"]["jump"], "jmp rel32")
+        self.runtime("detach", session=session)
+
+    # The inherited lifecycle tests run unpatched code paths; only the patch tests matter here.
+    test_spawn_session_lifecycle_honours_cwd_and_env = None
+    test_observe_without_hash_names_the_option = None
+    test_setup_reuses_an_installed_backend_as_a_job = None
 
 
 if __name__ == "__main__":

@@ -96,10 +96,10 @@ def tool_table() -> list[dict]:
         tool("sigscan", "Find a byte pattern in executable sections. ?? is a wildcard. Use this to locate a hook site.", {
             "exe": string, "pattern": string, "limit": integer,
         }, ["exe", "pattern"]),
-        tool("prologue", "Verify one prologue or checks[{address,expect,name?}] against one PE build. Any mismatch fails; no hook is installed.", {
+        tool("prologue", "Verify one prologue or checks[{address,expect (or accepted list),name?}] against one PE build's file bytes; with session, also live bytes and who patched them. Any mismatch fails; nothing is hooked.", {
             "exe": string, "address": pe_address, "expect": string,
             "checks": {"type": "array", "items": {"type": "object"}},
-            "sha256": string, "image_base": string,
+            "sha256": string, "image_base": string, "session": string,
         }, ["exe"]),
         tool("evidence_add", "Store one proved claim. note and source are required. target is any name you give this binary.", {
             "target": string, "build": string, "kind": string, "name": string,
@@ -113,7 +113,7 @@ def tool_table() -> list[dict]:
         }, ["target", "script"]),
         tool("ghidra_query", "Query saved analysis through the shared warm engine. Numeric VA/rva:/va: addresses; bounded pages via next_cursor. export starts a durable file job. Use backend help for options.", {
             "target": string,
-            "action": {"type": "string", "enum": ["decompile", "function", "functions", "xrefs", "types", "type", "data", "scan", "variables", "dossier", "blocks", "pcode", "trace", "type_edit", "export", "status", "stop"]},
+            "action": {"type": "string", "enum": ["decompile", "function", "functions", "xrefs", "types", "type", "data", "scan", "variables", "dossier", "blocks", "pcode", "trace", "type_edit", "diff", "export", "status", "stop"]},
             "address": string, "limit": integer, "cursor": string, "contains": string, "timeout_s": integer,
             "options": {"type": "object"},
         }, ["target"]),
@@ -204,6 +204,8 @@ def call(name: str, args: dict | None) -> str:
             if "address" in args or "expect" in args:
                 raise ValueError("use checks or a single address/expect pair")
             result = compare_table(image, args["checks"], lambda text: _addr(image, {"address": text}))
+            if args.get("session"):
+                _live(result, args, image)
             if not result["matched"]:
                 raise ValueError("PROLOGUE TABLE MISMATCH\n" + json.dumps(result, indent=2))
             return json.dumps(result, indent=2)
@@ -389,6 +391,23 @@ def _workflow(name: str, args: dict) -> str:
         return json.dumps(start_install(settings, "runtime"), indent=2)
     from rusticre.runtime import runtime
     return runtime(str(args.get("action") or ""), args.get("options") or {}, settings)
+
+
+def _live(result: dict, args: dict, image: Image) -> None:
+    """With a runtime session: each row's live bytes, and who patched them if they differ."""
+    from rusticre.runtime import RuntimeRunner
+    module = Path(str(args["exe"])).name
+    rows = [{"name": row["name"], "module": module, "rva": row["rva"].split(":", 1)[1],
+             "size": max(1, min(64, len(row["actual"].split())))} for row in result["rows"]]
+    live = RuntimeRunner(load()).call("patches", {"session": str(args["session"]), "rows": rows,
+                                                  "sha256": image.fingerprint()["sha256"]})
+    for row, observed in zip(result["rows"], live["rows"]):
+        row["live_bytes"] = observed["live_bytes"]
+        row["live_patched"] = observed["patched"]
+        if observed.get("patch"):
+            row["live_patch"] = observed["patch"]
+    result["summary"]["live_patched"] = live["patched"]
+    result["live_provenance"] = live["provenance"]
 
 
 def _image(args: dict) -> Image:
