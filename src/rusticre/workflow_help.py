@@ -61,6 +61,7 @@ def operation_help(component: str = "analysis") -> dict:
             "vtables": "address = a function: the tables of code pointers that hold it, and its slot",
             "vcalls": {"offset": "slot byte offset (0xc0)", "vtable": "optional: names the implementation and its direct callers", "receiver_from/receiver_type/receiver_global": "optional: verify each site's receiver on p-code"},
             "writes": {"offset": "field offset", "receiver_type": "optional struct name to verify the store's base", "coverage": "direct [reg+offset] stores; the answer lists what it does not cover"},
+            "orphans": {"referenced_only": "optional bool: only runs something refers to", "use": "decoded code no function contains, with references to each run's start: evidence for type_edit function_create"},
             "diff": {"against": "the other build's target (the source)", "checks": "optional prologue table of the source, re-addressed for this build; runs as a job"},
             "export": {"mode": "decompile/functions/types", "limit": "maximum records, default100000", "contains": "optional function/type filter", "timeout_s": "per-query deadline 1..300", "resume": "existing export job id; source/options identity must match"},
         },

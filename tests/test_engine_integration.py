@@ -93,6 +93,9 @@ class EngineIntegration(unittest.TestCase):
         self.assertIn("callers", scanned)
         self.assertGreater(scanned["instructions_scanned"], 0)
         self.assertIn("vtables", self.ask("vtables", address))
+        orphans = self.ask("orphans", limit=5)
+        self.assertIn("orphans", orphans)
+        self.assertGreater(orphans["instructions_scanned"], 0)
         warm = [self.ask("decompile", address)["query_s"] for _ in range(3)]
         self.assertLess(min(warm), 1.0)
 

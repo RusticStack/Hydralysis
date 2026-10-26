@@ -26,6 +26,12 @@ class AdvancedBudgets(unittest.TestCase):
             with self.subTest(action=action, options=options), self.assertRaises(ValueError):
                 validate_options(action, options)
 
+    def test_orphans_take_only_a_boolean_filter(self):
+        self.assertEqual(validate_options("orphans", {"referenced_only": True}), {"referenced_only": True})
+        for bad in ({"referenced_only": "yes"}, {"offset": "0x10"}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                validate_options("orphans", bad)
+
     def test_type_edits_require_a_source_and_matching_kind_fields(self):
         for options in ({"kind": "rename", "name": "KnownName"},
                         {"kind": "rename", "name": "KnownName", "source": " "},

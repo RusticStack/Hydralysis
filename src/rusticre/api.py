@@ -101,7 +101,7 @@ def tool_table() -> list[dict]:
             "checks": {"type": "array", "items": {"type": "object"}},
             "sha256": string, "image_base": string, "session": string,
         }, ["exe"]),
-        tool("evidence_add", "Store one proved claim (note and source required), attributed to this client; subsystem groups it; supersedes=<id> replaces an older claim without deleting it.", {
+        tool("evidence_add", "Store one proved claim (note and source required), attributed to this client; subsystem groups it; supersedes=<id> replaces an older claim, keeping it.", {
             "target": string, "build": string, "kind": string, "name": string,
             "note": string, "source": string, "address": string, "prologue": string, "db": string,
             "subsystem": string, "supersedes": integer,
@@ -116,7 +116,7 @@ def tool_table() -> list[dict]:
         }, ["target", "script"]),
         tool("ghidra_query", "Query saved analysis through the shared warm engine. Numeric VA/rva:/va: addresses; bounded pages via next_cursor. export starts a durable file job. Use backend help for options.", {
             "target": string,
-            "action": {"type": "string", "enum": ["decompile", "function", "functions", "xrefs", "types", "type", "data", "scan", "variables", "dossier", "blocks", "pcode", "trace", "type_edit", "diff", "vcalls", "vtables", "writes", "export", "status", "stop"]},
+            "action": {"type": "string", "enum": ["decompile", "function", "functions", "xrefs", "types", "type", "data", "scan", "variables", "dossier", "blocks", "pcode", "trace", "type_edit", "diff", "vcalls", "vtables", "writes", "orphans", "export", "status", "stop"]},
             "address": string, "limit": integer, "cursor": string, "contains": string, "timeout_s": integer,
             "options": {"type": "object"},
         }, ["target"]),

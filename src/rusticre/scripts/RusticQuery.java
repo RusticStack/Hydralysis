@@ -11,6 +11,7 @@ import ghidra.framework.options.Options;
 import ghidra.program.model.address.Address;
 import ghidra.program.model.address.AddressSet;
 import ghidra.program.model.listing.Function;
+import ghidra.program.model.listing.Instruction;
 import ghidra.program.model.listing.Program;
 import ghidra.program.model.block.BasicBlockModel;
 import ghidra.program.model.data.*;
@@ -1333,6 +1334,79 @@ public class RusticQuery extends GhidraScript {
         out.addProperty("coverage", "direct stores through [register + offset] in the analysed listing; not covered: computed offsets, block copies (memcpy/rep movs), stores made through another pointer to the same object, and code outside analysed functions. Probe the sites to see which run.");
     }
 
+    // Analysed instructions outside every function, as runs, with what refers to each run's start:
+    // the evidence a function_create correction cites. A call to the start suggests a missed entry; a
+    // data reference may be a table slot or a switch target, so the entry bytes decide.
+    private void orphans(JsonObject req, JsonObject out, long deadline) throws Exception {
+        JsonObject opts = options(req);
+        boolean referencedOnly = opts.has("referenced_only") && opts.get("referenced_only").getAsBoolean();
+        int limit = req.get("limit").getAsInt();
+        String cursor = text(req, "cursor");
+        var listing = currentProgram.getListing();
+        var functions = currentProgram.getFunctionManager();
+        var references = currentProgram.getReferenceManager();
+        var iterator = cursor.isEmpty() ? listing.getInstructions(true) : listing.getInstructions(address(cursor), true);
+        JsonArray rows = new JsonArray();
+        long scanned = 0, runs = 0;
+        Address next = null;
+        Instruction instruction = iterator.hasNext() ? iterator.next() : null;
+        while (instruction != null && rows.size() < limit && System.nanoTime() < deadline) {
+            if ((++scanned & 0xffff) == 0) monitor.checkCancelled();
+            if (functions.getFunctionContaining(instruction.getAddress()) != null) {
+                next = instruction.getMaxAddress().next();
+                instruction = iterator.hasNext() ? iterator.next() : null;
+                continue;
+            }
+            Address start = instruction.getAddress(), end = instruction.getMaxAddress();
+            int count = 1;
+            instruction = iterator.hasNext() ? iterator.next() : null;
+            while (instruction != null && count < 4096 && instruction.getAddress().equals(end.next())
+                    && functions.getFunctionContaining(instruction.getAddress()) == null) {
+                end = instruction.getMaxAddress(); count++; scanned++;
+                instruction = iterator.hasNext() ? iterator.next() : null;
+            }
+            next = end.next();
+            runs++;
+            JsonArray inbound = new JsonArray();
+            boolean called = false, data = false;
+            int total = 0;
+            for (var reference : references.getReferencesTo(start)) {
+                total++;
+                var kind = reference.getReferenceType();
+                called |= kind.isCall();
+                data |= kind.isData();
+                if (inbound.size() >= 8) continue;
+                JsonObject ref = new JsonObject();
+                ref.addProperty("from", "0x" + reference.getFromAddress());
+                ref.addProperty("type", kind.toString());
+                Function from = functions.getFunctionContaining(reference.getFromAddress());
+                if (from != null) ref.addProperty("function", clip(from.getName(), 256));
+                inbound.add(ref);
+            }
+            if (referencedOnly && total == 0) continue;
+            JsonObject row = new JsonObject();
+            row.addProperty("start", "0x" + start);
+            row.addProperty("rva", "0x" + Long.toHexString(start.subtract(currentProgram.getImageBase())));
+            row.addProperty("end", "0x" + end);
+            row.addProperty("instructions", count);
+            byte[] head = new byte[(int) Math.min(16, end.subtract(start) + 1)];
+            currentProgram.getMemory().getBytes(start, head);
+            row.addProperty("entry_bytes", HexFormat.ofDelimiter(" ").withUpperCase().formatHex(head));
+            row.addProperty("references_to_start", total);
+            row.add("references", inbound);
+            row.addProperty("called", called);
+            row.addProperty("data_referenced", data);
+            rows.add(row);
+        }
+        out.add("orphans", rows);
+        out.addProperty("runs_seen", runs);
+        out.addProperty("instructions_scanned", scanned);
+        boolean more = instruction != null;
+        out.addProperty("truncated", more);
+        if (more && next != null) out.addProperty("next_cursor", "0x" + next);
+        out.addProperty("coverage", "decoded instructions in the saved listing that no function contains; bytes the analysis never decoded are not listed. A run is evidence for function_create (exact entry bytes and ranges), not a proof of a function.");
+    }
+
     private boolean storeTyped(Function function, Address site, long offset, String type, long deadline) {
         try {
             HighFunction high = decompile(function, deadline).getHighFunction();
@@ -2017,6 +2091,9 @@ public class RusticQuery extends GhidraScript {
         }
         if (action.equals("writes")) {
             writes(req, out, deadline); out.addProperty("ok", true); return out;
+        }
+        if (action.equals("orphans")) {
+            orphans(req, out, deadline); out.addProperty("ok", true); return out;
         }
         if (action.equals("vtables")) {
             vtables(req, out, deadline); out.addProperty("ok", true); return out;
