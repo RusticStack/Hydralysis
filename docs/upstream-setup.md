@@ -20,22 +20,27 @@ upstream bridge, MCP server or implementation was copied into this repository.
   imported or not-yet-analysed programs. RusticRE implements its lifecycle with
   its own headless scripts rather than installing that extension/PyGhidra MCP.
 
-RusticRE admits the supported Ghidra 12.1.4 release, validates the native
-decompiler/JDK executable headers, and selects a full JDK satisfying the
-installation's declared Java bounds. Other Ghidra releases are reported as
-incompatible until their APIs are verified. When requested, a background setup
-job installs pinned official portable Windows x64 archives privately under
-the configured root, verifies their full SHA-256 before extraction, and refuses
-archive traversal/symlinks or replacement of an existing installation. It does
-not edit PATH, user environment, permissions or installed launch scripts.
+Since 0.4.0 analysis runs on [Hydra Engine](https://github.com/RusticStack/hydra-engine)
+release 12.3-hydra.2, a Ghidra 12.3 build with a headless session daemon that
+keeps programs open between requests and serves several clients. RusticRE
+admits that pinned release and its pinned client (`hydra.py`), validates the
+engine and the client's protocol version, and selects a full JDK satisfying
+the installation's declared Java bounds. Other releases are reported as
+incompatible unless `hydra_allow_unpinned` is set. When requested, a background
+setup job installs the pinned engine and client archives and a portable
+[Adoptium JDK 25.0.4.1+1](https://github.com/adoptium/temurin25-binaries/releases/tag/jdk-25.0.4.1%2B1)
+privately under the configured root, verifies their full SHA-256 before
+extraction, and refuses archive traversal/symlinks or replacement of an
+existing installation. It does not edit PATH, user environment, permissions or
+installed launch scripts. The archive digests are embedded in `hydra.py` and
+`backends.py`; there is no `latest` download or unverified executable
+installer. Existing compatible installations are reused.
 
-The pinned release metadata was read through the official GitHub release API:
-[Ghidra 12.1.4](https://github.com/NationalSecurityAgency/ghidra/releases/tag/Ghidra_12.1.4_build)
-and [Adoptium JDK 25.0.4.1+1](https://github.com/adoptium/temurin25-binaries/releases/tag/jdk-25.0.4.1%2B1).
-The archive digests are embedded in `backends.py`; there is no `latest` download
-or unverified executable installer. Existing compatible installations are reused.
+An analysed project is adopted in place (`prepare action=adopt`): it is
+validated and registered, never copied or imported, and a project saved by an
+older Ghidra is upgraded in memory only.
 
-An explicit preparation job snapshots one stable executable, imports and
+An explicit preparation job copies one stable executable, imports and
 analyses it once, checks the headless timeout flag, analysed flag and full
 program hash, and registers the target only after successful save. Logs and
 partial projects survive failure/cancellation. Completed hash reuse and active

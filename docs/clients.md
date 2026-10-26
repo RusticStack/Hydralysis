@@ -36,7 +36,7 @@ rusticre prepare --exe F:/binaries/sample.exe --target sample
 rusticre job <prepare-id>
 ```
 
-Install or reference this repository's `skills/rusticre/SKILL.md` in that client's agent guidance so the short command is discoverable. Prefer `ghidra-query` over hand-written `analyzeHeadless`: both CLI and MCP use the same warm worker. Use `--options-file` for trace/edit/runtime JSON and bulk work. In Qoder, explicit preparation/export commands can run later without changing the MCP catalog or importing per query. `sections`, `exports`, `ghidra-scripts` and `ghidra-jobs` are CLI aliases; use fingerprint detail and `job` in MCP.
+Install or reference this repository's `skills/rusticre/SKILL.md` in that client's agent guidance so the short command is discoverable. Prefer `ghidra-query` over hand-written headless Ghidra runs: CLI, MCP and scripts share one warm engine. Use `--options-file` for trace/edit/runtime JSON and bulk work. In Qoder, explicit preparation/export commands can run later without changing the MCP catalog or importing per query. `sections`, `exports`, `ghidra-scripts` and `ghidra-jobs` are CLI aliases; use fingerprint detail and `job` in MCP.
 
 Restart the client after the edit. A session that is already open keeps the tool list it started with.
 

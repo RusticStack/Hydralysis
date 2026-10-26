@@ -1,16 +1,17 @@
 ---
 name: rusticre-ghidra
-description: Decompile or script an already analysed Ghidra project without re-importing the binary. Use when inspect is not enough and you need decompiler text.
+description: Decompile, trace or correct an already analysed Ghidra project without re-importing the binary. Use when inspect is not enough and you need decompiler text, value flow or types.
 ---
 
 # Query saved analysis
 
-For a new executable, explicit `prepare` owns initial setup/import/auto-analysis as a durable job. `prepare --plan` is read-only. Do not start preparation when the user only requests tool design or lightweight inspection. For an existing analysed project, configure `targets` directly; do not reimport it. After that:
+For an existing analysed project, register it in place: `prepare --adopt <.gpr, its folder or a parent> --exe <path> --target <name>` (or `--sha256` and `--program`). Nothing is copied or imported; the program's stored hash and analysed flag must match. For a new executable, explicit `prepare` owns the one-time import/analysis as a durable job, and `prepare --plan` is read-only. Do not start preparation when the user only asks for tool design or lightweight inspection. After that:
 
-1. Close the master. A copy refuses to start while `<project>.lock` exists.
-2. Configure `exe` or its full `sha256` alongside `dir`, `name` and `program`. The program's stored executable hash and analysed flag must match before any decompile.
-3. `ghidra-query --target <name> <VA>` for decompilation; `--action function`, `functions` or `xrefs` for analysed facts. Addresses are numeric VAs. Continue incomplete enumeration with the returned `--cursor`; do not use whole-table xrefs by name.
-4. `--action status` inspects the worker; `--action stop` stops it. Startup has a separate deadline. A failed or timed-out worker is retired automatically, and the next query uses a new snapshot.
-5. A deliberate custom batch: configure `scripts`, use `ghidra-scripts --target <name>`, then `ghidra-run --target <name> Script.java <arguments>`. Check `state=done`, `exit=0` and the script body. Failures include full diagnostic paths.
+1. `ghidra-query --target <name> <VA>` for decompilation; `--action function`, `functions` or `xrefs` for analysed facts. Addresses are numeric VAs or `rva:`/`va:`. Continue incomplete enumeration with the returned `--cursor`; do not list whole tables by name.
+2. Value flow: `--action pcode` gives op/varnode ids; `--action trace` with `{"seed": ..., "direction": "backward", "brief": true}` follows them through memory and into callers. A stop is not a proof of absence.
+3. Virtual calls: `vtables` (which tables hold a function), `vcalls` (sites of a slot offset, receivers verified when asked). Field writes: `writes`.
+4. Corrections: `type_edit` with a `source`, flat options next to `kind`. Bulk types: `import_types` with a corpus. Undo: `revert` with the overlay ids. Every client reads the corrected program; the analysed project is never written.
+5. Two builds: `diff` with `against` the older target, then transfer names or a hook table.
+6. A deliberate custom script: `ghidra-run --target <name> Script.java <arguments>`. It runs contained on the warm engine. Check its output and exit.
 
-The command is `-process -noanalysis -readOnly` on a snapshot. Two script runs never share a lane; queries serialize per worker. Saved analysis is never imported implicitly. Source metadata detects stale snapshots, which are retained rather than overwritten. Use sourced `type_edit` overlays for persistent type/symbol/function corrections outside the canonical project. Atomic batches and file input support bulk work; worker restart replays the same build-bound history. Use `export` for durable bulk artifacts and `job` for progress/cancel, rather than sending an entire decompile corpus to MCP output. No project directory component may start with a period.
+One engine serves every client and keeps programs warm. `backend status` shows it; `backend stop` stops it. A timeout or a truncated page is not a result: narrow the query. Use `export` for durable bulk artifacts and `job` for progress/cancel, rather than sending an entire decompile corpus to MCP output. No project directory component may start with a period.
