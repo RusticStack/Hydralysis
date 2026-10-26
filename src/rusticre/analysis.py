@@ -12,7 +12,7 @@ import re
 import uuid
 from pathlib import Path
 
-ADVANCED_ACTIONS = frozenset(("types", "type", "variables", "dossier", "blocks", "pcode", "trace", "type_edit", "data", "scan"))
+ADVANCED_ACTIONS = frozenset(("types", "type", "variables", "dossier", "blocks", "pcode", "trace", "type_edit", "data", "scan", "diff"))
 _TYPE_KINDS = frozenset(("struct", "signature", "variable", "apply", "rename", "comment",
                          "function_create", "function_body", "function_delete", "batch", "import_types"))
 # Bulk kinds run as durable jobs: they can take minutes on a large program.
@@ -49,9 +49,9 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
     if not isinstance(options, dict):
         raise ValueError("options must be an object")
     allowed = {
-        "decompile": {"max_characters"}, "data": {"table"}, "scan": {"end", "mnemonic", "operand"},
+        "decompile": {"max_characters"}, "data": {"table"}, "scan": {"end", "mnemonic", "operand", "regex"},
         "types": set(), "type": {"path"}, "variables": set(), "dossier": set(),
-        "blocks": set(), "pcode": {"nodes"},
+        "blocks": set(), "pcode": {"nodes"}, "diff": {"against", "checks"},
         "trace": {"seed", "direction", "depth", "nodes", "functions", "argument", "brief", "callers", "debug"},
         "type_edit": {"kind", "source", "path", "size", "fields", "prototype", "variable", "type", "name", "comment", "expect", "ranges", "edits", "file", "expect_revision", "ids", "corpus", "category"} | (_BATCH_PROVENANCE | _CORPUS_RECORD if _record else set()),
     }
@@ -76,6 +76,20 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
         for name in ("mnemonic", "operand"):
             if name in out:
                 out[name] = _text(out[name], "scan " + name, 256)
+        if "regex" in out:
+            # Matched against one short instruction line at a time; bounded in length.
+            out["regex"] = _text(out["regex"], "scan regex", 256, True)
+            try:
+                re.compile(out["regex"])
+            except re.error as exc:
+                raise ValueError("scan regex does not compile: %s" % exc) from exc
+    elif action == "diff":
+        out["against"] = _text(out.get("against", ""), "against", 64, True)
+        if "checks" in out:
+            checks = Path(_text(out["checks"], "checks", 32768, True)).expanduser()
+            if not checks.is_absolute() or not checks.is_file():
+                raise ValueError("checks must be an absolute path to the source build's prologue table")
+            out["checks"] = str(checks.resolve())
     elif action == "type":
         if "path" in out:
             out["path"] = _text(out["path"], "path", 512, True)

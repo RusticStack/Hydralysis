@@ -47,6 +47,9 @@ class EngineError(RuntimeError):
         self.code = code
         self.details = details or {}
         payload = {"engine_error": code, "message": message, "command": command}
+        if "output" in self.details and code == "failed":
+            # A script that failed to compile says why only in its output.
+            payload["output_tail"] = str(self.details["output"])[-2000:]
         for key in ("holder", "suggest", "suggestion", "alternatives", "reason", "program", "project"):
             if key in self.details:
                 payload[key] = self.details[key]
@@ -153,6 +156,10 @@ def daemon_config(settings: dict) -> dict:
               "keepWarm": int(settings.get("hydra_keep_warm_s", 3600))}
     if settings.get("java_home"):
         config["java"] = str(settings["java_home"])
+    # Ghidra's per-user settings and caches (the OSGi script bundles among them) belong to this
+    # root: two daemons sharing them collide, and they stay off the system drive.
+    config["vmargs"] = ["-Dapplication.settingsdir=" + str(root / "hydra" / "ghidra-settings"),
+                        "-Dapplication.cachedir=" + str(root / "hydra" / "ghidra-cache")]
     if settings.get("hydra_max_heap"):
         config["maxHeap"] = str(settings["hydra_max_heap"])
     for key in ("maxImports", "maxQuick", "maxLong", "forkCopyLimitMb"):

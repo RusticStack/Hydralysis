@@ -139,6 +139,10 @@ class QueryRunner:
             return json.dumps(self.stop(selected))
         if action == "type_edit" and options.get("kind") == "revert":
             return json.dumps(workcopy.revert(self.settings, selected, options["ids"], options.get("expect_revision")))
+        if action == "diff":
+            from rusticre import overlayjobs
+            self.target(options["against"])
+            return json.dumps(overlayjobs.start(self.settings, selected["name"], "diff", "", options), ensure_ascii=False)
         if action == "type_edit" and options.get("kind") in BULK_KINDS:
             from rusticre import overlayjobs
             return json.dumps(overlayjobs.start(self.settings, selected["name"], "edit", address, options), ensure_ascii=False)

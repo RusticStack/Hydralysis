@@ -125,7 +125,10 @@ def run(path: Path) -> None:
     try:
         selected = targets.resolve(settings, record["target"])
         engine = hydra.Engine(settings)
-        if record["kind"] == "edit":
+        if record["kind"] == "diff":
+            from rusticre import crossbuild
+            result = crossbuild.run(settings, record, path.parent)
+        elif record["kind"] == "edit":
             result = workcopy.edit(settings, engine, selected, record["address"], dict(record["options"]), TIMEOUT_S)
         else:
             result = workcopy.repair(settings, engine, selected, TIMEOUT_S)

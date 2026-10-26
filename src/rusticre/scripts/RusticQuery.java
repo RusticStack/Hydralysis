@@ -212,6 +212,8 @@ public class RusticQuery extends GhidraScript {
         JsonArray rows = new JsonArray();
         String mnemonic = text(opts, "mnemonic").toLowerCase(Locale.ROOT);
         String operand = text(opts, "operand").toLowerCase(Locale.ROOT);
+        java.util.regex.Pattern regex = text(opts, "regex").isEmpty() ? null
+            : java.util.regex.Pattern.compile(text(opts, "regex"), java.util.regex.Pattern.CASE_INSENSITIVE);
         int scanned = 0, limit = req.get("limit").getAsInt();
         Address next = null;
         boolean pastEnd = false;
@@ -223,6 +225,7 @@ public class RusticQuery extends GhidraScript {
             String operands = "";
             for (int i = 0; i < instruction.getNumOperands(); i++) operands += (i == 0 ? "" : ", ") + instruction.getDefaultOperandRepresentation(i);
             if (!instruction.getMnemonicString().toLowerCase(Locale.ROOT).contains(mnemonic) || !operands.toLowerCase(Locale.ROOT).contains(operand)) continue;
+            if (regex != null && !regex.matcher(instruction.getMnemonicString() + " " + operands).find()) continue;
             JsonObject row = new JsonObject(); row.addProperty("address", "0x" + instruction.getAddress());
             row.addProperty("mnemonic", instruction.getMnemonicString()); row.addProperty("operands", clip(operands, 1024));
             byte[] bytes = instruction.getBytes();
@@ -233,7 +236,7 @@ public class RusticQuery extends GhidraScript {
         boolean more = !pastEnd && instructions.hasNext() && (next == null || end == null || next.compareTo(end) <= 0);
         out.add("instructions", rows); out.addProperty("scanned", scanned); out.addProperty("truncated", more);
         if (more) out.addProperty("next_cursor", "0x" + (next == null ? start : next));
-        out.addProperty("provenance", "decoded instructions in saved Ghidra listing; literal filters, no new disassembly or regex evaluation");
+        out.addProperty("provenance", "decoded instructions in saved Ghidra listing; mnemonic/operand are literal substrings, regex (case-insensitive) is matched against 'MNEMONIC operands'; no new disassembly");
     }
 
     private void types(JsonObject req, JsonObject out, long deadline) throws Exception {
@@ -984,7 +987,7 @@ public class RusticQuery extends GhidraScript {
 
     private void dossier(Function function, JsonObject out, int limit, long deadline) throws Exception {
         JsonArray instructions = new JsonArray(), callers = new JsonArray(), callees = new JsonArray();
-        JsonArray dataReferences = new JsonArray(), strings = new JsonArray();
+        JsonArray dataReferences = new JsonArray(), strings = new JsonArray(), stackReferences = new JsonArray();
         Set<Address> stringAddresses = new HashSet<>();
         var listing = currentProgram.getListing().getInstructions(function.getBody(), true);
         int scanned = 0, referencesScanned = 0;
@@ -1006,6 +1009,15 @@ public class RusticQuery extends GhidraScript {
                     } else calleesTruncated = true;
                 }
                 if (!reference.getReferenceType().isData()) continue;
+                if (reference.getToAddress().isStackAddress()) {
+                    // A stack slot is a local, not data: kept apart so data_refs are globals.
+                    if (stackReferences.size() < referenceLimit) {
+                        JsonObject row = new JsonObject(); row.addProperty("from", "0x" + reference.getFromAddress());
+                        row.addProperty("stack_offset", (reference.getToAddress().getOffset() < 0 ? "-0x" : "0x") + Long.toHexString(Math.abs(reference.getToAddress().getOffset())));
+                        row.addProperty("type", reference.getReferenceType().toString()); stackReferences.add(row);
+                    }
+                    continue;
+                }
                 var data = currentProgram.getListing().getDefinedDataContaining(reference.getToAddress());
                 if (dataReferences.size() < referenceLimit) {
                     JsonObject row = new JsonObject();
@@ -1041,7 +1053,7 @@ public class RusticQuery extends GhidraScript {
             if (reference.getReferenceType().isCall()) { JsonObject row = new JsonObject(); row.addProperty("from", "0x" + reference.getFromAddress()); row.addProperty("type", reference.getReferenceType().toString()); callers.add(row); }
         }
         out.add("instructions", instructions); out.add("callers", callers); out.add("callees", callees);
-        out.add("data_refs", dataReferences); out.add("referenced_strings", strings);
+        out.add("data_refs", dataReferences); out.add("referenced_strings", strings); out.add("stack_refs", stackReferences);
         out.addProperty("total_instructions_scanned", scanned); out.addProperty("instruction_count_complete", !listing.hasNext());
         out.addProperty("references_scanned", referencesScanned); out.addProperty("entry_references_scanned", entryReferencesScanned);
         out.addProperty("instructions_truncated", scanned > instructions.size() || scanTruncated);
@@ -1056,7 +1068,7 @@ public class RusticQuery extends GhidraScript {
         String c = result.getDecompiledFunction().getC();
         out.addProperty("c", clip(c, 16000)); out.addProperty("c_truncated", c.length() > 16000);
         out.addProperty("provenance", "saved Ghidra listing, per-instruction references/defined strings and decompiler; bounded results do not enumerate every reference to the entire function body");
-        String[] arrays = {"instructions", "callers", "callees", "data_refs", "referenced_strings", "blocks"};
+        String[] arrays = {"instructions", "callers", "callees", "data_refs", "stack_refs", "referenced_strings", "blocks"};
         int payload = json.toJson(out).getBytes(StandardCharsets.UTF_8).length;
         boolean payloadTruncated = false;
         while (payload > 78000) {
@@ -1076,6 +1088,98 @@ public class RusticQuery extends GhidraScript {
         for (String flag : new String[] {"instructions_truncated", "listing_scan_truncated", "callers_truncated", "callees_truncated", "data_refs_truncated", "referenced_strings_truncated", "blocks_truncated", "c_truncated"}) incomplete |= out.get(flag).getAsBoolean();
         out.addProperty("listing_truncated", incomplete); out.addProperty("truncated", incomplete);
         out.addProperty("payload_utf8_bytes", json.toJson(out).getBytes(StandardCharsets.UTF_8).length);
+    }
+
+    // ---- per-function fingerprints, for matching two builds ----------------------------------
+    // One JSON line per function, streamed to `artifact` (<artifact>.part until complete):
+    // entry RVA, name and its source, sizes, a hash of the raw bytes, a hash of the instruction
+    // shape (mnemonics, registers, small scalars; addresses and displacements masked), the
+    // strings, imports and large constants it references, its direct callees and its prologue.
+    private String digest(String text) throws Exception {
+        byte[] bytes = java.security.MessageDigest.getInstance("SHA-256").digest(text.getBytes(StandardCharsets.UTF_8));
+        return HexFormat.of().formatHex(bytes, 0, 10);
+    }
+
+    private void fingerprints(JsonObject req, JsonObject out) throws Exception {
+        String artifact = text(options(req), "artifact");
+        if (artifact.isEmpty()) throw new IllegalArgumentException("fingerprints needs options.artifact");
+        Path target = Path.of(artifact), part = Path.of(artifact + ".part");
+        var functions = currentProgram.getFunctionManager();
+        var listing = currentProgram.getListing();
+        var references = currentProgram.getReferenceManager();
+        var memory = currentProgram.getMemory();
+        Address base = currentProgram.getImageBase();
+        int total = functions.getFunctionCount(), done = 0;
+        monitor.initialize(total);
+        try (BufferedWriter writer = Files.newBufferedWriter(part, StandardCharsets.UTF_8)) {
+            for (Function function : functions.getFunctions(true)) {
+                monitor.checkCancelled();
+                if (function.isThunk() || function.isExternal()) continue;
+                StringBuilder raw = new StringBuilder(), shape = new StringBuilder();
+                TreeSet<String> strings = new TreeSet<>(), imports = new TreeSet<>(), constants = new TreeSet<>();
+                List<String> callees = new ArrayList<>();
+                int instructions = 0;
+                for (var instruction : listing.getInstructions(function.getBody(), true)) {
+                    instructions++;
+                    if (instructions > 20000) break;
+                    raw.append(HexFormat.of().formatHex(instruction.getBytes()));
+                    shape.append(instruction.getMnemonicString());
+                    for (int i = 0; i < instruction.getNumOperands(); i++) {
+                        int type = instruction.getOperandType(i);
+                        shape.append('|').append(type & ~(ghidra.program.model.lang.OperandType.ADDRESS));
+                        for (Object operand : instruction.getOpObjects(i)) {
+                            if (operand instanceof ghidra.program.model.lang.Register register) shape.append(register.getName());
+                            else if (operand instanceof ghidra.program.model.scalar.Scalar scalar) {
+                                long value = scalar.getUnsignedValue();
+                                boolean address = (type & (ghidra.program.model.lang.OperandType.ADDRESS | ghidra.program.model.lang.OperandType.RELATIVE)) != 0;
+                                if (!address) { try { address = memory.contains(base.getNewAddress(value)); } catch (Exception outOfRange) { } }
+                                if (!address && value < 0x1000) shape.append('#').append(Long.toHexString(value));
+                                else if (!address && constants.size() < 16) constants.add(Long.toHexString(value));
+                            }
+                        }
+                    }
+                    shape.append(';');
+                    for (var reference : instruction.getReferencesFrom()) {
+                        Address to = reference.getToAddress();
+                        if (reference.getReferenceType().isCall()) {
+                            Function callee = functions.getFunctionAt(to);
+                            if (callee != null && (callee.isExternal() || callee.isThunk())) {
+                                Function thunked = callee.isThunk() ? callee.getThunkedFunction(true) : callee;
+                                if (thunked != null && thunked.isExternal() && imports.size() < 16) imports.add(thunked.getName());
+                            } else if (callee != null && callees.size() < 64) callees.add("0x" + Long.toHexString(callee.getEntryPoint().subtract(base)));
+                        } else if (reference.getReferenceType().isData()) {
+                            var data = listing.getDefinedDataAt(to);
+                            if (data != null && data.hasStringValue() && strings.size() < 16) {
+                                Object value = data.getValue();
+                                if (value != null) strings.add(digest(value.toString()));
+                            }
+                        }
+                    }
+                }
+                byte[] prologue = new byte[24];
+                int read = 0;
+                try { read = memory.getBytes(function.getEntryPoint(), prologue); } catch (Exception ignored) { }
+                JsonObject row = new JsonObject();
+                row.addProperty("rva", "0x" + Long.toHexString(function.getEntryPoint().subtract(base)));
+                row.addProperty("name", function.getName(true));
+                row.addProperty("source", function.getSymbol().getSource().toString());
+                row.addProperty("size", function.getBody().getNumAddresses());
+                row.addProperty("instructions", instructions);
+                row.addProperty("bytes", digest(raw.toString()));
+                row.addProperty("shape", digest(shape.toString()));
+                JsonArray a = new JsonArray(); strings.forEach(a::add); row.add("strings", a);
+                JsonArray b = new JsonArray(); imports.forEach(b::add); row.add("imports", b);
+                JsonArray c = new JsonArray(); constants.forEach(c::add); row.add("constants", c);
+                JsonArray d = new JsonArray(); callees.forEach(d::add); row.add("callees", d);
+                row.addProperty("prologue", HexFormat.ofDelimiter(" ").withUpperCase().formatHex(prologue, 0, Math.max(0, read)));
+                writer.write(json.toJson(row));
+                writer.newLine();
+                if (++done % 2000 == 0) { monitor.setProgress(done); monitor.setMessage("fingerprints " + done + "/" + total); writer.flush(); }
+            }
+        }
+        Files.move(part, target, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+        out.addProperty("functions", done);
+        out.addProperty("artifact", artifact);
     }
 
     // ---- bulk types from a corpus ------------------------------------------------------------
@@ -1139,7 +1243,7 @@ public class RusticQuery extends GhidraScript {
         }
         Map<String, DataType> named = new HashMap<>();
         Map<String, Integer> counts = new TreeMap<>();
-        JsonArray conflicts = new JsonArray(), failures = new JsonArray();
+        JsonArray conflicts = new JsonArray(), failures = new JsonArray(), renames = new JsonArray();
         // 1. every composite and enum exists before any field refers to it
         for (JsonObject record : records) {
             monitor.checkCancelled();
@@ -1313,7 +1417,17 @@ public class RusticQuery extends GhidraScript {
                     DataType owner = named.containsKey(text(record, "this")) ? named.get(text(record, "this")) : corpusType(text(record, "this"), named, -1);
                     if (owner != null && bindThis(function, owner, failures)) bound++;
                 }
-                if (record.has("name")) { function.setName(text(record, "name"), SourceType.IMPORTED); renamed++; }
+                if (record.has("name")) {
+                    String before = function.getName();
+                    function.setName(text(record, "name"), SourceType.IMPORTED);
+                    renamed++;
+                    if (renames.size() < 200000) {
+                        JsonObject change = new JsonObject();
+                        change.addProperty("address", "0x" + function.getEntryPoint());
+                        change.addProperty("old", before); change.addProperty("new", function.getName());
+                        renames.add(change);
+                    }
+                }
                 if (record.has("comment")) currentProgram.getListing().setComment(function.getEntryPoint(), ghidra.program.model.listing.CommentType.PLATE, text(record, "comment"));
                 counts.merge(kind, 1, Integer::sum);
             }
@@ -1341,6 +1455,7 @@ public class RusticQuery extends GhidraScript {
         for (int i = 0; i < conflicts.size() && i < 2000; i++) someConflicts.add(conflicts.get(i));
         for (int i = 0; i < failures.size() && i < 2000; i++) someFailures.add(failures.get(i));
         report.add("conflicts", someConflicts);
+        report.add("renames", renames);
         report.add("failures", someFailures);
         if (!text(opts, "report_file").isEmpty()) write(Path.of(text(opts, "report_file")), report);
         lastImport = report;
@@ -1617,6 +1732,9 @@ public class RusticQuery extends GhidraScript {
         out.addProperty("overlay_state", overlayState());
         if (action.equals("overlay_state")) {
             out.addProperty("changed", currentProgram.isChanged()); out.addProperty("ok", true); return out;
+        }
+        if (action.equals("fingerprints")) {
+            fingerprints(req, out); out.addProperty("ok", true); return out;
         }
         if (action.equals("apply_overlays")) {
             applyOverlays(req, out, deadline); out.addProperty("ok", true); return out;
