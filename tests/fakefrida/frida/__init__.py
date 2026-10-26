@@ -58,9 +58,16 @@ class Script:
                 raise RuntimeError("PROLOGUE MISMATCH; probe refused")
             self._send({"event": "probe_installed", "hook_id": self.parameters["id"], "verified_bytes": got})
             # One simulated hit, so status, continue and unload have something to act on.
-            self._send({"event": "break" if self.parameters["pause"] else "enter", "hook_id": self.parameters["id"],
-                        "hit": 1, "thread": 1, "address": hex(BASE + self.parameters["rva"]),
-                        "arguments": ["0x0"] * 8, "backtrace": []})
+            if self.parameters.get("sample"):
+                self._send({"event": "sample", "hook_id": self.parameters["id"], "window_s": self.parameters["sample"]["window_s"],
+                            "count": 120, "rate": 12.0, "min": 0.5, "max": 4.0, "last": 3.5})
+            else:
+                # A hit whose first capture points at "ABC": what the probe copies, decoded by the worker.
+                captures = [{"pointer": hex(BASE), "hex": ("414243" + "00" * c["size"])[:c["size"] * 2]}
+                            for c in self.parameters.get("captures", [])]
+                self._send({"event": "break" if self.parameters["pause"] else "enter", "hook_id": self.parameters["id"],
+                            "hit": 1, "thread": 1, "address": hex(BASE + self.parameters["rva"]),
+                            "arguments": ["0x0"] * 8, "backtrace": [], "captures": captures})
         self.loaded = True
 
     def unload(self):

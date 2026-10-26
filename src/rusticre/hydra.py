@@ -204,7 +204,7 @@ class Engine:
     _connections: dict[str, object] = {}
     _guard = threading.Lock()
 
-    def __init__(self, settings: dict, role: str = "reader"):
+    def __init__(self, settings: dict, role: str = "reader", start: bool = True):
         # Reads use one long-lived connection and run contained (in parallel, rolled back).
         # A writer gets its own connection: a client that may write a program runs its
         # scripts as owner, exclusively, which reads must not do.
@@ -214,6 +214,8 @@ class Engine:
         self.client_path = Path(settings["hydra_client"])
         self.allow_unpinned = bool(settings.get("hydra_allow_unpinned"))
         self.role = role
+        # A background helper (the saver) joins a running daemon but never starts one.
+        self.start = start
         self.key = (str(self.root).lower() if os.name == "nt" else str(self.root)) + "|" + role
 
     def module(self):
@@ -225,7 +227,8 @@ class Engine:
         write_daemon_config(self.settings)
         try:
             session = module.connect(client=_IDENTITY["client"], harness=_IDENTITY["harness"],
-                                     ghidra=str(self.engine_dir), state=str(state_dir(self.settings)), instance=INSTANCE)
+                                     ghidra=str(self.engine_dir), state=str(state_dir(self.settings)), instance=INSTANCE,
+                                     start=self.start)
         except module.IncompatibleError as exc:
             raise RuntimeError("Hydra engine refused: %s. Stop the old daemon (backend action=stop) or install the "
                                "pinned release %s" % (exc, RELEASE)) from exc

@@ -116,7 +116,7 @@ def tool_table() -> list[dict]:
         }, ["target", "script"]),
         tool("ghidra_query", "Query saved analysis through the shared warm engine. Numeric VA/rva:/va: addresses; bounded pages via next_cursor. export starts a durable file job. Use backend help for options.", {
             "target": string,
-            "action": {"type": "string", "enum": ["decompile", "function", "functions", "xrefs", "types", "type", "data", "scan", "variables", "dossier", "blocks", "pcode", "trace", "type_edit", "diff", "vcalls", "vtables", "export", "status", "stop"]},
+            "action": {"type": "string", "enum": ["decompile", "function", "functions", "xrefs", "types", "type", "data", "scan", "variables", "dossier", "blocks", "pcode", "trace", "type_edit", "diff", "vcalls", "vtables", "writes", "export", "status", "stop"]},
             "address": string, "limit": integer, "cursor": string, "contains": string, "timeout_s": integer,
             "options": {"type": "object"},
         }, ["target"]),

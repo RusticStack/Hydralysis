@@ -43,7 +43,9 @@ class Ledger(unittest.TestCase):
         rows = evidence.query(self.db, "cp", "vehicles", limit=1000)
         self.assertEqual(len(rows), 160)
         self.assertEqual({row["harness"] for row in rows}, {"writer"})
-        mode = sqlite3.connect(self.db).execute("PRAGMA journal_mode").fetchone()[0]
+        check = sqlite3.connect(self.db)
+        mode = check.execute("PRAGMA journal_mode").fetchone()[0]
+        check.close()
         self.assertEqual(mode.lower(), "wal")
 
     def test_supersession_keeps_the_old_claim_and_filters_it(self):

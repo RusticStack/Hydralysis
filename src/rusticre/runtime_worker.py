@@ -176,9 +176,13 @@ def _expect(text: str) -> list[int]:
     return [int(word, 16) for word in words]
 
 
-def _probe_source(module: dict, rva: int, expected: list[int], hook_id: str, limit: int, pause: bool) -> str:
+def _probe_source(module: dict, rva: int, expected: list[int], hook_id: str, limit: int, pause: bool,
+                  captures: list | None = None, sample: dict | None = None) -> str:
     parameters = json.dumps({"module": module["path"], "base": module["base"], "rva": rva,
-                             "expect": expected, "id": hook_id, "limit": limit, "pause": pause})
+                             "expect": expected, "id": hook_id, "limit": limit, "pause": pause,
+                             "captures": [{"arg": c["arg"], "deref": c["deref"], "size": c["size"], "value_only": c["value_only"]}
+                                          for c in (captures or [])],
+                             "sample": sample})
     return CONTEXT_HELPER + MEMORY_HELPER + r"""const p=PARAMETERS;
 const all=Process.enumerateModules().filter(m=>m.path===p.module);
 if(all.length!==1||all[0].base.toString()!==p.base)throw new Error('module mapping changed before probe installation');
@@ -186,15 +190,32 @@ const site=all[0].base.add(p.rva);
 const got=readExact(site,p.expect.length);
 if(got.some((b,i)=>b!==p.expect[i]))throw new Error('PROLOGUE MISMATCH; probe refused');
 let hits=0;
+// Bounded copies of what arguments point to; every read is checked against a readable range.
+function readable(q,n){const r=Process.findRangeByAddress(q);return r!==null&&r.protection.indexOf('r')>=0&&q.add(n).compare(r.base.add(r.size))<=0;}
+function captureArgs(args){return p.captures.map(c=>{try{let q=args[c.arg];
+  if(c.value_only)return {pointer:q.toString(),hex:Array.from({length:c.size},(_,i)=>q.shr(8*i).and(255).toInt32().toString(16).padStart(2,'0')).join('')};
+  for(const off of c.deref){if(!readable(q.add(off),8))return {error:'unreadable pointer at '+q.add(off)};q=q.add(off).readPointer();}
+  if(!readable(q,c.size))return {pointer:q.toString(),error:'unreadable '+c.size+' bytes'};
+  return {pointer:q.toString(),hex:Array.from(new Uint8Array(q.readVolatile(c.size)),b=>b.toString(16).padStart(2,'0')).join('')};
+ }catch(e){return {error:String(e)};}});}
+// Sampled observation: count every call, keep min/max/last of one captured number, send one summary per window.
+const agg={count:0,min:null,max:null,last:null};
+if(p.sample){setInterval(()=>{send({event:'sample',hook_id:p.id,window_s:p.sample.window_s,count:agg.count,
+  rate:agg.count/p.sample.window_s,min:agg.min,max:agg.max,last:agg.last});agg.count=0;agg.min=agg.max=null;},p.sample.window_s*1000);}
+function sampleValue(hexed){const b=new Uint8Array(hexed.match(/../g).map(x=>parseInt(x,16))).buffer,v=new DataView(b);
+  switch(p.sample.as){case 'f32':return v.getFloat32(0,true);case 'f64':return v.getFloat64(0,true);case 'i32':return v.getInt32(0,true);
+   case 'u32':return v.getUint32(0,true);case 'i16':return v.getInt16(0,true);case 'u16':return v.getUint16(0,true);case 'u8':return v.getUint8(0);default:return Number(v.getBigUint64(0,true));}}
 const listener=Interceptor.attach(site,{
  onEnter(args){
+  if(p.sample){agg.count++;const c=captureArgs(args)[p.sample.capture];
+   if(c&&c.hex){const x=sampleValue(c.hex);agg.last=x;agg.min=agg.min===null||x<agg.min?x:agg.min;agg.max=agg.max===null||x>agg.max?x:agg.max;}return;}
   this.capture=hits++<p.limit;
   if(!this.capture)return;
   const context=captureContext(this.context);
   let backtrace=[];try{backtrace=Thread.backtrace(this.context,Backtracer.ACCURATE).slice(0,16).map(a=>a.toString());}catch(e){}
   send({event:p.pause?'break':'enter',hook_id:p.id,hit:hits,thread:this.threadId,
     address:site.toString(),return_address:this.returnAddress.toString(),context,
-    arguments:Array.from({length:8},(_,i)=>args[i].toString()),backtrace});
+    arguments:Array.from({length:8},(_,i)=>args[i].toString()),backtrace,captures:captureArgs(args)});
   if(p.pause)recv('continue:'+p.id,()=>{}).wait();
  },
  onLeave(retval){if(this.capture)send({event:'return',hook_id:p.id,thread:this.threadId,value:retval.toString()});}
@@ -256,6 +277,10 @@ class RuntimeAgent:
                 self.event_bytes -= old_size
                 self.dropped += 1
             payload = message.get("payload", {})
+            specs = (self.scripts.get(script_id) or {}).get("captures")
+            if specs and isinstance(payload, dict) and payload.get("captures") is not None:
+                from rusticre.runtime_decode import decode_event
+                payload["decoded"] = decode_event(specs, payload.pop("captures"))
             if message.get("type") == "error" and script_id in self.scripts:
                 self.scripts[script_id]["script_error"] = str(message.get("description") or message.get("stack") or "script error")[:1000]
             if message.get("type") == "send" and isinstance(payload, dict) and payload.get("event") == "break":
@@ -462,7 +487,15 @@ class RuntimeAgent:
                     raise ValueError("read must remain inside selected module")
                 provenance = self.control.exports_sync.locate(address)
             data = self.control.exports_sync.read(address, size)
+            layout = args.get("layout")
+            typed = None
+            if layout is not None:
+                from rusticre.runtime_decode import layout_values
+                if not isinstance(layout, list) or len(layout) > 512:
+                    raise ValueError("layout is a list of at most 512 {name, offset, type, size?} fields")
+                typed = layout_values(layout, bytes(data))
             return {"module": module, "rva": hex(rva) if rva is not None else None, "address": address,
+                    **({"fields": typed, "type": args.get("type_name")} if typed is not None else {}),
                     "range": provenance.get("range"), "target": {"pid": self.pid, "created_ms": self.target_created_ms,
                     "exe": self.target_exe, "exe_sha256": self.target_sha256},
                     "bytes": " ".join("%02X" % x for x in data)}
@@ -489,9 +522,20 @@ class RuntimeAgent:
             limit = int(args.get("limit", 20))
             if not 1 <= limit <= 200:
                 raise ValueError("probe limit must be 1..200")
+            from rusticre.runtime_decode import SCALARS, normalize
+            captures = normalize(args.get("capture"))
+            sample = args.get("sample")
+            if sample is not None:
+                if action != "observe" or not isinstance(sample, dict) or set(sample) - {"window_s", "capture"}:
+                    raise ValueError("sample is for observe: {window_s 1..300, capture: index of a numeric capture}")
+                window, index = int(sample.get("window_s", 10)), int(sample.get("capture", 0))
+                if not 1 <= window <= 300 or not 0 <= index < len(captures) or captures[index]["as"] not in SCALARS:
+                    raise ValueError("sample needs window_s 1..300 and a capture index whose decoder is a number")
+                sample = {"window_s": window, "capture": index, "as": captures[index]["as"]}
             hook_id = uuid.uuid4().hex
-            source = _probe_source(module, rva, expected, hook_id, limit, action == "break")
-            handle = self._load(hook_id, source, {"kind": action, "module": module, "rva": hex(rva), "expected_bytes": expected})
+            source = _probe_source(module, rva, expected, hook_id, limit, action == "break", captures, sample)
+            handle = self._load(hook_id, source, {"kind": action, "module": module, "rva": hex(rva), "expected_bytes": expected,
+                                                  "captures": captures, "sample": sample})
             return {"hook_id": hook_id, "verified": True, "module": module, "rva": hex(rva),
                     "address": address, "script_sha256": handle["source_sha256"], "pause_deadline_s": 30 if action == "break" else None,
                     **({"past_patch": patch} if patch else {})}

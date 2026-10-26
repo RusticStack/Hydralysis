@@ -40,8 +40,13 @@ def run(directory: Path, name: str) -> int:
                 time.sleep(min(debounce - quiet, debounce) + 0.1)
                 continue
             from rusticre.query import forget, open_program
-            engine = hydra.Engine(settings, role="saver")
+            # No daemon means no unsaved changes left to save: the next sync replays them.
+            engine = hydra.Engine(settings, role="saver", start=False)
             try:
+                try:
+                    engine.hello()
+                except RuntimeError:
+                    return 0
                 program = open_program(engine, state["fork_gpr"], target["program"], target["sha256"],
                                        writable=True, upgrade=True, refresh=True)
                 began = time.time()

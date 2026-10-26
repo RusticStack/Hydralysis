@@ -58,9 +58,14 @@ class EngineIntegration(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         from rusticre import hydra
+        engine = hydra.Engine(cls.settings)
         try:
-            hydra.Engine(cls.settings).stop(force=True)
+            engine.stop(force=True)
         finally:
+            # A daemon that ignored the stop must not outlive the test (it holds the work dir).
+            daemon = engine.module().Daemon(str(engine.engine_dir), str(hydra.state_dir(cls.settings)), hydra.INSTANCE)
+            if daemon.jvm_alive() or daemon.read_endpoint():
+                daemon.kill()
             cls.env.stop()
             time.sleep(1)
             cls.work.cleanup()

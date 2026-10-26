@@ -1278,6 +1278,84 @@ public class RusticQuery extends GhidraScript {
         return null;
     }
 
+    // Static write sites of a field: instructions that store through [register + offset].
+    private void writes(JsonObject req, JsonObject out, long deadline) throws Exception {
+        JsonObject opts = options(req);
+        long offset = Long.decode(text(opts, "offset"));
+        String type = text(opts, "receiver_type");
+        int limit = req.get("limit").getAsInt();
+        String cursor = text(req, "cursor");
+        var iterator = cursor.isEmpty() ? currentProgram.getListing().getInstructions(true)
+            : currentProgram.getListing().getInstructions(address(cursor), true);
+        JsonArray rows = new JsonArray();
+        long scanned = 0;
+        int verified = 0;
+        Address next = null;
+        while (iterator.hasNext() && rows.size() < limit && System.nanoTime() < deadline) {
+            if ((++scanned & 0xffff) == 0) monitor.checkCancelled();
+            var instruction = iterator.next();
+            next = instruction.getMaxAddress().next();
+            boolean stores = false;
+            for (PcodeOp op : instruction.getPcode()) stores |= op.getOpcode() == PcodeOp.STORE;
+            if (!stores || instruction.getNumOperands() == 0) continue;
+            Object[] parts = instruction.getOpObjects(0);
+            boolean register = false, displacement = false;
+            for (Object part : parts) {
+                if (part instanceof ghidra.program.model.lang.Register reg && !reg.isProgramCounter() && !reg.getName().equalsIgnoreCase("RSP")) register = true;
+                if (part instanceof ghidra.program.model.scalar.Scalar scalar && scalar.getUnsignedValue() == offset) displacement = true;
+            }
+            if (!register || !displacement || parts.length != 2) continue;
+            Function function = currentProgram.getFunctionManager().getFunctionContaining(instruction.getAddress());
+            JsonObject row = new JsonObject();
+            row.addProperty("site", "0x" + instruction.getAddress());
+            row.addProperty("rva", "0x" + Long.toHexString(instruction.getAddress().subtract(currentProgram.getImageBase())));
+            row.addProperty("instruction", clip(instruction.toString(), 256));
+            byte[] bytes = instruction.getBytes();
+            row.addProperty("bytes", HexFormat.ofDelimiter(" ").withUpperCase().formatHex(bytes));
+            if (function != null) { row.addProperty("function", "0x" + function.getEntryPoint()); row.addProperty("function_name", clip(function.getName(), 256)); }
+            if (function != null && !type.isEmpty()) {
+                boolean typed = storeTyped(function, instruction.getAddress(), offset, type, deadline);
+                row.addProperty("verified", typed);
+                if (typed) verified++;
+            }
+            rows.add(row);
+        }
+        out.add("writes", rows);
+        out.addProperty("verified", verified);
+        out.addProperty("instructions_scanned", scanned);
+        boolean more = iterator.hasNext();
+        out.addProperty("truncated", more);
+        if (more && next != null) out.addProperty("next_cursor", "0x" + next);
+        out.addProperty("coverage", "direct stores through [register + offset] in the analysed listing; not covered: computed offsets, block copies (memcpy/rep movs), stores made through another pointer to the same object, and code outside analysed functions. Probe the sites to see which run.");
+    }
+
+    private boolean storeTyped(Function function, Address site, long offset, String type, long deadline) {
+        try {
+            HighFunction high = decompile(function, deadline).getHighFunction();
+            for (var iterator = high.getPcodeOps(site); iterator.hasNext(); ) {
+                PcodeOpAST store = iterator.next();
+                if (store.getOpcode() != PcodeOp.STORE) continue;
+                Varnode address = strip(store.getInput(1));
+                PcodeOp add = address.getDef();
+                long seen = 0;
+                Varnode base = address;
+                if (add != null && (add.getOpcode() == PcodeOp.INT_ADD || add.getOpcode() == PcodeOp.PTRSUB) && add.getInput(1).isConstant()) {
+                    seen = add.getInput(1).getOffset();
+                    base = strip(add.getInput(0));
+                }
+                if (seen != offset) continue;
+                for (int guard = 0; guard < 8; guard++) {
+                    if (base.getHigh() != null && base.getHigh().getDataType() instanceof Pointer pointer
+                            && pointer.getDataType() != null && pointer.getDataType().getName().equals(type)) return true;
+                    PcodeOp step = base.getDef();
+                    if (step == null || step.getOpcode() != PcodeOp.PTRSUB || !step.getInput(1).isConstant() || step.getInput(1).getOffset() != 0) break;
+                    base = strip(step.getInput(0));
+                }
+            }
+        } catch (Exception refused) { }
+        return false;
+    }
+
     private Varnode strip(Varnode node) {
         for (int guard = 0; guard < 8 && node.getDef() != null; guard++) {
             int code = node.getDef().getOpcode();
@@ -1932,6 +2010,9 @@ public class RusticQuery extends GhidraScript {
         }
         if (action.equals("vcalls")) {
             vcalls(req, out, deadline); out.addProperty("ok", true); return out;
+        }
+        if (action.equals("writes")) {
+            writes(req, out, deadline); out.addProperty("ok", true); return out;
         }
         if (action.equals("vtables")) {
             vtables(req, out, deadline); out.addProperty("ok", true); return out;

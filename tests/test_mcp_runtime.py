@@ -151,6 +151,25 @@ class RuntimeOverMCP(unittest.TestCase):
         self.assertEqual(self.runtime("resume", session=session)["state"], "running")
         self.assertEqual(self.runtime("detach", session=session)["state"], "detached")
 
+    def test_probe_decodes_captured_arguments_and_samples(self):
+        target = subprocess.Popen([self.exe, "-c", "import time;time.sleep(60)"], stdin=subprocess.DEVNULL)
+        self.children.append(target.pid)
+        session = self.runtime("attach", exe=self.exe, sha256=self.digest, pid=target.pid)["session"]
+        try:
+            site = {"session": session, "module": Path(self.exe).name, "rva": "0x0", "sha256": self.digest, "expect": self.head}
+            self.runtime("observe", **site, capture=[{"arg": 1, "deref": [0], "size": 8, "as": "utf8", "label": "path"}])
+            sampled = self.runtime("observe", **site, capture=[{"arg": 2, "as": "f32"}], sample={"window_s": 10, "capture": 0})
+            events = [event["message"]["payload"] for event in self.runtime("status", session=session, limit=200)["events"]
+                      if event["message"].get("type") == "send"]
+            hit = next(event for event in events if event.get("event") == "enter" and event.get("decoded"))
+            self.assertEqual(hit["decoded"][0], {"arg": 1, "label": "path", "pointer": "0x140000000", "value": "ABC"})
+            summary = next(event for event in events if event.get("event") == "sample" and event["hook_id"] == sampled["hook_id"])
+            self.assertEqual((summary["count"], summary["max"]), (120, 4.0))
+            text = self.call("runtime", {"action": "observe", "options": {**site, "sample": {"window_s": 10, "capture": 0}}}, error=True)
+            self.assertIn("decoder is a number", text)
+        finally:
+            self.runtime("detach", session=session)
+
     def test_observe_without_hash_names_the_option(self):
         target = subprocess.Popen([self.exe, "-c", "import time;time.sleep(60)"], stdin=subprocess.DEVNULL)
         self.children.append(target.pid)

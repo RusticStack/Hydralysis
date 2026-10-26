@@ -217,6 +217,8 @@ class RuntimeRunner:
             raise PermissionError("runtime session %s is owned by %s (%s) since %s; other clients may use status, modules, "
                                   "threads, read and patches; driving it needs options.owner, the token its spawn/attach returned"
                                   % (session_id, owner.get("client"), owner.get("harness"), owner.get("since")))
+        if action == "read" and "type" in args:
+            args.update(self._layout(args))
         timeout = int(args.pop("timeout_s", 15))
         if not 1 <= timeout <= 60:
             raise ValueError("runtime timeout_s must be 1..60")
@@ -321,6 +323,22 @@ class RuntimeRunner:
             proc.terminate_tree(process)
         raise TimeoutError("runtime startup timed out; target state unknown; inspect %s" % (directory / "worker.log"))
 
+
+    def _layout(self, args: dict) -> dict:
+        """A type from a target's saved analysis (imported or overlay types included), as a read layout."""
+        from rusticre.backends import resolved
+        from rusticre.query import QueryRunner
+        name, target = str(args.pop("type")), str(args.pop("target", "") or "")
+        if not target:
+            raise ValueError("read with type needs options.target: the analysis target that defines the type")
+        answer = json.loads(QueryRunner(resolved(self.settings)).query(target, "type", options={"path": name}, limit=200))
+        described = answer["type"]
+        layout = [{"name": field.get("field") or "field_%x" % field["offset"], "offset": field["offset"],
+                   "type": field.get("name", ""), "size": field.get("length")} for field in described.get("fields", [])]
+        if not layout:
+            raise ValueError("type %s has no fields to read" % name)
+        size = int(args.get("size") or described.get("length") or 0)
+        return {"layout": layout, "size": max(1, min(4096, size)), "type_name": described.get("path")}
 
     # ---- one driving session per executable, and an optional external game lock ----------------
     def _lock_path(self, exe: Path) -> Path:
