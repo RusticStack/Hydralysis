@@ -21,7 +21,7 @@ from rusticre import hydra, targets, workcopy
 from rusticre.analysis import ADVANCED_ACTIONS, BULK_KINDS, validate_options
 
 ACTIONS = {"decompile", "function", "functions", "xrefs", "status", "stop"} | ADVANCED_ACTIONS
-ADDRESS_ACTIONS = {"decompile", "function", "xrefs", "variables", "dossier", "blocks", "pcode", "trace", "data", "scan"}
+ADDRESS_ACTIONS = {"decompile", "function", "xrefs", "variables", "dossier", "blocks", "pcode", "trace", "data", "scan", "vtables"}
 _ADDRESS = re.compile(r"(?:(?:rva|va):)?(?:0x)?[0-9a-fA-F]+")
 MAX_CHARS = 16_000_000
 # A background save of a large working copy holds its program for up to a few minutes;

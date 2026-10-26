@@ -84,6 +84,10 @@ class EngineIntegration(unittest.TestCase):
         for key in ("constants", "stops", "memory_edges", "selected_operations"):
             self.assertIn(key, traced)
         self.assertNotIn("result", traced)
+        scanned = self.ask("vcalls", limit=5, options={"offset": "0x8"})
+        self.assertIn("callers", scanned)
+        self.assertGreater(scanned["instructions_scanned"], 0)
+        self.assertIn("vtables", self.ask("vtables", address))
         warm = [self.ask("decompile", address)["query_s"] for _ in range(3)]
         self.assertLess(min(warm), 1.0)
 

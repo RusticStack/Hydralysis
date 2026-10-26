@@ -1090,6 +1090,203 @@ public class RusticQuery extends GhidraScript {
         out.addProperty("payload_utf8_bytes", json.toJson(out).getBytes(StandardCharsets.UTF_8).length);
     }
 
+    // ---- calls through vtables ----------------------------------------------------------------
+    private Address pointerAt(Address slot) {
+        try {
+            int size = currentProgram.getDefaultPointerSize();
+            long value = size == 8 ? currentProgram.getMemory().getLong(slot) : Integer.toUnsignedLong(currentProgram.getMemory().getInt(slot));
+            return currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(value);
+        } catch (Exception unreadable) { return null; }
+    }
+
+    // A vtable slot points at code: a function start, or code the analysis did not make one.
+    private boolean isFunctionPointer(Address slot) {
+        Address target = pointerAt(slot);
+        if (target == null) return false;
+        var block = currentProgram.getMemory().getBlock(target);
+        return block != null && block.isExecute() && block.isInitialized();
+    }
+
+    // function -> the tables of function pointers that hold it, and its slot in each.
+    private void vtables(JsonObject req, JsonObject out, long deadline) throws Exception {
+        Function function = currentProgram.getFunctionManager().getFunctionContaining(address(text(req, "address")));
+        if (function == null) throw new IllegalArgumentException("no analysed function contains this address");
+        out.add("function", function(function));
+        int size = currentProgram.getDefaultPointerSize(), limit = req.get("limit").getAsInt();
+        JsonArray rows = new JsonArray();
+        for (var reference : currentProgram.getReferenceManager().getReferencesTo(function.getEntryPoint())) {
+            if (rows.size() >= limit || System.nanoTime() >= deadline) break;
+            Address from = reference.getFromAddress();
+            var block = currentProgram.getMemory().getBlock(from);
+            if (block == null || block.isExecute() || !isFunctionPointer(from)) continue;
+            Address start = from;
+            // Back to where the run of function pointers starts: MSVC puts the RTTI locator
+            // pointer (not a function) right before each vtable. Labels inside are not starts.
+            for (int guard = 0; guard < 4096 && isFunctionPointer(start.subtract(size)); guard++) start = start.subtract(size);
+            JsonObject row = new JsonObject();
+            row.addProperty("table", "0x" + start);
+            row.addProperty("table_rva", "0x" + Long.toHexString(start.subtract(currentProgram.getImageBase())));
+            var symbol = currentProgram.getSymbolTable().getPrimarySymbol(start);
+            if (symbol != null) row.addProperty("label", clip(symbol.getName(true), 512));
+            row.addProperty("slot", from.subtract(start) / size);
+            row.addProperty("offset", "0x" + Long.toHexString(from.subtract(start)));
+            rows.add(row);
+        }
+        out.add("vtables", rows);
+        out.addProperty("provenance", "data references to the entry inside runs of function pointers; a run starts at a labelled address or where pointers stop, which bounds but does not prove a vtable");
+    }
+
+    // indirect calls through [reg + offset], verified on p-code where the receiver is known.
+    private void vcalls(JsonObject req, JsonObject out, long deadline) throws Exception {
+        JsonObject opts = options(req);
+        long offset = Long.decode(text(opts, "offset"));
+        String receiverType = text(opts, "receiver_type");
+        Address receiverGlobal = text(opts, "receiver_global").isEmpty() ? null : address(text(opts, "receiver_global"));
+        Function receiverFrom = text(opts, "receiver_from").isEmpty() ? null
+            : currentProgram.getFunctionManager().getFunctionContaining(address(text(opts, "receiver_from")));
+        if (!text(opts, "receiver_from").isEmpty() && receiverFrom == null) throw new IllegalArgumentException("receiver_from is not in an analysed function");
+        if (!text(opts, "vtable").isEmpty()) {
+            Address table = address(text(opts, "vtable"));
+            Address target = pointerAt(table.add(offset));
+            JsonObject implementation = new JsonObject();
+            implementation.addProperty("vtable", "0x" + table);
+            implementation.addProperty("slot", offset / currentProgram.getDefaultPointerSize());
+            Function function = target == null ? null : currentProgram.getFunctionManager().getFunctionAt(target);
+            implementation.addProperty("target", target == null ? null : "0x" + target);
+            if (function != null) {
+                implementation.add("function", function(function));
+                // A caller that knows the class calls the implementation directly.
+                JsonArray direct = new JsonArray();
+                for (var reference : currentProgram.getReferenceManager().getReferencesTo(function.getEntryPoint())) {
+                    if (!reference.getReferenceType().isCall() || direct.size() >= 200) continue;
+                    Function caller = currentProgram.getFunctionManager().getFunctionContaining(reference.getFromAddress());
+                    JsonObject row = new JsonObject();
+                    row.addProperty("site", "0x" + reference.getFromAddress());
+                    if (caller != null) { row.addProperty("function", "0x" + caller.getEntryPoint()); row.addProperty("function_name", clip(caller.getName(), 256)); }
+                    direct.add(row);
+                }
+                implementation.add("direct_callers", direct);
+            }
+            out.add("implementation", implementation);
+        }
+        int limit = req.get("limit").getAsInt();
+        String cursor = text(req, "cursor");
+        var iterator = cursor.isEmpty() ? currentProgram.getListing().getInstructions(true)
+            : currentProgram.getListing().getInstructions(address(cursor), true);
+        JsonArray rows = new JsonArray();
+        long scanned = 0;
+        Address next = null;
+        int verified = 0;
+        while (iterator.hasNext() && rows.size() < limit && System.nanoTime() < deadline) {
+            if ((++scanned & 0xffff) == 0) monitor.checkCancelled();
+            var instruction = iterator.next();
+            next = instruction.getMaxAddress().next();
+            if (!instruction.getFlowType().isCall() || !instruction.getFlowType().isComputed()) continue;
+            boolean match = false;
+            for (int i = 0; i < instruction.getNumOperands() && !match; i++) {
+                Object[] parts = instruction.getOpObjects(i);
+                boolean register = false, displacement = false;
+                for (Object part : parts) {
+                    if (part instanceof ghidra.program.model.lang.Register reg && !reg.isProgramCounter()) register = true;
+                    if (part instanceof ghidra.program.model.scalar.Scalar scalar && scalar.getUnsignedValue() == offset) displacement = true;
+                }
+                match = register && displacement && parts.length == 2;
+            }
+            if (!match) continue;
+            Function caller = currentProgram.getFunctionManager().getFunctionContaining(instruction.getAddress());
+            JsonObject row = new JsonObject();
+            row.addProperty("site", "0x" + instruction.getAddress());
+            row.addProperty("instruction", clip(instruction.toString(), 256));
+            if (caller != null) { row.addProperty("function", "0x" + caller.getEntryPoint()); row.addProperty("function_name", clip(caller.getName(), 256)); }
+            if (caller != null && (receiverFrom != null || !receiverType.isEmpty() || receiverGlobal != null)) {
+                String evidence = receiver(caller, instruction.getAddress(), offset, receiverFrom, receiverType, receiverGlobal, deadline);
+                row.addProperty("verified", evidence != null);
+                if (evidence != null) { row.addProperty("receiver", evidence); verified++; }
+            }
+            rows.add(row);
+        }
+        out.add("callers", rows);
+        out.addProperty("verified", verified);
+        out.addProperty("instructions_scanned", scanned);
+        boolean more = iterator.hasNext();
+        out.addProperty("truncated", more);
+        if (more && next != null) out.addProperty("next_cursor", "0x" + next);
+        out.addProperty("provenance", "listing scan for indirect calls through [register + offset]; verified means the decompiler's call target is LOAD(LOAD(receiver) + offset) with the receiver from receiver_from's result or typed receiver_type");
+    }
+
+    // Why this site calls through the receiver's vtable, or null.
+    private String receiver(Function caller, Address site, long offset, Function from, String type, Address global, long deadline) {
+        try {
+            HighFunction high = decompile(caller, deadline).getHighFunction();
+            for (var iterator = high.getPcodeOps(site); iterator.hasNext(); ) {
+                PcodeOpAST call = iterator.next();
+                if (call.getOpcode() != PcodeOp.CALLIND) continue;
+                Varnode target = strip(call.getInput(0));
+                PcodeOp load = target.getDef();
+                if (load == null || load.getOpcode() != PcodeOp.LOAD) continue;
+                Varnode slot = strip(load.getInput(1));
+                PcodeOp add = slot.getDef();
+                long seen = 0;
+                Varnode table = slot;
+                if (add != null && (add.getOpcode() == PcodeOp.INT_ADD || add.getOpcode() == PcodeOp.PTRSUB || add.getOpcode() == PcodeOp.PTRADD)) {
+                    if (add.getOpcode() == PcodeOp.PTRADD && add.getInput(1).isConstant() && add.getInput(2).isConstant())
+                        seen = add.getInput(1).getOffset() * add.getInput(2).getOffset();
+                    else if (add.getInput(1).isConstant()) seen = add.getInput(1).getOffset();
+                    table = strip(add.getInput(0));
+                }
+                if (seen != offset) continue;
+                PcodeOp vtableLoad = table.getDef();
+                if (vtableLoad == null || vtableLoad.getOpcode() != PcodeOp.LOAD) continue;
+                Varnode object = strip(vtableLoad.getInput(1));
+                // An embedded base at offset 0 (PTRSUB(obj, 0)) is the same pointer: its type is the
+                // base's, so look through such steps for the receiver's own type.
+                for (int guard = 0; guard < 8; guard++) {
+                    if (!type.isEmpty() && object.getHigh() != null) {
+                        DataType declared = object.getHigh().getDataType();
+                        if (declared instanceof Pointer pointer && pointer.getDataType() != null && pointer.getDataType().getName().equals(type))
+                            return "receiver typed " + type + " *";
+                    }
+                    PcodeOp step = object.getDef();
+                    if (step == null || step.getOpcode() != PcodeOp.PTRSUB || !step.getInput(1).isConstant() || step.getInput(1).getOffset() != 0) break;
+                    object = strip(step.getInput(0));
+                }
+                if (global != null) {
+                    // The object itself at a fixed address, or a global that holds a pointer to it.
+                    Varnode at = object;
+                    if (at.isConstant() && at.getOffset() == global.getOffset()) return "receiver is the object at 0x" + global;
+                    if (at.getAddress().isMemoryAddress() && at.getAddress().equals(global)) return "receiver loaded from 0x" + global;
+                    PcodeOp definition = at.getDef();
+                    if (definition != null && definition.getOpcode() == PcodeOp.LOAD) {
+                        Varnode source = strip(definition.getInput(1));
+                        if (source.isConstant() && source.getOffset() == global.getOffset()) return "receiver loaded from 0x" + global;
+                    }
+                    if (definition != null && definition.getOpcode() == PcodeOp.PTRSUB && definition.getInput(1).isConstant()
+                            && definition.getInput(1).getOffset() == global.getOffset()) return "receiver is the object at 0x" + global;
+                }
+                if (from != null) {
+                    for (int guard = 0; guard < 8 && object.getDef() != null; guard++) {
+                        PcodeOp definition = object.getDef();
+                        if ((definition.getOpcode() == PcodeOp.CALL) && definition.getInput(0).getAddress().equals(from.getEntryPoint()))
+                            return "receiver returned by " + from.getName() + " at 0x" + definition.getSeqnum().getTarget();
+                        if (definition.getOpcode() == PcodeOp.LOAD) object = strip(definition.getInput(1));
+                        else if (definition.getOpcode() == PcodeOp.MULTIEQUAL || definition.getOpcode() == PcodeOp.INDIRECT) object = strip(definition.getInput(0));
+                        else break;
+                    }
+                }
+            }
+        } catch (Exception refused) { }
+        return null;
+    }
+
+    private Varnode strip(Varnode node) {
+        for (int guard = 0; guard < 8 && node.getDef() != null; guard++) {
+            int code = node.getDef().getOpcode();
+            if (code == PcodeOp.CAST || code == PcodeOp.COPY) node = node.getDef().getInput(0);
+            else break;
+        }
+        return node;
+    }
+
     // ---- per-function fingerprints, for matching two builds ----------------------------------
     // One JSON line per function, streamed to `artifact` (<artifact>.part until complete):
     // entry RVA, name and its source, sizes, a hash of the raw bytes, a hash of the instruction
@@ -1732,6 +1929,12 @@ public class RusticQuery extends GhidraScript {
         out.addProperty("overlay_state", overlayState());
         if (action.equals("overlay_state")) {
             out.addProperty("changed", currentProgram.isChanged()); out.addProperty("ok", true); return out;
+        }
+        if (action.equals("vcalls")) {
+            vcalls(req, out, deadline); out.addProperty("ok", true); return out;
+        }
+        if (action.equals("vtables")) {
+            vtables(req, out, deadline); out.addProperty("ok", true); return out;
         }
         if (action.equals("fingerprints")) {
             fingerprints(req, out); out.addProperty("ok", true); return out;

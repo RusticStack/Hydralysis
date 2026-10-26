@@ -12,7 +12,8 @@ import re
 import uuid
 from pathlib import Path
 
-ADVANCED_ACTIONS = frozenset(("types", "type", "variables", "dossier", "blocks", "pcode", "trace", "type_edit", "data", "scan", "diff"))
+ADVANCED_ACTIONS = frozenset(("types", "type", "variables", "dossier", "blocks", "pcode", "trace", "type_edit", "data", "scan", "diff",
+                              "vcalls", "vtables"))
 _TYPE_KINDS = frozenset(("struct", "signature", "variable", "apply", "rename", "comment",
                          "function_create", "function_body", "function_delete", "batch", "import_types"))
 # Bulk kinds run as durable jobs: they can take minutes on a large program.
@@ -51,7 +52,8 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
     allowed = {
         "decompile": {"max_characters"}, "data": {"table"}, "scan": {"end", "mnemonic", "operand", "regex"},
         "types": set(), "type": {"path"}, "variables": set(), "dossier": set(),
-        "blocks": set(), "pcode": {"nodes"}, "diff": {"against", "checks"},
+        "blocks": set(), "pcode": {"nodes"}, "diff": {"against", "checks"}, "vtables": set(),
+        "vcalls": {"offset", "receiver_from", "receiver_type", "receiver_global", "vtable"},
         "trace": {"seed", "direction", "depth", "nodes", "functions", "argument", "brief", "callers", "debug"},
         "type_edit": {"kind", "source", "path", "size", "fields", "prototype", "variable", "type", "name", "comment", "expect", "ranges", "edits", "file", "expect_revision", "ids", "corpus", "category"} | (_BATCH_PROVENANCE | _CORPUS_RECORD if _record else set()),
     }
@@ -83,6 +85,15 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
                 re.compile(out["regex"])
             except re.error as exc:
                 raise ValueError("scan regex does not compile: %s" % exc) from exc
+    elif action == "vcalls":
+        offset = _text(out.get("offset", ""), "offset", 32, True)
+        if not re.fullmatch(r"0x[0-9a-fA-F]{1,6}|\d{1,7}", offset):
+            raise ValueError("vcalls offset is the slot's byte offset, such as 0xc0")
+        for name in ("receiver_from", "receiver_global", "vtable"):
+            if name in out and not _ADDRESS.fullmatch(str(out[name]).removeprefix("rva:").removeprefix("va:")):
+                raise ValueError("%s must be an address" % name)
+        if "receiver_type" in out:
+            out["receiver_type"] = _text(out["receiver_type"], "receiver_type", 256, True)
     elif action == "diff":
         out["against"] = _text(out.get("against", ""), "against", 64, True)
         if "checks" in out:
