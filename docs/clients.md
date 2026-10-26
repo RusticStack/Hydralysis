@@ -39,3 +39,32 @@ rusticre job <prepare-id>
 Install or reference this repository's `skills/rusticre/SKILL.md` in that client's agent guidance so the short command is discoverable. Prefer `ghidra-query` over hand-written `analyzeHeadless`: both CLI and MCP use the same warm worker. Use `--options-file` for trace/edit/runtime JSON and bulk work. In Qoder, explicit preparation/export commands can run later without changing the MCP catalog or importing per query. `sections`, `exports`, `ghidra-scripts` and `ghidra-jobs` are CLI aliases; use fingerprint detail and `job` in MCP.
 
 Restart the client after the edit. A session that is already open keeps the tool list it started with.
+
+## From scripts
+
+Python tools import the same operations instead of reimplementing PE reading or prologue checks. `rusticre.client.Client` calls the dispatch the MCP server uses, so names, arguments, bounds and refusals are the MCP contract; JSON answers come back parsed and a refusal raises `RusticError`.
+
+```python
+from rusticre.client import Client
+
+re = Client()                       # Client(config="F:/dev-cache/rusticre/config.json") selects targets
+build = re.fingerprint(exe)         # {"sha256": ..., "image_base": ..., ...}
+head = re.read(exe, "rva:0x5d53a0", 32)
+table = re.check_prologues(exe, rows, sha256=build["sha256"])   # rows: [{address, expect | [alternatives], name?}]
+table["matched"], [row["name"] for row in table["rows"] if not row["match"]]
+re.query("cp25", "decompile", "rva:0x5d53a0")
+re.call("xrefs", exe=exe, address="rva:0x5d53a0", limit=20)     # any tool by its MCP name
+```
+
+`check_prologues` returns a mismatching table rather than raising, and pages tables longer than the tool's 200 rows. PowerShell and other languages use the JSON command, which prints one envelope and exits 0 or 1:
+
+```text
+rusticre call prologue --args-file checks.json
+{"ok": true, "result": {"fingerprint": {...}, "rows": [...], "matched": true}}
+{"ok": false, "error": "ValueError: prologue table build SHA-256 mismatch; no rows verified"}
+```
+
+```powershell
+$answer = rusticre call bytes --args '{"exe": "D:/Game/bin/x64/Game.exe", "address": "rva:0x1000", "size": 16}' | ConvertFrom-Json
+if (-not $answer.ok) { throw $answer.error }
+```

@@ -112,6 +112,11 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("ghidra-jobs")
     sub.add_parser("tools")
     sub.add_parser("mcp")
+    called = sub.add_parser("call", help="Any MCP tool with its MCP arguments; prints one JSON envelope")
+    called.add_argument("tool", choices=TOOL_NAMES)
+    given = called.add_mutually_exclusive_group()
+    given.add_argument("--args", type=_json_options, default={})
+    given.add_argument("--args-file", help="UTF-8 JSON object of the tool's arguments")
 
     args = parser.parse_args(argv)
     if not args.command:
@@ -124,6 +129,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "tools":
             print("\n".join(TOOL_NAMES))
             return 0
+        if args.command == "call":
+            return _call_json(args)
         print(call(*_pair(args)))
         return 0
     except (ValueError, OSError, KeyError, RuntimeError) as exc:
@@ -195,6 +202,24 @@ def _pair(args: argparse.Namespace) -> tuple[str, dict]:
     if hasattr(args, "size"):
         payload["size"] = args.size
     return command, payload
+
+
+def _call_json(args: argparse.Namespace) -> int:
+    """The stable machine contract: exit 0 with {"ok": true, "result"}, exit 1 with {"ok": false, "error"}."""
+    import json
+    from rusticre.client import parse
+
+    try:
+        payload = args.args
+        if args.args_file:
+            args.options_file = args.args_file
+            payload = _options(args)
+        result = parse(call(args.tool, payload))
+    except (ValueError, OSError, KeyError, RuntimeError) as exc:
+        print(json.dumps({"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}))
+        return 1
+    print(json.dumps({"ok": True, "result": result}))
+    return 0
 
 
 def _json_options(value: str) -> dict:
