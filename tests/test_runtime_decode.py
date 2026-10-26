@@ -45,6 +45,8 @@ class Decoding(unittest.TestCase):
         self.assertEqual((spec["reg"], spec["arg"], spec["value_only"]), ("ecx", None, True))
         row = decode.decode_event([spec], [{"pointer": "0x1234", "hex": "3412000000000000"}])[0]
         self.assertEqual((row["reg"], row["value"]), ("ecx", "0x1234"))
+        vector = decode.normalize([{"reg": "xmm2", "as": "f32"}])[0]
+        self.assertEqual(decode.decode_event([vector], [{"pointer": None, "hex": "0000c03f"}])[0]["value"], 1.5)
         for bad in ({"reg": "ecx", "arg": 0}, {"reg": "e cx"}, {"reg": 3}):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 decode.normalize([{**bad, "as": "u32"}])

@@ -203,6 +203,8 @@ function argAt(context,args,i){
 function captureArgs(args,context){return p.captures.map(c=>{try{
   if(c.reg!==null&&context[c.reg]===undefined)return {error:'no register '+c.reg+' on '+Process.arch};
   let q=c.reg!==null?context[c.reg]:argAt(context,args,c.arg);
+  // A vector register (x64 xmm0..xmm15) is its bytes: a float argument is the low 4 or 8.
+  if(q instanceof ArrayBuffer)return {pointer:null,hex:Array.from(new Uint8Array(q).slice(0,Math.min(c.size,q.byteLength)),b=>b.toString(16).padStart(2,'0')).join('')};
   // A pointer is the target's own width (4 bytes in a 32-bit process).
   const n=c.ptr?Process.pointerSize:c.size;
   if(c.value_only)return {pointer:q.toString(),hex:Array.from({length:n},(_,i)=>q.shr(8*i).and(255).toInt32().toString(16).padStart(2,'0')).join('')};
