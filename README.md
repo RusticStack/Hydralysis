@@ -64,6 +64,7 @@ Query actions:
 - Value flow: `trace` follows a p-code value backward or forward. It goes through memory: stack slots, stores to a field, out-parameters. It also goes into callers and callees, cheapest path first. `brief` returns only the constants, stops and memory edges it reached. Every step cites its instruction and operation.
 - Virtual calls: `vtables` names the tables and slot that hold a function. `vcalls` lists the call sites of a slot offset and can verify each receiver on p-code.
 - Field writes: `writes` lists the direct stores to a field offset and says what it does not cover.
+- Missed code: `orphans` pages through decoded instructions that no function contains, with what refers to each run's start. Cite one in a `function_create` correction.
 - Two builds: `diff` matches every function of two analysed builds and writes the result as a job. Names and a hook table can then be carried across.
 
 Traces report unknown aliasing, indirect calls and runtime reachability; they do not prove source types or feasible paths.
@@ -94,7 +95,7 @@ The optional pinned Frida backend supports verified attach/spawn (with working d
 
 Probes:
 
-- `capture` copies and decodes arguments and the memory they point to.
+- `capture` copies and decodes arguments and the memory they point to. On 32-bit targets `convention` (`thiscall`, `fastcall`) maps the arguments, and a capture can name a register instead (`ecx`, or `xmm0`..`xmm15` for x64 float arguments).
 - `sample` summarizes a per-frame call per time window instead of sending one event per call.
 - `patches` compares live code with the file and decodes a detour another tool installed. `accept_patch` probes past it.
 
@@ -104,7 +105,7 @@ Hooks require the module's full hash and **matching exact live bytes** before in
 
 | MCP tools | Purpose |
 | --- | --- |
-| `fingerprint`, `imports` | Identity, packing triage and tables; fingerprint `detail=sections|exports` |
+| `fingerprint`, `imports` | Identity, packing triage and tables (imports with their IAT slots); fingerprint `detail=sections|exports` |
 | `inspect`, `disasm`, `function`, `bytes`, `strings`, `xrefs`, `callers`, `callees` | Cheap PE evidence |
 | `sigscan`, `prologue` | Locate candidates and verify bytes/tables |
 | `evidence_add`, `evidence_list` | Claims with mandatory sources, attributed to their client, grouped by subsystem, superseded rather than deleted |
