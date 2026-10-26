@@ -1078,6 +1078,317 @@ public class RusticQuery extends GhidraScript {
         out.addProperty("payload_utf8_bytes", json.toJson(out).getBytes(StandardCharsets.UTF_8).length);
     }
 
+    // ---- bulk types from a corpus ------------------------------------------------------------
+    // One JSON object per line: struct/union {name, size, align?, parent?, fields[{name, offset,
+    // type, size?, comment?}]}, enum {name, size, members[[name, value]]}, typedef {name, type},
+    // function_type {name, return, params[{name, type}]}, vtable {class, address, slots?, names?},
+    // function {address, name?, this?, signature?, comment?}. Types live under one category; a
+    // name the corpus does not define and Ghidra cannot parse becomes bytes of the declared size
+    // and is reported. The report is written to report_file; the edit is all or nothing.
+    private final Map<String, Integer> unresolvedTypes = new HashMap<>();
+
+    private DataType corpusType(String text, Map<String, DataType> named, int size) {
+        String type = text.trim();
+        if (type.endsWith("*")) {
+            DataType inner = corpusType(type.substring(0, type.length() - 1), named, -1);
+            return new PointerDataType(inner == null ? DataType.DEFAULT : inner, currentProgram.getDataTypeManager());
+        }
+        var array = java.util.regex.Pattern.compile("^(.*)\\[(\\d+)\\]$").matcher(type);
+        if (array.matches()) {
+            int count = Integer.parseInt(array.group(2));
+            DataType element = corpusType(array.group(1), named, -1);
+            if (element != null && element.getLength() > 0 && count > 0) return new ArrayDataType(element, count, element.getLength());
+        } else {
+            DataType found = named.get(type);
+            if (found != null) return found;
+            switch (type) {
+                case "int8": return SignedByteDataType.dataType;
+                case "uint8": case "byte": return ByteDataType.dataType;
+                case "int16": return ShortDataType.dataType;
+                case "uint16": return UnsignedShortDataType.dataType;
+                case "int32": return IntegerDataType.dataType;
+                case "uint32": return UnsignedIntegerDataType.dataType;
+                case "int64": return LongLongDataType.dataType;
+                case "uint64": return UnsignedLongLongDataType.dataType;
+                case "float": return FloatDataType.dataType;
+                case "double": return DoubleDataType.dataType;
+                case "bool": return BooleanDataType.dataType;
+                case "char16": return WideChar16DataType.dataType;
+                case "void": return VoidDataType.dataType;
+                case "pointer": return new PointerDataType(DataType.DEFAULT, currentProgram.getDataTypeManager());
+                default:
+                    try { return resolveType(type); } catch (Exception ignored) { }
+            }
+        }
+        unresolvedTypes.merge(type, 1, Integer::sum);
+        if (size <= 0) return null;
+        return size == 1 ? Undefined1DataType.dataType : new ArrayDataType(Undefined1DataType.dataType, size, 1);
+    }
+
+    private void importTypes(JsonObject opts, long deadline) throws Exception {
+        String file = text(opts, "corpus_file");
+        if (file.isEmpty()) throw new IllegalArgumentException("import_types needs its corpus (corpus_file)");
+        String root = text(opts, "category").isEmpty() ? "/corpus" : text(opts, "category");
+        bindDeadline = deadline;
+        autoThis = 0;
+        var manager = currentProgram.getDataTypeManager();
+        unresolvedTypes.clear();
+        List<JsonObject> records = new ArrayList<>();
+        try (BufferedReader reader = Files.newBufferedReader(Path.of(file), StandardCharsets.UTF_8)) {
+            for (String line; (line = reader.readLine()) != null; ) if (!line.isBlank()) records.add(JsonParser.parseString(line).getAsJsonObject());
+        }
+        Map<String, DataType> named = new HashMap<>();
+        Map<String, Integer> counts = new TreeMap<>();
+        JsonArray conflicts = new JsonArray(), failures = new JsonArray();
+        // 1. every composite and enum exists before any field refers to it
+        for (JsonObject record : records) {
+            monitor.checkCancelled();
+            String kind = text(record, "kind"), name = text(record, "name");
+            if (name.isEmpty() && !kind.equals("vtable") && !kind.equals("function")) throw new IllegalArgumentException("corpus record without a name: " + record);
+            CategoryPath category = new CategoryPath(record.has("category") ? text(record, "category") : root);
+            DataType created = null;
+            if (kind.equals("struct")) created = new StructureDataType(category, name, Math.max(0, number(record, "size", 0)), manager);
+            else if (kind.equals("union")) created = new UnionDataType(category, name, manager);
+            else if (kind.equals("enum")) {
+                int size = number(record, "size", 4);
+                EnumDataType enumeration = new EnumDataType(category, name, size == 1 || size == 2 || size == 8 ? size : 4, manager);
+                for (JsonElement member : record.has("members") ? record.getAsJsonArray("members") : new JsonArray()) {
+                    JsonArray pair = member.getAsJsonArray();
+                    try { enumeration.add(pair.get(0).getAsString(), pair.get(1).getAsLong()); }
+                    catch (IllegalArgumentException duplicate) { conflicts.add(name + "." + pair.get(0).getAsString() + ": " + duplicate.getMessage()); }
+                }
+                created = enumeration;
+            }
+            if (created != null) {
+                DataType existing = manager.getDataType(category, name);
+                if (existing != null && !kind.equals("enum") && existing.getLength() != created.getLength() && existing.getLength() > 0)
+                    conflicts.add(category + "/" + name + ": replaced a type of length " + existing.getLength());
+                named.put(name, manager.addDataType(created, DataTypeConflictHandler.REPLACE_HANDLER));
+                counts.merge(kind, 1, Integer::sum);
+            }
+        }
+        // 2. typedefs and function types, then fields (parents first, as an embedded base)
+        for (JsonObject record : records) {
+            String kind = text(record, "kind"), name = text(record, "name");
+            CategoryPath category = new CategoryPath(record.has("category") ? text(record, "category") : root);
+            if (kind.equals("typedef")) {
+                DataType base = corpusType(text(record, "type"), named, number(record, "size", 0));
+                if (base != null) { named.put(name, manager.addDataType(new TypedefDataType(category, name, base, manager), DataTypeConflictHandler.REPLACE_HANDLER)); counts.merge(kind, 1, Integer::sum); }
+            } else if (kind.equals("function_type")) {
+                FunctionDefinitionDataType definition = new FunctionDefinitionDataType(category, name, manager);
+                DataType returned = record.has("return") ? corpusType(text(record, "return"), named, -1) : VoidDataType.dataType;
+                definition.setReturnType(returned == null ? DataType.DEFAULT : returned);
+                List<ParameterDefinition> parameters = new ArrayList<>();
+                for (JsonElement item : record.has("params") ? record.getAsJsonArray("params") : new JsonArray()) {
+                    JsonObject parameter = item.getAsJsonObject();
+                    DataType type = corpusType(text(parameter, "type"), named, -1);
+                    parameters.add(new ParameterDefinitionImpl(text(parameter, "name"), type == null ? DataType.DEFAULT : type, null));
+                }
+                definition.setArguments(parameters.toArray(new ParameterDefinition[0]));
+                named.put(name, manager.addDataType(definition, DataTypeConflictHandler.REPLACE_HANDLER));
+                counts.merge(kind, 1, Integer::sum);
+            }
+        }
+        int fields = 0, parents = 0, inherited = 0, flattened = 0;
+        // Parents are filled before their subclasses, so a field a dump repeats on a subclass
+        // is recognised as the base's.
+        Map<String, JsonObject> composites = new LinkedHashMap<>();
+        for (JsonObject record : records) if (text(record, "kind").equals("struct") || text(record, "kind").equals("union")) composites.put(text(record, "name"), record);
+        List<JsonObject> ordered = new ArrayList<>();
+        Set<String> placed = new HashSet<>();
+        for (String start : composites.keySet()) {
+            ArrayDeque<String> chain = new ArrayDeque<>();
+            for (String name = start; name != null && composites.containsKey(name) && !placed.contains(name) && chain.size() < 256; ) {
+                chain.push(name);
+                String parent = text(composites.get(name), "parent");
+                name = parent.isEmpty() || chain.contains(parent) ? null : parent;
+            }
+            while (!chain.isEmpty()) { String name = chain.pop(); if (placed.add(name)) ordered.add(composites.get(name)); }
+        }
+        for (JsonObject record : ordered) {
+            monitor.checkCancelled();
+            if (System.nanoTime() >= deadline) throw new IllegalStateException("type import deadline reached; nothing applied");
+            String kind = text(record, "kind"), name = text(record, "name");
+            if (!kind.equals("struct") && !kind.equals("union")) continue;
+            Composite composite = (Composite) named.get(name);
+            List<int[]> occupied = new ArrayList<>();
+            Structure embedded = null;
+            if (kind.equals("struct") && record.has("parent") && named.get(text(record, "parent")) instanceof Structure parent
+                    && parent.getLength() > 0 && parent.getLength() <= composite.getLength() && !parent.equals(composite)) {
+                // A base embeds whole when it ends before this struct's own fields begin. Dumps that
+                // give allocation sizes (a base as large as its subclass) get the base's fields
+                // copied instead, as far as they fit before the first own field.
+                int own = composite.getLength();
+                for (JsonElement element : record.has("fields") ? record.getAsJsonArray("fields") : new JsonArray()) {
+                    JsonObject field = element.getAsJsonObject();
+                    int offset = number(field, "offset", 0);
+                    if (!inherits(parent, offset, text(field, "name"))) own = Math.min(own, offset);
+                }
+                if (parent.getLength() <= own) {
+                    ((Structure) composite).replaceAtOffset(0, parent, parent.getLength(), "super_" + parent.getName(), "base class");
+                    occupied.add(new int[] {0, parent.getLength()});
+                    embedded = parent;
+                    parents++;
+                } else {
+                    for (var component : parent.getDefinedComponents()) {
+                        if (component.getOffset() + component.getLength() > own) continue;
+                        ((Structure) composite).replaceAtOffset(component.getOffset(), component.getDataType(), component.getLength(),
+                            component.getFieldName(), "from " + parent.getName());
+                        occupied.add(new int[] {component.getOffset(), component.getOffset() + component.getLength()});
+                    }
+                    embedded = parent;
+                    flattened++;
+                }
+            }
+            for (JsonElement element : record.has("fields") ? record.getAsJsonArray("fields") : new JsonArray()) {
+                JsonObject field = element.getAsJsonObject();
+                int size = number(field, "size", -1);
+                DataType type = corpusType(text(field, "type"), named, size);
+                if (type == null) { failures.add(name + "." + text(field, "name") + ": no size for unresolved " + text(field, "type")); continue; }
+                int length = type.getLength() > 0 ? type.getLength() : size;
+                if (size > 0 && length != size) {
+                    conflicts.add(name + "." + text(field, "name") + ": " + type.getName() + " is " + length + " bytes, corpus says " + size);
+                    type = size == 1 ? Undefined1DataType.dataType : new ArrayDataType(Undefined1DataType.dataType, size, 1);
+                    length = size;
+                }
+                String comment = field.has("comment") ? text(field, "comment") : null;
+                try {
+                    if (composite instanceof Union union) union.add(type, length, text(field, "name"), comment);
+                    else {
+                        int offset = number(field, "offset", 0);
+                        boolean overlaps = false;
+                        for (int[] range : occupied) overlaps |= offset < range[1] && offset + length > range[0];
+                        if (overlaps && embedded != null && inherits(embedded, offset, text(field, "name"))) {
+                            inherited++;
+                            continue;
+                        }
+                        if (overlaps || offset + length > composite.getLength()) {
+                            conflicts.add(name + "." + text(field, "name") + " at +0x" + Integer.toHexString(offset) + " overlaps or exceeds the struct; skipped");
+                            continue;
+                        }
+                        ((Structure) composite).replaceAtOffset(offset, type, length, text(field, "name"), comment);
+                        occupied.add(new int[] {offset, offset + length});
+                    }
+                    fields++;
+                } catch (IllegalArgumentException error) { failures.add(name + "." + text(field, "name") + ": " + error.getMessage()); }
+            }
+        }
+        // 3. functions: this types from vtables, names, signatures and comments
+        int bound = 0, renamed = 0;
+        int pointerSize = currentProgram.getDefaultPointerSize();
+        for (JsonObject record : records) {
+            monitor.checkCancelled();
+            String kind = text(record, "kind");
+            if (kind.equals("vtable")) {
+                DataType owner = named.get(text(record, "class"));
+                if (owner == null) { failures.add("vtable for unknown class " + text(record, "class")); continue; }
+                Address table = address(text(record, "address"));
+                JsonArray names = record.has("names") ? record.getAsJsonArray("names") : new JsonArray();
+                int slots = number(record, "slots", Math.max(names.size(), 0));
+                for (int slot = 0; slot < slots && slot < 4096; slot++) {
+                    Address entry;
+                    try {
+                        long value = pointerSize == 8 ? currentProgram.getMemory().getLong(table.add((long) slot * 8)) : Integer.toUnsignedLong(currentProgram.getMemory().getInt(table.add((long) slot * 4)));
+                        entry = currentProgram.getAddressFactory().getDefaultAddressSpace().getAddress(value);
+                    } catch (Exception unreadable) { failures.add("vtable " + table + " slot " + slot + " unreadable"); break; }
+                    Function function = currentProgram.getFunctionManager().getFunctionAt(entry);
+                    if (function == null) continue;
+                    String slotName = slot < names.size() && !names.get(slot).isJsonNull() ? names.get(slot).getAsString() : "";
+                    if (bindThis(function, owner, failures)) bound++;
+                    if (!slotName.isEmpty() && function.getSymbol().getSource() != SourceType.USER_DEFINED) {
+                        function.setName(owner.getName() + "_" + slotName, SourceType.IMPORTED);
+                        renamed++;
+                    }
+                }
+                counts.merge(kind, 1, Integer::sum);
+            } else if (kind.equals("function")) {
+                Function function = currentProgram.getFunctionManager().getFunctionAt(address(text(record, "address")));
+                if (function == null) { failures.add("no function at " + text(record, "address")); continue; }
+                if (record.has("signature")) {
+                    var signature = new FunctionSignatureParser(manager, null).parse(function.getSignature(), text(record, "signature"));
+                    if (!new ApplyFunctionSignatureCmd(function.getEntryPoint(), signature, SourceType.IMPORTED).applyTo(currentProgram, monitor))
+                        failures.add("signature at " + function.getEntryPoint() + " refused");
+                }
+                if (record.has("this")) {
+                    DataType owner = named.containsKey(text(record, "this")) ? named.get(text(record, "this")) : corpusType(text(record, "this"), named, -1);
+                    if (owner != null && bindThis(function, owner, failures)) bound++;
+                }
+                if (record.has("name")) { function.setName(text(record, "name"), SourceType.IMPORTED); renamed++; }
+                if (record.has("comment")) currentProgram.getListing().setComment(function.getEntryPoint(), ghidra.program.model.listing.CommentType.PLATE, text(record, "comment"));
+                counts.merge(kind, 1, Integer::sum);
+            }
+        }
+        JsonObject report = new JsonObject();
+        report.addProperty("records", records.size());
+        JsonObject created = new JsonObject(); counts.forEach(created::addProperty); report.add("by_kind", created);
+        report.addProperty("fields", fields);
+        report.addProperty("embedded_parents", parents);
+        report.addProperty("inherited_fields", inherited);
+        report.addProperty("flattened_parents", flattened);
+        report.addProperty("functions_typed_this", bound);
+        report.addProperty("functions_thiscall_kept", autoThis);
+        report.addProperty("functions_renamed", renamed);
+        report.addProperty("category", root);
+        JsonArray unresolved = new JsonArray();
+        unresolvedTypes.entrySet().stream().sorted((a, b) -> b.getValue() - a.getValue()).limit(500).forEach(entry -> {
+            JsonObject row = new JsonObject(); row.addProperty("type", entry.getKey()); row.addProperty("uses", entry.getValue()); unresolved.add(row);
+        });
+        report.addProperty("unresolved_type_names", unresolvedTypes.size());
+        report.add("unresolved", unresolved);
+        report.addProperty("conflicts_total", conflicts.size());
+        report.addProperty("failures_total", failures.size());
+        JsonArray someConflicts = new JsonArray(), someFailures = new JsonArray();
+        for (int i = 0; i < conflicts.size() && i < 2000; i++) someConflicts.add(conflicts.get(i));
+        for (int i = 0; i < failures.size() && i < 2000; i++) someFailures.add(failures.get(i));
+        report.add("conflicts", someConflicts);
+        report.add("failures", someFailures);
+        if (!text(opts, "report_file").isEmpty()) write(Path.of(text(opts, "report_file")), report);
+        lastImport = report;
+    }
+
+    private JsonObject lastImport;
+
+    // A field the dump lists again on a subclass, which the embedded base already holds.
+    private boolean inherits(Structure base, int offset, String name) {
+        for (int guard = 0; base != null && guard < 64; guard++) {
+            var component = base.getComponentContaining(offset);
+            if (component == null) return false;
+            if (name.equals(component.getFieldName()) && component.getOffset() == offset) return true;
+            if (!(component.getDataType() instanceof Structure inner)) return false;
+            offset -= component.getOffset();
+            base = inner;
+        }
+        return false;
+    }
+
+    // param 0 becomes `Type *` (this). A function whose parameters were never committed gets the
+    // decompiler's recovered signature first, so only the type of `this` changes.
+    private long bindDeadline;
+    private int autoThis;
+
+    private boolean bindThis(Function function, DataType owner, JsonArray failures) {
+        try {
+            DataType pointer = new PointerDataType(owner, currentProgram.getDataTypeManager());
+            if (function.getParameterCount() == 0) {
+                HighFunction high = decompile(function, bindDeadline).getHighFunction();
+                HighFunctionDBUtil.commitParamsToDatabase(high, true, HighFunctionDBUtil.ReturnCommitOption.COMMIT, SourceType.ANALYSIS);
+            }
+            if (function.getParameterCount() == 0) {
+                failures.add("this for " + function.getEntryPoint() + ": the decompiler recovered no parameters");
+                return false;
+            }
+            var first = function.getParameter(0);
+            if (first.getDataType().isEquivalent(pointer)) return false;
+            if (first.isAutoParameter()) { autoThis++; return false; }  // __thiscall: this is implied
+            first.setDataType(pointer, SourceType.IMPORTED);
+            if (!"this".equals(first.getName())) first.setName("this", SourceType.IMPORTED);
+            return true;
+        } catch (Exception error) {
+            if (failures.size() < 4000) failures.add("this for " + function.getEntryPoint() + ": " + error.getMessage());
+            return false;
+        }
+    }
+
     private void typeEdit(String addressText, JsonObject opts, long deadline) throws Exception {
         if (System.nanoTime() >= deadline) throw new IllegalStateException("overlay edit deadline reached; edit not completed");
         monitor.checkCancelled();
@@ -1118,6 +1429,8 @@ public class RusticQuery extends GhidraScript {
                 DataType existing = manager.getDataType(path);
                 if (existing != null && !existing.isEquivalent(structure)) throw new IllegalArgumentException("different type already exists at path; choose a new overlay path");
                 manager.addDataType(structure, DataTypeConflictHandler.KEEP_HANDLER);
+            } else if (kind.equals("import_types")) {
+                importTypes(opts, deadline);
             } else if (kind.startsWith("function_")) {
                 Address entry = address(addressText);
                 var listing = currentProgram.getListing();
@@ -1226,6 +1539,7 @@ public class RusticQuery extends GhidraScript {
             success = true;
         } finally { currentProgram.endTransaction(transaction, success); }
         out.addProperty("applied", records.size());
+        if (lastImport != null) out.add("import_report", lastImport);
         out.addProperty("overlay_state", overlayState());
     }
 

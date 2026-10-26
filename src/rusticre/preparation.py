@@ -131,7 +131,7 @@ def _launch(settings: dict, record: dict) -> dict:
     path.parent.mkdir(parents=True)
     write_json(path, record)
     keys = ("root", "hydra_dir", "hydra_client", "java_home", "hydra_idle_s", "hydra_keep_warm_s", "hydra_max_heap",
-            "hydra_allow_unpinned", "hydra", "fork_mode", "forbidden_drives")
+            "hydra_allow_unpinned", "hydra", "fork_mode", "fork_max_copy_mb", "forbidden_drives")
     runtime = {key: settings[key] for key in keys if key in settings}
     runtime["root"] = str(root_path(settings))
     write_json(path.parent / "settings.json", runtime)

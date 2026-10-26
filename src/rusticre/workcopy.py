@@ -116,18 +116,54 @@ def _attribution() -> dict:
     return {"client": who["client"], "harness": who["harness"]}
 
 
-def _apply(settings: dict, writer: hydra.Engine, program: dict, records: list[dict], state: dict, timeout_s: int) -> dict:
+def corpus_path(settings: dict, digest: str) -> Path:
+    return root_path(settings) / "corpora" / (digest + ".jsonl")
+
+
+def store_corpus(settings: dict, source: str) -> tuple[str, int]:
+    """Copy a corpus under its SHA-256 once; overlay replay never rereads the caller's file."""
+    source_path = Path(source)
+    digest = hashlib.sha256()
+    with source_path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 22), b""):
+            digest.update(block)
+    value = digest.hexdigest()
+    destination = corpus_path(settings, value)
+    if not destination.is_file():
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(destination.name + "." + uuid.uuid4().hex + ".tmp")
+        shutil.copyfile(source_path, temporary)
+        temporary.replace(destination)
+    return value, destination.stat().st_size
+
+
+def _replayable(settings: dict, target: dict, record: dict) -> dict:
+    """What RusticQuery needs to replay one record: bulk records get their files."""
+    options = dict(record["options"])
+    if options.get("kind") == "import_types":
+        corpus = corpus_path(settings, options["corpus_sha256"])
+        if not corpus.is_file():
+            raise ValueError("corpus %s of overlay %s is missing from %s; preserved overlays cannot be replayed"
+                             % (options["corpus_sha256"][:12], record["id"], corpus.parent))
+        options["corpus_file"] = str(corpus)
+        options["report_file"] = str(_directory(settings, target) / ("import-%s.json" % record["id"]))
+    return {"id": record["id"], "address": record["address"], "options": options}
+
+
+def _apply(settings: dict, writer: hydra.Engine, program: dict, records: list[dict], state: dict, timeout_s: int,
+           target: dict | None = None) -> dict:
     from rusticre.query import run_script
     directory = root_path(settings) / "hydra" / "requests"
     directory.mkdir(parents=True, exist_ok=True)
     batch = directory / ("overlays-%s.json" % uuid.uuid4().hex)
-    batch.write_text(json.dumps({"edits": [{key: record[key] for key in ("id", "address", "options")} for record in records],
+    batch.write_text(json.dumps({"edits": [_replayable(settings, target, record) if target else
+                                           {key: record[key] for key in ("id", "address", "options")} for record in records],
                                  "state": state}), encoding="utf-8")
     try:
         request = {"id": uuid.uuid4().hex, "action": "apply_overlays", "address": "", "limit": 1, "cursor": "",
                    "contains": "", "timeout_s": timeout_s, "options": {}, "edits_file": str(batch)}
         # A background save holds the program for about 35 s on a large project.
-        response, raw = run_script(writer, program, request, timeout_s, wait_ms=120000)
+        response, raw = run_script(writer, program, request, timeout_s, wait_ms=300000)
     finally:
         batch.unlink(missing_ok=True)
     if raw.get("mode") != "owner":
@@ -141,8 +177,10 @@ def _fork(settings: dict, writer: hydra.Engine, target: dict, source: str, prefi
     directory = _directory(settings, target)
     directory.mkdir(parents=True, exist_ok=True)
     destination = directory / (prefix + uuid.uuid4().hex[:10])
+    # On one ReFS volume this is a block clone; across volumes (a master on another drive) a full
+    # copy, allowed up to fork_max_copy_mb and reported in the sync's fork details.
     return writer.call("fork_project", project=source, path=str(destination), writable=True,
-                       mode=str(settings.get("fork_mode", "auto")))
+                       mode=str(settings.get("fork_mode", "auto")), maxCopyMb=int(settings.get("fork_max_copy_mb", 8192)))
 
 
 def _base(settings: dict, writer: hydra.Engine, target: dict, master: dict, current: dict) -> dict:
@@ -215,6 +253,7 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
         master = writer.call("open_project", path=target["gpr"])
         how = {"rebuilt": False}
         program = None
+        applied = None
         if Path(current.get("fork_gpr", "")).is_file() and current.get("master_revision") == master.get("revision"):
             program = open_program(writer, current["fork_gpr"], target["program"], target["sha256"],
                                    writable=True, upgrade=True, refresh=True)
@@ -233,16 +272,18 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
             program = open_program(writer, gpr, target["program"], target["sha256"], writable=True, upgrade=True, refresh=True)
             pending = records
         if pending or state_text(wanted) != current.get("state"):
-            _apply(settings, writer, program, pending, wanted, timeout_s)
+            applied = _apply(settings, writer, program, pending, wanted, timeout_s, target)
         retired = list(current.get("retired", []))
         for old in (current.get("fork_gpr"), (current.get("base") or {}).get("gpr")):
             if old and old not in (gpr, base.get("gpr")) and old not in retired:
                 retired.append(old)
+        report = (applied or {}).get("import_report") if pending else None
         state = {"fork_gpr": gpr, "master_revision": master.get("revision"), "state": state_text(wanted),
                  "base": base, "edits": len(records), "updated_at": time.time(),
                  "saved_at": current.get("saved_at") if not how["rebuilt"] else None,
                  "retired": _retire(writer, retired),
-                 "last_sync": {**how, "applied_now": len(pending), "seconds": round(time.monotonic() - started, 3)}}
+                 "last_sync": {**how, "applied_now": len(pending), "seconds": round(time.monotonic() - started, 3),
+                               **({"import_report": report} if report else {})}}
         write_json(_directory(settings, target) / "state.json", state)
         _start_saver(settings, target)
         return state
@@ -265,7 +306,7 @@ def _start_saver(settings: dict, target: dict) -> None:
     env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
     env["RUSTICRE_HARNESS"] = hydra.identity()["harness"]
     keys = ("root", "hydra_dir", "hydra_client", "java_home", "hydra_idle_s", "hydra_keep_warm_s", "hydra_max_heap",
-            "hydra_allow_unpinned", "hydra", "fork_mode", "forbidden_drives", "overlay_save_debounce_s")
+            "hydra_allow_unpinned", "hydra", "fork_mode", "fork_max_copy_mb", "forbidden_drives", "overlay_save_debounce_s")
     write_json(directory / "saver-settings.json", {**{key: settings[key] for key in keys if key in settings},
                                                    "targets": {target["name"]: targets_entry(settings, target)}})
     with (directory / "saver.log").open("ab") as log:
@@ -302,16 +343,31 @@ def reader(settings: dict, engine: hydra.Engine, target: dict) -> dict:
     wanted = state_text(state_of(store))
     state = _state(settings, target)
     if state.get("state") != wanted or not Path(state.get("fork_gpr", "")).is_file():
+        if heavy(store):
+            rebuilding(settings, target)
         with locked(_directory(settings, target) / ".sync.lock", SYNC_LOCK_S, "working copy"):
             store = load_store(settings, target)
             state = _sync(settings, target, store, 300)
     return open_program(engine, state["fork_gpr"], target["program"], target["sha256"])
 
 
-def repair(settings: dict, engine: hydra.Engine, target: dict) -> dict:
+def repair(settings: dict, engine: hydra.Engine, target: dict, timeout_s: int = 300) -> dict:
     """Re-sync the working copy from the store, whatever its program holds now."""
     with locked(_directory(settings, target) / ".sync.lock", SYNC_LOCK_S, "working copy"):
-        return _sync(settings, target, load_store(settings, target), 300)
+        return _sync(settings, target, load_store(settings, target), timeout_s)
+
+
+def heavy(store: dict) -> bool:
+    from rusticre.analysis import BULK_KINDS
+    return any(edit["options"].get("kind") in BULK_KINDS for edit in store["edits"])
+
+
+def rebuilding(settings: dict, target: dict) -> dict:
+    """A replay of bulk overlays runs as a job; the reader is told which one."""
+    from rusticre import overlayjobs
+    job = overlayjobs.start(settings, target["name"], "sync")
+    raise RuntimeError(json.dumps({"working_copy": "synchronizing", "job": job["id"], "state": job["state"],
+                                   "suggest": "job status %s; queries answer once it is done" % job["id"]}))
 
 
 def refresh(settings: dict, engine: hydra.Engine, target: dict) -> None:
@@ -327,6 +383,9 @@ def refresh(settings: dict, engine: hydra.Engine, target: dict) -> None:
 def edit(settings: dict, engine: hydra.Engine, target: dict, address: str, options: dict, timeout_s: int) -> dict:
     """Validate, apply and record one cited edit (or batch) with an optimistic revision check."""
     expect = options.pop("expect_revision", None)
+    if options.get("kind") == "import_types":
+        digest, size = store_corpus(settings, options.pop("corpus"))
+        options.update(corpus_sha256=digest, corpus_bytes=size)
     record = {"id": uuid.uuid4().hex, "address": address, "options": options}
     clean = {**_edit(record), "by": _attribution(), "at": time.time()}
     with locked(_directory(settings, target) / ".sync.lock", SYNC_LOCK_S, "working copy"):
@@ -342,10 +401,19 @@ def edit(settings: dict, engine: hydra.Engine, target: dict, address: str, optio
         store["edits"].append(clean)
         store["revision"] += 1
         _save_store(settings, target, store)
+    import_report = (state.get("last_sync") or {}).get("import_report")
     return {"ok": True, "overlay_id": clean["id"], "revision": store["revision"], "by": clean["by"],
+            **({"import_report": _summary(import_report)} if import_report else {}),
             "edits_applied": len(options.get("edits", [])) if options.get("kind") == "batch" else 1,
             "working_copy": state["fork_gpr"], "sync": state.get("last_sync"),
             "persistence": "cited, build-bound overlay applied to the working copy; the canonical project is unchanged"}
+
+
+def _summary(report: dict) -> dict:
+    """The import report's counts; the full report stays in its file."""
+    return {key: report.get(key) for key in ("records", "by_kind", "fields", "embedded_parents", "flattened_parents", "inherited_fields", "functions_typed_this", "functions_thiscall_kept",
+                                             "functions_renamed", "unresolved_type_names", "conflicts_total",
+                                             "failures_total", "category")} | {"unresolved_top": report.get("unresolved", [])[:10]}
 
 
 def revert(settings: dict, target: dict, ids: list[str], expect: int | None = None) -> dict:

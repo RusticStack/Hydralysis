@@ -14,7 +14,11 @@ from pathlib import Path
 
 ADVANCED_ACTIONS = frozenset(("types", "type", "variables", "dossier", "blocks", "pcode", "trace", "type_edit", "data", "scan"))
 _TYPE_KINDS = frozenset(("struct", "signature", "variable", "apply", "rename", "comment",
-                         "function_create", "function_body", "function_delete", "batch"))
+                         "function_create", "function_body", "function_delete", "batch", "import_types"))
+# Bulk kinds run as durable jobs: they can take minutes on a large program.
+BULK_KINDS = frozenset(("import_types",))
+_CORPUS_RECORD = {"corpus_sha256", "corpus_bytes", "corpus_input"}
+MAX_CORPUS_BYTES = 1024 * 1024 * 1024
 _SHA256 = re.compile(r"[0-9a-fA-F]{64}")
 _ADDRESS = re.compile(r"(?:0x)?[0-9a-fA-F]+")
 MAX_OVERLAYS = 4096
@@ -49,7 +53,7 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
         "types": set(), "type": {"path"}, "variables": set(), "dossier": set(),
         "blocks": set(), "pcode": {"nodes"},
         "trace": {"seed", "direction", "depth", "nodes", "functions", "argument", "brief", "callers", "debug"},
-        "type_edit": {"kind", "source", "path", "size", "fields", "prototype", "variable", "type", "name", "comment", "expect", "ranges", "edits", "file", "expect_revision", "ids"} | (_BATCH_PROVENANCE if _record else set()),
+        "type_edit": {"kind", "source", "path", "size", "fields", "prototype", "variable", "type", "name", "comment", "expect", "ranges", "edits", "file", "expect_revision", "ids", "corpus", "category"} | (_BATCH_PROVENANCE | _CORPUS_RECORD if _record else set()),
     }
     if action not in allowed:
         if options:
@@ -112,12 +116,15 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
             "function_body": {"expect", "ranges", "name"},
             "function_delete": {"expect"},
             "batch": {"edits", "file"} | (_BATCH_PROVENANCE if _record else set()),
+            "import_types": {"corpus", "category"} | (_CORPUS_RECORD if _record else set()),
         }[kind]
         if set(out) - {"kind", "source", "expect_revision"} - kind_fields:
             raise ValueError("options do not belong to type_edit kind %s" % kind)
         out["source"] = _text(out.get("source", ""), "source", 4096, True)
         if kind == "batch":
             return _batch(out, _record)
+        if kind == "import_types":
+            return _corpus(out, _record)
         required = {
             "struct": ("path",), "signature": ("prototype",), "variable": ("variable", "type"),
             "apply": ("type",), "rename": ("name",), "comment": ("comment",),
@@ -175,6 +182,33 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
                 out["ranges"] = clean_ranges
     # Round-trip ensures callers cannot mutate a validated record through nested aliases.
     return json.loads(json.dumps(out))
+
+
+def _corpus(value: dict, recorded: bool) -> dict:
+    """A type corpus is referenced by content hash; replay reads RusticRE's own copy."""
+    result = {"kind": "import_types", "source": value["source"]}
+    if "category" in value:
+        category = _text(value["category"], "category", 512, True)
+        if not category.startswith("/") or category.endswith("/") or len(category) < 2:
+            raise ValueError("category must be an absolute data type category such as /reflection")
+        result["category"] = category
+    if recorded:
+        if set(value) & {"corpus"}:
+            raise ValueError("a recorded corpus import carries corpus_sha256, not a path")
+        result["corpus_sha256"] = _digest(value.get("corpus_sha256", ""))
+        result["corpus_bytes"] = _integer(value.get("corpus_bytes"), "corpus_bytes", 1, MAX_CORPUS_BYTES)
+        if "corpus_input" in value:
+            result["corpus_input"] = _text(value["corpus_input"], "corpus_input", 32768)
+        return result
+    if set(value) & _CORPUS_RECORD:
+        raise ValueError("corpus provenance is computed, not supplied")
+    path = Path(_text(value.get("corpus", ""), "corpus", 32768, True)).expanduser()
+    if not path.is_absolute() or not path.is_file():
+        raise ValueError("corpus must be an absolute path to a JSONL type corpus")
+    if path.stat().st_size > MAX_CORPUS_BYTES:
+        raise ValueError("corpus exceeds 1 GiB")
+    result["corpus"] = str(path.resolve())
+    return result
 
 
 def _overlay_path(root: str | Path, target_key: str) -> Path:
@@ -242,7 +276,7 @@ def _edit(value: dict) -> dict:
     address = _text(value.get("address", ""), "overlay address", 128)
     if address and not _ADDRESS.fullmatch(address):
         raise ValueError("overlay address must be a numeric Ghidra VA")
-    if options["kind"] not in ("struct", "batch") and not address:
+    if options["kind"] not in ("struct", "batch", "import_types") and not address:
         raise ValueError("this type edit requires a Ghidra VA")
     edit_id = value.get("id") or uuid.uuid4().hex
     if not isinstance(edit_id, str) or not re.fullmatch(r"[0-9a-f]{32}", edit_id):

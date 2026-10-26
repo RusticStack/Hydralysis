@@ -154,6 +154,47 @@ class Overlays(EngineCase):
         query._keys.clear()
         self.assertEqual(self.ask()["function"]["name"], "One")
 
+    def corpus(self, text='{"kind":"struct","name":"Thing","size":8}\n'):
+        path = self.root / "types.jsonl"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_type_import_validates_and_runs_as_a_job(self):
+        from rusticre.analysis import validate_options
+        with self.assertRaisesRegex(ValueError, "absolute path"):
+            validate_options("type_edit", {"kind": "import_types", "corpus": "types.jsonl", "source": "s"})
+        with self.assertRaisesRegex(ValueError, "corpus_sha256"):
+            validate_options("type_edit", {"kind": "import_types", "corpus": str(self.corpus()), "source": "s",
+                                           "corpus_sha256": "0" * 64})
+        with patch("rusticre.overlayjobs.start", return_value={"id": "overlay-0123456789ab", "state": "queued"}) as start:
+            answer = json.loads(self.runner.query("owned", "type_edit", options={
+                "kind": "import_types", "corpus": str(self.corpus()), "source": "reflection dump"}))
+        self.assertEqual(answer["id"], "overlay-0123456789ab")
+        self.assertEqual(start.call_args.args[2], "edit")
+
+    def test_corpus_is_stored_once_under_its_hash_and_recorded_by_hash(self):
+        source = self.corpus()
+        result = workcopy.edit(self.settings, fakehydra.FakeEngine(self.settings), self.runner.target("owned"), "",
+                               {"kind": "import_types", "corpus": str(source), "source": "dump"}, 60)
+        self.assertTrue(result["ok"])
+        record = workcopy.load_store(self.settings, self.runner.target("owned"))["edits"][0]
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        self.assertEqual(record["options"]["corpus_sha256"], digest)
+        self.assertNotIn("corpus", record["options"])
+        self.assertEqual(workcopy.corpus_path(self.settings, digest).read_bytes(), source.read_bytes())
+
+    def test_a_rebuild_that_replays_a_corpus_is_handed_to_a_job(self):
+        target = self.runner.target("owned")
+        workcopy.edit(self.settings, fakehydra.FakeEngine(self.settings), target, "",
+                      {"kind": "import_types", "corpus": str(self.corpus()), "source": "dump"}, 60)
+        workcopy.edit(self.settings, fakehydra.FakeEngine(self.settings), target, "0x140001000",
+                      {"kind": "rename", "name": "Named", "source": "s"}, 60)
+        last = workcopy.load_store(self.settings, target)["edits"][-1]["id"]
+        workcopy.revert(self.settings, target, [last])
+        with patch("rusticre.overlayjobs.start", return_value={"id": "overlay-0123456789ab", "state": "queued"}):
+            with self.assertRaisesRegex(RuntimeError, "overlay-0123456789ab"):
+                self.ask()
+
     def test_rva_edits_are_recorded_as_plain_vas(self):
         self.edit(address="rva:0x1000", kind="rename", name="Named")
         record = workcopy.load_store(self.settings, self.runner.target("owned"))["edits"][0]

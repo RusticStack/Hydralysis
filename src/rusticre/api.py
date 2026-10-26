@@ -340,6 +340,9 @@ def _workflow(name: str, args: dict) -> str:
             if job_id.startswith("export-"):
                 from rusticre.exporting import cancel as cancel_export
                 return json.dumps(cancel_export(settings, job_id), indent=2)
+            if job_id.startswith("overlay-"):
+                from rusticre.overlayjobs import cancel as cancel_overlay
+                return json.dumps(cancel_overlay(settings, job_id), indent=2)
             return json.dumps(cancel(settings, job_id), indent=2)
         if action != "status":
             raise ValueError("job action must be status or cancel")
@@ -356,6 +359,10 @@ def _workflow(name: str, args: dict) -> str:
             scripts = sorted((Path(settings["root"]) / "jobs").glob("job-*.json"),
                              key=lambda item: item.stat().st_mtime_ns, reverse=True)[:limit]
             records.extend(read_json(item) for item in scripts)
+            from rusticre.overlayjobs import status as overlay_status
+            overlays = sorted((Path(settings["root"]) / "overlay-jobs").glob("overlay-*/job.json"),
+                              key=lambda item: item.stat().st_mtime_ns, reverse=True)[:limit]
+            records.extend(overlay_status(settings, item.parent.name) for item in overlays)
             records.sort(key=lambda item: item.get("created_at", item.get("started_at", 0)), reverse=True)
             fields = ("id", "job_id", "kind", "component", "state", "stage", "target", "game", "script",
                       "created_at", "started_at", "elapsed_s", "duration_s", "completed", "failed", "complete", "log_path")
@@ -364,6 +371,9 @@ def _workflow(name: str, args: dict) -> str:
         if job_id.startswith("export-"):
             from rusticre.exporting import status as export_status
             return json.dumps(export_status(settings, job_id), indent=2)
+        if job_id.startswith("overlay-"):
+            from rusticre.overlayjobs import status as overlay_status
+            return json.dumps(overlay_status(settings, job_id), indent=2)
         if job_id.startswith("job-"):
             import re
             if not re.fullmatch(r"job-[0-9a-f]{12}", job_id):

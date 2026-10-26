@@ -18,12 +18,15 @@ import uuid
 from pathlib import Path
 
 from rusticre import hydra, targets, workcopy
-from rusticre.analysis import ADVANCED_ACTIONS, validate_options
+from rusticre.analysis import ADVANCED_ACTIONS, BULK_KINDS, validate_options
 
 ACTIONS = {"decompile", "function", "functions", "xrefs", "status", "stop"} | ADVANCED_ACTIONS
 ADDRESS_ACTIONS = {"decompile", "function", "xrefs", "variables", "dossier", "blocks", "pcode", "trace", "data", "scan"}
 _ADDRESS = re.compile(r"(?:(?:rva|va):)?(?:0x)?[0-9a-fA-F]+")
 MAX_CHARS = 16_000_000
+# A background save of a large working copy holds its program for up to a few minutes;
+# requests wait for it rather than fail.
+BUSY_WAIT_MS = 180_000
 
 # Program keys per (root, project, program) for this process. The daemon may
 # restart; a stale key is reopened once.
@@ -48,11 +51,11 @@ def open_program(engine: hydra.Engine, gpr: str, program: str, sha256: str, *, w
         known = _keys.get(cache_key)
     if known and not refresh:
         return known
-    opened = engine.call("open_project", path=gpr, writable=writable)
+    opened = engine.call("open_project", path=gpr, writable=writable, wait=BUSY_WAIT_MS)
     fields = {"path": program, "project": opened["id"]}
     if writable:
         fields.update(writable=True, share=True, upgrade=upgrade)
-    info = engine.call("open_program", **fields)
+    info = engine.call("open_program", wait=BUSY_WAIT_MS, **fields)
     if str(info.get("sha256", "")).lower() != sha256:
         raise ValueError("%s in %s reports SHA-256 %s, not the target build %s; nothing was answered"
                          % (program, opened.get("gpr", gpr), info.get("sha256"), sha256))
@@ -71,7 +74,7 @@ def forget(engine: hydra.Engine) -> None:
 
 
 def run_script(engine: hydra.Engine, program: dict, request: dict, timeout_s: int, request_dir: Path | None = None,
-               wait_ms: int = 30000) -> tuple[dict, dict]:
+               wait_ms: int = 0) -> tuple[dict, dict]:
     """One RusticQuery run. Large requests travel as a file, not a command argument."""
     body = json.dumps(request, ensure_ascii=False)
     argument = body
@@ -85,7 +88,7 @@ def run_script(engine: hydra.Engine, program: dict, request: dict, timeout_s: in
         argument = "@" + str(path)
     try:
         result = engine.call("script", script="RusticQuery.java", program=program["key"], args=[argument],
-                             maxChars=MAX_CHARS, timeout=timeout_s + 5, wait=wait_ms)
+                             maxChars=MAX_CHARS, timeout=timeout_s + 5, wait=wait_ms or BUSY_WAIT_MS)
     finally:
         if path is not None:
             path.unlink(missing_ok=True)
@@ -120,7 +123,7 @@ class QueryRunner:
         if not 1 <= limit <= 200 or not 1 <= timeout_s <= 300:
             raise ValueError("limit must be 1..200; timeout_s must be 1..300")
         requires_address = action in ADDRESS_ACTIONS
-        requires_address |= action == "type_edit" and options.get("kind") not in ("struct", "batch", "revert")
+        requires_address |= action == "type_edit" and options.get("kind") not in ("struct", "batch", "revert", "import_types")
         if requires_address and not address:
             raise ValueError("address is required (a VA such as 0x140001000, or rva:0x1000)")
         if action == "type" and not (address or options.get("path")):
@@ -136,6 +139,9 @@ class QueryRunner:
             return json.dumps(self.stop(selected))
         if action == "type_edit" and options.get("kind") == "revert":
             return json.dumps(workcopy.revert(self.settings, selected, options["ids"], options.get("expect_revision")))
+        if action == "type_edit" and options.get("kind") in BULK_KINDS:
+            from rusticre import overlayjobs
+            return json.dumps(overlayjobs.start(self.settings, selected["name"], "edit", address, options), ensure_ascii=False)
         if action == "type_edit":
             if address.startswith(("rva:", "va:")):
                 # Overlay records hold plain VAs, so replay never depends on how an edit was typed.
@@ -169,6 +175,8 @@ class QueryRunner:
                 if attempt == 0:
                     # The working copy does not hold the store's state (a daemon restart lost
                     # unsaved changes, or another process is mid-edit): replay from the store.
+                    if workcopy.heavy(workcopy.load_store(self.settings, selected)):
+                        workcopy.rebuilding(self.settings, selected)
                     workcopy.repair(self.settings, self.engine, selected)
                     forget(self.engine)
                     continue

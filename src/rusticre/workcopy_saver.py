@@ -26,7 +26,9 @@ def run(directory: Path, name: str) -> int:
         return 0
     try:
         settings = read_json(directory / "saver-settings.json")
-        debounce = float(settings.get("overlay_save_debounce_s", 15))
+        # Saving only shortens a restart (the store is the record; lost changes are replayed),
+        # and it holds the program for minutes on a large project, so it waits for a quiet time.
+        debounce = float(settings.get("overlay_save_debounce_s", 600))
         target = targets.resolve(settings, name)
         started = time.monotonic()
         while time.monotonic() - started < MAX_RUN_S:

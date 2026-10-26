@@ -121,7 +121,7 @@ def provenance(settings: dict, target: str) -> tuple[dict, dict]:
 
 def worker_settings(settings: dict, target: str, project: dict) -> dict:
     fields = ("root", "hydra_dir", "hydra_client", "java_home", "hydra_idle_s", "hydra_keep_warm_s", "hydra_max_heap",
-              "hydra_allow_unpinned", "hydra", "fork_mode", "forbidden_drives")
+              "hydra_allow_unpinned", "hydra", "fork_mode", "fork_max_copy_mb", "forbidden_drives")
     result = {name: settings[name] for name in fields if name in settings}
     result["root"] = str(root_path(settings))
     result["targets"] = {target: project}
