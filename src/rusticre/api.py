@@ -303,7 +303,7 @@ def _workflow(name: str, args: dict) -> str:
         action = args.get("action", "start")
         if action not in ("plan", "start"):
             raise ValueError("prepare action must be plan or start")
-        install = args.get("install", True)
+        install = args.get("install", False)
         if not isinstance(install, bool):
             raise ValueError("install must be a boolean")
         operation = plan if action == "plan" else prepare

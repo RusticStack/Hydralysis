@@ -1,6 +1,5 @@
 import io
 import json
-import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -12,6 +11,8 @@ from rusticre.ghidra import build_command, filter_script_output
 from rusticre.mcp import Server
 from rusticre.prologue import compare, find_pattern, matches, parse_expect
 from rusticre.red4ext import iter_entries, lookup_hashes
+
+from support import workdir
 
 
 class PrologueTests(unittest.TestCase):
@@ -34,12 +35,12 @@ class AddressTableTests(unittest.TestCase):
             + b'{"hash": "10", "symbol": "Alpha", "offset": "0001:00001000"}\n'
             + b'{"hash": "11", "symbol": "Beta", "offset": "0002:00000020"}\n'
         )
-        with tempfile.TemporaryDirectory() as tmp:
+        with workdir() as tmp:
             path = Path(tmp) / "table.json"
             path.write_bytes(body)
             rows = list(iter_entries(path, chunk_size=24, overlap=16))
         self.assertEqual([row[0] for row in rows], [10, 11])
-        with tempfile.TemporaryDirectory() as tmp:
+        with workdir() as tmp:
             path = Path(tmp) / "table.json"
             path.write_bytes(body)
             text = "\n".join(lookup_hashes(path, {10}, chunk_size=24, overlap=16))
@@ -77,7 +78,7 @@ class GhidraCommandTests(unittest.TestCase):
 
 class EvidenceTests(unittest.TestCase):
     def test_a_claim_needs_a_source(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with workdir() as tmp:
             path = Path(tmp) / "e.db"
             with self.assertRaises(ValueError):
                 add_claim(path, game="cyberpunk", build="2.5", kind="function", name="X", note="n", source="")

@@ -15,8 +15,9 @@ import uuid
 import zipfile
 from pathlib import Path
 
-from rusticre.ghidra import LaneLock, headless_path, validate_project_path
+from rusticre.ghidra import LaneLock, headless_path
 from rusticre.localio import read_text as local_read_text
+from rusticre.paths import root_path
 
 SUPPORTED_GHIDRA_VERSION = "12.1.4"
 
@@ -34,14 +35,6 @@ ASSETS = {
         "size": 141167264,
     },
 }
-
-
-def root_path(settings: dict) -> Path:
-    default = "F:/dev-cache/rusticre" if os.name == "nt" else str(Path.home() / "rusticre-workspace")
-    root = Path(settings.get("root") or os.environ.get("RUSTICRE_ROOT") or default).expanduser().resolve()
-    if os.name == "nt" and root.drive.upper() in ("C:", "D:"):
-        raise ValueError("RusticRE data root must be on the development/data drive, not C: or D:")
-    return validate_project_path(root)
 
 
 def read_json(path: Path) -> dict:
@@ -103,8 +96,6 @@ def inspect(settings: dict) -> dict:
     saved = read_json(root / "backend.json")
     ghidra_candidates = [settings.get("ghidra_dir"), os.environ.get("GHIDRA_INSTALL_DIR"), saved.get("ghidra_dir")]
     ghidra_candidates += _children(root / "backends", "ghidra_*")
-    if os.name == "nt":
-        ghidra_candidates += _children(Path("F:/dev-cache/ghidra"), "ghidra_*")
     launcher = shutil.which("analyzeHeadless.bat" if os.name == "nt" else "analyzeHeadless")
     if launcher:
         ghidra_candidates.append(Path(launcher).resolve().parent.parent)
@@ -133,7 +124,6 @@ def inspect(settings: dict) -> dict:
         java_candidates.append(Path(javac).resolve().parent.parent)
     if os.name == "nt":
         java_candidates += _children(Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Eclipse Adoptium", "jdk*")
-        java_candidates += _children(Path("F:/dev-cache"), "jdk*")
     java = None
     minimum = ghidra["java_min"] if ghidra else 21
     maximum = ghidra["java_max"] if ghidra else None

@@ -1,7 +1,6 @@
 import io
 import json
 import os
-import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -10,6 +9,8 @@ from unittest.mock import Mock, patch
 from rusticre.api import _settings, call, tool_table
 from rusticre.cli import main
 from rusticre.mcp import Server
+
+from support import workdir
 
 
 class AgentContracts(unittest.TestCase):
@@ -84,7 +85,7 @@ class AgentContracts(unittest.TestCase):
         prepare.assert_not_called()
 
     def test_cli_options_file_preserves_json_and_rejects_arrays(self):
-        with tempfile.TemporaryDirectory() as folder:
+        with workdir() as folder:
             path = Path(folder) / "options.json"
             expected = {"kind": "comment", "source": "fixture:1", "comment": "quoted \"value\"\nsecond line"}
             path.write_text(json.dumps(expected), encoding="utf-8-sig")
@@ -99,7 +100,7 @@ class AgentContracts(unittest.TestCase):
 
     def test_prepared_registry_and_installed_paths_load_without_config_edits(self):
         from rusticre.config import load
-        with tempfile.TemporaryDirectory() as folder:
+        with workdir() as folder:
             root = Path(folder)
             config = root / "local.json"
             config.write_text(json.dumps({"targets": {"manual": {"program": "manual.exe"}}}))
@@ -112,7 +113,7 @@ class AgentContracts(unittest.TestCase):
 
     def test_example_config_is_never_loaded_as_a_live_target(self):
         from rusticre.config import config_path
-        with tempfile.TemporaryDirectory() as folder:
+        with workdir() as folder:
             root = Path(folder)
             (root / "config.example.json").write_text('{"targets":{"sample":{"exe":"missing.exe"}}}')
             with patch.dict(os.environ, {}, clear=True), patch("rusticre.config.Path.cwd", return_value=root):
@@ -126,7 +127,7 @@ class AgentContracts(unittest.TestCase):
     def test_hook_manifest_normalizes_real_table_shape_and_checks_build(self):
         from test_pe import image
         pe = image()
-        with tempfile.TemporaryDirectory() as folder:
+        with workdir() as folder:
             path = Path(folder) / "hooks.json"
             envelope = {"schema": "owned-hooks/1", "module": "fixture.exe", "build_id": "fixture",
                         "build_sha256": pe.fingerprint()["sha256"], "image_base": hex(pe.base),

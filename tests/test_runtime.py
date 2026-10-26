@@ -2,7 +2,6 @@ import hashlib
 import json
 import socket
 import struct
-import tempfile
 import threading
 import time
 import unittest
@@ -13,10 +12,12 @@ from unittest.mock import Mock, patch
 from rusticre import runtime, runtime_ipc
 from rusticre.runtime_worker import CONTROL, MEMORY_HELPER, RuntimeAgent, _expect, _probe_source, _ready_record, _read
 
+from support import workdir
+
 
 class RuntimeCase(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = workdir()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.binary = self.root / "owned.exe"
@@ -260,11 +261,50 @@ class HostRuntimeContracts(RuntimeCase):
 
     def test_inspect_has_no_filesystem_or_install_side_effects(self):
         settings = {"root": str(self.root / "missing-root")}
-        result = SimpleNamespace(returncode=1, stdout="", stderr="missing")
-        with patch("rusticre.runtime.subprocess.run", return_value=result):
+        with patch("rusticre.runtime.proc.run") as run:
             report = runtime.inspect(settings)
         self.assertFalse(report["ready"])
+        self.assertIn("backend action=install component=runtime", report["reason"])
+        # A backend that was never installed is reported without starting any child.
+        run.assert_not_called()
         self.assertFalse(Path(settings["root"]).exists())
+
+    def test_missing_backend_fails_fast_for_every_action_that_needs_it(self):
+        runner = runtime.RuntimeRunner({"root": str(self.root / "no-backend")})
+        with patch("rusticre.runtime.proc.run") as run, patch("rusticre.runtime.proc.popen") as launch:
+            for action, args in (("processes", {}),
+                                 ("spawn", {"exe": str(self.binary), "sha256": self.digest}),
+                                 ("attach", {"exe": str(self.binary), "sha256": self.digest, "pid": 4})):
+                with self.subTest(action=action), self.assertRaisesRegex(RuntimeError, "not installed"):
+                    runner.call(action, args)
+        run.assert_not_called()
+        launch.assert_not_called()
+
+    def test_spawn_and_attach_name_the_options_they_need(self):
+        runner = runtime.RuntimeRunner({"root": str(self.root / "options")})
+        cases = (("spawn", {"exe": str(self.binary)}, "options.sha256"),
+                 ("attach", {"exe": str(self.binary), "pid": 4}, "options.sha256"),
+                 ("spawn", {"sha256": self.digest}, "options.exe"),
+                 ("spawn", {"exe": str(self.binary), "sha256": self.digest, "cwd": "relative"}, "options.cwd"),
+                 ("spawn", {"exe": str(self.binary), "sha256": self.digest, "env": {"A": 1}}, "options.env"),
+                 ("spawn", {"exe": str(self.binary), "sha256": self.digest, "working_dir": "x"}, "unknown spawn options"),
+                 ("attach", {"exe": str(self.binary), "sha256": self.digest, "cwd": str(self.root)}, "unknown attach options"))
+        with patch("rusticre.runtime.proc.popen") as launch:
+            for action, args, message in cases:
+                with self.subTest(args=args), self.assertRaisesRegex(ValueError, message):
+                    runner.call(action, args)
+        launch.assert_not_called()
+
+    def test_spawned_target_gets_the_callers_environment_not_the_workers(self):
+        from rusticre.runtime_worker import target_environment
+        restore = json.dumps({"TEMP": "C:/caller-temp", "PYTHONPATH": None})
+        with patch.dict("os.environ", {"RUSTICRE_TARGET_ENV_RESTORE": restore, "TEMP": "worker-temp",
+                                       "PYTHONPATH": "worker-site"}):
+            env = target_environment({"MESA_LOADER_DRIVER_OVERRIDE": "zink"})
+        self.assertEqual(env["TEMP"], "C:/caller-temp")
+        self.assertNotIn("PYTHONPATH", env)
+        self.assertNotIn("RUSTICRE_TARGET_ENV_RESTORE", env)
+        self.assertEqual(env["MESA_LOADER_DRIVER_OVERRIDE"], "zink")
 
     def test_setup_passes_hashes_and_explicit_target_without_global_install(self):
         settings = {"root": str(self.root / "runtime-root")}
@@ -273,7 +313,7 @@ class HostRuntimeContracts(RuntimeCase):
                      SimpleNamespace(returncode=0, stdout=json.dumps({"version": runtime.FRIDA_VERSION}), stderr="")]
         metadata = {"urls": [{"packagetype": "bdist_wheel", "digests": {"sha256": "a" * 64}}]}
         from io import BytesIO
-        with patch("rusticre.runtime.subprocess.run", side_effect=responses) as run, patch("rusticre.runtime.urllib.request.urlopen", return_value=BytesIO(json.dumps(metadata).encode())):
+        with patch("rusticre.runtime.proc.run", side_effect=responses) as run, patch("rusticre.runtime.urllib.request.urlopen", return_value=BytesIO(json.dumps(metadata).encode())):
             result = runtime.setup(settings)
         self.assertEqual(result["state"], "ready")
         command = run.call_args_list[1].args[0]
@@ -285,10 +325,10 @@ class HostRuntimeContracts(RuntimeCase):
 
     def test_invalid_sessions_and_target_builds_do_not_launch_worker(self):
         runner = runtime.RuntimeRunner({"root": str(self.root / "sessions")})
-        with patch("rusticre.runtime.subprocess.Popen") as launch:
+        with patch("rusticre.runtime.proc.popen") as launch:
             for action, args in (("read", {"session": "../foreign"}),
                                  ("spawn", {"exe": str(self.binary), "sha256": "1" * 64}),
-                                 ("attach", {"exe": str(self.binary), "pid": 0})):
+                                 ("attach", {"exe": str(self.binary), "sha256": self.digest, "pid": 0})):
                 with self.subTest(action=action), self.assertRaises(ValueError):
                     runner.call(action, args)
             launch.assert_not_called()

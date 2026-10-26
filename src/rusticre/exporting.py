@@ -16,6 +16,7 @@ import time
 import uuid
 from pathlib import Path
 
+from rusticre import proc
 from rusticre.analysis import load_overlays
 from rusticre.backends import read_json, root_path, write_json
 from rusticre.ghidra import GhidraRunner, LaneLock, _held
@@ -111,7 +112,7 @@ def _launch(path: Path, record: dict, settings: dict) -> dict:
     command = [sys.executable, "-m", "rusticre.export_worker", str(path), generation]
     try:
         with Path(record["log_path"]).open("ab") as output:
-            process = subprocess.Popen(command, env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+            process = proc.popen(command, env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=output,
                                        **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {"start_new_session": True}))
     except OSError as exc:
         update(path, state="failed", stage="launch", error=str(exc))

@@ -1,7 +1,6 @@
 import json
 import os
 import subprocess
-import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -12,10 +11,12 @@ from rusticre import preparation as prep
 from rusticre.backends import sha256, write_json
 from rusticre.preparation_worker import build_analysis_command, run
 
+from support import workdir
+
 
 class PreparationTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = workdir()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.exe = self.root / "fresh.exe"

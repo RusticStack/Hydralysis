@@ -88,7 +88,7 @@ def main(argv: list[str] | None = None) -> int:
     prepare.add_argument("--exe", required=True)
     prepare.add_argument("--target", default="")
     prepare.add_argument("--timeout", type=int, default=3600)
-    prepare.add_argument("--no-install", action="store_true")
+    prepare.add_argument("--install", action="store_true", help="Also download and install missing engines (about 700 MB); off by default")
     prepare.add_argument("--plan", action="store_true", help="Inspect the proposed setup/analysis without creating a job or importing")
 
     job = sub.add_parser("job", help="Durable setup/analysis status or cancellation")
@@ -127,7 +127,7 @@ def _pair(args: argparse.Namespace) -> tuple[str, dict]:
     if command == "backend":
         return command, {"action": args.action, "component": args.component}
     if command == "prepare":
-        return command, {"exe": args.exe, "target": args.target, "timeout_s": args.timeout, "install": not args.no_install,
+        return command, {"exe": args.exe, "target": args.target, "timeout_s": args.timeout, "install": args.install,
                          "action": "plan" if args.plan else "start"}
     if command == "job":
         return command, {"action": args.action, "id": args.id, "limit": args.limit}

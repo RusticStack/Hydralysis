@@ -1,17 +1,18 @@
 import json
 import os
 import subprocess
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from rusticre.ghidra import GhidraJobError, GhidraRunner, _held, _release, ghidra_environment, ghidra_locked, build_command, launch_command
 
+from support import workdir
+
 
 class SnapshotTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = workdir()
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
         master = root / "master"

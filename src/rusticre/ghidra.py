@@ -25,6 +25,9 @@ import time
 import uuid
 from pathlib import Path
 
+from rusticre import proc as child
+from rusticre.paths import validate_project_path
+
 try:
     import msvcrt
 except ImportError:  # pragma: no cover - not Windows
@@ -37,15 +40,6 @@ except ImportError:  # pragma: no cover - Windows
 SCRIPT_LINE = re.compile(r"^INFO\s+(?P<script>\S+\.(?:java|py))>\s?(?P<text>.*)$")
 SCRIPT_END = re.compile(r"\(GhidraScript\)\s*$")
 LOG_LINE = re.compile(r"^(?:INFO|ERROR|WARN|DEBUG|SEVERE)\s")
-
-
-def validate_project_path(directory: str | Path) -> Path:
-    """Fail before a JVM launch: Ghidra rejects dot-prefixed path components."""
-    path = Path(directory).expanduser().resolve()
-    if any(part.startswith(".") for part in path.parts):
-        raise ValueError("Ghidra project paths cannot contain dot-prefixed directories: %s; "
-                         "choose a dot-free data root/project directory" % path)
-    return path
 
 
 def headless_path(ghidra_dir: str) -> str:
@@ -271,7 +265,7 @@ def _script_failed(output: str) -> bool:
 def _terminate_owned_tree(proc: subprocess.Popen) -> None:
     """Do not release a lane while a child JVM can still hold its project lock."""
     if os.name == "nt":
-        result = subprocess.run(["taskkill.exe", "/PID", str(proc.pid), "/T", "/F"],
+        result = child.run(["taskkill.exe", "/PID", str(proc.pid), "/T", "/F"],
                                 capture_output=True, text=True, timeout=30)
         if result.returncode != 0:
             raise RuntimeError("owned process tree cleanup failed: %s" % (result.stderr or result.stdout).strip())
@@ -386,7 +380,7 @@ class GhidraRunner:
         error = ""
         stdout = stderr = ""
         try:
-            proc = subprocess.Popen(
+            proc = child.popen(
                 launch_command(command),
                 env=env,
                 stdout=subprocess.PIPE,

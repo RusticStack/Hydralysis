@@ -11,6 +11,7 @@ import sys
 import time
 from pathlib import Path
 
+from rusticre import proc
 from rusticre.backends import ensure, read_json, root_path, sha256
 from rusticre.ghidra import LaneLock, _terminate_owned_tree, ghidra_environment, headless_path, launch_command
 from rusticre.preparation import locked, process_start_ms, register, update_job
@@ -68,7 +69,7 @@ def run(path: Path) -> None:
             update_job(path, stage="analysing", command=command, project_dir=str(directory), analysis_started_at=time.time())
             options = {"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
             with Path(record["log_path"]).open("wb") as output:
-                process = subprocess.Popen(launch_command(command), stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+                process = proc.popen(launch_command(command), stdin=subprocess.DEVNULL, stdout=output, stderr=output,
                                            env=ghidra_environment(settings), **options)
             update_job(path, headless_pid=process.pid, headless_started_ms=process_start_ms(process.pid), headless_group_id=process.pid)
             started = time.monotonic()

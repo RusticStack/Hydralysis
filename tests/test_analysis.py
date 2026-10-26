@@ -1,11 +1,12 @@
 import hashlib
 import json
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from rusticre.analysis import load_overlays, save_overlay, validate_options
+
+from support import workdir
 
 
 class AdvancedBudgets(unittest.TestCase):
@@ -83,7 +84,7 @@ class AdvancedBudgets(unittest.TestCase):
 
 class DurableOverlays(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = workdir()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.sha = "a" * 64

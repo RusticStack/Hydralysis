@@ -1,7 +1,6 @@
 import ctypes
 import json
 import os
-import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -9,10 +8,12 @@ from unittest.mock import Mock, patch
 from rusticre import localio
 from rusticre.backends import read_json
 
+from support import workdir
+
 
 class LocalMetadataReadTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = workdir()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 

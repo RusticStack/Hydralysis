@@ -7,8 +7,10 @@ def operation_help(component: str = "analysis") -> dict:
             "setup": "backend action=install component=runtime returns a job id; poll job status",
             "runtime_actions": {
                 "processes": {"limit": "1..200"},
-                "spawn": {"exe": "absolute owned executable", "sha256": "full build hash", "argv": "optional argument array"},
-                "attach": {"pid": "explicit process id", "exe": "expected executable path", "sha256": "full build hash"},
+                "spawn": {"exe": "absolute owned executable", "sha256": "required full SHA-256 of exe", "argv": "optional argument array",
+                          "cwd": "optional absolute working directory (games resolve data relative to it)",
+                          "env": "optional {name: value} added to the caller's environment"},
+                "attach": {"pid": "explicit process id", "exe": "expected executable path", "sha256": "required full SHA-256 of exe"},
                 "status": {"session": "returned session id", "after": "event cursor", "limit": "bounded event count"},
                 "modules": {"session": "id", "limit": "bounded rows"},
                 "threads": {"session": "id", "limit": "bounded rows"},

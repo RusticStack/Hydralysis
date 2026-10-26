@@ -1,7 +1,6 @@
 import hashlib
 import io
 import os
-import tempfile
 import unittest
 import zipfile
 from pathlib import Path
@@ -9,10 +8,12 @@ from unittest.mock import patch
 
 from rusticre import backends
 
+from support import workdir
+
 
 class BackendSetupTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = workdir()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
 

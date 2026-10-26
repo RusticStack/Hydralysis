@@ -133,6 +133,19 @@ def _process_path(pid: int) -> str:
         kernel.CloseHandle(handle)
 
 
+def target_environment(overrides: dict) -> dict:
+    """The caller's environment, not this worker's private TEMP/PYTHONPATH, plus overrides."""
+    env = dict(os.environ)
+    restore = json.loads(env.pop("RUSTICRE_TARGET_ENV_RESTORE", "{}") or "{}")
+    for key, value in restore.items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
+    env.update(overrides)
+    return env
+
+
 def _same_path(a: str, b: str) -> bool:
     return os.path.normcase(str(Path(a).resolve())) == os.path.normcase(str(Path(b).resolve()))
 
@@ -238,7 +251,10 @@ class RuntimeAgent:
         self.target_exe = exe
         self.target_sha256 = initial["sha256"]
         if initial["action"] == "spawn":
-            self.pid = self.device.spawn([exe, *initial["argv"]])
+            options = {"envp": target_environment(initial.get("env") or {})}
+            if initial.get("cwd"):
+                options["cwd"] = initial["cwd"]
+            self.pid = self.device.spawn([exe, *initial["argv"]], **options)
             self.paused_spawn = True
         else:
             self.pid = int(initial["pid"])
@@ -298,7 +314,8 @@ class RuntimeAgent:
         if not 0 <= rva < module["size"]:
             raise ValueError("RVA is outside selected module")
         if hook and not re.fullmatch("[0-9a-f]{64}", str(args.get("sha256") or "").lower()):
-            raise ValueError("live probes require the full expected module SHA256")
+            raise ValueError("live probes require options.sha256: the full SHA-256 of the selected module's file "
+                             "(for the main executable, the same hash as spawn/attach)")
         return module, rva, hex(int(module["base"], 16) + rva)
 
     def _continue(self, hook_id: str):

@@ -12,6 +12,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
+from rusticre import proc
 from rusticre.backends import ensure, inspect, read_json, root_path, sha256, write_json
 from rusticre.ghidra import LaneLock
 
@@ -105,7 +106,7 @@ def _cancel_owned_headless(record: dict) -> None:
     if not pid or not started or process_start_ms(pid) != started:
         raise RuntimeError("cannot verify the original owned headless process; no process was signalled and the build reservation remains")
     if os.name == "nt":
-        result = subprocess.run(["taskkill.exe", "/PID", str(pid), "/T", "/F"],
+        result = proc.run(["taskkill.exe", "/PID", str(pid), "/T", "/F"],
                                 capture_output=True, text=True, timeout=15)
         if result.returncode != 0:
             raise RuntimeError("owned process-tree cleanup was not confirmed: %s" % (result.stderr or result.stdout)[-1000:])
@@ -199,7 +200,7 @@ def _launch(settings: dict, record: dict) -> dict:
     options = {"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == "nt" else {"start_new_session": True}
     try:
         with (path.parent / "worker.log").open("wb") as output:
-            process = subprocess.Popen([sys.executable, "-m", "rusticre.preparation_worker", str(path)],
+            process = proc.popen([sys.executable, "-m", "rusticre.preparation_worker", str(path)],
                                        stdin=subprocess.DEVNULL, stdout=output, stderr=output, env=env, **options)
         # A Windows venv launcher can spawn the real Python worker. Do not
         # overwrite the child's published identity if it reached running first.

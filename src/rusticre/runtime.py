@@ -10,14 +10,15 @@ import hashlib
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 import urllib.request
 import uuid
 from pathlib import Path
 
+from rusticre import proc
 from rusticre.ghidra import LaneLock
+from rusticre.paths import root_path
 from rusticre.query import _identity, _json as _query_json, _stop, _write
 from rusticre.runtime_ipc import request as ipc_request
 
@@ -40,10 +41,29 @@ def _public_ready(ready: dict) -> dict:
 
 
 def _root(settings: dict, create: bool = True) -> Path:
-    directory = Path(settings.get("root") or os.environ.get("RUSTICRE_ROOT") or "F:/dev-cache/rusticre").resolve()
+    # The same resolver as static analysis, so a session and its target's
+    # evidence can never live under roots with different rules.
+    directory = root_path(settings)
     if create:
         directory.mkdir(parents=True, exist_ok=True)
     return directory
+
+
+# The worker's own environment points TEMP and PYTHONPATH at RusticRE's private
+# backend. A spawned target must not inherit that; the worker restores these.
+WORKER_ONLY = ("TEMP", "TMP", "TMPDIR", "PYTHONPATH", "PYTHONNOUSERSITE", "PYTHONDONTWRITEBYTECODE")
+
+
+def _site(settings: dict) -> Path:
+    return _root(settings, create=False) / "runtime-backend" / ("frida-" + FRIDA_VERSION)
+
+
+def _missing(settings: dict) -> str | None:
+    """Answer at once when the optional backend was never installed."""
+    site = _site(settings)
+    if not (site / "frida").is_dir():
+        return "optional runtime backend is not installed under %s; run backend action=install component=runtime" % site
+    return None
 
 
 def _environment(settings: dict, create: bool = True) -> dict:
@@ -53,6 +73,7 @@ def _environment(settings: dict, create: bool = True) -> dict:
     if create:
         temp.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
+    env["RUSTICRE_TARGET_ENV_RESTORE"] = json.dumps({key: os.environ.get(key) for key in WORKER_ONLY})
     env["TEMP"] = env["TMP"] = env["TMPDIR"] = str(temp)
     package_root = str(Path(__file__).resolve().parent.parent)
     env["PYTHONPATH"] = os.pathsep.join([str(site), package_root])
@@ -63,10 +84,12 @@ def _environment(settings: dict, create: bool = True) -> dict:
 
 def inspect(settings: dict) -> dict:
     """Probe the optional Python binding without creating files or installing."""
-    site = _root(settings, create=False) / "runtime-backend" / ("frida-" + FRIDA_VERSION)
+    site = _site(settings)
+    missing = _missing(settings)
+    if missing:
+        return {"ready": False, "component": "runtime", "version": FRIDA_VERSION, "path": str(site), "reason": missing}
     command = [sys.executable, "-c", "import frida,json; print(json.dumps({'version':frida.__version__,'path':frida.__file__}))"]
-    process = subprocess.run(command, env=_environment(settings, create=False), capture_output=True, text=True,
-                             timeout=15, **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}))
+    process = proc.run(command, env=_environment(settings, create=False), capture_output=True, text=True, timeout=15)
     if process.returncode:
         return {"ready": False, "component": "runtime", "version": FRIDA_VERSION, "path": str(site),
                 "reason": "optional runtime backend is not available; use backend install component=runtime"}
@@ -86,7 +109,7 @@ def setup(settings: dict) -> dict:
         site = root / ("frida-" + FRIDA_VERSION)
         env = _environment(settings)
         probe = [sys.executable, "-c", "import frida,json; print(json.dumps({'version':frida.__version__}))"]
-        result = subprocess.run(probe, capture_output=True, text=True, env=env, timeout=15)
+        result = proc.run(probe, capture_output=True, text=True, env=env, timeout=15)
         if result.returncode == 0:
             version = json.loads(result.stdout)["version"]
             if version != FRIDA_VERSION:
@@ -108,11 +131,10 @@ def setup(settings: dict) -> dict:
                    "--only-binary=:all:", "--no-deps", "--require-hashes", "--target", str(site),
                    "--cache-dir", str(root / "cache"), "-r", str(requirement)]
         with log.open("wb") as output:
-            result = subprocess.run(command, stdout=output, stderr=output, env=env, timeout=240,
-                                    **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}))
+            result = proc.run(command, stdout=output, stderr=output, env=env, timeout=240)
         if result.returncode:
             raise RuntimeError("runtime backend installation failed, exit=%s; log=%s" % (result.returncode, log))
-        verify = subprocess.run(probe, capture_output=True, text=True, env=env, timeout=15)
+        verify = proc.run(probe, capture_output=True, text=True, env=env, timeout=15)
         if verify.returncode or json.loads(verify.stdout).get("version") != FRIDA_VERSION:
             raise RuntimeError("runtime backend import verification failed; log=%s; %s" % (log, verify.stderr[-1000:]))
         manifest = {"state": "ready", "version": FRIDA_VERSION, "path": str(site), "reused": False,
@@ -141,9 +163,11 @@ class RuntimeRunner:
             limit = int(args.get("limit", 40))
             if not 1 <= limit <= 200:
                 raise ValueError("limit must be 1..200")
-            process = subprocess.run([sys.executable, "-m", "rusticre.runtime_worker", "--processes", str(limit)],
-                                     env=_environment(self.settings), capture_output=True, text=True, timeout=20,
-                                     **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}))
+            missing = _missing(self.settings)
+            if missing:
+                raise RuntimeError(missing)
+            process = proc.run([sys.executable, "-m", "rusticre.runtime_worker", "--processes", str(limit)],
+                               env=_environment(self.settings), capture_output=True, text=True, timeout=20)
             if process.returncode:
                 raise RuntimeError("runtime discovery failed; run runtime action=setup first: " + process.stderr[-2000:])
             result = json.loads(process.stdout)
@@ -190,28 +214,50 @@ class RuntimeRunner:
             lock.release()
 
     def _start(self, action: str, args: dict) -> dict:
+        allowed = {"spawn": {"exe", "sha256", "argv", "cwd", "env"}, "attach": {"exe", "sha256", "pid"}}[action]
+        unknown = set(args) - allowed
+        if unknown:
+            raise ValueError("unknown %s options: %s; accepted: %s"
+                             % (action, ", ".join(sorted(unknown)), ", ".join(sorted(allowed))))
         exe = Path(str(args.get("exe") or "")).resolve()
-        if not exe.is_file():
-            raise ValueError("spawn/attach requires the exact executable path in exe")
+        if not args.get("exe") or not exe.is_file():
+            raise ValueError("%s requires options.exe: the exact executable path" % action)
+        expected = str(args.get("sha256") or "").lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", expected):
+            raise ValueError("%s requires options.sha256: the full SHA-256 of options.exe, so that a mistyped "
+                             "path cannot select another program" % action)
         digest = hashlib.sha256(exe.read_bytes()).hexdigest()
-        if args.get("sha256") and str(args["sha256"]).lower() != digest:
-            raise ValueError("target executable SHA256 does not match")
+        if expected != digest:
+            raise ValueError("options.sha256 does not match %s (its SHA-256 is %s)" % (exe, digest))
         argv = args.get("argv", [])
         if not isinstance(argv, list) or any(not isinstance(item, str) for item in argv) or len(argv) > 100:
             raise ValueError("argv must be a list of at most 100 strings")
+        cwd = None
+        if "cwd" in args:
+            if not isinstance(args["cwd"], str) or not Path(args["cwd"]).is_absolute() or not Path(args["cwd"]).is_dir():
+                raise ValueError("options.cwd must be an absolute, existing directory")
+            cwd = str(Path(args["cwd"]).resolve())
+        env = args.get("env", {})
+        if not isinstance(env, dict) or len(env) > 64 or any(
+                not isinstance(key, str) or not isinstance(value, str) or not key or "=" in key
+                or "\x00" in key + value or len(key) > 256 or len(value) > 32768 for key, value in env.items()):
+            raise ValueError("options.env must map at most 64 variable names to string values")
         if action == "attach" and (isinstance(args.get("pid"), bool) or int(args.get("pid", 0)) <= 0):
-            raise ValueError("attach requires a positive process id")
+            raise ValueError("attach requires options.pid: a positive process id")
+        missing = _missing(self.settings)
+        if missing:
+            raise RuntimeError(missing)
         session_id = uuid.uuid4().hex
         directory = self.root / session_id
         directory.mkdir()
-        initial = {"action": action, "exe": str(exe), "sha256": digest, "argv": argv,
+        initial = {"action": action, "exe": str(exe), "sha256": digest, "argv": argv, "cwd": cwd, "env": env,
                    "pid": int(args.get("pid", 0)), "session": session_id,
                    "idle_s": int(self.settings.get("runtime_idle_s", 600))}
         _write(directory / "start.json", initial)
         with (directory / "worker.log").open("wb") as output:
-            process = subprocess.Popen([sys.executable, "-m", "rusticre.runtime_worker", str(directory)],
-                                       env=_environment(self.settings), stdin=subprocess.DEVNULL, stdout=output, stderr=output,
-                                       **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {"start_new_session": True}))
+            process = proc.popen([sys.executable, "-m", "rusticre.runtime_worker", str(directory)],
+                                 env=_environment(self.settings), stdout=output, stderr=output,
+                                 **({} if os.name == "nt" else {"start_new_session": True}))
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             ready = _json(directory / "ready.json")
@@ -221,7 +267,8 @@ class RuntimeRunner:
                 if not ready.get("ok"):
                     process.wait(timeout=10)
                     raise RuntimeError("runtime startup failed: %s; log=%s" % (ready.get("error"), directory / "worker.log"))
-                return {"session": session_id, "worker": _public_ready(ready), "log": str(directory / "worker.log")}
+                return {"session": session_id, "exe": str(exe), "sha256": digest, "cwd": cwd, "env_keys": sorted(env),
+                        "worker": _public_ready(ready), "log": str(directory / "worker.log")}
             if process.poll() is not None:
                 raise RuntimeError("runtime worker exited %s; install optional backend with action=setup; log=%s"
                                    % (process.returncode, directory / "worker.log"))

@@ -16,6 +16,7 @@ import time
 import uuid
 from pathlib import Path
 
+from rusticre import proc
 from rusticre.ghidra import GhidraRunner, LaneLock, build_command, ghidra_environment, launch_command, _terminate_owned_tree
 from rusticre.analysis import ADVANCED_ACTIONS, load_overlays, save_overlay, validate_options
 from rusticre.runtime_ipc import rpc
@@ -91,7 +92,7 @@ def _stop(ready: dict) -> None:
     if not _identity(pid, started):
         return
     if os.name == "nt":
-        stopped = subprocess.run(["taskkill.exe", "/PID", str(pid), "/T", "/F"],
+        stopped = proc.run(["taskkill.exe", "/PID", str(pid), "/T", "/F"],
                                  capture_output=True, timeout=15)
         if stopped.returncode and _identity(pid, started):
             raise RuntimeError("could not stop owned Ghidra worker %d: %s" % (pid, stopped.stderr))
@@ -335,7 +336,7 @@ class QueryRunner:
             launch = {"state": "starting", "session": str(session), "log": str(log)}
             _write(reservation, launch)
             with log.open("wb") as output:
-                process = subprocess.Popen(launch_command(command), env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=output, **options)
+                process = proc.popen(launch_command(command), env=env, stdin=subprocess.DEVNULL, stdout=output, stderr=output, **options)
             launch["launcher"] = {"pid": process.pid, "started_ms": _process_start_ms(process.pid), "group_id": process.pid}
             _write(reservation, launch)
             started = time.monotonic()

@@ -1,7 +1,6 @@
 import hashlib
 import io
 import json
-import tempfile
 import time
 import unittest
 from contextlib import redirect_stdout
@@ -11,6 +10,8 @@ from unittest.mock import Mock, patch
 from rusticre import exporting
 from rusticre import export_worker
 from rusticre.backends import read_json
+
+from support import workdir
 
 
 class FakeRunner:
@@ -43,7 +44,7 @@ class FakeRunner:
 
 class ExportTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = workdir()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         master = self.root / "master"

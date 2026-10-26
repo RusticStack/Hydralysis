@@ -8,3 +8,4 @@ build/
 .rusticre/
 *.db
 rusticre.local.json
+test-work/

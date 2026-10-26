@@ -14,7 +14,7 @@ uv venv .venv
 .venv/Scripts/rusticre.exe tools
 ```
 
-Select a data directory with no dot-prefixed path components using `RUSTICRE_ROOT`, or set `root` in `rusticre.local.json`. Windows defaults to `F:/dev-cache/rusticre`; other hosts default to `~/rusticre-workspace`. Existing compatible Ghidra/JDK installations are discovered. Explicit `backend install` can privately install verified portable engines on Windows x64, without administrator privileges or machine configuration changes. Other hosts need configured existing engines. This release supports Ghidra **12.1.4**.
+Select a data directory with no dot-prefixed path components using `RUSTICRE_ROOT`, or set `root` in `rusticre.local.json`. The default is per user: `%LOCALAPPDATA%\RusticRE` on Windows, `~/Library/Application Support/RusticRE` on macOS, `$XDG_DATA_HOME/rusticre` (when dot-free) or `~/rusticre` on Linux. Any drive is accepted; a machine that keeps data off some drives says so with `forbidden_drives` in the config or `RUSTICRE_FORBIDDEN_DRIVES=C:,D:`. Existing compatible Ghidra/JDK installations are discovered. Explicit `backend install` can privately install verified portable engines on Windows x64, without administrator privileges or machine configuration changes. Other hosts need configured existing engines. This release supports Ghidra **12.1.4**.
 
 ```text
 rusticre fingerprint --exe F:/binaries/sample.exe

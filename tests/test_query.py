@@ -5,7 +5,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
@@ -14,10 +13,12 @@ from unittest.mock import Mock, patch
 
 from rusticre import query
 
+from support import workdir
+
 
 class QueryWorkerTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = workdir()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         master = self.root / "master"
