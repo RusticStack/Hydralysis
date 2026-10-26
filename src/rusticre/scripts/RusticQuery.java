@@ -1291,6 +1291,9 @@ public class RusticQuery extends GhidraScript {
         long scanned = 0;
         int verified = 0;
         Address next = null;
+        // Stores through the stack pointer are locals and outgoing arguments, not fields (RSP, ESP, ...).
+        var stack = currentProgram.getCompilerSpec().getStackPointer();
+        var stackBase = stack == null ? null : stack.getBaseRegister();
         while (iterator.hasNext() && rows.size() < limit && System.nanoTime() < deadline) {
             if ((++scanned & 0xffff) == 0) monitor.checkCancelled();
             var instruction = iterator.next();
@@ -1301,7 +1304,8 @@ public class RusticQuery extends GhidraScript {
             Object[] parts = instruction.getOpObjects(0);
             boolean register = false, displacement = false;
             for (Object part : parts) {
-                if (part instanceof ghidra.program.model.lang.Register reg && !reg.isProgramCounter() && !reg.getName().equalsIgnoreCase("RSP")) register = true;
+                if (part instanceof ghidra.program.model.lang.Register reg && !reg.isProgramCounter()
+                        && !(stackBase != null && stackBase.equals(reg.getBaseRegister()))) register = true;
                 if (part instanceof ghidra.program.model.scalar.Scalar scalar && scalar.getUnsignedValue() == offset) displacement = true;
             }
             if (!register || !displacement || parts.length != 2) continue;
