@@ -19,6 +19,8 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--exe", required=True)
         if name in ("imports", "exports"):
             command.add_argument("--limit", type=int, default=80)
+        if name == "imports":
+            command.add_argument("--pattern", default="", help="case-insensitive regex over 'DLL name'")
         if name == "fingerprint":
             command.add_argument("--detail", choices=("header", "sections", "exports"), default="header")
 
@@ -181,6 +183,8 @@ def _pair(args: argparse.Namespace) -> tuple[str, dict]:
         payload = {"exe": args.exe}
         if hasattr(args, "limit"):
             payload["limit"] = args.limit
+        if command == "imports" and args.pattern:
+            payload["pattern"] = args.pattern
         if command == "fingerprint":
             payload["detail"] = args.detail
         return command, payload

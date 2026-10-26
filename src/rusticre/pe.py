@@ -290,9 +290,11 @@ class Image:
             )
         return "\n".join(lines)
 
-    def imports_text(self, limit: int = 80) -> str:
+    def imports_text(self, limit: int = 80, pattern: str = "") -> str:
+        """One line per import: its IAT slot (callers reference the slot: xrefs on it finds them), DLL and name."""
         self.pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
         lines = [self.header()]
+        wanted = re.compile(pattern, re.I) if pattern else None
         count = 0
         for entry in getattr(self.pe, "DIRECTORY_ENTRY_IMPORT", []) or []:
             dll = entry.dll.decode("utf-8", "replace") if isinstance(entry.dll, bytes) else str(entry.dll)
@@ -301,7 +303,10 @@ class Image:
                     label = item.name.decode("utf-8", "replace") if isinstance(item.name, bytes) else str(item.name)
                 else:
                     label = "ord:%s" % item.ordinal
-                lines.append("%s %s" % (dll, label))
+                if wanted and not wanted.search("%s %s" % (dll, label)):
+                    continue
+                slot = "rva:%#x" % (item.address - self.base) if item.address else "rva:?"
+                lines.append("%s %s %s" % (slot, dll, label))
                 count += 1
                 if count >= limit:
                     lines.append("[limit reached; results may be incomplete]")

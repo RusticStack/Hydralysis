@@ -49,6 +49,11 @@ class Decoding(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 decode.normalize([{**bad, "as": "u32"}])
 
+    def test_a_32_bit_pointer_decodes_from_four_bytes(self):
+        spec = decode.normalize([{"arg": 0, "as": "pointer"}])[0]
+        row = decode.decode_event([spec], [{"pointer": "0x4a4cb70", "hex": "70cba404"}])[0]
+        self.assertEqual(row["value"], "0x4a4cb70")
+
     def test_the_probe_carries_its_calling_convention(self):
         from rusticre.runtime_worker import _probe_source
         captures = decode.normalize([{"arg": 0, "as": "pointer"}])

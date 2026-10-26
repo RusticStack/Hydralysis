@@ -70,7 +70,7 @@ def tool_table() -> list[dict]:
     pe_address = {"type": "string", "description": "Use rva:0x... or va:0x...; ambiguous unprefixed addresses are refused."}
     return [
         tool("fingerprint", "PE build identity and packing triage. detail=sections/exports returns those tables.", {"exe": string, "detail": {"type": "string", "enum": ["header", "sections", "exports"]}}, ["exe"]),
-        tool("imports", "Imported DLL symbols.", {"exe": string, "limit": integer}, ["exe"]),
+        tool("imports", "Imported symbols and IAT slots (xrefs on a slot: its callers); pattern filters.", {"exe": string, "limit": integer, "pattern": string}, ["exe"]),
         tool("disasm", "Disassemble at an RVA or VA. 64-bit rip-relative operands show their target.", {
             "exe": string, "address": pe_address, "count": integer,
         }, ["exe", "address"]),
@@ -162,7 +162,7 @@ def call(name: str, args: dict | None) -> str:
     if name == "sections":
         return _image(args).sections_text()
     if name == "imports":
-        return _image(args).imports_text(int(args.get("limit") or 80))
+        return _image(args).imports_text(int(args.get("limit") or 80), str(args.get("pattern") or ""))
     if name == "exports":
         return _image(args).exports_text(int(args.get("limit") or 80))
     if name == "disasm":

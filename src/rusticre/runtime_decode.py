@@ -86,6 +86,8 @@ def normalize(captures) -> list[dict]:
 
 def _unpack(kind: str, data: bytes, offset: int = 0):
     form, size = SCALARS[kind]
+    if kind == "pointer" and len(data) - offset == 4:
+        form = "<I"  # a 32-bit target's pointer (the probe copies the target's pointer width)
     value = struct.unpack_from(form, data, offset)[0]
     return hex(value) if kind == "pointer" else value
 

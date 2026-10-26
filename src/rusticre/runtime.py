@@ -323,7 +323,10 @@ class RuntimeRunner:
                 if not ready.get("ok"):
                     process.wait(timeout=10)
                     raise RuntimeError("runtime startup failed: %s; log=%s" % (ready.get("error"), directory / "worker.log"))
-                return {"session": session_id, "owner": token, "exe": str(exe), "sha256": digest, "cwd": cwd, "env_keys": sorted(env),
+                target = ready.get("target") or {}
+                return {"session": session_id, "owner": token, "pid": target.get("pid"), "arch": target.get("arch"),
+                        "pointer_size": target.get("pointer_size"), "state": ready.get("state"),
+                        "exe": str(exe), "sha256": digest, "cwd": cwd, "env_keys": sorted(env),
                         "worker": _public_ready(ready), "log": str(directory / "worker.log")}
             if process.poll() is not None:
                 raise RuntimeError("runtime worker exited %s; install optional backend with action=setup; log=%s"

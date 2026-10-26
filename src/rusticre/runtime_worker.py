@@ -181,7 +181,7 @@ def _probe_source(module: dict, rva: int, expected: list[int], hook_id: str, lim
     parameters = json.dumps({"module": module["path"], "base": module["base"], "rva": rva,
                              "expect": expected, "id": hook_id, "limit": limit, "pause": pause,
                              "captures": [{"arg": c["arg"], "reg": c.get("reg"), "deref": c["deref"], "size": c["size"],
-                                           "value_only": c["value_only"]} for c in (captures or [])],
+                                           "value_only": c["value_only"], "ptr": c["as"] == "pointer"} for c in (captures or [])],
                              "sample": sample, "convention": convention})
     return CONTEXT_HELPER + MEMORY_HELPER + r"""const p=PARAMETERS;
 const all=Process.enumerateModules().filter(m=>m.path===p.module);
@@ -203,10 +203,12 @@ function argAt(context,args,i){
 function captureArgs(args,context){return p.captures.map(c=>{try{
   if(c.reg!==null&&context[c.reg]===undefined)return {error:'no register '+c.reg+' on '+Process.arch};
   let q=c.reg!==null?context[c.reg]:argAt(context,args,c.arg);
-  if(c.value_only)return {pointer:q.toString(),hex:Array.from({length:c.size},(_,i)=>q.shr(8*i).and(255).toInt32().toString(16).padStart(2,'0')).join('')};
-  for(const off of c.deref){if(!readable(q.add(off),8))return {error:'unreadable pointer at '+q.add(off)};q=q.add(off).readPointer();}
-  if(!readable(q,c.size))return {pointer:q.toString(),error:'unreadable '+c.size+' bytes'};
-  return {pointer:q.toString(),hex:Array.from(new Uint8Array(q.readVolatile(c.size)),b=>b.toString(16).padStart(2,'0')).join('')};
+  // A pointer is the target's own width (4 bytes in a 32-bit process).
+  const n=c.ptr?Process.pointerSize:c.size;
+  if(c.value_only)return {pointer:q.toString(),hex:Array.from({length:n},(_,i)=>q.shr(8*i).and(255).toInt32().toString(16).padStart(2,'0')).join('')};
+  for(const off of c.deref){if(!readable(q.add(off),Process.pointerSize))return {error:'unreadable pointer at '+q.add(off)};q=q.add(off).readPointer();}
+  if(!readable(q,n))return {pointer:q.toString(),error:'unreadable '+n+' bytes'};
+  return {pointer:q.toString(),hex:Array.from(new Uint8Array(q.readVolatile(n)),b=>b.toString(16).padStart(2,'0')).join('')};
  }catch(e){return {error:String(e)};}});}
 // Sampled observation: count every call, keep min/max/last of one captured number, send one summary per window.
 const agg={count:0,min:null,max:null,last:null};
@@ -214,7 +216,7 @@ if(p.sample){setInterval(()=>{send({event:'sample',hook_id:p.id,window_s:p.sampl
   rate:agg.count/p.sample.window_s,min:agg.min,max:agg.max,last:agg.last});agg.count=0;agg.min=agg.max=null;},p.sample.window_s*1000);}
 function sampleValue(hexed){const b=new Uint8Array(hexed.match(/../g).map(x=>parseInt(x,16))).buffer,v=new DataView(b);
   switch(p.sample.as){case 'f32':return v.getFloat32(0,true);case 'f64':return v.getFloat64(0,true);case 'i32':return v.getInt32(0,true);
-   case 'u32':return v.getUint32(0,true);case 'i16':return v.getInt16(0,true);case 'u16':return v.getUint16(0,true);case 'u8':return v.getUint8(0);default:return Number(v.getBigUint64(0,true));}}
+   case 'u32':return v.getUint32(0,true);case 'i16':return v.getInt16(0,true);case 'u16':return v.getUint16(0,true);case 'u8':return v.getUint8(0);default:return b.byteLength>=8?Number(v.getBigUint64(0,true)):v.getUint32(0,true);}}
 const listener=Interceptor.attach(site,{
  onEnter(args){
   if(p.sample){agg.count++;const c=captureArgs(args,this.context)[p.sample.capture];

@@ -73,7 +73,19 @@ class Client:
             try:
                 return parse(api.call(tool, {key: value for key, value in args.items() if value is not None}))
             except (ValueError, OSError, KeyError, RuntimeError) as exc:
-                raise RusticError("%s: %s" % (type(exc).__name__, exc)) from exc
+                # An engine refusal is its JSON answer (error_kind says not_found, timeout, ...).
+                answer = parse(str(exc))
+                raise RusticError("%s: %s" % (type(exc).__name__, exc),
+                                  answer if isinstance(answer, dict) else None) from exc
+
+    def try_query(self, target: str, action: str, address: str = "", **options) -> dict | None:
+        """query, but None when the engine answers not_found (no function there, no such type)."""
+        try:
+            return self.query(target, action, address, **options)
+        except RusticError as exc:
+            if (exc.result or {}).get("error_kind") == "not_found":
+                return None
+            raise
 
     # Static PE work: no engine, no JVM.
 

@@ -47,9 +47,38 @@ class LibraryAPI(unittest.TestCase):
         with self.assertRaisesRegex(RusticError, "size must be"):
             self.re.read(self.exe, "rva:0x1000", 0)
 
+    def test_engine_refusals_are_structured(self):
+        from unittest.mock import patch
+        refusal = RuntimeError(json.dumps({"ok": False, "error_kind": "not_found", "error": "no analysed function"}))
+        with patch("rusticre.client.api.call", side_effect=refusal):
+            self.assertIsNone(self.re.try_query("t", "function", "0x1"))
+            with self.assertRaises(RusticError) as caught:
+                self.re.query("t", "function", "0x1")
+        self.assertEqual(caught.exception.result["error_kind"], "not_found")
+        with patch("rusticre.client.api.call", side_effect=RuntimeError(json.dumps({"ok": False, "error_kind": "timeout"}))),                 self.assertRaises(RusticError):
+            self.re.try_query("t", "decompile", "0x1")
+
     def test_parse_leaves_text_answers_alone(self):
         self.assertEqual(parse(' {"a": 1}'), {"a": 1})
         self.assertEqual(parse("# exe x\nCC"), "# exe x\nCC")
+
+
+class ImportSlots(unittest.TestCase):
+    def test_each_import_names_its_iat_slot_and_a_pattern_filters(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        pe = image()
+        entry = SimpleNamespace(dll=b"OPENGL32.dll", imports=[
+            SimpleNamespace(name=b"glClear", ordinal=None, address=pe.base + 0x2010),
+            SimpleNamespace(name=b"glFlush", ordinal=None, address=pe.base + 0x2014),
+            SimpleNamespace(name=None, ordinal=7, address=pe.base + 0x2018)])
+        with patch.object(pe.pe, "parse_data_directories"):
+            pe.pe.DIRECTORY_ENTRY_IMPORT = [entry]
+            listed = pe.imports_text(10)
+            filtered = pe.imports_text(10, "glclear")
+        self.assertIn("rva:0x2010 OPENGL32.dll glClear", listed)
+        self.assertIn("rva:0x2018 OPENGL32.dll ord:7", listed)
+        self.assertNotIn("glFlush", filtered)
 
 
 class JsonCommandLine(unittest.TestCase):
