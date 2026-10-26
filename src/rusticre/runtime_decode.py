@@ -128,8 +128,13 @@ def layout_values(fields: list[dict], data: bytes) -> list[dict]:
         offset, size = int(field["offset"]), int(field.get("size") or (SCALARS[kind][1] if kind else 0))
         row = {"name": field.get("name"), "offset": hex(offset), "type": field.get("type")}
         chunk = data[offset:offset + size]
+        if field.get("enum"):
+            row["type"] = field["enum"]
         if kind and len(chunk) >= SCALARS[kind][1]:
             row["value"] = _unpack(kind, chunk)
+            names = field.get("names")
+            if isinstance(names, dict):
+                row["name"] = names.get(str(row["value"]), "(no member %s)" % row["value"])
         else:
             row["bytes"] = chunk.hex(" ").upper()
         rows.append(row)

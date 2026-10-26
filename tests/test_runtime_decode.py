@@ -40,6 +40,14 @@ class Decoding(unittest.TestCase):
         self.assertEqual([row.get("value") for row in rows[:3]], [-3, "0x140000000", 2.0])
         self.assertEqual(rows[3]["bytes"], "FD FF FF FF")
 
+    def test_enum_fields_read_as_value_and_member(self):
+        names = {"0": "ECCTV_All", "2": "ECCTV_OnlyOnscreen"}
+        rows = decode.layout_values([{"name": "target", "offset": 0, "type": "u8", "enum": "ECustomCameraTarget", "names": names},
+                                     {"name": "odd", "offset": 1, "type": "u8", "enum": "ECustomCameraTarget", "names": names}],
+                                    b"\x02\x07")
+        self.assertEqual((rows[0]["type"], rows[0]["value"], rows[0]["name"]), ("ECustomCameraTarget", 2, "ECCTV_OnlyOnscreen"))
+        self.assertEqual(rows[1]["name"], "(no member 7)")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -219,6 +219,10 @@ class RuntimeRunner:
             if action == "status":
                 return {"session": session_id, "worker_alive": False, "state": state,
                         "log": str(directory / "worker.log")}
+            if state.get("detached"):
+                raise RuntimeError("runtime session %s has ended (%s); the target was detached cleanly and keeps "
+                                   "running: attach again with pid %s" % (session_id, state.get("ended") or "detached",
+                                                                          state.get("pid")))
             raise RuntimeError("runtime worker is no longer alive; target state is unknown; log=%s" % (directory / "worker.log"))
         token = str(args.pop("owner", "") or _TOKENS.get(session_id, ""))
         owner = _json(directory / "owner.json")
@@ -343,8 +347,18 @@ class RuntimeRunner:
             raise ValueError("read with type needs options.target: the analysis target that defines the type")
         answer = json.loads(QueryRunner(resolved(self.settings)).query(target, "type", options={"path": name}, limit=200))
         described = answer["type"]
-        layout = [{"name": field.get("field") or "field_%x" % field["offset"], "offset": field["offset"],
-                   "type": field.get("name", ""), "size": field.get("length")} for field in described.get("fields", [])]
+        layout, enums = [], {}
+        for field in described.get("fields", []):
+            row = {"name": field.get("field") or "field_%x" % field["offset"], "offset": field["offset"],
+                   "type": field.get("name", ""), "size": field.get("length")}
+            # An enum reads as its unsigned value plus the member name (a few per type; each is one query).
+            if field.get("kind") == "EnumDB" and field.get("length") in (1, 2, 4, 8) and len(enums) < 32:
+                if field["path"] not in enums:
+                    members = json.loads(QueryRunner(resolved(self.settings)).query(
+                        target, "type", options={"path": field["path"]}, limit=200)).get("type", {}).get("values", [])
+                    enums[field["path"]] = {str(int(str(item["value"]), 0)): item["name"] for item in members}
+                row.update({"enum": row["type"], "type": "u%d" % (8 * field["length"]), "names": enums[field["path"]]})
+            layout.append(row)
         if not layout:
             raise ValueError("type %s has no fields to read" % name)
         size = int(args.get("size") or described.get("length") or 0)

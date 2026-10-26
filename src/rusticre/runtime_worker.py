@@ -237,6 +237,7 @@ class RuntimeAgent:
         self.target_sha256 = ""
         self.paused_spawn = False
         self.detached = False
+        self.ended = ""
         self.scripts = {}
         self.pauses = {}
         self.events = collections.deque()
@@ -253,7 +254,8 @@ class RuntimeAgent:
             return {"session": self.directory.name, "state": self.state, "pid": self.pid,
                      "target_created_ms": self.target_created_ms, "spawn_paused": self.paused_spawn,
                      "detached": self.detached, "scripts": list(self.scripts), "paused_hooks": list(self.pauses),
-                     "last_sequence": self.sequence, "dropped_events": self.dropped}
+                     "last_sequence": self.sequence, "dropped_events": self.dropped,
+                     **({"ended": self.ended} if self.ended else {})}
 
     def publish(self):
         state = self.snapshot()
@@ -682,6 +684,7 @@ def main() -> int:
     finally:
         listener.close()
         if not agent.closed:
+            agent.ended = "idle: no request for %d s (runtime_idle_s)" % int(initial.get("idle_s", 600))
             try:
                 agent.cleanup()
             except Exception as exc:

@@ -333,6 +333,17 @@ class HostRuntimeContracts(RuntimeCase):
         with patch("rusticre.runtime.proc.run", return_value=SimpleNamespace(returncode=0, stdout=elsewhere, stderr="")),                 self.assertRaisesRegex(RuntimeError, "incomplete"):
             runtime.setup(settings)
 
+    def test_an_idle_ended_session_says_so_and_how_to_continue(self):
+        runner = runtime.RuntimeRunner({"root": str(self.root / "ended")})
+        session = "e" * 32
+        directory = runner.root / session
+        directory.mkdir(parents=True)
+        (directory / "ready.json").write_text(json.dumps({"pid": 0, "started_ms": 0}))
+        (directory / "state.json").write_text(json.dumps({"detached": True, "pid": 4242,
+                                                          "ended": "idle: no request for 600 s (runtime_idle_s)"}))
+        with self.assertRaisesRegex(RuntimeError, "ended .idle.*attach again with pid 4242"):
+            runner.call("read", {"session": session, "address": "0x1000", "size": 4})
+
     def test_invalid_sessions_and_target_builds_do_not_launch_worker(self):
         runner = runtime.RuntimeRunner({"root": str(self.root / "sessions")})
         with patch("rusticre.runtime.proc.popen") as launch:
