@@ -47,8 +47,9 @@ def _prepare(path: Path, record: dict, settings: dict, cancelled) -> None:
         update_job(path, stage="analysing", project_dir=str(directory), analysis_started_at=time.time())
         engine.on_event(lambda event: _log(path, "%s %s/%s" % (event.get("message", ""), event.get("progress", ""),
                                                                 event.get("maximum", ""))))
+        # A job waits its turn for one of the engine's long slots rather than failing busy.
         request = engine.send("import", file=str(binary), project=opened["id"], analyze=True,
-                              timeout=int(record["timeout_s"]))
+                              timeout=int(record["timeout_s"]), wait=int(record["timeout_s"]) * 1000)
         update_job(path, engine_request=request)
         outcome: dict = {}
 

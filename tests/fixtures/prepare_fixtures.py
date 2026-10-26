@@ -1,0 +1,42 @@
+"""Prepare every built fixture as an analysis target (fx-<arch>-<name>) and wait for the jobs.
+
+usage: python tests/fixtures/prepare_fixtures.py <fixtures out dir>   (RUSTICRE_CONFIG selects the root)
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import time
+from pathlib import Path
+
+from rusticre.client import Client
+
+
+def main(out_dir: str) -> int:
+    manifest = json.loads((Path(out_dir) / "manifest.json").read_text())
+    re = Client()
+    jobs = {}
+    for key, build in manifest.items():
+        arch, exe = key.split("/")
+        target = "fx-%s-%s" % (arch, exe.removesuffix(".exe").replace("_fixture", ""))
+        started = re.call("prepare", exe=build["path"], target=target)
+        jobs[target] = started.get("job_id")
+        print(target, started.get("state"), started.get("job_id"))
+    failed = 0
+    for target, job in jobs.items():
+        if not job:
+            continue
+        while True:
+            status = re.call("job", id=job)
+            if status["state"] not in ("queued", "running"):
+                break
+            time.sleep(3)
+        verification = status.get("verification") or {}
+        print(target, status["state"], verification.get("functions"), status.get("error", ""))
+        failed += status["state"] != "done"
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1]))

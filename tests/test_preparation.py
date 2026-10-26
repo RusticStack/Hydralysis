@@ -166,6 +166,7 @@ class WorkerTests(unittest.TestCase):
             return {"output": '{"created":true}\n', "mode": "none"}
 
         def send(engine_self, command, **fields):
+            self.sent = fields
             project = self.daemon.project_by_id(fields["project"])
             name = "/" + Path(fields["file"]).name
             project["programs"][name] = {"sha256": self.digest, "analyzed": self.analyzed, "functions": 3,
@@ -192,6 +193,8 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(result["state"], "done", result.get("error"))
         registered = prep.registry(self.settings)["fresh"]
         self.assertEqual(registered["sha256"], self.digest)
+        # A busy engine is waited for within the job's own budget, not a failure.
+        self.assertEqual(self.sent["wait"], self.sent["timeout"] * 1000)
         self.assertTrue(Path(registered["gpr"]).is_file())
 
     def test_unanalysed_result_is_refused_without_registration(self):
