@@ -101,11 +101,14 @@ def tool_table() -> list[dict]:
             "checks": {"type": "array", "items": {"type": "object"}},
             "sha256": string, "image_base": string, "session": string,
         }, ["exe"]),
-        tool("evidence_add", "Store one proved claim. note and source are required. target is any name you give this binary.", {
+        tool("evidence_add", "Store one proved claim (note and source required), attributed to this client; subsystem groups it; supersedes=<id> replaces an older claim without deleting it.", {
             "target": string, "build": string, "kind": string, "name": string,
             "note": string, "source": string, "address": string, "prologue": string, "db": string,
+            "subsystem": string, "supersedes": integer,
         }, ["target", "build", "kind", "name", "note", "source"]),
-        tool("evidence_list", "List stored claims, newest first.", {"target": string, "limit": integer, "db": string}),
+        tool("evidence_list", "Claims, newest first, filtered by target/subsystem/address/build; superseded ones only on request. export=<path.md> writes a subsystem's claims (and .jsonl).", {
+            "target": string, "limit": integer, "db": string, "subsystem": string, "address": string, "build": string,
+            "include_superseded": {"type": "boolean"}, "export": string}),
         tool("ghidra_run", "Run one of your Ghidra scripts on a target's saved analysis, contained (rolled back). No import, no copy.", {
             "target": string, "script": string,
             "args": {"type": "array", "items": string},
@@ -230,13 +233,21 @@ def call(name: str, args: dict | None) -> str:
             source=str(args.get("source") or ""),
             address=str(args.get("address") or ""),
             prologue=str(args.get("prologue") or ""),
+            subsystem=str(args.get("subsystem") or ""),
+            supersedes=int(args["supersedes"]) if args.get("supersedes") is not None else None,
         )
     if name == "evidence_list":
-        return list_claims(
-            evidence_path(str(args.get("db") or "")),
-            str(args.get("target") or args.get("game") or ""),
-            int(args.get("limit") or 50),
-        )
+        path = evidence_path(str(args.get("db") or ""))
+        target = str(args.get("target") or args.get("game") or "")
+        if args.get("export"):
+            from rusticre.evidence import export
+            out = Path(str(args["export"]))
+            if not out.is_absolute() or out.suffix != ".md":
+                raise ValueError("export must be an absolute path ending in .md")
+            return json.dumps(export(path, out, target, str(args.get("subsystem") or "")), indent=2)
+        return list_claims(path, target, int(args.get("limit") or 50), subsystem=str(args.get("subsystem") or ""),
+                           address=str(args.get("address") or ""), build=str(args.get("build") or ""),
+                           include_superseded=bool(args.get("include_superseded")))
     target = str(args.get("target") or args.get("game") or "")
     if name == "ghidra_query":
         if args.get("action") == "export":

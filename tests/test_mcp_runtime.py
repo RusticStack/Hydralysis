@@ -28,8 +28,9 @@ BUDGET_S = 10
 
 class Server:
     def __init__(self, root: Path, **extra):
-        env = dict(os.environ, RUSTICRE_ROOT=str(root), PYTHONPATH=str(REPOSITORY / "src"), **extra)
+        env = dict(os.environ)
         env.pop("RUSTICRE_CONFIG", None)
+        env.update(RUSTICRE_ROOT=str(root), PYTHONPATH=str(REPOSITORY / "src"), **extra)
         self.process = subprocess.Popen([sys.executable, "-m", "rusticre", "mcp"], stdin=subprocess.PIPE,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=str(root))
         self.replies: queue.Queue = queue.Queue()
@@ -162,6 +163,61 @@ class RuntimeOverMCP(unittest.TestCase):
     def test_attach_requires_the_build_hash(self):
         text = self.call("runtime", {"action": "attach", "options": {"exe": self.exe, "pid": os.getpid()}}, error=True)
         self.assertIn("options.sha256", text)
+
+
+class TwoHarnessesOneGame(unittest.TestCase):
+    """One driving session per program; the other harness reads, and a project lock can refuse."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.work = workdir("mcp-owners")
+        cls.root = Path(cls.work.name)
+        shutil.copytree(FAKE_FRIDA, cls.root / "runtime-backend" / "frida-17.24.3" / "frida")
+        cls.exe = str(Path(sys.executable).resolve())
+        cls.digest = hashlib.sha256(Path(cls.exe).read_bytes()).hexdigest()
+        cls.first = Server(cls.root, RUSTICRE_HARNESS="harness-a")
+        cls.second = Server(cls.root, RUSTICRE_HARNESS="harness-b")
+        refuse = cls.root / "refuse.json"
+        refuse.write_text(json.dumps({"runtime_lock_check": [sys.executable, "-c", "import sys; print('held by agent-x'); sys.exit(2)"]}))
+        shutil.copytree(FAKE_FRIDA, cls.root / "locked-root" / "runtime-backend" / "frida-17.24.3" / "frida")
+        cls.locked = Server(cls.root / "locked-root", RUSTICRE_CONFIG=str(refuse), RUSTICRE_HARNESS="harness-c")
+        cls.target = subprocess.Popen([cls.exe, "-c", "import time;time.sleep(60)"], stdin=subprocess.DEVNULL)
+
+    @classmethod
+    def tearDownClass(cls):
+        for server in (cls.first, cls.second, cls.locked):
+            server.close()
+        cls.target.kill()
+        cls.target.wait(10)
+        deadline = time.monotonic() + 10
+        while Path(cls.work.name).exists() and time.monotonic() < deadline:
+            cls.work.cleanup()
+            time.sleep(0.1)
+
+    def tool(self, server, action, error=False, **options):
+        result, elapsed = server.tool("runtime", {"action": action, "options": options})
+        self.assertLess(elapsed, BUDGET_S)
+        text = result["content"][0]["text"]
+        self.assertEqual(result["isError"], error, text[:1500])
+        return text if error else json.loads(text)
+
+    def test_the_second_harness_reads_but_cannot_drive_or_attach(self):
+        started = self.tool(self.first, "attach", exe=self.exe, sha256=self.digest, pid=self.target.pid)
+        session = started["session"]
+        self.assertTrue(started["owner"])
+        refused = self.tool(self.second, "attach", error=True, exe=self.exe, sha256=self.digest, pid=self.target.pid)
+        self.assertIn("harness-a", refused)
+        self.assertEqual(self.tool(self.second, "modules", session=session)["total"], 1)
+        denied = self.tool(self.second, "detach", error=True, session=session)
+        self.assertIn("owned by", denied)
+        self.assertIn("harness-a", denied)
+        self.assertEqual(self.tool(self.second, "detach", session=session, owner=started["owner"])["state"], "detached")
+        again = self.tool(self.second, "attach", exe=self.exe, sha256=self.digest, pid=self.target.pid)
+        self.assertEqual(self.tool(self.second, "detach", session=again["session"])["state"], "detached")
+
+    def test_the_projects_own_game_lock_can_refuse(self):
+        refused = self.tool(self.locked, "attach", error=True, exe=self.exe, sha256=self.digest, pid=self.target.pid)
+        self.assertIn("held by agent-x", refused)
 
 
 class PatchedFunctionOverMCP(RuntimeOverMCP):

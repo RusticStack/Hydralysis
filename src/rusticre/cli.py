@@ -52,11 +52,18 @@ def main(argv: list[str] | None = None) -> int:
         add.add_argument("--" + flag, required=True)
     add.add_argument("--address", default="")
     add.add_argument("--prologue", default="")
+    add.add_argument("--subsystem", default="")
+    add.add_argument("--supersedes", type=int)
     add.add_argument("--db", default="")
 
     listed = sub.add_parser("evidence-list")
     listed.add_argument("--target", default="")
     listed.add_argument("--limit", type=int, default=50)
+    listed.add_argument("--subsystem", default="")
+    listed.add_argument("--address", default="")
+    listed.add_argument("--build", default="")
+    listed.add_argument("--include-superseded", action="store_true")
+    listed.add_argument("--export", default="", help="Absolute .md path: the subsystem's claims (and a .jsonl)")
     listed.add_argument("--db", default="")
 
     grun = sub.add_parser("ghidra-run")
@@ -144,10 +151,12 @@ def _pair(args: argparse.Namespace) -> tuple[str, dict]:
         return command, {
             "target": args.target, "build": args.build, "kind": args.kind, "name": args.name,
             "note": args.note, "source": args.source, "address": args.address,
-            "prologue": args.prologue, "db": args.db,
+            "prologue": args.prologue, "db": args.db, "subsystem": args.subsystem, "supersedes": args.supersedes,
         }
     if command == "evidence_list":
-        return command, {"target": args.target, "limit": args.limit, "db": args.db}
+        return command, {"target": args.target, "limit": args.limit, "db": args.db, "subsystem": args.subsystem,
+                         "address": args.address, "build": args.build, "include_superseded": args.include_superseded,
+                         "export": args.export}
     if command == "ghidra_run":
         return "ghidra_run", {
             "target": args.target, "script": args.script, "args": args.script_args,

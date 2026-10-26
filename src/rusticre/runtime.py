@@ -9,7 +9,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import hmac
 import re
+import secrets
 import sys
 import time
 import urllib.request
@@ -26,6 +28,10 @@ from rusticre.runtime_ipc import request as ipc_request
 FRIDA_VERSION = "17.24.3"
 ACTION_NAMES = ("setup", "processes", "spawn", "attach", "status", "modules", "threads", "read", "patches",
                 "observe", "break", "continue", "unload", "resume", "detach")
+# Only the session's owner drives the target; any client may look.
+MUTATING = ("observe", "break", "continue", "unload", "resume", "detach")
+# Owner tokens of the sessions this process started (an MCP server keeps its own).
+_TOKENS: dict[str, str] = {}
 
 
 def _write(path: Path, value: dict) -> None:
@@ -204,6 +210,13 @@ class RuntimeRunner:
                 return {"session": session_id, "worker_alive": False, "state": state,
                         "log": str(directory / "worker.log")}
             raise RuntimeError("runtime worker is no longer alive; target state is unknown; log=%s" % (directory / "worker.log"))
+        token = str(args.pop("owner", "") or _TOKENS.get(session_id, ""))
+        owner = _json(directory / "owner.json")
+        if action in MUTATING and owner and not hmac.compare_digest(
+                hashlib.sha256(token.encode()).hexdigest(), str(owner.get("token_sha256", ""))):
+            raise PermissionError("runtime session %s is owned by %s (%s) since %s; other clients may use status, modules, "
+                                  "threads, read and patches; driving it needs options.owner, the token its spawn/attach returned"
+                                  % (session_id, owner.get("client"), owner.get("harness"), owner.get("since")))
         timeout = int(args.pop("timeout_s", 15))
         if not 1 <= timeout <= 60:
             raise ValueError("runtime timeout_s must be 1..60")
@@ -225,6 +238,8 @@ class RuntimeRunner:
                                    % (exc.errno, getattr(exc, "winerror", None), directory / "worker.log", exc)) from exc
             if not response.get("ok"):
                 raise RuntimeError(json.dumps(response))
+            if action == "detach":
+                self._release(owner.get("exe", ""), session_id)
             return response["result"]
         finally:
             lock.release()
@@ -263,9 +278,18 @@ class RuntimeRunner:
         missing = _missing(self.settings)
         if missing:
             raise RuntimeError(missing)
+        self._external_lock(action, exe)
         session_id = uuid.uuid4().hex
+        token = secrets.token_hex(16)
+        self._claim(exe, session_id)
         directory = self.root / session_id
         directory.mkdir()
+        from rusticre import hydra
+        who = hydra.identity()
+        _write(directory / "owner.json", {"client": who["client"], "harness": who["harness"], "exe": str(exe),
+                                          "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+                                          "since": time.strftime("%Y-%m-%dT%H:%M:%S")})
+        _TOKENS[session_id] = token
         initial = {"action": action, "exe": str(exe), "sha256": digest, "argv": argv, "cwd": cwd, "env": env,
                    "pid": int(args.get("pid", 0)), "session": session_id,
                    "idle_s": int(self.settings.get("runtime_idle_s", 600))}
@@ -283,7 +307,7 @@ class RuntimeRunner:
                 if not ready.get("ok"):
                     process.wait(timeout=10)
                     raise RuntimeError("runtime startup failed: %s; log=%s" % (ready.get("error"), directory / "worker.log"))
-                return {"session": session_id, "exe": str(exe), "sha256": digest, "cwd": cwd, "env_keys": sorted(env),
+                return {"session": session_id, "owner": token, "exe": str(exe), "sha256": digest, "cwd": cwd, "env_keys": sorted(env),
                         "worker": _public_ready(ready), "log": str(directory / "worker.log")}
             if process.poll() is not None:
                 raise RuntimeError("runtime worker exited %s; install optional backend with action=setup; log=%s"
@@ -296,6 +320,52 @@ class RuntimeRunner:
         else:
             proc.terminate_tree(process)
         raise TimeoutError("runtime startup timed out; target state unknown; inspect %s" % (directory / "worker.log"))
+
+
+    # ---- one driving session per executable, and an optional external game lock ----------------
+    def _lock_path(self, exe: Path) -> Path:
+        key = hashlib.sha256(os.path.normcase(str(exe)).encode()).hexdigest()[:16]
+        return self.root.parent / "runtime-locks" / (key + ".json")
+
+    def _live(self, session_id: str) -> bool:
+        ready = _json(self.root / session_id / "ready.json")
+        return _identity(int(ready.get("pid", 0)), int(ready.get("started_ms", 0)))
+
+    def _claim(self, exe: Path, session_id: str) -> None:
+        from rusticre import hydra
+        from rusticre.locks import locked
+        path = self._lock_path(exe)
+        with locked(path.with_suffix(".lock"), what="runtime lock"):
+            held = _json(path)
+            starting = held and time.time() - float(held.get("at", 0)) < 60 and not (self.root / held["session"] / "ready.json").exists()
+            if held and (self._live(held["session"]) or starting):
+                raise PermissionError("%s is driven by runtime session %s of %s (%s) since %s; one session drives a program "
+                                      "at a time: read its status, or wait for its detach" % (exe.name, held["session"], held.get("client"),
+                                                                                             held.get("harness"), held.get("since")))
+            who = hydra.identity()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _write(path, {"session": session_id, "client": who["client"], "harness": who["harness"], "exe": str(exe),
+                          "since": time.strftime("%Y-%m-%dT%H:%M:%S"), "at": time.time()})
+
+    def _release(self, exe: str, session_id: str) -> None:
+        if not exe:
+            return
+        path = self._lock_path(Path(exe))
+        if _json(path).get("session") == session_id:
+            path.unlink(missing_ok=True)
+
+    def _external_lock(self, action: str, exe: Path) -> None:
+        """A project's own game lock (runtime_lock_check: a command; non-zero exit refuses)."""
+        command = self.settings.get("runtime_lock_check")
+        if not command:
+            return
+        if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
+            raise ValueError("runtime_lock_check must be a command as a list of strings")
+        result = proc.run([*command, "--tool", "rusticre", "--command", "%s %s" % (action, exe.name)],
+                          capture_output=True, text=True, timeout=60)
+        if result.returncode:
+            raise PermissionError("the external game lock refused %s (exit %d): %s"
+                                  % (action, result.returncode, (result.stdout + result.stderr).strip()[-1500:]))
 
 
 def runtime(action: str, args: dict | None, settings: dict) -> str:
