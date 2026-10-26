@@ -1138,6 +1138,26 @@ public class RusticQuery extends GhidraScript {
     }
 
     // indirect calls through [reg + offset], verified on p-code where the receiver is known.
+    // [base + n] addresses a stack slot, not an object, when base is the stack pointer, or the frame
+    // pointer (EBP/RBP) of a function whose first instructions set it from the stack pointer.
+    private final Map<Address, Boolean> framed = new HashMap<>();
+    private boolean frameBase(ghidra.program.model.lang.Register reg, Address at) {
+        var stack = currentProgram.getCompilerSpec().getStackPointer();
+        if (stack != null && stack.getBaseRegister().equals(reg.getBaseRegister())) return true;
+        String name = reg.getBaseRegister().getName();
+        if (!name.equalsIgnoreCase("RBP") && !name.equalsIgnoreCase("EBP")) return false;
+        Function function = currentProgram.getFunctionManager().getFunctionContaining(at);
+        if (function == null) return false;
+        return framed.computeIfAbsent(function.getEntryPoint(), entry -> {
+            var instruction = currentProgram.getListing().getInstructionAt(entry);
+            for (int i = 0; i < 6 && instruction != null; i++, instruction = instruction.getNext()) {
+                String text = instruction.toString().toUpperCase();
+                if (text.matches("(MOV|LEA) [ER]BP,(\\[)?[ER]SP.*")) return true;
+            }
+            return false;
+        });
+    }
+
     private void vcalls(JsonObject req, JsonObject out, long deadline) throws Exception {
         JsonObject opts = options(req);
         long offset = Long.decode(text(opts, "offset"));
@@ -1188,7 +1208,8 @@ public class RusticQuery extends GhidraScript {
                 Object[] parts = instruction.getOpObjects(i);
                 boolean register = false, displacement = false;
                 for (Object part : parts) {
-                    if (part instanceof ghidra.program.model.lang.Register reg && !reg.isProgramCounter()) register = true;
+                    if (part instanceof ghidra.program.model.lang.Register reg && !reg.isProgramCounter()
+                            && !frameBase(reg, instruction.getAddress())) register = true;
                     if (part instanceof ghidra.program.model.scalar.Scalar scalar && scalar.getUnsignedValue() == offset) displacement = true;
                 }
                 match = register && displacement && parts.length == 2;
@@ -1292,9 +1313,7 @@ public class RusticQuery extends GhidraScript {
         long scanned = 0;
         int verified = 0;
         Address next = null;
-        // Stores through the stack pointer are locals and outgoing arguments, not fields (RSP, ESP, ...).
-        var stack = currentProgram.getCompilerSpec().getStackPointer();
-        var stackBase = stack == null ? null : stack.getBaseRegister();
+        // Stores through the stack or frame pointer are locals and arguments, not fields (frameBase).
         while (iterator.hasNext() && rows.size() < limit && System.nanoTime() < deadline) {
             if ((++scanned & 0xffff) == 0) monitor.checkCancelled();
             var instruction = iterator.next();
@@ -1308,7 +1327,7 @@ public class RusticQuery extends GhidraScript {
             boolean register = false, displacement = false;
             for (Object part : parts) {
                 if (part instanceof ghidra.program.model.lang.Register reg && !reg.isProgramCounter()
-                        && !(stackBase != null && stackBase.equals(reg.getBaseRegister()))) register = true;
+                        && !frameBase(reg, instruction.getAddress())) register = true;
                 if (part instanceof ghidra.program.model.scalar.Scalar scalar && scalar.getUnsignedValue() == offset) displacement = true;
             }
             if (!register || !displacement || parts.length != 2) continue;
