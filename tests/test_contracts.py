@@ -20,6 +20,9 @@ from support import workdir
 CATALOG_HISTORY = {
     0: "f2fbf7471829d41e7c2210a2883b10133fd9e5cf4a5824882e519ce12c2f4fde",
     1: "a16c22e45a57780b88e9bebc91df85ecbe0e3fa115ef18b79a6bebbb10d0086e",
+    # Epoch 2: the pe_address description is "Use rva:/va:; ambiguous unprefixed addresses are refused." again
+    # (epoch 1 had weakened it to "(bare values may be refused)"). Epoch 1 was never released outside this branch.
+    2: "9f1051b0cf70c8a8231b9d07fe46e7a9561142dcfba2442fd9aa7e11a6d85423",
 }
 
 
@@ -59,6 +62,24 @@ class CatalogEpoch(unittest.TestCase):
             with patch("hydralysis.api._settings", return_value={}), patch("hydralysis.hydra.Engine", return_value=engine):
                 status = json.loads(call("backend", {"action": "status"}))
         self.assertEqual(status["catalog"], expected)
+
+    def test_inspect_and_the_mcp_initialize_reply_report_the_catalog_too(self):
+        expected = {"epoch": api.CATALOG_EPOCH, "hash": catalog_hash()}
+        for component in ("analysis", "runtime"):
+            module = "hydralysis.backends.inspect" if component == "analysis" else "hydralysis.runtime.inspect"
+            with patch("hydralysis.api.load", return_value={}), patch(module, return_value={"engine": "x"}):
+                report = json.loads(call("backend", {"action": "inspect", "component": component}))
+            self.assertEqual(report["catalog"], expected, component)
+            self.assertEqual(report["engine"], "x")
+        reply = Server().handle({"id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}})
+        self.assertEqual(reply["result"]["_meta"]["hydralysis/catalog"], expected)
+        self.assertEqual(reply["result"]["serverInfo"], {"name": "hydralysis", "version": reply["result"]["serverInfo"]["version"]})
+
+    def test_the_address_description_keeps_the_refusal_wording(self):
+        for tool in tool_table():
+            address = tool["inputSchema"]["properties"].get("address")
+            if tool["name"] in ("disasm", "bytes", "inspect", "prologue") and address:
+                self.assertIn("ambiguous unprefixed addresses are refused", address["description"], tool["name"])
 
     def test_new_surface_rides_options_and_two_enum_values_on_the_same_twenty_tools(self):
         table = {tool["name"]: tool["inputSchema"]["properties"] for tool in tool_table()}

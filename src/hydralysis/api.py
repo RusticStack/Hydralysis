@@ -62,8 +62,11 @@ REJECTED = (
 # The advertised tool table is cached by running MCP sessions (listChanged is False), so it may
 # change only through a catalog epoch: bump CATALOG_EPOCH together with an entry in
 # tests/test_contracts.py CATALOG_HISTORY, and tell users a harness restart is needed once.
+# Epoch 2 restored the stronger pe_address wording ("ambiguous unprefixed addresses are refused").
+# Where the catalog is reported: backend status, backend help and backend inspect (api.py), and the
+# MCP initialize result under _meta (mcp.py). ghidra_query status is built in query.py and does not carry it.
 # Everything added after epoch 1 rides the free-form `options` objects (see OPTION_BAGS).
-CATALOG_EPOCH = 1
+CATALOG_EPOCH = 2
 
 # Which `options` bag carries which feature (PROTOCOL-3.md 7.7). The bags are free-form objects
 # in the schema, so a later package changes a handler, never the schema.
@@ -103,7 +106,7 @@ def tool_table() -> list[dict]:
 
     string = {"type": "string"}
     integer = {"type": "integer"}
-    pe_address = {"type": "string", "description": "rva:0x... or va:0x... (bare values may be refused)."}
+    pe_address = {"type": "string", "description": "Use rva:/va:; ambiguous unprefixed addresses are refused."}
     options = {"type": "object"}
     return [
         tool("fingerprint", "PE build identity and packing triage. detail=sections/exports returns those tables.", {"exe": string, "detail": {"type": "string", "enum": ["header", "sections", "exports"]}}, ["exe"]),
@@ -390,7 +393,7 @@ def _workflow(name: str, args: dict) -> str:
             from hydralysis.runtime import inspect
         else:
             from hydralysis.backends import inspect
-        report = inspect(settings)
+        report = {**inspect(settings), "catalog": catalog()}
         from hydralysis import compat
         if compat.deprecations():
             # Names inherited from RusticRE that this process still honoured (one release).

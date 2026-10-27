@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from hydralysis import __version__
 from hydralysis import compat
-from hydralysis.api import TOOL_NAMES, call, instructions, tool_table
+from hydralysis.api import TOOL_NAMES, call, catalog, instructions, tool_table
 
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 SERVER_INFO = {"name": "hydralysis", "version": __version__}
@@ -63,6 +63,9 @@ class Server:
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": SERVER_INFO,
                 "instructions": instructions(),
+                # The tool table is cached for the life of this session (listChanged is false): the epoch
+                # and hash say which table the session was started with.
+                "_meta": {"hydralysis/catalog": catalog()},
             })
         if method in ("notifications/initialized", "notifications/cancelled"):
             return None
