@@ -193,13 +193,30 @@ class SealedJson(Base):
     def test_a_torn_file_at_every_cut_returns_the_old_content_never_empty(self):
         path = self.write_two()
         good = path.read_bytes()
-        for cut in range(0, len(good) - 1):
+        for cut in range(0, len(good)):  # includes the cut that drops only the final "}"
             with self.subTest(cut=cut):
                 path.write_bytes(good[:cut])
                 value, source = durable.read_sealed_info(path)
                 self.assertEqual((value["gen"], source), (1, "backup"))
         path.write_bytes(good)
         self.assertEqual(durable.read_sealed_info(path)[1], "file")
+
+    def test_an_unpaired_surrogate_is_refused_not_sealed(self):
+        # PROTOCOL-3.md 3.4: an unpaired surrogate is refused (no 'surrogatepass').
+        for value in ({"a": "\ud800"}, {"a": ["x", "\udc00"]}, {"\udfff": 1}):
+            with self.subTest(value=ascii(value)):
+                with self.assertRaisesRegex(ValueError, "unpaired surrogate"):
+                    durable.canonical(value)
+                path = self.root / ("s%d.json" % abs(hash(ascii(value))))
+                with self.assertRaisesRegex(ValueError, "unpaired surrogate"):
+                    durable.write_sealed(path, value)
+                self.assertFalse(path.exists())
+        # a real astral character is one code point and is fine
+        self.assertEqual(durable.canonical({"a": "\U0001F600"}), '{"a":"\U0001F600"}'.encode("utf-8"))
+        # a stored record whose body holds an escaped lone surrogate cannot be verified: it is invalid, not sealed
+        path = self.root / "lone.json"
+        path.write_text('{"a": "\\ud800", "seal": {"algo": "sha256", "value": "' + "0" * 64 + '"}}', encoding="utf-8")
+        self.assertEqual(durable.inspect_file(path)[0::2], ("invalid", "body cannot be canonicalised"))
 
     def test_a_mis_sealed_file_is_rejected(self):
         path = self.write_two()
@@ -560,6 +577,129 @@ class AppendLogTests(Base):
         log.path.write_bytes(log.path.read_bytes() + line_of({"n": 2})[:5])
         log.append({"n": 3})
         self.assertEqual(log.read(), [{"n": 1}, {"n": 3}])
+
+    def scans(self):
+        """Patch durable.scan_file so a test can see which scans the writer made: a list of start offsets."""
+        started, real = [], durable.scan_file
+
+        def spy(path, start=0, collect=True):
+            started.append(start)
+            return real(path, start, collect)
+
+        patcher = patch("hydralysis.durable.scan_file", side_effect=spy)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return started
+
+    def test_two_processes_a_appends_b_is_killed_mid_line_a_appends_again_and_a_repair_is_recorded(self):
+        # The check is made on every lock acquisition, not only on the first append of a process: A has
+        # verified the log and remembers it, B dies half way through a line, A must still notice.
+        log = self.log()
+        log.append({"n": 1})
+        self.assertIn(log._key, durable._VERIFIED)
+        before = log.path.stat().st_size
+        full = len(line_of({"n": 2, "pad": "y" * 20}))
+        for cut in (1, 9, full - 1):
+            with self.subTest(cut=cut):
+                code = ("import sys\nfrom hydralysis import durable\n"
+                        "durable.AppendLog(sys.argv[1], lock_path=sys.argv[2], by='B').append({'n': 2, 'pad': 'y' * 20})\n")
+                result = run_child(code, log.path, log.lock_path, fault="log.torn_append:torn:%d" % cut)
+                self.assertEqual(result.returncode, 137, result.stderr)
+                self.assertEqual(log.path.stat().st_size, before + cut)
+                self.assertEqual(log.read(), [{"n": 1}])  # a reader sees the valid prefix and writes nothing
+                repairs_before = len(log.repairs())
+                log.append({"n": 3})  # no durable._VERIFIED.clear(): A believes the log is verified
+                repairs = log.repairs()
+                self.assertEqual(len(repairs), repairs_before + 1)
+                self.assertEqual((repairs[-1]["offset"], repairs[-1]["bytes"], repairs[-1]["by"]), (before, cut, "test"))
+                self.assertIsNone(log.status()["corrupt"])  # no lineage_corrupt
+                self.assertIsNone(log.status()["torn_tail"])
+                self.assertEqual(log.last(), {"n": 3})  # the new line is valid
+                self.assertEqual(log.read()[-1], {"n": 3})
+                fragment = line_of({"n": 2, "pad": "y" * 20})[:cut]
+                copy = log.path.with_name("%s.torn-%d-%s" % (log.path.name, before, hashlib.sha256(fragment).hexdigest()[:8]))
+                self.assertEqual(copy.read_bytes(), fragment)
+                log.path.write_bytes(line_of({"n": 1}))  # reset for the next cut
+                durable._VERIFIED[log._key] = log.path.stat().st_size
+                before = log.path.stat().st_size
+
+    def test_a_foreign_garbage_line_that_ends_in_lf_is_also_repaired_on_the_next_acquisition(self):
+        log = self.log()
+        log.append({"n": 1})
+        size = log.path.stat().st_size
+        log.path.write_bytes(log.path.read_bytes() + b"not a framed line\n")  # ends in LF, but invalid
+        log.append({"n": 2})
+        self.assertEqual(log.read(), [{"n": 1}, {"n": 2}])
+        self.assertEqual([(row["offset"], row["bytes"]) for row in log.repairs()], [(size, len(b"not a framed line\n"))])
+
+    def test_the_cheap_check_scans_nothing_when_the_log_is_as_this_process_left_it(self):
+        log = self.log()
+        log.append({"n": 1})
+        started = self.scans()
+        log.append({"n": 2})
+        log.append({"n": 3})
+        self.assertEqual(started, [])  # size equals the last known valid end and the file ends in LF
+        # a valid line appended by another process: only the new bytes are scanned, from the known end
+        known = durable._VERIFIED[log._key]
+        code = ("import sys\nfrom hydralysis import durable\n"
+                "durable.AppendLog(sys.argv[1], lock_path=sys.argv[2]).append({'n': 4})\n")
+        result = run_child(code, log.path, log.lock_path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        log.append({"n": 5})
+        self.assertEqual(started, [known])
+        self.assertEqual(log.read(), [{"n": 1}, {"n": 2}, {"n": 3}, {"n": 4}, {"n": 5}])
+        self.assertEqual(log.repairs(), [])
+
+    def test_a_log_larger_than_the_32_mib_localio_budget_is_read_scanned_and_appended_to(self):
+        from hydralysis import localio
+
+        pad = "p" * 1000
+        lines = [line_of({"n": number, "pad": pad}) for number in range(64)]
+        block = b"".join(lines)  # about 66 KB; the file is built from repeated blocks, so it is cheap
+        repeats = (localio.DEFAULT_MAX_BYTES // len(block)) + 20
+        log = self.log()
+        with open(log.path, "wb") as handle:
+            for _ in range(repeats):
+                handle.write(block)
+        size = log.path.stat().st_size
+        self.assertGreater(size, localio.DEFAULT_MAX_BYTES)
+        with self.assertRaises(ValueError):  # the premise: the old whole-file read refuses this file
+            localio.read_bytes(log.path)
+        started = self.scans()
+        status = log.status()  # streamed: no budget error
+        self.assertEqual((status["records"], status["valid_bytes"], status["size"]), (64 * repeats, size, size))
+        self.assertEqual(len(log.read()), 64 * repeats)
+        self.assertEqual(log.last(), {"n": 63, "pad": pad})  # tail-aware: reads a window, not the file
+        self.assertEqual(log.last(strict=True), {"n": 63, "pad": pad})
+        del started[:]  # the reads above scanned too; count only the writer's scans from here
+        # the writer's first acquisition scans the whole log by streaming (O(n), required once), then never again
+        offset = log.append({"n": "new"})
+        self.assertEqual((offset, started), (size, [0]))
+        log.append({"n": "newer"})
+        self.assertEqual(started, [0])
+        self.assertEqual(log.last(), {"n": "newer"})
+        # a torn tail after the huge prefix is found by the bounded scan from the known end, not the start
+        known = durable._VERIFIED[log._key]
+        with open(log.path, "ab") as handle:
+            handle.write(b"1234")
+        entry = log.repair()
+        self.assertEqual((entry["offset"], entry["bytes"]), (known, 4))
+        self.assertEqual(started, [0, known])
+        self.assertIsNone(log.status()["torn_tail"])
+
+    def test_the_tail_read_finds_the_last_valid_line_across_garbage_and_long_lines(self):
+        log = self.log()
+        log.append({"n": 1})
+        big = {"n": 2, "pad": "z" * (durable.TAIL_WINDOW * 3)}  # longer than the first window
+        log.append(big)
+        self.assertEqual(log.last(), big)
+        log.path.write_bytes(log.path.read_bytes() + b"garbage\n" + b"frag")
+        self.assertEqual(log.last(), big)
+        with patch.object(durable, "TAIL_WINDOW", 100), patch.object(durable, "TAIL_WINDOW_MAX", 400):
+            self.assertEqual(log.last(), big)  # window limit reached: falls back to the full scan
+        self.assertIsNone(durable.AppendLog(self.root / "none.log").last())
+        (self.root / "empty.log").write_bytes(b"")
+        self.assertIsNone(durable.AppendLog(self.root / "empty.log").last())
 
     def test_an_append_to_a_missing_log_creates_it_and_the_caller_may_hold_the_lock(self):
         log = self.log()

@@ -9,10 +9,18 @@
   sealed version kept by the writer, and otherwise raises `store_corrupt`. It never
   starts empty. A file that was never written is not corruption.
 * AppendLog: CRC-32 framed JSON lines. Readers never write and ignore a torn final
-  fragment; writers repair it under the log's lock before appending; an invalid line
-  followed by a valid one is corruption (`lineage_corrupt`) and is refused.
+  fragment; writers check the tail on EVERY acquisition of the writer lock (the file ends
+  in LF and its size equals the end of the last valid line, otherwise the new bytes are
+  scanned) and repair a torn tail under that lock before appending; an invalid line
+  followed by a valid one is corruption (`lineage_corrupt`) and is refused. Logs are read
+  by streaming, not through localio.read_bytes, so the 32 MiB metadata budget does not
+  apply to them.
 * fault(name): a test hook, inert unless HYDRALYSIS_TEST_MODE=1 and
   HYDRALYSIS_TEST_FAULT=<name>:<action> are both set.
+
+Measured cost (input for gate 9.10): write_sealed is a read, a `.bak` atomic_write and a main
+atomic_write, i.e. two fsyncs and two replaces: about 16 ms per 600-byte record on D: (mean of
+100 writes, Y0a review), against 0.11 ms per read_sealed. Not measured on F:, C: or E:.
 
 What is not verified: whether write-through is honoured by the owner's ReFS Dev Drive,
 and anything about power loss. The claims are tested by killing a writer process and by
@@ -204,8 +212,11 @@ def atomic_write(path, data: bytes, *, point: str = "atomic") -> None:
 
 def canonical(value) -> bytes:
     """The canonical form of PROTOCOL-3.md 3.4: sorted keys, minimal separators, UTF-8, floats allowed."""
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
-                      allow_nan=False).encode("utf-8", "surrogatepass")
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+                          allow_nan=False).encode("utf-8")
+    except UnicodeEncodeError as exc:  # an unpaired surrogate cannot be UTF-8; 3.4 refuses it
+        raise ValueError("canonical form refuses an unpaired surrogate (PROTOCOL-3.md 3.4): %s" % exc) from exc
 
 
 def seal_of(body: dict) -> dict:
@@ -350,8 +361,14 @@ def update_sealed(path, update, *, lock_path=None, default=None, timeout_s: floa
 # --------------------------------------------------------------------------- append log
 
 _HEX = frozenset(b"0123456789abcdef")
-_VERIFIED: set[str] = set()
+# key -> end of the last line this process knows to be valid (the size after its own last append or repair).
+# An entry only lets a writer skip a scan: every lock acquisition still checks the size and the final LF.
+_VERIFIED: dict[str, int] = {}
 _VERIFIED_GUARD = threading.Lock()
+CHUNK = 1 << 20
+TAIL_WINDOW = 64 * 1024
+TAIL_WINDOW_MAX = 8 * 1024 * 1024
+_UNBOUNDED = object()
 
 
 def frame(record) -> bytes:
@@ -384,29 +401,117 @@ class Scan:
                 "torn_tail": self.torn_tail, "corrupt": self.corrupt}
 
 
-def scan_bytes(data: bytes) -> Scan:
-    records, position, bad_from, line_no = [], 0, None, 0
-    bad_line = 0
-    while position < len(data):
-        end = data.find(b"\n", position)
-        if end < 0:  # an unterminated fragment is never valid, even if its CRC happens to match
-            if bad_from is None:
-                bad_from, bad_line = position, line_no + 1
-            break
-        line_no += 1
-        parsed = _parse(data[position:end])
-        if parsed is None:
-            if bad_from is None:
-                bad_from, bad_line = position, line_no
-        elif bad_from is not None:
-            return Scan(records, bad_from, len(data), None,
-                        {"offset": bad_from, "line": bad_line, "error": "lineage_corrupt"})
-        else:
-            records.append(parsed[0])
-        position = end + 1
+def scan_chunks(chunks, base: int = 0, collect: bool = True, size: int | None = None) -> Scan:
+    """Scan consecutive chunks that start at byte `base` of a log (`base` must be a line start).
+
+    `size` is the total size to report (default: base plus the bytes seen). With collect=False the
+    lines are validated but the records are not kept (`Scan.records` is then empty).
+    """
+    records: list = []
+    pending, pending_start, seen = b"", base, base
+    bad_from, bad_line, line_no = None, 0, 0
+    for chunk in chunks:
+        seen += len(chunk)
+        pending += chunk
+        cursor = 0
+        while True:
+            end = pending.find(b"\n", cursor)
+            if end < 0:
+                break
+            line_no += 1
+            parsed = _parse(pending[cursor:end])
+            if parsed is None:
+                if bad_from is None:
+                    bad_from, bad_line = pending_start + cursor, line_no
+            elif bad_from is not None:
+                return Scan(records, bad_from, seen if size is None else size, None,
+                            {"offset": bad_from, "line": bad_line, "error": "lineage_corrupt"})
+            elif collect:
+                records.append(parsed[0])
+            cursor = end + 1
+        pending_start += cursor
+        pending = pending[cursor:]
+    total = seen if size is None else size
+    if pending and bad_from is None:  # an unterminated fragment is never valid, even if its CRC happens to match
+        bad_from, bad_line = pending_start, line_no + 1
     if bad_from is None:
-        return Scan(records, len(data), len(data), None, None)
-    return Scan(records, bad_from, len(data), {"offset": bad_from, "bytes": len(data) - bad_from}, None)
+        return Scan(records, total, total, None, None)
+    return Scan(records, bad_from, total, {"offset": bad_from, "bytes": total - bad_from}, None)
+
+
+def scan_bytes(data: bytes) -> Scan:
+    return scan_chunks([data])
+
+
+def _file_chunks(handle, start: int, stop: int):
+    handle.seek(start)
+    remaining = stop - start
+    while remaining > 0:
+        chunk = handle.read(min(CHUNK, remaining))
+        if not chunk:
+            return
+        remaining -= len(chunk)
+        yield chunk
+
+
+def scan_file(path, start: int = 0, collect: bool = True) -> Scan:
+    """Scan a log by streaming, from byte `start` (a line start) to its size at the moment it was opened."""
+    try:
+        handle = open(path, "rb")
+    except FileNotFoundError:
+        return Scan([], 0, 0, None, None)
+    with handle:
+        stop = os.fstat(handle.fileno()).st_size
+        if start > stop:
+            start = 0
+        return scan_chunks(_file_chunks(handle, start, stop), start, collect, stop)
+
+
+def _complete_lines(path):
+    """Yield every LF-terminated line of a file by streaming (a missing file yields nothing)."""
+    try:
+        handle = open(path, "rb")
+    except FileNotFoundError:
+        return
+    with handle:
+        stop = os.fstat(handle.fileno()).st_size
+        pending = b""
+        for chunk in _file_chunks(handle, 0, stop):
+            pending += chunk
+            *lines, pending = pending.split(b"\n")
+            yield from lines
+
+
+def _tail_last_valid(path):
+    """`(record,)` for the last valid line, None when there is none, or _UNBOUNDED.
+
+    Reads from the end in growing windows. It trusts the tail: it does not look for corruption earlier
+    in the log. _UNBOUNDED means TAIL_WINDOW_MAX was reached without finding a valid line.
+    """
+    try:
+        handle = open(path, "rb")
+    except FileNotFoundError:
+        return None
+    with handle:
+        size = os.fstat(handle.fileno()).st_size
+        window = TAIL_WINDOW
+        while True:
+            start = max(0, size - window)
+            handle.seek(start)
+            data = handle.read(size - start)
+            if start:  # the first line of the window may be cut: begin at the next line
+                cut = data.find(b"\n")
+                data = b"" if cut < 0 else data[cut + 1:]
+            lines = data.split(b"\n")[:-1]  # the last element is empty or an unterminated fragment
+            for line in reversed(lines):
+                parsed = _parse(line)
+                if parsed is not None:
+                    return parsed
+            if start == 0:
+                return None
+            if window >= TAIL_WINDOW_MAX:
+                return _UNBOUNDED
+            window *= 4
 
 
 class AppendLog:
@@ -419,13 +524,12 @@ class AppendLog:
         self.lock_timeout_s = lock_timeout_s
         self._key = os.path.normcase(os.path.abspath(self.path))
 
-    # readers: no lock, never write
+    # readers: no lock, never write; streamed, so the 32 MiB localio budget does not apply
     def scan(self) -> Scan:
-        data = _read(self.path, None)
-        return scan_bytes(data or b"")
+        return scan_file(self.path)
 
     def read(self) -> list:
-        """The valid prefix; a torn tail is ignored. Mid-log corruption raises LineageCorrupt."""
+        """The valid prefix; a torn tail is ignored. Mid-log corruption raises LineageCorrupt. O(n)."""
         result = self.scan()
         if result.corrupt:
             raise LineageCorrupt(self.path, result.corrupt["offset"], result.records)
@@ -434,14 +538,22 @@ class AppendLog:
     def status(self) -> dict:
         return self.scan().as_status()
 
-    def last(self):
+    def last(self, *, strict: bool = False):
+        """The last valid record, or None.
+
+        By default only the tail is read (bounded) and corruption earlier in the log is not looked for;
+        strict=True scans the whole log and raises LineageCorrupt like read().
+        """
+        if not strict:
+            found = _tail_last_valid(self.path)
+            if found is not _UNBOUNDED:
+                return None if found is None else found[0]
         records = self.read()
         return records[-1] if records else None
 
     def repairs(self) -> list:
-        data = _read(self.path.with_name(self.path.name + ".repairs"), None) or b""
         rows = []
-        for line in data.split(b"\n"):
+        for line in _complete_lines(self.path.with_name(self.path.name + ".repairs")):
             parsed = _parse(line)
             if parsed is not None:
                 rows.append(parsed[0])
@@ -459,30 +571,53 @@ class AppendLog:
     def repair(self, *, lock_held: bool = False) -> dict | None:
         """Repair a torn tail (and refuse corruption) without appending. Returns the repair record or None."""
         if lock_held:
-            return self._repair()
+            return self._check_tail()
         with file_lock(self.lock_path, self.lock_timeout_s, what="log " + self.path.name):
-            return self._repair()
+            return self._check_tail()
 
-    def _clean_tail(self) -> bool:
+    def _check_tail(self) -> dict | None:
+        """The check made on EVERY acquisition of the writer lock; returns the repair record, if one was made.
+
+        Cheap case: the size equals the end this process last saw valid and the file ends in LF. Otherwise
+        scan what this process has not verified (from its last known valid end when that is still a line
+        boundary, else from the start), refuse mid-log corruption and repair a torn tail. A writer in another
+        process that was killed mid-line changes the size and leaves no final LF, so it is always noticed.
+        """
         try:
             size = self.path.stat().st_size
         except FileNotFoundError:
-            return True
+            size = 0
         if size == 0:
-            return True
-        with open(self.path, "rb") as handle:
-            handle.seek(size - 1)
-            return handle.read(1) == b"\n"
-
-    def _repair(self) -> dict | None:
-        data = _read(self.path, None) or b""
-        result = scan_bytes(data)
-        if result.corrupt:
-            raise LineageCorrupt(self.path, result.corrupt["offset"], result.records)
-        if not result.torn_tail:
+            self._remember(0)
             return None
-        offset = result.torn_tail["offset"]
-        tail = data[offset:]
+        with _VERIFIED_GUARD:
+            known = _VERIFIED.get(self._key)
+        start = 0
+        if known and known <= size:
+            with open(self.path, "rb") as handle:
+                handle.seek(known - 1)
+                if handle.read(1) == b"\n":
+                    start = known
+        if start == size:  # nothing new, and the byte before `start` is the LF that ends the last line
+            return None
+        result = scan_file(self.path, start, collect=False)
+        if result.corrupt:
+            raise LineageCorrupt(self.path, result.corrupt["offset"], [])
+        if not result.torn_tail:
+            self._remember(result.size)
+            return None
+        entry = self._repair_tail(result.torn_tail["offset"], result.size)
+        self._remember(entry["offset"])
+        return entry
+
+    def _remember(self, valid_end: int) -> None:
+        with _VERIFIED_GUARD:
+            _VERIFIED[self._key] = valid_end
+
+    def _repair_tail(self, offset: int, size: int) -> dict:
+        with open(self.path, "rb") as handle:
+            handle.seek(offset)
+            tail = handle.read(size - offset)
         digest = hashlib.sha256(tail).hexdigest()
         # (c) preserve the fragment and force the copy; every step is idempotent.
         atomic_write(self.path.with_name("%s.torn-%d-%s" % (self.path.name, offset, digest[:8])), tail, point="log.copy")
@@ -530,19 +665,13 @@ class AppendLog:
 
     def _append_locked(self, line: bytes) -> int:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with _VERIFIED_GUARD:
-            verified = self._key in _VERIFIED
         try:
-            # Before the first append in a process, after any failed append, and whenever the file does
-            # not end in LF (another process's failed append): scan, refuse corruption, repair a torn tail.
-            if not verified or not self._clean_tail():
-                self._repair()
-                with _VERIFIED_GUARD:
-                    _VERIFIED.add(self._key)
+            self._check_tail()
             offset = self._raw_append(self.path, line)
+            self._remember(offset + len(line))
             fault("log.after_append")
             return offset
         except BaseException:
             with _VERIFIED_GUARD:
-                _VERIFIED.discard(self._key)
+                _VERIFIED.pop(self._key, None)
             raise
