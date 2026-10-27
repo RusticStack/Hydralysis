@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -58,6 +59,41 @@ REJECTED = (
 )
 
 
+# The advertised tool table is cached by running MCP sessions (listChanged is False), so it may
+# change only through a catalog epoch: bump CATALOG_EPOCH together with an entry in
+# tests/test_contracts.py CATALOG_HISTORY, and tell users a harness restart is needed once.
+# Everything added after epoch 1 rides the free-form `options` objects (see OPTION_BAGS).
+CATALOG_EPOCH = 1
+
+# Which `options` bag carries which feature (PROTOCOL-3.md 7.7). The bags are free-form objects
+# in the schema, so a later package changes a handler, never the schema.
+OPTION_BAGS = {
+    "ghidra_query": "type_edit options.kind (commit, commit_revert, rebase, publish, merge, export_bundle, "
+                    "import_bundle, plus today's kinds), options.view, options.expect_revision; "
+                    "status options.show (changes, views, lineage, queue, health)",
+    "backend": "action=backups options.op (list, verify) and selectors; action=doctor options (sections, verbose)",
+    "ghidra_run": "options.isolation (private, shared, exclusive), options.readonly",
+    "job": "reserved: status/cancel filters (kind, cid) for commit and backup jobs",
+    "runtime": "per-action options (exists)",
+}
+
+
+def catalog_hash(table: list[dict] | None = None) -> str:
+    """SHA-256 over the canonical JSON of the advertised tools (names, descriptions, schemas)."""
+    canonical = json.dumps(tool_table() if table is None else table, sort_keys=True,
+                           separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("ascii")).hexdigest()
+
+
+def catalog() -> dict:
+    return {"epoch": CATALOG_EPOCH, "hash": catalog_hash()}
+
+
+def not_available(capability: str, message: str, **detail) -> str:
+    """The reply of a carrier whose engine or Hydralysis capability is not there yet (a result, not an error)."""
+    return json.dumps({"not_available": capability, "message": message, **detail, "catalog": catalog()}, indent=2)
+
+
 def tool_table() -> list[dict]:
     def tool(name: str, description: str, properties: dict, required: list[str] | None = None) -> dict:
         schema: dict = {"type": "object", "properties": properties}
@@ -67,7 +103,8 @@ def tool_table() -> list[dict]:
 
     string = {"type": "string"}
     integer = {"type": "integer"}
-    pe_address = {"type": "string", "description": "Use rva:0x... or va:0x...; ambiguous unprefixed addresses are refused."}
+    pe_address = {"type": "string", "description": "rva:0x... or va:0x... (bare values may be refused)."}
+    options = {"type": "object"}
     return [
         tool("fingerprint", "PE build identity and packing triage. detail=sections/exports returns those tables.", {"exe": string, "detail": {"type": "string", "enum": ["header", "sections", "exports"]}}, ["exe"]),
         tool("imports", "Imported symbols and IAT slots (xrefs on a slot: its callers); pattern filters.", {"exe": string, "limit": integer, "pattern": string}, ["exe"]),
@@ -112,17 +149,17 @@ def tool_table() -> list[dict]:
         tool("ghidra_run", "Run your Ghidra script on saved analysis; contained and rolled back.", {
             "target": string, "script": string, "view": string,
             "args": {"type": "array", "items": string},
-            "timeout_s": integer,
+            "timeout_s": integer, "options": options,
         }, ["target", "script"]),
         tool("ghidra_query", "Query saved analysis; pages use next_cursor. address_map imports cited name/hash maps; export starts a job. See backend help.", {
             "target": string,
             "action": {"type": "string", "enum": ["decompile", "function", "functions", "xrefs", "types", "type", "data", "scan", "variables", "dossier", "blocks", "pcode", "trace", "type_edit", "diff", "vcalls", "vtables", "writes", "orphans", "export", "address_map", "status", "stop"]},
             "address": string, "limit": integer, "cursor": string, "contains": string, "timeout_s": integer,
-            "options": {"type": "object"},
+            "options": options,
         }, ["target"]),
-        tool("backend", "Discover/install private analysis or runtime engines, never other MCPs. install returns a durable job. status/stop the shared engine. help gives operation options.", {
-            "action": {"type": "string", "enum": ["inspect", "install", "status", "stop", "help"]},
-            "component": {"type": "string", "enum": ["analysis", "runtime"]},
+        tool("backend", "Discover/install private analysis or runtime engines, never other MCPs. install returns a durable job. status/stop the shared engine. doctor and backups take options. help gives operation options.", {
+            "action": {"type": "string", "enum": ["inspect", "install", "status", "stop", "help", "doctor", "backups"]},
+            "component": {"type": "string", "enum": ["analysis", "runtime"]}, "options": options,
         }),
         tool("prepare", "Register a build: adopt an analysed project in place (path=.gpr or folder; hash-checked, no copy), or start a one-time import/analysis job. plan is read-only.", {
             "exe": string, "target": string, "timeout_s": integer, "install": {"type": "boolean"},
@@ -131,9 +168,10 @@ def tool_table() -> list[dict]:
         }),
         tool("job", "Job status, bounded logs or cancel (needs owner, its start's owner_token). No id lists every client's jobs.", {
             "action": {"type": "string", "enum": ["status", "cancel"]}, "id": string, "limit": integer, "owner": string,
+            "options": options,
         }),
         tool("runtime", "Own-process debugging/instrumentation sessions: spawn/attach, modules, memory, verified probes/breakpoints, registers, continue and detach. Use backend help for options.", {
-            "action": string, "options": {"type": "object"},
+            "action": string, "options": options,
         }, ["action"]),
     ]
 
@@ -279,6 +317,9 @@ def call(name: str, args: dict | None) -> str:
             return json.dumps(decoded, ensure_ascii=False)
         return result
     if name == "ghidra_run":
+        stub = _script_options(args.get("options"))
+        if stub:
+            return stub
         from hydralysis.userscripts import run
         return run(_settings(), target, str(args.get("script") or ""),
                    [str(item) for item in _list(args.get("args"))], int(args.get("timeout_s") or 600),
@@ -315,9 +356,12 @@ def _workflow(name: str, args: dict) -> str:
         action, component = args.get("action", "inspect"), args.get("component", "analysis")
         if component not in ("analysis", "runtime"):
             raise ValueError("component must be analysis or runtime")
+        options = _options_bag(args)
+        if action in ("doctor", "backups"):
+            return _backend_stub(action, options)
         if action == "help":
             from hydralysis.workflow_help import operation_help
-            return json.dumps(operation_help(component), indent=2)
+            return json.dumps({**operation_help(component), "catalog": catalog()}, indent=2)
         if action == "install":
             from hydralysis.preparation import start_install
             return json.dumps(start_install(settings, component), indent=2)
@@ -331,6 +375,7 @@ def _workflow(name: str, args: dict) -> str:
             status = engine.call("status")
             keep = ("protocol", "hydraVersion", "ghidraVersion", "installId", "pid", "startedAt", "memory", "youAre")
             summary = {key: status.get(key) for key in keep if key in status}
+            summary["catalog"] = catalog()
             summary["projects"] = [{key: item.get(key) for key in ("id", "name", "gpr", "writable", "revision", "stale", "users")}
                                    for item in status.get("projects", [])][:20]
             summary["programs"] = [{key: item.get(key) for key in ("key", "mode", "owner", "users", "busy")}
@@ -340,7 +385,7 @@ def _workflow(name: str, args: dict) -> str:
             summary["imports"] = status.get("imports")
             return json.dumps(summary, indent=2, default=str)
         if action != "inspect":
-            raise ValueError("backend action must be inspect, install, status, stop or help")
+            raise ValueError("backend action must be inspect, install, status, stop, help, doctor or backups")
         if component == "runtime":
             from hydralysis.runtime import inspect
         else:
@@ -369,6 +414,10 @@ def _workflow(name: str, args: dict) -> str:
         return json.dumps(operation(settings, str(args.get("exe") or ""), str(args.get("target") or ""),
                                   int(args.get("timeout_s", 3600)), install), indent=2)
     if name == "job":
+        options = _options_bag(args)
+        if options:
+            return not_available("jobOptions", "job options are reserved for commit and backup jobs and are not implemented yet; "
+                                 "call job without options", tool="job", options=sorted(options))
         from hydralysis.preparation import cancel, status
         job_id = str(args.get("id") or "")
         action = args.get("action", "status")
@@ -427,6 +476,49 @@ def _workflow(name: str, args: dict) -> str:
         return json.dumps(start_install(settings, "runtime"), indent=2)
     from hydralysis.runtime import runtime
     return runtime(str(args.get("action") or ""), args.get("options") or {}, settings)
+
+
+def _options_bag(args: dict) -> dict:
+    """The tool's free-form `options` object ({} when absent); anything else is refused."""
+    options = args.get("options")
+    if options is None:
+        return {}
+    if not isinstance(options, dict):
+        raise ValueError("options must be an object")
+    return options
+
+
+def _backend_stub(action: str, options: dict) -> str:
+    """doctor and backups: carriers only until Y4b (doctor.py) and Y2 (backups.py) dispatch them here."""
+    if action == "backups":
+        op = options.get("op", "list")
+        if op not in ("list", "verify"):
+            raise ValueError("backups options.op must be list or verify")
+        return not_available("backups", "backend action=backups is not implemented in this release; no backup was listed or verified",
+                             tool="backend", action=action, op=op)
+    return not_available("doctor", "backend action=doctor is not implemented in this release; use backend status and inspect",
+                         tool="backend", action=action)
+
+
+def _script_options(options) -> str:
+    """ghidra_run options.{isolation, readonly}: validated, then not_available until the engine capability exists.
+
+    Empty or absent options run the script exactly as before. Options are never silently ignored: a
+    request for private isolation or a read-only run must not turn into a different mode."""
+    if options is None:
+        return ""
+    if not isinstance(options, dict):
+        raise ValueError("options must be an object")
+    if not options:
+        return ""
+    isolation = options.get("isolation")
+    if isolation is not None and isolation not in ("private", "shared", "exclusive"):
+        raise ValueError("ghidra_run options.isolation must be private, shared or exclusive")
+    if "readonly" in options and not isinstance(options["readonly"], bool):
+        raise ValueError("ghidra_run options.readonly must be a boolean")
+    return not_available("scriptIsolation", "ghidra_run options are not implemented in this release; the script was not run. "
+                         "Call ghidra_run without options for today's contained mode",
+                         tool="ghidra_run", options=sorted(options))
 
 
 def _live(result: dict, args: dict, image: Image) -> None:
