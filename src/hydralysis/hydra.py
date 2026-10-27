@@ -24,7 +24,7 @@ import time
 import zipfile
 from pathlib import Path
 
-from hydralysis import compat
+from hydralysis import compat, durable
 from hydralysis.paths import root_path
 
 RELEASE = "12.3-hydra.2"
@@ -299,9 +299,9 @@ def write_daemon_config(settings: dict) -> Path:
     except (OSError, ValueError):
         current = None
     if current != wanted:
-        temporary = path.with_name("config.json.tmp")
-        temporary.write_text(json.dumps(wanted, indent=2), encoding="utf-8")
-        temporary.replace(path)
+        # Durable (fsync, write-through replace) but NOT sealed: the engine's launcher reads this file and must
+        # see the plain JSON object it expects, so it carries no `seal` key and no `.bak` is kept (PROTOCOL-3.md 8.2).
+        durable.atomic_write(path, json.dumps(wanted, indent=2).encode("utf-8"))
     return path
 
 

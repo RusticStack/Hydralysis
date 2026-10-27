@@ -10,6 +10,10 @@ from hydralysis.mcp import Server
 from hydralysis.analysis import ADVANCED_ACTIONS
 
 
+# The same enum as the MCP tool (api.py): doctor and backups answer `not_available` until Y4b and Y2 land their handlers.
+BACKEND_ACTIONS = ("inspect", "install", "status", "stop", "help", "doctor", "backups")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="hydralysis", description="Reverse engineering for a PE you own.")
     sub = parser.add_subparsers(dest="command")
@@ -89,9 +93,13 @@ def main(argv: list[str] | None = None) -> int:
     query.add_argument("--timeout", type=int, default=30)
     _options_arguments(query)
 
-    backend = sub.add_parser("backend", help="Discover or privately install analysis/runtime engines")
-    backend.add_argument("action", nargs="?", choices=("inspect", "install", "status", "stop", "help"), default="inspect")
+    backend = sub.add_parser("backend", help="Discover or privately install analysis/runtime engines; doctor and backups "
+                                             "take --options (the tool's options object)")
+    backend.add_argument("action", nargs="?", choices=BACKEND_ACTIONS, default=None,
+                         help="same as --action; default inspect")
+    backend.add_argument("--action", dest="action_flag", choices=BACKEND_ACTIONS, default=None)
     backend.add_argument("--component", choices=("analysis", "runtime"), default="analysis")
+    _options_arguments(backend)
 
     prepare = sub.add_parser("prepare", help="Adopt an analysed project in place, or import/analyse once as a background job")
     prepare.add_argument("--exe", default="")
@@ -145,7 +153,13 @@ def main(argv: list[str] | None = None) -> int:
 def _pair(args: argparse.Namespace) -> tuple[str, dict]:
     command = args.command.replace("-", "_")
     if command == "backend":
-        return command, {"action": args.action, "component": args.component}
+        if args.action and args.action_flag and args.action != args.action_flag:
+            raise ValueError("backend got two actions (%s and --action %s); give one" % (args.action, args.action_flag))
+        payload = {"action": args.action or args.action_flag or "inspect", "component": args.component}
+        options = _options(args)
+        if options:  # absent options leave the call exactly as before; the dispatcher refuses what a bag may not carry
+            payload["options"] = options
+        return command, payload
     if command == "prepare":
         if args.adopt:
             return command, {"action": "adopt", "path": args.adopt, "exe": args.exe, "sha256": args.sha256,

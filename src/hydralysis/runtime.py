@@ -18,7 +18,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-from hydralysis import hydra, proc
+from hydralysis import durable, hydra, proc
 from hydralysis.locks import LaneLock
 from hydralysis.paths import root_path
 from hydralysis.proc import identity as _identity, stop as _stop
@@ -39,17 +39,40 @@ _TOKENS: dict[str, str] = {}
 
 
 def _write(path: Path, value: dict) -> None:
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(value), encoding="utf-8")
-    temporary.replace(path)
+    """A mailbox record: sealed, the previous version kept as `.bak`, atomic and fsynced (durable.write_sealed)."""
+    durable.write_sealed(path, value, indent=None)
+
+
+def _load(path: Path) -> dict:
+    """One mailbox file, unsealed. A file from before the seal (no `seal` key) loads as it is.
+
+    FileNotFoundError when the file is absent; ValueError when it is not a JSON object or its seal does not match.
+    """
+    value = json.loads(local_read_text(path))
+    if not isinstance(value, dict):
+        raise ValueError("not a JSON object")
+    if "seal" in value:
+        claimed = value.pop("seal")
+        if claimed != durable.seal_of(value):
+            raise ValueError("mis-sealed (content does not match its seal)")
+    return value
 
 
 def _json(path: Path) -> dict:
+    """A mailbox record, {} when it was never written. A bad file falls back to its `.bak` (the previous sealed
+    version) and, when that is no better, raises durable.StoreCorrupt: it never reads as empty."""
     try:
-        try:
-            return json.loads(local_read_text(path))
-        except (FileNotFoundError, ValueError):
+        reasons = {}
+        for candidate in (path, durable.backup_path(path)):
+            try:
+                return _load(candidate)
+            except FileNotFoundError:
+                reasons[candidate.name] = "missing"
+            except ValueError as exc:
+                reasons[candidate.name] = str(exc)[:80]
+        if all(reason == "missing" for reason in reasons.values()):
             return {}
+        raise durable.StoreCorrupt(path, durable.backup_path(path), reasons)
     except OSError as exc:
         raise RuntimeError("runtime mailbox read failed: errno=%s winerror=%s path=%s: %s"
                            % (exc.errno, getattr(exc, "winerror", None), path, exc)) from exc
@@ -593,6 +616,8 @@ class RuntimeRunner:
             return
         path = self._lock_path(Path(exe))
         if _json(path).get("session") == session_id:
+            # The previous sealed version goes too: a missing record with a `.bak` reads as the `.bak`.
+            durable.backup_path(path).unlink(missing_ok=True)
             path.unlink(missing_ok=True)
 
     def _external_lock(self, action: str, exe: Path) -> None:

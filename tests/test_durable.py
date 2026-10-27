@@ -12,7 +12,7 @@ import zlib
 from pathlib import Path
 from unittest.mock import patch
 
-from hydralysis import backends, durable, overlayjobs, targets, workcopy
+from hydralysis import backends, durable, hydra, overlayjobs, runtime, runtime_worker, targets, workcopy
 from support import workdir
 
 SRC = Path(__file__).resolve().parent.parent / "src"
@@ -417,6 +417,140 @@ class RecordFiles(Base):
             backends.read_json(path)
 
 
+class DaemonConfig(Base):
+    """hydra.write_daemon_config: durable (fsync, write-through replace) but unsealed (PROTOCOL-3.md 8.2)."""
+
+    def setUp(self):
+        super().setUp()
+        self.settings = {"root": str(self.root / "data")}
+
+    def path(self):
+        return hydra.state_dir(self.settings) / "config.json"
+
+    def test_it_is_the_plain_json_the_launcher_reads_with_no_seal_no_backup_and_no_temporary(self):
+        path = hydra.write_daemon_config(self.settings)
+        self.assertEqual(path, self.path())
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), hydra.daemon_config(self.settings))
+        self.assertNotIn("seal", json.loads(path.read_text(encoding="utf-8")))
+        hydra.write_daemon_config({**self.settings, "hydra_idle_s": 99})  # a second, different version
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["idleTimeout"], 99)
+        self.assertEqual(sorted(item.name for item in path.parent.iterdir()), ["config.json"])
+
+    def test_it_writes_through_durable_atomic_write_and_only_when_the_content_changed(self):
+        with patch.object(hydra.durable, "atomic_write", wraps=durable.atomic_write) as write:
+            hydra.write_daemon_config(self.settings)
+            hydra.write_daemon_config(self.settings)
+            self.assertEqual(write.call_count, 1)
+            hydra.write_daemon_config({**self.settings, "hydra_keep_warm_s": 5})
+            self.assertEqual(write.call_count, 2)
+        self.assertEqual(write.call_args.args[0], self.path())
+        self.assertIsInstance(write.call_args.args[1], bytes)
+
+    def test_a_writer_killed_before_the_replace_leaves_the_previous_config_whole(self):
+        hydra.write_daemon_config(self.settings)
+        before = self.path().read_bytes()
+        code = ("import sys, json\nfrom hydralysis import hydra\n"
+                "hydra.write_daemon_config({**json.loads(sys.argv[1]), 'hydra_idle_s': 1234})\n")
+        result = run_child(code, json.dumps(self.settings), fault="atomic.before_replace:exit")
+        self.assertEqual(result.returncode, 137, result.stderr)
+        self.assertEqual(self.path().read_bytes(), before)
+        self.assertEqual(json.loads(before.decode("utf-8")), hydra.daemon_config(self.settings))
+
+    def test_a_torn_config_is_rewritten_not_trusted(self):
+        hydra.write_daemon_config(self.settings)
+        self.path().write_bytes(b'{"scriptPath": [')
+        hydra.write_daemon_config(self.settings)
+        self.assertEqual(json.loads(self.path().read_text(encoding="utf-8")), hydra.daemon_config(self.settings))
+
+
+class RuntimeMailbox(Base):
+    """runtime._write and runtime_worker._write are sealed; their readers unseal, fall back and never read empty."""
+
+    def pairs(self):
+        return (("runtime", runtime._write, runtime._json), ("runtime_worker", runtime_worker._write, runtime_worker._read))
+
+    def test_a_record_is_sealed_on_disk_and_reads_back_without_its_seal(self):
+        for name, write, read in self.pairs():
+            with self.subTest(module=name):
+                path = self.root / name / "ready.json"
+                path.parent.mkdir()
+                record = {"pid": 7, "started_ms": 9, "ok": True, "ipc": {"token": "t"}, "text": "café"}
+                write(path, record)
+                on_disk = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(on_disk["seal"], durable.seal_of(record))
+                self.assertEqual(read(path), record)
+                rewritten = read(path)  # the read-modify-write of runtime.py (group_id) must not trip over the seal
+                rewritten["group_id"] = 1
+                write(path, rewritten)
+                self.assertEqual(read(path), {**record, "group_id": 1})
+                self.assertEqual(sorted(item.name for item in path.parent.iterdir()), ["ready.json", "ready.json.bak"])
+
+    def test_a_record_that_was_never_written_is_empty_and_a_pre_seal_record_loads_as_it_is(self):
+        for name, write, read in self.pairs():
+            with self.subTest(module=name):
+                path = self.root / name
+                path.mkdir()
+                self.assertEqual(read(path / "none.json"), {})
+                (path / "old.json").write_text(json.dumps({"detached": True, "pid": 4242}), encoding="utf-8")
+                self.assertEqual(read(path / "old.json"), {"detached": True, "pid": 4242})
+                write(path / "old.json", {"detached": True, "pid": 4243})  # the pre-seal file becomes the .bak
+                self.assertEqual(read(durable.backup_path(path / "old.json")), {"detached": True, "pid": 4242})
+
+    def test_a_torn_or_mis_sealed_file_falls_back_to_the_previous_version_and_never_reads_empty(self):
+        for name, write, read in self.pairs():
+            with self.subTest(module=name):
+                path = self.root / name / "state.json"
+                path.parent.mkdir()
+                write(path, {"v": 1})
+                write(path, {"v": 2})
+                path.write_bytes(path.read_bytes()[:12])  # torn
+                self.assertEqual(read(path), {"v": 1})
+                other = self.root / name / "other.json"
+                write(other, {"v": 1})
+                write(other, {"v": 2})
+                tampered = json.loads(other.read_text(encoding="utf-8"))
+                tampered["v"] = 4
+                other.write_text(json.dumps(tampered), encoding="utf-8")  # mis-sealed
+                self.assertEqual(read(other), {"v": 1})
+                path.write_bytes(b"")
+                durable.backup_path(path).write_bytes(b"[1]")
+                with self.assertRaises(durable.StoreCorrupt) as raised:
+                    read(path)
+                self.assertIn("state.json.bak", str(raised.exception))
+
+    def test_the_mailbox_error_contract_of_the_readers_is_unchanged(self):
+        error = PermissionError(13, "denied")
+        error.winerror = 5
+        for name, module in (("runtime", runtime), ("runtime_worker", runtime_worker)):
+            with self.subTest(module=name), patch.object(module, "local_read_text", side_effect=error), \
+                    self.assertRaisesRegex(RuntimeError, "errno=13 winerror=5"):
+                (module._json if name == "runtime" else module._read)(self.root / "response.json")
+
+    def test_releasing_the_executable_lock_removes_the_record_and_its_previous_version(self):
+        runner = runtime.RuntimeRunner({"root": str(self.root / "sessions")})
+        exe = self.root / "game.exe"
+        first, second = "a" * 32, "b" * 32
+        (runner.root / first).mkdir(parents=True)
+        runtime._write(runner.root / first / "ready.json", {"pid": 0, "started_ms": 0})  # no longer "starting"
+        with patch.object(runtime.RuntimeRunner, "_live", return_value=False):
+            runner._claim(exe, first)
+            runner._claim(exe, second)  # the first session's worker is gone: the lock is taken over, the old record is the .bak
+        path = runner._lock_path(exe)
+        self.assertEqual((runtime._json(path)["session"], runtime._json(durable.backup_path(path))["session"]), (second, first))
+        runner._release(str(exe), second)
+        self.assertEqual((path.exists(), durable.backup_path(path).exists()), (False, False))
+        self.assertEqual(runtime._json(path), {})  # a released lock is not resurrected from the .bak
+
+    def test_a_writer_killed_before_the_replace_leaves_the_previous_record_whole(self):
+        path = self.root / "ready.json"
+        runtime._write(path, {"v": 1})
+        code = ("import sys\nfrom pathlib import Path\nfrom hydralysis import runtime_worker\n"
+                "runtime_worker._write(Path(sys.argv[1]), {'v': 2})\n")
+        result = run_child(code, path, fault="atomic.before_replace:exit")
+        self.assertEqual(result.returncode, 137, result.stderr)
+        self.assertEqual(runtime._json(path), {"v": 1})
+
+
 def line_of(record):
     return durable.frame(record)
 
@@ -744,6 +878,12 @@ from hydralysis import durable
 durable.AppendLog(sys.argv[1], lock_path=sys.argv[2], by="B").append({"n": 2, "pad": "y" * 20})
 """
 
+APPEND_RECORD = """
+import json, sys
+from hydralysis import durable
+durable.AppendLog(sys.argv[1], lock_path=sys.argv[2] or None, by="B").append(json.loads(sys.argv[3]))
+"""
+
 
 class TwoProcessWriters(unittest.TestCase):
     def setUp(self):
@@ -754,7 +894,7 @@ class TwoProcessWriters(unittest.TestCase):
         self.lock = self.root / ".commit.lock"
 
     def start_a(self):
-        child = subprocess.Popen([sys.executable, "-c", PERSISTENT_WRITER, str(self.path), str(self.lock)],
+        child = subprocess.Popen([sys.executable, "-c", PERSISTENT_WRITER, str(self.path), str(self.lock or "")],
                                  env=child_env(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True)
         watchdog = threading.Timer(90, child.kill)  # a hung child fails the test instead of blocking the suite
@@ -816,6 +956,31 @@ class TwoProcessWriters(unittest.TestCase):
                 self.a_appends(a, {"n": 3})  # A verified the log long ago and has been waiting since
                 self.assert_repaired_and_valid(full[:cut], [{"n": 1}, {"n": 3}])
 
+    def test_the_same_with_a_rollback_append_and_with_a_backups_log_append(self):
+        # PROTOCOL-3.md 4.1 tests: "the same test with a rollback append (reason: rollback) and a backups.log append".
+        # CURRENT.log and the intent logs lock on `.commit.lock`; backups.log locks on its own `.lock` (the default).
+        cases = (("CURRENT.log", self.root / ".commit.lock", {"reason": "rollback", "to": 4, "pad": "r" * 30}),
+                 ("backups.log", None, {"op": "backup", "id": "b-0001", "pad": "k" * 30}))
+        for name, lock, record in cases:
+            for cut in (1, 12, len(line_of(record)) - 1):
+                with self.subTest(log=name, cut=cut):
+                    for leftover in self.root.glob("*.log*"):  # the log, its .torn-* copies, .repairs and own .lock
+                        leftover.unlink(missing_ok=True)
+                    self.path, self.lock = self.root / name, lock
+                    a = self.start_a()
+                    self.a_appends(a, {"n": 1})
+                    result = run_child(APPEND_RECORD, self.path, lock or "", json.dumps(record),
+                                       fault="log.torn_append:torn:%d" % cut)
+                    self.assertEqual(result.returncode, 137, result.stderr)
+                    self.assertEqual(self.path.read_bytes(), line_of({"n": 1}) + line_of(record)[:cut])
+                    self.a_appends(a, {"n": 3})
+                    self.assert_repaired_and_valid(line_of(record)[:cut], [{"n": 1}, {"n": 3}])
+                    self.a_appends(a, {"n": 4})  # and the log keeps working
+                    self.assertEqual(durable.AppendLog(self.path, lock_path=lock).read(), [{"n": 1}, {"n": 3}, {"n": 4}])
+                    a.stdin.write("quit" + chr(10))
+                    a.stdin.flush()
+                    a.wait(timeout=30)
+
     def test_a_foreign_writer_leaves_a_terminated_but_invalid_line_and_a_still_repairs_it(self):
         junk = b"half a rec\n"
         a = self.start_a()
@@ -867,12 +1032,6 @@ NOT_A_RECORD = {  # (file, function, kind) -> why
 FOLLOW_UP = {  # (file, function, kind) -> (category, note)
     ("analysis.py", "save_overlay", "write_bytes"): ("record", "legacy v1 overlay store; no production caller (tests only)"),
     ("analysis.py", "save_overlay", "Path.replace"): ("record", "legacy v1 overlay store; no production caller (tests only)"),
-    ("hydra.py", "write_daemon_config", "write_text"): ("record", "daemon configuration"),
-    ("hydra.py", "write_daemon_config", "Path.replace"): ("record", "daemon configuration"),
-    ("runtime.py", "_write", "write_text"): ("record", "runtime session state"),
-    ("runtime.py", "_write", "Path.replace"): ("record", "runtime session state"),
-    ("runtime_worker.py", "_write", "write_text"): ("record", "runtime worker state"),
-    ("runtime_worker.py", "_write", "Path.replace"): ("record", "runtime worker state"),
     ("hydra.py", "sync_scripts", "write_bytes"): ("artifact", "engine script staging"),
     ("hydra.py", "sync_scripts", "Path.replace"): ("artifact", "engine script staging"),
     ("hydra.py", "install", "Path.rename"): ("artifact", "engine install directory rename"),
@@ -981,9 +1140,13 @@ class WriteGate(unittest.TestCase):
 
     def test_the_follow_up_table_is_counted(self):
         records = [key for key, (category, _) in FOLLOW_UP.items() if category == "record"]
-        self.assertEqual(len(records), 8)
-        self.assertEqual(len(FOLLOW_UP), 30)
-        self.assertEqual(sum(COUNTS.get(key, 1) for key in FOLLOW_UP), 32)
+        # Y0e moved hydra.write_daemon_config, runtime._write and runtime_worker._write onto durable (six rows gone).
+        # What is left: the two rows of the legacy analysis.save_overlay (Y1 deletes it, then 0 / 22 / 24) and the
+        # artifact sites that are not records.
+        self.assertEqual(len(records), 2)
+        self.assertEqual(len(FOLLOW_UP), 24)
+        self.assertEqual(sum(COUNTS.get(key, 1) for key in FOLLOW_UP), 26)
+        self.assertEqual(sorted(key[:2] for key in records), [("analysis.py", "save_overlay")] * 2)
 
 
 if __name__ == "__main__":
