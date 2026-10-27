@@ -376,15 +376,35 @@ def _replayable(settings: dict, target: dict, record: dict) -> dict:
     return {"id": record["id"], "address": record["address"], "options": options}
 
 
-def _apply(settings: dict, writer: hydra.Engine, program: dict, records: list[dict], state: dict, timeout_s: int,
-           target: dict | None = None) -> dict:
+class VerifyMismatch(ValueError):
+    """`verify_before` found a value other than the one a record saw; the whole transaction was rolled back.
+
+    `detail` names the effect: {id, subject, field, expected, found}."""
+
+    def __init__(self, message: str, detail: dict):
+        super().__init__(message)
+        self.detail = detail
+
+
+def _apply(settings: dict, writer: hydra.Engine, program: dict, records: list[dict], state: dict | None, timeout_s: int,
+           target: dict | None = None, verify_before: bool = False) -> dict:
+    """Apply RECORDS to the working copy in one owner transaction and set its marker to STATE (None clears it).
+
+    With `verify_before` the engine first checks, record by record, that the first effect of each (subject, field)
+    finds the value the record saw (its `before`); a mismatch rolls the whole call back and raises VerifyMismatch.
+    """
     from hydralysis.query import run_script
     directory = root_path(settings) / "hydra" / "requests"
     directory.mkdir(parents=True, exist_ok=True)
     batch = directory / ("overlays-%s.json" % uuid.uuid4().hex)
-    batch.write_text(json.dumps({"edits": [_replayable(settings, target, record) if target else
-                                           {key: record[key] for key in ("id", "address", "options")} for record in records],
-                                 "state": state}), encoding="utf-8")
+    sent = []
+    for record in records:
+        item = _replayable(settings, target, record) if target else {key: record[key] for key in ("id", "address", "options")}
+        if verify_before and record.get("effects"):
+            item["effects"] = record["effects"]
+        sent.append(item)
+    batch.write_text(json.dumps({"edits": sent, "state": state, **({"verify_before": True} if verify_before else {})}),
+                     encoding="utf-8")
     try:
         request = {"id": uuid.uuid4().hex, "action": "apply_overlays", "address": "", "limit": 1, "cursor": "",
                    "contains": "", "timeout_s": timeout_s, "options": {}, "edits_file": str(batch)}
@@ -395,8 +415,31 @@ def _apply(settings: dict, writer: hydra.Engine, program: dict, records: list[di
     if raw.get("mode") != "owner":
         raise RuntimeError("overlay apply ran %s, not as the working copy's writer; nothing recorded" % raw.get("mode"))
     if not response.get("ok"):
+        if response.get("verify_mismatch"):
+            raise VerifyMismatch("overlay apply refused: %s" % response.get("error"), response["verify_mismatch"])
         raise ValueError("overlay apply refused: %s" % response.get("error"))
     return response
+
+
+def probe(engine: hydra.Engine, program: dict, probes: list[tuple[str, str]], timeout_s: int = 60) -> dict:
+    """The current value of each (subject, field) in PROGRAM, read-only (RusticQuery `annotation_probe`, contained).
+
+    Values are in the text an effect uses (`absent` for none); a pair the engine cannot probe (a bulk report)
+    maps to None. This is what a bundle import and a commit's drift check compare a record's `before` with.
+    """
+    from hydralysis.query import run_script
+    found: dict[tuple[str, str], str | None] = {}
+    for start in range(0, len(probes), 2000):
+        chunk = probes[start:start + 2000]
+        request = {"id": uuid.uuid4().hex, "action": "annotation_probe", "address": "", "limit": 1, "cursor": "",
+                   "contains": "", "timeout_s": timeout_s,
+                   "options": {"probes": [{"subject": subject, "field": field} for subject, field in chunk]}}
+        response, _ = run_script(engine, program, request, timeout_s)
+        if not response.get("ok"):
+            raise ValueError("annotation probe refused: %s" % response.get("error"))
+        for row in response.get("values", []):
+            found[(row["subject"], row["field"])] = row.get("value")
+    return found
 
 
 PHASES = ("master_open", "fork", "copy", "base_upgrade", "open", "replay")
@@ -592,7 +635,9 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
         _start_saver(settings, target)
         if extra:
             # What each record changed and what was there before, as the engine saw it (store v3 `effects`).
-            return {**state, "effects": {item["id"]: item.get("effects") for item in (applied or {}).get("effects") or []}}
+            return {**state, "effects": {item["id"]: [{"before": None, "after": None, **effect} for effect in item["effects"]]
+                                         if item.get("effects") is not None else None
+                                         for item in (applied or {}).get("effects") or []}}
         return state
     finally:
         # Disconnecting keeps the committed changes in the daemon (shared mode);

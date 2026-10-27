@@ -2218,11 +2218,15 @@ public class RusticQuery extends GhidraScript {
                 }
                 DataType existing = manager.getDataType(path);
                 if (existing != null && !existing.isEquivalent(structure)) throw new IllegalArgumentException("different type already exists at path; choose a new overlay path");
+                String definitionBefore = existing == null ? "absent" : definitionOf(existing);
                 manager.addDataType(structure, DataTypeConflictHandler.KEEP_HANDLER);
+                effect("type:" + path, "definition", definitionBefore, definitionOf(structure));
             } else if (kind.equals("import_types")) {
                 importTypes(opts, deadline);
+                reportEffect();
             } else if (kind.equals("import_archive")) {
                 importArchive(opts, deadline);
+                reportEffect();
             } else if (kind.startsWith("function_")) {
                 Address entry = address(addressText);
                 var listing = currentProgram.getListing();
@@ -2236,8 +2240,12 @@ public class RusticQuery extends GhidraScript {
                 }
                 var manager = currentProgram.getFunctionManager();
                 Function existing = manager.getFunctionAt(entry);
+                String nameBefore = nameOf(existing), bodyBefore = bodyText(existing), where = subjectOf(entry);
                 if (kind.equals("function_delete")) {
                     if (existing == null || !manager.removeFunction(entry)) throw new IllegalArgumentException("no function exists at the exact entry for deletion");
+                    effect(where, "existence", "present", "absent");
+                    effect(where, "body", bodyBefore, "absent");
+                    effect(where, "name", nameBefore, "absent");
                 } else {
                     AddressSet body = new AddressSet();
                     JsonArray ranges = opts.getAsJsonArray("ranges");
@@ -2258,11 +2266,18 @@ public class RusticQuery extends GhidraScript {
                     while (overlapping.hasNext()) if (!overlapping.next().getEntryPoint().equals(entry)) throw new IllegalArgumentException("body overlaps another function; correct its cited definition explicitly first");
                     if (kind.equals("function_create")) {
                         if (existing != null) throw new IllegalArgumentException("function already exists at entry; use function_body for an explicit correction");
-                        manager.createFunction(text(opts, "name").isEmpty() ? null : text(opts, "name"), entry, body, SourceType.USER_DEFINED);
+                        Function created = manager.createFunction(text(opts, "name").isEmpty() ? null : text(opts, "name"), entry, body, SourceType.USER_DEFINED);
+                        effect(where, "existence", "absent", "present");
+                        effect(where, "body", "absent", bodyText(created));
+                        effect(where, "name", "absent", nameOf(created));
                     } else if (kind.equals("function_body")) {
                         if (existing == null) throw new IllegalArgumentException("no function exists at entry; use function_create");
                         existing.setBody(body);
-                        if (!text(opts, "name").isEmpty()) existing.setName(text(opts, "name"), SourceType.USER_DEFINED);
+                        effect(where, "body", bodyBefore, bodyText(existing));
+                        if (!text(opts, "name").isEmpty()) {
+                            existing.setName(text(opts, "name"), SourceType.USER_DEFINED);
+                            effect(where, "name", nameBefore, nameOf(existing));
+                        }
                     } else throw new IllegalArgumentException("unknown function edit kind");
                 }
             } else {
@@ -2270,24 +2285,44 @@ public class RusticQuery extends GhidraScript {
                 Function function = currentProgram.getFunctionManager().getFunctionContaining(addr);
                 if (kind.equals("label")) {
                     if (!currentProgram.getMemory().contains(addr)) throw new IllegalArgumentException("label address must be in mapped program memory");
+                    String labelBefore = labelText(addr, text(opts, "name"));
                     currentProgram.getSymbolTable().createLabel(addr, text(opts, "name"), SourceType.USER_DEFINED);
+                    effect(subjectOf(addr), "label:" + text(opts, "name"), labelBefore, labelText(addr, text(opts, "name")));
                 }
-                else if (kind.equals("apply")) DataUtilities.createData(currentProgram, addr, resolveType(text(opts, "type")), -1, DataUtilities.ClearDataMode.CHECK_FOR_SPACE);
-                else if (kind.equals("comment")) currentProgram.getListing().setComment(addr, ghidra.program.model.listing.CommentType.PLATE, text(opts, "comment") + "\nsource: " + text(opts, "source"));
+                else if (kind.equals("apply")) {
+                    String typeBefore = definedTypeText(addr);
+                    DataUtilities.createData(currentProgram, addr, resolveType(text(opts, "type")), -1, DataUtilities.ClearDataMode.CHECK_FOR_SPACE);
+                    effect(subjectOf(addr), "type", typeBefore, definedTypeText(addr));
+                }
+                else if (kind.equals("comment")) {
+                    String commentBefore = plateText(addr);
+                    currentProgram.getListing().setComment(addr, ghidra.program.model.listing.CommentType.PLATE, text(opts, "comment") + "\nsource: " + text(opts, "source"));
+                    effect(subjectOf(addr), "comment:plate", commentBefore, plateText(addr));
+                }
                 else {
                     if (function == null) throw new IllegalArgumentException("no function contains edit address");
-                    if (kind.equals("rename")) function.setName(text(opts, "name"), SourceType.USER_DEFINED);
+                    if (kind.equals("rename")) {
+                        String nameBefore = function.getName();
+                        function.setName(text(opts, "name"), SourceType.USER_DEFINED);
+                        effect(subjectOf(addr), "name", nameBefore, function.getName());
+                    }
                     else if (kind.equals("signature")) {
+                        String signatureBefore = function.getPrototypeString(false, false);
                         var signature = new FunctionSignatureParser(currentProgram.getDataTypeManager(), null).parse(function.getSignature(), text(opts, "prototype"));
                         var command = new ApplyFunctionSignatureCmd(function.getEntryPoint(), signature, SourceType.USER_DEFINED);
                         if (!command.applyTo(currentProgram, monitor)) throw new IllegalStateException(command.getStatusMsg());
+                        effect(subjectOf(addr), "signature", signatureBefore, function.getPrototypeString(false, false));
                     } else if (kind.equals("variable")) {
                         HighFunction high = decompile(function, deadline).getHighFunction();
                         var symbols = high.getLocalSymbolMap().getSymbols();
                         HighSymbol selected = null;
                         while (symbols.hasNext()) { HighSymbol symbol = symbols.next(); if (symbol.getName().equals(text(opts, "variable"))) { if (selected != null) throw new IllegalArgumentException("variable name is ambiguous"); selected = symbol; } }
                         if (selected == null) throw new IllegalArgumentException("variable not found in recovered symbol map");
-                        HighFunctionDBUtil.updateDBVariable(selected, text(opts, "name").isEmpty() ? null : text(opts, "name"), resolveType(text(opts, "type")), SourceType.USER_DEFINED);
+                        String variableBefore = selected.getName() + ":" + selected.getDataType().getDisplayName();
+                        DataType variableType = resolveType(text(opts, "type"));
+                        String variableName = text(opts, "name").isEmpty() ? selected.getName() : text(opts, "name");
+                        HighFunctionDBUtil.updateDBVariable(selected, text(opts, "name").isEmpty() ? null : text(opts, "name"), variableType, SourceType.USER_DEFINED);
+                        effect(subjectOf(addr), "variable:" + text(opts, "variable"), variableBefore, variableName + ":" + variableType.getDisplayName());
                     } else throw new IllegalArgumentException("unknown type edit kind");
                 }
             }
@@ -2295,6 +2330,166 @@ public class RusticQuery extends GhidraScript {
         } finally {
             currentProgram.endTransaction(transaction, success);
             if (decompiler != null) decompiler.flushCache();
+        }
+    }
+
+    // ---- the subject record: what an edit changed and what was there before (store v3 `effects`) --------
+    // Each applied edit reports effects [{subject, field, before, after}]: subject is a coarse subject string
+    // (address:0x..., type:/path, or * for a bulk import), field names the aspect (name, label:<name>,
+    // comment:plate, signature, type, variable:<name>, definition, body, existence, report); before and after
+    // are canonical text ("absent" for none, sha256:<hex> for a structure definition or an import report).
+    // A null before or after is left out of the JSON (Gson drops nulls). The same values are what
+    // `annotation_probe` reads and what `verify_before` compares.
+    private JsonArray currentEffects;
+
+    private void effect(String subject, String field, String before, String after) {
+        if (currentEffects == null) return;
+        JsonObject row = new JsonObject();
+        row.addProperty("subject", subject);
+        row.addProperty("field", field);
+        if (before != null) row.addProperty("before", before);
+        if (after != null) row.addProperty("after", after);
+        currentEffects.add(row);
+    }
+
+    private void reportEffect() {
+        if (lastImport != null) effect("*", "report", null, "sha256:" + sha256(json.toJson(lastImport)));
+    }
+
+    private static String sha256(String text) {
+        try {
+            return HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256").digest(text.getBytes(StandardCharsets.UTF_8)));
+        } catch (java.security.NoSuchAlgorithmException error) { throw new IllegalStateException(error); }
+    }
+
+    private String subjectOf(Address at) { return "address:0x" + Long.toHexString(at.getOffset()); }
+
+    private String nameOf(Function function) { return function == null ? "absent" : function.getName(); }
+
+    private String bodyText(Function function) {
+        if (function == null) return "absent";
+        StringBuilder text = new StringBuilder();
+        var ranges = function.getBody().getAddressRanges();
+        while (ranges.hasNext()) {
+            var range = ranges.next();
+            if (text.length() > 0) text.append(',');
+            text.append("0x").append(Long.toHexString(range.getMinAddress().getOffset())).append("-0x").append(Long.toHexString(range.getMaxAddress().getOffset()));
+        }
+        return text.toString();
+    }
+
+    private String definitionOf(DataType type) {
+        StringBuilder text = new StringBuilder();
+        text.append(type.getPathName()).append('|').append(type.getLength());
+        if (type instanceof Structure structure) {
+            for (DataTypeComponent component : structure.getDefinedComponents())
+                text.append('|').append(component.getOffset()).append(':').append(component.getLength()).append(':')
+                    .append(component.getDataType().getDisplayName()).append(':').append(component.getFieldName() == null ? "" : component.getFieldName());
+        }
+        return "sha256:" + sha256(text.toString());
+    }
+
+    private String labelText(Address at, String name) {
+        return currentProgram.getSymbolTable().getSymbol(name, at, currentProgram.getGlobalNamespace()) != null ? "present" : "absent";
+    }
+
+    private String definedTypeText(Address at) {
+        var data = currentProgram.getListing().getDefinedDataAt(at);
+        return data == null ? "absent" : data.getDataType().getDisplayName();
+    }
+
+    private String plateText(Address at) {
+        String comment = currentProgram.getListing().getComment(ghidra.program.model.listing.CommentType.PLATE, at);
+        return comment == null ? "absent" : comment;
+    }
+
+    // The current value of one (subject, field), in the text an effect uses; null when the pair is not probeable
+    // (a bulk report has no per-subject value: its drift is checked by input hash).
+    private String probe(String subject, String field, long deadline) throws Exception {
+        String kind = field.contains(":") ? field.substring(0, field.indexOf(':')) : field;
+        String argument = field.contains(":") ? field.substring(field.indexOf(':') + 1) : "";
+        if (subject.equals("*")) return null;
+        if (subject.startsWith("type:")) {
+            if (!kind.equals("definition")) throw new IllegalArgumentException("unknown field for a type subject: " + field);
+            DataType type = currentProgram.getDataTypeManager().getDataType(subject.substring(5));
+            return type == null ? "absent" : definitionOf(type);
+        }
+        if (!subject.startsWith("address:")) throw new IllegalArgumentException("unknown subject: " + subject);
+        Address at = address(subject.substring(8));
+        var functions = currentProgram.getFunctionManager();
+        switch (kind) {
+            case "name": return nameOf(functions.getFunctionContaining(at));
+            case "label": return labelText(at, argument);
+            case "comment":
+                if (!argument.equals("plate")) throw new IllegalArgumentException("unknown comment type: " + argument);
+                return plateText(at);
+            case "signature": { Function f = functions.getFunctionContaining(at); return f == null ? "absent" : f.getPrototypeString(false, false); }
+            case "type": return definedTypeText(at);
+            case "existence": return functions.getFunctionAt(at) == null ? "absent" : "present";
+            case "body": return bodyText(functions.getFunctionAt(at));
+            case "variable": {
+                Function f = functions.getFunctionContaining(at);
+                if (f == null) return "absent";
+                var symbols = decompile(f, deadline).getHighFunction().getLocalSymbolMap().getSymbols();
+                String found = "absent";
+                while (symbols.hasNext()) {
+                    HighSymbol symbol = symbols.next();
+                    if (!symbol.getName().equals(argument)) continue;
+                    if (!found.equals("absent")) return "ambiguous";
+                    found = symbol.getName() + ":" + symbol.getDataType().getDisplayName();
+                }
+                return found;
+            }
+            default: throw new IllegalArgumentException("unknown field: " + field);
+        }
+    }
+
+    // annotation_probe: options.probes = [{subject, field}] -> values [{subject, field, value}], read-only.
+    private void annotationProbe(JsonObject req, JsonObject out, long deadline) throws Exception {
+        JsonArray probes = options(req).getAsJsonArray("probes");
+        if (probes == null || probes.size() == 0 || probes.size() > 2000) throw new IllegalArgumentException("annotation_probe needs options.probes with 1..2000 entries");
+        JsonArray values = new JsonArray();
+        for (JsonElement element : probes) {
+            monitor.checkCancelled();
+            JsonObject item = element.getAsJsonObject();
+            JsonObject row = new JsonObject();
+            row.addProperty("subject", text(item, "subject"));
+            row.addProperty("field", text(item, "field"));
+            String value = probe(text(item, "subject"), text(item, "field"), deadline);
+            if (value != null) row.addProperty("value", value);
+            values.add(row);
+        }
+        out.add("values", values);
+    }
+
+    // verify_before: the first effect of a record on each (subject, field) must find, in the program as it is
+    // now (the records before it already applied), the value the record saw. A mismatch names the effect.
+    private static final class VerifyMismatch extends IllegalArgumentException {
+        final JsonObject detail;
+        VerifyMismatch(String message, JsonObject detail) { super(message); this.detail = detail; }
+    }
+
+    private void verifyBefore(JsonObject edit, long deadline) throws Exception {
+        JsonArray effects = edit.getAsJsonArray("effects");
+        if (effects == null) return;
+        Set<String> seen = new HashSet<>();
+        for (JsonElement element : effects) {
+            JsonObject item = element.getAsJsonObject();
+            String subject = text(item, "subject"), field = text(item, "field");
+            if (!seen.add(subject + "\n" + field)) continue;
+            if (!item.has("before") || item.get("before").isJsonNull()) continue;
+            String found = probe(subject, field, deadline);
+            if (found == null) continue;
+            String expected = text(item, "before");
+            if (!expected.equals(found)) {
+                JsonObject detail = new JsonObject();
+                detail.addProperty("id", text(edit, "id"));
+                detail.addProperty("subject", subject);
+                detail.addProperty("field", field);
+                detail.addProperty("expected", expected);
+                detail.addProperty("found", found);
+                throw new VerifyMismatch("verify_before mismatch: " + subject + " " + field + " expected '" + expected + "' found '" + found + "'", detail);
+            }
         }
     }
 
@@ -2313,6 +2508,8 @@ public class RusticQuery extends GhidraScript {
         JsonObject batch = JsonParser.parseString(Files.readString(Path.of(file), StandardCharsets.UTF_8)).getAsJsonObject();
         JsonArray records = batch.getAsJsonArray("edits");
         lastImport = null;
+        boolean verify = batch.has("verify_before") && batch.get("verify_before").getAsBoolean();
+        JsonArray reported = new JsonArray();
         monitor.initialize(records.size());
         // One outer transaction: a record that fails rolls back the whole call, so the
         // working copy is either at the new state or unchanged.
@@ -2325,17 +2522,30 @@ public class RusticQuery extends GhidraScript {
                 monitor.checkCancelled();
                 if (System.nanoTime() >= deadline) throw new IllegalStateException("overlay apply incomplete at " + index + "/" + records.size() + "; deadline reached; nothing applied");
                 JsonObject edit = element.getAsJsonObject();
-                try { typeEdit(text(edit, "address"), edit.getAsJsonObject("options"), deadline); }
+                currentEffects = new JsonArray();
+                try {
+                    if (verify) verifyBefore(edit, deadline);
+                    typeEdit(text(edit, "address"), edit.getAsJsonObject("options"), deadline);
+                }
                 catch (Exception error) {
                     throw new IllegalArgumentException("overlay record " + index + "/" + records.size() + " (" + text(edit, "id") + ") refused, nothing applied: " + error.getMessage(), error);
                 }
+                JsonObject row = new JsonObject();
+                row.addProperty("id", text(edit, "id"));
+                row.add("effects", currentEffects);
+                reported.add(row);
                 if (index % 64 == 0) { monitor.setMessage("overlays " + index + "/" + records.size()); monitor.setProgress(index); }
             }
             Options options = currentProgram.getOptions("RusticRE");
-            options.setString(STATE_OPTION, json.toJson(batch.getAsJsonObject("state")));
+            // "state": null clears the marker (a generation's base holds none, 4.6 step 5); no "state" leaves it alone.
+            if (batch.has("state")) {
+                if (batch.get("state").isJsonNull()) options.removeOption(STATE_OPTION);
+                else options.setString(STATE_OPTION, json.toJson(batch.getAsJsonObject("state")));
+            }
             success = true;
-        } finally { currentProgram.endTransaction(transaction, success); }
+        } finally { currentProgram.endTransaction(transaction, success); currentEffects = null; }
         out.addProperty("applied", records.size());
+        out.add("effects", reported);
         if (lastImport != null) out.add("import_report", lastImport);
         out.addProperty("overlay_state", overlayState());
     }
@@ -2355,6 +2565,8 @@ public class RusticQuery extends GhidraScript {
         response.addProperty("image_base", "0x" + currentProgram.getImageBase());
         response.addProperty("address_kind", "VA");
         response.addProperty("error", error.toString());
+        for (Throwable cause = error; cause != null; cause = cause.getCause())
+            if (cause instanceof VerifyMismatch) { response.add("verify_mismatch", ((VerifyMismatch) cause).detail); break; }
         boolean recoverable = error instanceof IllegalArgumentException;
         response.addProperty("recoverable", recoverable);
         if (recoverable) {
@@ -2433,6 +2645,9 @@ public class RusticQuery extends GhidraScript {
         if (action.equals("apply_overlays")) {
             applyOverlays(req, out, deadline); out.addProperty("ok", true); return out;
         }
+        if (action.equals("annotation_probe")) {
+            annotationProbe(req, out, deadline); out.addProperty("ok", true); return out;
+        }
         if (action.equals("types")) {
             types(req, out, deadline); out.addProperty("ok", true); return out;
         }
@@ -2447,7 +2662,14 @@ public class RusticQuery extends GhidraScript {
         }
         if (action.equals("type_edit")) {
             // Run contained, this is a dry run: the engine rolls the edit back afterwards.
+            currentEffects = new JsonArray();
             typeEdit(text(req, "address"), options(req), deadline);
+            JsonObject row = new JsonObject();
+            row.addProperty("id", text(req, "id"));
+            row.add("effects", currentEffects);
+            JsonArray reported = new JsonArray();
+            reported.add(row);
+            out.add("effects", reported);
             out.addProperty("edit_validated", true);
             out.addProperty("edits_applied", text(options(req), "kind").equals("batch") ? options(req).getAsJsonArray("edits").size() : 1);
             out.addProperty("ok", true); return out;

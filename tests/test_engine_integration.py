@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 import time
@@ -72,6 +73,11 @@ def _release(cls):
         cls.env.stop()
         time.sleep(1)
         cls.work.cleanup()
+
+
+def workcopy_store(case, view=None):
+    from hydralysis import workcopy
+    return workcopy.load_store(case.settings, workcopy.with_view(case.runner.target("fixture"), view or case.VIEW))
 
 
 @unittest.skipUnless(ENGINE and CLIENT and BINARY and Path(BINARY).is_file(), "set HYDRALYSIS_INTEGRATION_ENGINE/CLIENT")
@@ -208,6 +214,175 @@ class EngineIntegration(unittest.TestCase):
                                        "view": "archive-fixture", "expect_revision": 1})
         with self.assertRaises(RuntimeError):
             self.ask("type", options={"path": "/u4", "view": "archive-fixture"})
+
+    # ---- store v3: the subject record (effects), the probe and verify_before, on the real engine ----------------
+
+    VIEW = "subject-record"
+
+    def edit_in_view(self, address, **options):
+        view = options.pop("view", self.VIEW)
+        return json.loads(self.runner.query("fixture", "type_edit", address, timeout_s=300, options={
+            "source": "integration test", "view": view, "expect_revision": self.revision(view), **options}))
+
+    def data_address(self):
+        from hydralysis.pe import Image
+        image = Image(Path(self.root / "fixture.exe"))
+        section = next(s for s in image.sections if not (s.Characteristics & 0x20000000) and s.SizeOfRawData)
+        return hex(image.base + section.VirtualAddress)
+
+    def test_effects_are_reported_for_rename_comment_signature_label_and_struct(self):
+        from hydralysis import revisions
+        address = self.entry()
+        subject = "address:%s" % hex(int(address, 16))
+        original = self.ask("decompile", address, options={"view": self.VIEW})["function"]["name"]
+        renamed = self.edit_in_view(address, kind="rename", name="effect_one")
+        self.assertEqual(renamed["effects"], [{"subject": subject, "field": "name", "before": original, "after": "effect_one"}])
+        again = self.edit_in_view(address, kind="rename", name="effect_two")
+        self.assertEqual(again["effects"], [{"subject": subject, "field": "name", "before": "effect_one", "after": "effect_two"}])
+        commented = self.edit_in_view(address, kind="comment", comment="what it does")
+        (effect,) = commented["effects"]
+        self.assertEqual((effect["subject"], effect["field"], effect["before"]), (subject, "comment:plate", "absent"))
+        self.assertTrue(effect["after"].startswith("what it does\nsource: integration test"), effect)
+        signed = self.edit_in_view(address, kind="signature", prototype="int effect_two(int first)")
+        (effect,) = signed["effects"]
+        self.assertEqual((effect["subject"], effect["field"]), (subject, "signature"))
+        self.assertEqual(effect["after"], "int effect_two(int first)")
+        self.assertNotEqual(effect["before"], effect["after"])
+        data = self.data_address()
+        labelled = self.edit_in_view(data, kind="label", name="effect_global")
+        self.assertEqual(labelled["effects"], [{"subject": "address:%s" % hex(int(data, 16)), "field": "label:effect_global",
+                                                "before": "absent", "after": "present"}])
+        struct = self.edit_in_view("", kind="struct", path="/RusticRE/EffectFixture", size=8,
+                                   fields=[{"offset": 0, "type": "int", "name": "count", "length": 4}])
+        (effect,) = struct["effects"]
+        self.assertEqual((effect["subject"], effect["field"], effect["before"]), ("type:/RusticRE/EffectFixture", "definition", "absent"))
+        self.assertRegex(effect["after"], r"^sha256:[0-9a-f]{64}$")
+        # What the store keeps is what the engine reported, and every effect's subject is one the journal knows.
+        store = workcopy_store(self)
+        by_id = {record["id"]: record for record in store["edits"]}
+        for answer in (renamed, again, commented, signed, labelled, struct):
+            record = by_id[answer["overlay_id"]]
+            self.assertEqual(record["effects"], answer["effects"])
+            self.assertNotIn("before_unknown", record)
+            allowed = set(revisions.subjects_of(record["address"], record["options"]))
+            self.assertLessEqual({item["subject"] for item in record["effects"]}, allowed)
+        self.assertEqual([record["seq"] for record in store["edits"]], list(range(1, len(store["edits"]) + 1)))
+
+    def test_function_edits_report_existence_body_and_name_and_chain_through_delete_and_create(self):
+        from hydralysis.pe import Image
+        row = self.ask("functions", limit=5)["functions"][0]
+        entry = int(row["address"], 16)
+        ranges = [tuple(int(part, 16) for part in re.findall(r"[0-9a-fA-F]+", text)) for text in row["body"]]
+        if len(ranges) != 1:
+            self.skipTest("the first function of the fixture has more than one body range")
+        image = Image(Path(self.root / "fixture.exe"))
+        expect = " ".join("%02X" % byte for byte in image.read_rva(entry - image.base, 3))
+        view, subject = "subject-function", "address:%s" % hex(entry)
+        body = "0x%x-0x%x" % ranges[0]
+        original = row["name"]
+        deleted = self.edit_in_view(row["address"], kind="function_delete", expect=expect, view=view)
+        self.assertEqual({(item["field"], item["before"], item["after"]) for item in deleted["effects"]},
+                         {("existence", "present", "absent"), ("body", body, "absent"), ("name", original, "absent")})
+        created = self.edit_in_view(row["address"], kind="function_create", expect=expect, name="effect_recreated", view=view,
+                                    ranges=[{"start": hex(ranges[0][0]), "end": hex(ranges[0][1])}])
+        self.assertEqual({(item["field"], item["before"], item["after"]) for item in created["effects"]},
+                         {("existence", "absent", "present"), ("body", "absent", body), ("name", "absent", "effect_recreated")})
+        self.assertTrue(all(item["subject"] == subject for item in created["effects"]))
+        resized = self.edit_in_view(row["address"], kind="function_body", expect=expect, name="effect_again", view=view,
+                                    ranges=[{"start": hex(ranges[0][0]), "end": hex(ranges[0][1])}])
+        self.assertEqual({(item["field"], item["before"], item["after"]) for item in resized["effects"]},
+                         {("body", body, body), ("name", "effect_recreated", "effect_again")})
+
+    def test_a_data_type_applied_to_data_reports_its_type_before_and_after(self):
+        data = self.data_address()
+        applied = self.edit_in_view(data, kind="apply", type="int", view="subject-apply")
+        (effect,) = applied["effects"]
+        self.assertEqual((effect["subject"], effect["field"], effect["after"]), ("address:%s" % hex(int(data, 16)), "type", "int"))
+        self.assertIn("before", effect)
+
+    def test_a_variable_edit_reports_name_and_type_before_and_after(self):
+        for row in self.ask("functions", limit=5)["functions"]:
+            try:
+                variables = self.ask("variables", row["address"], options={"view": self.VIEW}).get("variables") or []
+            except RuntimeError:
+                continue
+            local = next((item for item in variables if item.get("variable") and item.get("name")), None)
+            if local:
+                break
+        else:
+            self.skipTest("no decompiled variable in the first functions of the fixture")
+        renamed = self.edit_in_view(row["address"], kind="variable", variable=local["variable"], type=local["name"],
+                                    name="effect_local", view="subject-variable")
+        (effect,) = renamed["effects"]
+        self.assertEqual(effect["field"], "variable:%s" % local["variable"])
+        self.assertTrue(effect["before"].startswith(local["variable"] + ":"), effect)
+        self.assertTrue(effect["after"].startswith("effect_local:"), effect)
+
+    def test_the_probe_reads_what_the_effects_reported_and_verify_before_rolls_back_on_a_mismatch(self):
+        from hydralysis import hydra, query, workcopy
+        view = "subject-verify"
+        address = self.entry()
+        subject = "address:%s" % hex(int(address, 16))
+        original = self.ask("decompile", address, options={"view": view})["function"]["name"]
+        renamed = self.edit_in_view(address, kind="rename", name="verify_one", view=view)
+        selected = workcopy.with_view(self.runner.target("fixture"), view)
+        program = self.runner.program_for(selected)
+        engine = self.runner.engine
+        values = workcopy.probe(engine, program, [(subject, "name"), (subject, "existence"), (subject, "label:nothing_here"),
+                                                  ("type:/RusticRE/NotThere", "definition"), ("*", "report")])
+        self.assertEqual(values[(subject, "name")], "verify_one")
+        self.assertEqual(values[(subject, "existence")], "present")
+        self.assertEqual(values[(subject, "label:nothing_here")], "absent")
+        self.assertEqual(values[("type:/RusticRE/NotThere", "definition")], "absent")
+        self.assertIsNone(values[("*", "report")])
+        # verify_before on the working copy's own writer: a record whose before is wrong is refused, and the
+        # transaction (the earlier records of the same call included) is rolled back, the marker untouched.
+        writer = hydra.Engine(self.settings, role="writer")
+        try:
+            state = workcopy._state(self.settings, selected)
+            held = query.open_program(writer, state["fork_gpr"], selected["program"], selected["sha256"], writable=True,
+                                      upgrade=True, refresh=True)
+            marker = workcopy._marker(writer, held)
+            good = {"id": "1" * 32, "address": address, "effects": [{"subject": subject, "field": "name", "before": "verify_one",
+                                                                      "after": "verify_two"}],
+                    "options": {"kind": "rename", "name": "verify_two", "source": "integration test"}}
+            bad = {"id": "2" * 32, "address": address, "effects": [{"subject": subject, "field": "name", "before": "not_this",
+                                                                     "after": "verify_three"}],
+                   "options": {"kind": "rename", "name": "verify_three", "source": "integration test"}}
+            with self.assertRaises(workcopy.VerifyMismatch) as raised:
+                workcopy._apply(self.settings, writer, held, [good, bad], marker, 120, verify_before=True)
+            self.assertEqual({key: raised.exception.detail[key] for key in ("id", "subject", "field", "expected", "found")},
+                             {"id": "2" * 32, "subject": subject, "field": "name", "expected": "not_this", "found": "verify_two"})
+            self.assertEqual(workcopy.probe(engine, held, [(subject, "name")])[(subject, "name")], "verify_one")
+            self.assertEqual(workcopy._marker(writer, held), marker)
+            # The first effect on a (subject, field) is the one checked: a chain inside one call passes.
+            chain = {**bad, "effects": [{**bad["effects"][0], "before": "verify_two"}]}
+            workcopy._apply(self.settings, writer, held, [good, chain], marker, 120, verify_before=True)
+            self.assertEqual(workcopy.probe(engine, held, [(subject, "name")])[(subject, "name")], "verify_three")
+            # state:null clears the marker (the generation base of 4.6 step 5 holds none).
+            workcopy._apply(self.settings, writer, held, [], None, 60)
+            self.assertIsNone(workcopy._marker(writer, held))
+        finally:
+            writer.reset()
+            query.forget(writer)
+        # Put the working copy back in step with the store (it replays the one recorded record, not the two applied here).
+        workcopy.repair(self.settings, self.runner.engine, selected)
+        self.assertEqual(self.ask("decompile", address, options={"view": view})["function"]["name"], "verify_one")
+        self.assertNotEqual(original, "verify_one")
+        self.assertEqual(renamed["effects"][0]["before"], original)
+
+    def test_a_removed_main_store_with_an_intact_backup_still_serves_the_overlays(self):
+        from hydralysis import durable, workcopy
+        view = "subject-backup"
+        address = self.entry()
+        self.edit_in_view(address, kind="rename", name="backup_one", view=view)
+        self.edit_in_view(address, kind="rename", name="backup_two", view=view)
+        selected = workcopy.with_view(self.runner.target("fixture"), view)
+        path = workcopy._store_path(self.settings, selected)
+        path.unlink()
+        self.assertTrue(workcopy.has_overlays(self.settings, selected))
+        self.assertEqual(self.ask("decompile", address, options={"view": view})["function"]["name"], "backup_one")
+        self.assertTrue(durable.exists(path))
 
     def test_adopt_registers_the_prepared_project_in_place(self):
         from hydralysis import hydra, targets
