@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import unittest
 import zlib
 from pathlib import Path
@@ -591,38 +592,6 @@ class AppendLogTests(Base):
         self.addCleanup(patcher.stop)
         return started
 
-    def test_two_processes_a_appends_b_is_killed_mid_line_a_appends_again_and_a_repair_is_recorded(self):
-        # The check is made on every lock acquisition, not only on the first append of a process: A has
-        # verified the log and remembers it, B dies half way through a line, A must still notice.
-        log = self.log()
-        log.append({"n": 1})
-        self.assertIn(log._key, durable._VERIFIED)
-        before = log.path.stat().st_size
-        full = len(line_of({"n": 2, "pad": "y" * 20}))
-        for cut in (1, 9, full - 1):
-            with self.subTest(cut=cut):
-                code = ("import sys\nfrom hydralysis import durable\n"
-                        "durable.AppendLog(sys.argv[1], lock_path=sys.argv[2], by='B').append({'n': 2, 'pad': 'y' * 20})\n")
-                result = run_child(code, log.path, log.lock_path, fault="log.torn_append:torn:%d" % cut)
-                self.assertEqual(result.returncode, 137, result.stderr)
-                self.assertEqual(log.path.stat().st_size, before + cut)
-                self.assertEqual(log.read(), [{"n": 1}])  # a reader sees the valid prefix and writes nothing
-                repairs_before = len(log.repairs())
-                log.append({"n": 3})  # no durable._VERIFIED.clear(): A believes the log is verified
-                repairs = log.repairs()
-                self.assertEqual(len(repairs), repairs_before + 1)
-                self.assertEqual((repairs[-1]["offset"], repairs[-1]["bytes"], repairs[-1]["by"]), (before, cut, "test"))
-                self.assertIsNone(log.status()["corrupt"])  # no lineage_corrupt
-                self.assertIsNone(log.status()["torn_tail"])
-                self.assertEqual(log.last(), {"n": 3})  # the new line is valid
-                self.assertEqual(log.read()[-1], {"n": 3})
-                fragment = line_of({"n": 2, "pad": "y" * 20})[:cut]
-                copy = log.path.with_name("%s.torn-%d-%s" % (log.path.name, before, hashlib.sha256(fragment).hexdigest()[:8]))
-                self.assertEqual(copy.read_bytes(), fragment)
-                log.path.write_bytes(line_of({"n": 1}))  # reset for the next cut
-                durable._VERIFIED[log._key] = log.path.stat().st_size
-                before = log.path.stat().st_size
-
     def test_a_foreign_garbage_line_that_ends_in_lf_is_also_repaired_on_the_next_acquisition(self):
         log = self.log()
         log.append({"n": 1})
@@ -732,6 +701,141 @@ class AppendLogTests(Base):
         self.assertEqual(len(result.records), 5 * 25)
         for number in range(5):
             self.assertEqual([row["i"] for row in result.records if row["w"] == number], list(range(25)))  # per-writer order
+
+
+# A black-box test of the writer-lock check: it uses only the public API and real processes, and reads nothing
+# of the module's internal memory. Process A is a persistent writer that appends, reports and then WAITS on its
+# stdin pipe. While it waits, another process (B) damages the log. Then A appends again and a fresh reader looks
+# at the file. A writer that checked the tail only on its first append in a process would write straight after
+# B's damage and produce a merged or invalid line.
+#
+# What each test proves, measured by running this class against the 589432e source (before the tail check
+# on every acquisition):
+#   * the killed-mid-line test (a fragment that does not end in LF) PASSES on 589432e as well: that code already
+#     refused to append behind a file that did not end in LF. It guards the contract; it does not discriminate.
+#   * the terminated-but-invalid-line test FAILS on 589432e (LineageCorrupt: an invalid line followed by A's valid
+#     line, no repair record) and passes now: it is the one that needs the check on every lock acquisition.
+#   * the control (a valid line from another process) passes on both and shows the failure above is not noise.
+
+PERSISTENT_WRITER = """
+import json, sys
+from hydralysis import durable
+log = durable.AppendLog(sys.argv[1], lock_path=sys.argv[2], by="A")
+print("ready", flush=True)
+for command in sys.stdin:
+    command = command.strip()
+    if command == "quit":
+        break
+    log.append(json.loads(command))
+    print("appended", flush=True)
+"""
+
+RAW_DAMAGE = """
+import os, sys
+descriptor = os.open(sys.argv[1], os.O_WRONLY | os.O_APPEND | getattr(os, "O_BINARY", 0))
+os.write(descriptor, sys.argv[2].encode("ascii").decode("unicode_escape").encode("latin-1"))
+os.fsync(descriptor)
+os._exit(137)
+"""
+
+APPEND_ONE = """
+import sys
+from hydralysis import durable
+durable.AppendLog(sys.argv[1], lock_path=sys.argv[2], by="B").append({"n": 2, "pad": "y" * 20})
+"""
+
+
+class TwoProcessWriters(unittest.TestCase):
+    def setUp(self):
+        self.work = workdir("durable2p")
+        self.addCleanup(self.work.cleanup)
+        self.root = Path(self.work.name)
+        self.path = self.root / "CURRENT.log"
+        self.lock = self.root / ".commit.lock"
+
+    def start_a(self):
+        child = subprocess.Popen([sys.executable, "-c", PERSISTENT_WRITER, str(self.path), str(self.lock)],
+                                 env=child_env(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True)
+        watchdog = threading.Timer(90, child.kill)  # a hung child fails the test instead of blocking the suite
+        watchdog.start()
+
+        def stop():
+            watchdog.cancel()
+            if child.poll() is None:
+                try:
+                    child.stdin.write("quit\n")
+                    child.stdin.flush()
+                    child.wait(timeout=10)
+                except (OSError, subprocess.TimeoutExpired):
+                    child.kill()
+            for stream in (child.stdin, child.stdout, child.stderr):
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+            child.wait()
+
+        self.addCleanup(stop)
+        self.assertEqual(child.stdout.readline().strip(), "ready")
+        return child
+
+    def a_appends(self, child, record):
+        child.stdin.write(json.dumps(record) + "\n")
+        child.stdin.flush()
+        self.assertEqual(child.stdout.readline().strip(), "appended",
+                         "writer A did not append %r (exit code %r)" % (record, child.poll()))
+
+    def torn_copies(self):
+        return sorted(item for item in self.root.iterdir() if ".torn-" in item.name)
+
+    def assert_repaired_and_valid(self, damage: bytes, expect_lines):
+        fresh = durable.AppendLog(self.path, lock_path=self.lock, by="reader")  # a new object in a new process state
+        self.assertEqual(fresh.read(), expect_lines)  # a LineageCorrupt would raise here
+        status = fresh.status()
+        self.assertEqual((status["torn_tail"], status["corrupt"]), (None, None))
+        repairs = fresh.repairs()
+        self.assertEqual(len(repairs), 1, repairs)
+        self.assertEqual((repairs[0]["bytes"], repairs[0]["by"], repairs[0]["sha256"]),
+                         (len(damage), "A", hashlib.sha256(damage).hexdigest()))
+        self.assertEqual([copy.read_bytes() for copy in self.torn_copies()], [damage])  # the fragment was kept aside
+        self.assertEqual(fresh.last(), expect_lines[-1])
+        self.assertTrue(self.path.read_bytes().endswith(b"\n"))
+
+    def test_a_appends_b_is_killed_mid_line_a_appends_again_and_a_repair_is_recorded(self):
+        full = line_of({"n": 2, "pad": "y" * 20})
+        for cut in (1, 9, len(full) - 1):
+            with self.subTest(cut=cut):
+                for leftover in [self.path, *self.torn_copies(), *self.root.glob("*.repairs")]:
+                    leftover.unlink(missing_ok=True)
+                a = self.start_a()
+                self.a_appends(a, {"n": 1})
+                result = run_child(APPEND_ONE, self.path, self.lock, fault="log.torn_append:torn:%d" % cut)
+                self.assertEqual(result.returncode, 137, result.stderr)  # B was killed after writing `cut` bytes
+                self.assertEqual(self.path.read_bytes(), line_of({"n": 1}) + full[:cut])
+                self.a_appends(a, {"n": 3})  # A verified the log long ago and has been waiting since
+                self.assert_repaired_and_valid(full[:cut], [{"n": 1}, {"n": 3}])
+
+    def test_a_foreign_writer_leaves_a_terminated_but_invalid_line_and_a_still_repairs_it(self):
+        junk = b"half a rec\n"
+        a = self.start_a()
+        self.a_appends(a, {"n": 1})
+        result = subprocess.run([sys.executable, "-c", RAW_DAMAGE, str(self.path), "half a rec\\n"], env=child_env(),
+                                capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 137, result.stderr)
+        self.assertEqual(self.path.read_bytes(), line_of({"n": 1}) + junk)
+        self.a_appends(a, {"n": 2})
+        self.assert_repaired_and_valid(junk, [{"n": 1}, {"n": 2}])
+
+    def test_control_a_valid_line_from_another_process_needs_no_repair(self):
+        a = self.start_a()
+        self.a_appends(a, {"n": 1})
+        result = run_child(APPEND_ONE, self.path, self.lock)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.a_appends(a, {"n": 3})
+        fresh = durable.AppendLog(self.path, lock_path=self.lock)
+        self.assertEqual(fresh.read(), [{"n": 1}, {"n": 2, "pad": "y" * 20}, {"n": 3}])
+        self.assertEqual((fresh.repairs(), self.torn_copies()), ([], []))
 
 
 # --------------------------------------------------------------------------- the write gate

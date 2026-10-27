@@ -59,7 +59,12 @@ class StoreCorrupt(ValueError):
 
 
 class LineageCorrupt(ValueError):
-    """An append log has an invalid line followed by a valid one."""
+    """An append log has an invalid line followed by a valid one.
+
+    `offset` is the absolute byte offset of the first invalid line. `records` is the valid prefix when the
+    error is raised by a reader (read()), and always [] when it is raised from the writer (append(), repair()):
+    the writer's check scans only the bytes it has not verified and does not collect records.
+    """
 
     code = "lineage_corrupt"
 
@@ -390,7 +395,12 @@ def _parse(line: bytes):
 
 
 class Scan:
-    """What a reader sees: the valid prefix, a torn tail (ignored) or mid-log corruption."""
+    """What a reader sees: the valid prefix, a torn tail (ignored) or mid-log corruption.
+
+    Byte offsets are always absolute (from the start of the file). `corrupt["line"]` is a line number counted
+    from where the scan started: for a partial scan (scan_file with start > 0, which is what the writer's
+    check makes) it is relative to that start and not a line number of the whole file.
+    """
 
     def __init__(self, records: list, valid_end: int, size: int, torn: dict | None, corrupt: dict | None):
         self.records, self.valid_end, self.size = records, valid_end, size
@@ -541,8 +551,10 @@ class AppendLog:
     def last(self, *, strict: bool = False):
         """The last valid record, or None.
 
-        By default only the tail is read (bounded) and corruption earlier in the log is not looked for;
-        strict=True scans the whole log and raises LineageCorrupt like read().
+        By default only the tail is read (bounded) and corruption earlier in the log is NOT looked for: last()
+        is tail-only, so it can return a record of a log whose middle is corrupt. A caller that needs
+        whole-log strictness must use scan() (inspect `.corrupt`) or read(), or pass strict=True, which scans
+        the whole log and raises LineageCorrupt like read().
         """
         if not strict:
             found = _tail_last_valid(self.path)
