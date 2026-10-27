@@ -124,6 +124,47 @@ class Image:
         mode = capstone.CS_MODE_32 if self.bits == 32 else capstone.CS_MODE_64
         return capstone.Cs(capstone.CS_ARCH_X86, mode)
 
+    def _relocations(self) -> list[tuple[int, int]]:
+        """Every base relocation as (rva, width), sorted; parsed once."""
+        if getattr(self, "_relocs", None) is None:
+            self.pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_BASERELOC"]])
+            found = []
+            for block in getattr(self.pe, "DIRECTORY_ENTRY_BASERELOC", []) or []:
+                for entry in block.entries:
+                    if entry.type == 3:      # IMAGE_REL_BASED_HIGHLOW
+                        found.append((entry.rva, 4))
+                    elif entry.type == 10:   # IMAGE_REL_BASED_DIR64
+                        found.append((entry.rva, 8))
+            self._relocs = sorted(found)
+        return self._relocs
+
+    def loaded_bytes(self, rva: int, size: int, load_base: int) -> bytes:
+        """The file's bytes as the loader leaves them at load_base: base relocations applied.
+
+        A relocatable image loaded away from its preferred base has every absolute address in
+        its code rewritten (32-bit code above all), so a live comparison against the raw file
+        would call those fixups patches.
+        """
+        import bisect
+        delta = load_base - self.base
+        data = bytearray(self.read_rva(rva, size))
+        if not delta:
+            return bytes(data)
+        relocations = self._relocations()
+        start = bisect.bisect_left(relocations, (rva - 8, 0))
+        for at, width in relocations[start:]:
+            if at >= rva + size:
+                break
+            if at + width <= rva:
+                continue
+            word = bytearray(self.read_rva(at, width))
+            value = (int.from_bytes(word, "little") + delta) % (1 << (8 * width))
+            fixed = value.to_bytes(width, "little")
+            for index in range(width):
+                if rva <= at + index < rva + size:
+                    data[at + index - rva] = fixed[index]
+        return bytes(data)
+
     def read_rva(self, rva: int, size: int) -> bytes:
         if rva < 0 or size < 0:
             raise ValueError("RVA and size must be non-negative")

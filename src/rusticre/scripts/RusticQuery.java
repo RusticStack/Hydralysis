@@ -1411,7 +1411,11 @@ public class RusticQuery extends GhidraScript {
             var instruction = iterator.next();
             next = instruction.getMaxAddress().next();
             boolean stores = false;
-            for (PcodeOp op : instruction.getPcode()) stores |= op.getOpcode() == PcodeOp.STORE;
+            // A PUSH of a field reads it and stores only through the stack pointer.
+            var stackPointer = currentProgram.getCompilerSpec().getStackPointer();
+            for (PcodeOp op : instruction.getPcode())
+                stores |= op.getOpcode() == PcodeOp.STORE && !(op.getInput(1).isRegister() && stackPointer != null
+                    && op.getInput(1).getAddress().equals(stackPointer.getAddress()));
             // A call's p-code stores its return address; an indirect call or jump through [reg + n] is a read.
             var flow = instruction.getFlowType();
             if (!stores || instruction.getNumOperands() == 0 || flow.isCall() || flow.isJump()) continue;

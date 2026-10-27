@@ -2,7 +2,8 @@
 
 usage: python tests/fixtures/build_fixtures.py <out dir>
 
-No PDB is written, so analysis sees what it sees in a shipped program; each build's
+No PDB is written, so analysis sees what it sees in a shipped program, and builds are
+reproducible (/Brepro), so a rebuild keeps the prepared targets valid. Each build's
 linker map (/MAP) is the ground truth for function addresses. Writes <out>/<arch>/*.exe,
 *.map and manifest.json (sha256 and map addresses of every fx_/df_ function).
 """
@@ -19,7 +20,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 BUILDS = [("flow_fixture.exe", "flow_fixture.c", []), ("vcall_fixture.exe", "vcall_fixture.cpp", ["/EHsc", "/GR"]),
           ("diff1.exe", "diff_fixture.c", []), ("diff2.exe", "diff_fixture.c", ["/DV2"])]
-SYMBOL = re.compile(r"^\s*\d{4}:[0-9a-f]{8}\s+(\S+)\s+([0-9a-f]{8,16})\s+f\s", re.I)
+SYMBOL = re.compile(r"^\s*\d{4}:[0-9a-f]{8}\s+(\S+)\s+([0-9a-f]{8,16})\s+(f\s)?", re.I)
 
 
 def vcvars() -> Path:
@@ -32,16 +33,18 @@ def vcvars() -> Path:
     return Path(found) / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat"
 
 
-def functions(map_path: Path) -> dict:
-    """fx_/df_ function VAs from a linker map (C names may carry a leading underscore on x86)."""
-    out = {}
+def symbols(map_path: Path) -> tuple[dict, dict]:
+    """fx_/df_ function and g_ data VAs from a linker map (C names carry a leading underscore on x86)."""
+    functions, data = {}, {}
     for line in map_path.read_text(errors="replace").splitlines():
         match = SYMBOL.match(line)
         if match:
             name = match.group(1).lstrip("_")
-            if name.startswith(("fx_", "df_")):
-                out[name] = "0x%x" % int(match.group(2), 16)
-    return out
+            if match.group(3) and name.startswith(("fx_", "df_")):
+                functions[name] = "0x%x" % int(match.group(2), 16)
+            elif not match.group(3) and name.startswith("g_"):
+                data[name] = "0x%x" % int(match.group(2), 16)
+    return functions, data
 
 
 def main(out_dir: str) -> int:
@@ -52,16 +55,18 @@ def main(out_dir: str) -> int:
         target = root / arch
         target.mkdir(parents=True, exist_ok=True)
         for exe, source, extra in BUILDS:
-            command = ('"%s" %s >nul && cl /nologo /O2 /GS- /MT %s "%s" /Fe:"%s" /Fo:"%s\\\\" '
-                       '/link /INCREMENTAL:NO /MAP:"%s" /DEBUG:NONE'
+            command = ('"%s" %s >nul && cl /nologo /Brepro /O2 /GS- /MT %s "%s" /Fe:"%s" /Fo:"%s\\\\" '
+                       '/link /Brepro /INCREMENTAL:NO /MAP:"%s" /DEBUG:NONE'
                        % (script, host, " ".join(extra), HERE / source, target / exe, target, target / exe.replace(".exe", ".map")))
             result = subprocess.run(command, shell=True, capture_output=True, text=True, stdin=subprocess.DEVNULL, cwd=target)
             if result.returncode:
                 print(result.stdout[-3000:], result.stderr[-3000:])
                 raise SystemExit("build of %s for %s failed" % (exe, arch))
             path = target / exe
+            functions, data = symbols(target / exe.replace(".exe", ".map"))
             manifest["%s/%s" % (arch, exe)] = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-                                               "functions": functions(target / exe.replace(".exe", ".map"))}
+                                               "image_base": "0x%x" % (0x140000000 if arch == "x64" else 0x400000),
+                                               "functions": functions, "globals": data}
             print(arch, exe, len(manifest["%s/%s" % (arch, exe)]["functions"]), "functions in the map")
     (root / "manifest.json").write_text(json.dumps(manifest, indent=1))
     return 0

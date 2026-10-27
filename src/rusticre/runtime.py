@@ -27,9 +27,13 @@ from rusticre.runtime_ipc import request as ipc_request
 
 FRIDA_VERSION = "17.24.3"
 ACTION_NAMES = ("setup", "processes", "spawn", "attach", "status", "modules", "threads", "read", "patches",
-                "observe", "break", "continue", "unload", "resume", "detach")
+                "observe", "break", "continue", "unload", "resume", "detach", "writers")
 # Only the session's owner drives the target; any client may look.
-MUTATING = ("observe", "break", "continue", "unload", "resume", "detach")
+MUTATING = ("observe", "break", "continue", "unload", "resume", "detach", "writers")
+# A store site's memory operand, as the analysis prints it: [BASE + 0xOFF].
+_STORE_OPERAND = re.compile(r"\[([A-Za-z][A-Za-z0-9]*)\s*\+\s*0x([0-9a-fA-F]+)\]")
+# How many bytes past a site a probe may overwrite; no jump may land inside them.
+_PROBE_SPAN = 8
 # Owner tokens of the sessions this process started (an MCP server keeps its own).
 _TOKENS: dict[str, str] = {}
 
@@ -233,6 +237,8 @@ class RuntimeRunner:
                                   % (session_id, owner.get("client"), owner.get("harness"), owner.get("since")))
         if action == "read" and "type" in args:
             args.update(self._layout(args))
+        if action == "writers":
+            return self._writers(session_id, args, token, owner)
         timeout = int(args.pop("timeout_s", 15))
         if not 1 <= timeout <= 60:
             raise ValueError("runtime timeout_s must be 1..60")
@@ -367,6 +373,168 @@ class RuntimeRunner:
         size = int(args.get("size") or described.get("length") or 0)
         return {"layout": layout, "size": max(1, min(4096, size)), "type_name": described.get("path")}
 
+    def _writers(self, session_id: str, args: dict, token: str, owner: dict) -> dict:
+        """Which static store sites write one live object's field during a window.
+
+        rows are what ghidra_query action=writes returned (site/rva and instruction). Each site
+        gets a probe that captures its base register; a hit whose base + displacement is
+        object + offset wrote the field. A site is refused when the analysis shows a jump into
+        the bytes a probe would overwrite, or when its live bytes differ from the file.
+        """
+        from rusticre.backends import resolved
+        from rusticre.pe import Image
+        from rusticre.query import QueryRunner
+        rows, target = args.get("rows"), str(args.get("target") or "")
+        if not isinstance(rows, list) or not 1 <= len(rows) <= 32:
+            raise ValueError("writers needs rows: 1..32 store sites from ghidra_query action=writes")
+        if not target:
+            raise ValueError("writers needs target: the analysis target, to check each site before probing it")
+        try:
+            offset = int(str(args.get("offset")), 0)
+            obj = int(str(args.get("object")), 0)
+        except ValueError as exc:
+            raise ValueError("writers needs object (the live object's address) and offset (the field's)") from exc
+        size = int(args.get("size", 4))
+        window = float(args.get("window_s", 5))
+        if not 1 <= size <= 64 or not 1 <= window <= 60:
+            raise ValueError("writers size is 1..64 and window_s 1..60")
+        exe = Path(owner.get("exe", ""))
+        image = Image(exe)
+        digest = str(_json(self.root / session_id / "ready.json").get("sha256", ""))
+        query = QueryRunner(resolved(self.settings))
+        driver = {"session": session_id, "owner": token}
+        probes, report = {}, []
+        for row in rows:
+            site = int(str(row.get("site") or "0"), 16) if row.get("site") else image.base + int(str(row.get("rva")), 16)
+            rva = site - image.base
+            entry = {"site": hex(site), "rva": hex(rva), "instruction": str(row.get("instruction", ""))[:256]}
+            operand = _STORE_OPERAND.search(entry["instruction"])
+            if not operand or int(operand.group(2), 16) != offset:
+                report.append({**entry, "probed": False, "reason": "no [register + offset] store operand at this offset"})
+                continue
+            base = operand.group(1).lower()
+            landing = []
+            for inside in range(1, _PROBE_SPAN):
+                answer = json.loads(query.query(target, "xrefs", hex(site + inside), limit=5))
+                landing += [ref.get("from") for ref in answer.get("references", [])]
+            if landing:
+                report.append({**entry, "probed": False, "reason": "a jump lands inside the bytes a probe would overwrite: %s" % landing[:4]})
+                continue
+            expect = image.read_rva(rva, _PROBE_SPAN).hex(" ").upper()
+            try:
+                hook = self.call("observe", {**driver, "module": exe.name, "rva": hex(rva), "sha256": digest, "expect": expect,
+                                             "limit": 200, "instruction": True,
+                                             "capture": [{"reg": base, "as": "pointer", "label": base}]})
+                probes[hook["hook_id"]] = entry
+                entry.update({"probed": True, "via": "site", "base": base, "calls": 0, "wrote": 0, "other_objects": []})
+                report.append(entry)
+                continue
+            except (ValueError, RuntimeError, PermissionError) as exc:
+                refused = str(exc)[:300]
+            # Too little room for a probe (a short setter ends right after its store): when the
+            # base register is still one of the function's arguments, probe its direct call sites
+            # and capture that argument before the call.
+            function = query.query(target, "function", hex(site), limit=1)
+            entry_va = int(json.loads(function)["function"]["address"], 16)
+            source = _base_argument(image, entry_va - image.base, rva, base)
+            callers = json.loads(query.query(target, "xrefs", hex(entry_va), limit=32)).get("references", []) if source else []
+            calls = [int(ref["from"], 16) for ref in callers if "CALL" in str(ref.get("type", ""))]
+            if not calls:
+                report.append({**entry, "probed": False, "reason": refused + ("; its base register is not an argument at the "
+                               "store" if not source else "; no direct call sites in the analysis")})
+                continue
+            if source[0] == "reg":
+                capture = {"reg": source[1], "as": "pointer", "label": source[1]}
+            else:
+                # At the call instruction the i-th stack argument is at [esp + 4i]; the capture's
+                # pointer is that argument (the bytes read behind it are not used).
+                capture = {"reg": "esp", "deref": [4 * source[1]], "as": "hex", "size": 1, "label": "stack argument %d" % source[1]}
+            entry.update({"probed": False, "via": "call_site", "base": base, "argument": list(source), "calls": 0, "wrote": 0,
+                          "other_objects": [], "call_sites": [], "note": "the store's own bytes cannot hold a probe (%s); the "
+                          "function receives the base as %s %s, so each call is counted where it returns, with the object "
+                          "it was given: a conditional store may not run on every call" % (refused[:120], source[0], source[1])})
+            for call in calls[:8]:
+                # Never probe the call itself (see the worker's call-in-span refusal): probe the
+                # instruction it returns to, where the argument is still known.
+                listing = json.loads(query.query(target, "scan", hex(call - 0x40), limit=64,
+                                                 options={"end": hex(call + 0x10)})).get("instructions", [])
+                known = _argument_at_return(listing, call, source, image.bits)
+                after = [row for row in listing if int(row["address"], 16) > call]
+                if not known or not after:
+                    continue
+                back = int(after[0]["address"], 16)
+                landing = []
+                for inside in range(1, _PROBE_SPAN):
+                    answer = json.loads(query.query(target, "xrefs", hex(back + inside), limit=5))
+                    landing += [ref.get("from") for ref in answer.get("references", [])]
+                if landing:
+                    continue
+                if known[0] == "static":
+                    capture = None
+                elif known[0] == "reg":
+                    capture = {"reg": known[1], "as": "pointer", "label": known[1]}
+                else:
+                    capture = {"reg": "esp", "deref": [4 * known[1]], "as": "hex", "size": 1, "label": "stack argument %d" % known[1]}
+                try:
+                    hook = self.call("observe", {**driver, "module": exe.name, "rva": hex(back - image.base), "sha256": digest,
+                                                 "expect": image.read_rva(back - image.base, _PROBE_SPAN).hex(" ").upper(),
+                                                 "limit": 200, "instruction": True, **({"capture": [capture]} if capture else {})})
+                except (ValueError, RuntimeError, PermissionError):
+                    continue
+                probes[hook["hook_id"]] = entry
+                entry.setdefault("returns", {})[hook["hook_id"]] = list(known)
+                entry["call_sites"].append({"call": hex(call), "probed_at": hex(back), "argument": list(known)})
+            entry["probed"] = bool(entry["call_sites"])
+            if not entry["probed"]:
+                entry["reason"] = refused + "; none of its call sites could hold a probe either"
+            report.append(entry)
+        # Count only calls after the probes were in place: start at the session's latest event.
+        cursor = int(self.call("status", {"session": session_id, "limit": 1}).get("last_sequence", 0)) if probes else 0
+        # Where the module is loaded, for a fixed address the analysis gave as a VA.
+        loaded = [m for m in self.call("modules", {"session": session_id, "limit": 200}).get("modules", [])
+                  if m.get("name", "").lower() == exe.name.lower()]
+        module_base = int(loaded[0]["base"], 16) if loaded else image.base
+        deadline = time.monotonic() + window
+        while probes and time.monotonic() < deadline:
+            time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+        try:
+            while probes:
+                status = self.call("status", {"session": session_id, "after": cursor, "limit": 200})
+                for event in status.get("events", []):
+                    payload = (event.get("message") or {}).get("payload") or {}
+                    entry = probes.get(event.get("script"))
+                    if entry is None or payload.get("event") != "enter":
+                        continue
+                    entry["calls"] += 1
+                    decoded = (payload.get("decoded") or [{}])[0]
+                    known = entry.get("returns", {}).get(event.get("script"))
+                    if known and known[0] == "static":
+                        value = hex(known[1] - image.base + module_base)
+                    elif known and known[0] == "stack":
+                        value = decoded.get("pointer")
+                    else:
+                        value = decoded.get("value")
+                    address = int(value, 16) + offset if isinstance(value, str) else None
+                    if address is not None and obj + offset <= address < obj + offset + size:
+                        entry["wrote"] += 1
+                    elif address is not None and len(entry["other_objects"]) < 4 and hex(address - offset) not in entry["other_objects"]:
+                        entry["other_objects"].append(hex(address - offset))
+                cursor = status.get("next_after", cursor)
+                if not status.get("truncated"):
+                    break
+        finally:
+            for hook_id in probes:
+                try:
+                    self.call("unload", {**driver, "hook_id": hook_id})
+                except (ValueError, RuntimeError):
+                    pass
+        return {"object": hex(obj), "offset": hex(offset), "size": size, "window_s": window,
+                "writers": [entry for entry in report if entry.get("wrote")], "sites": report,
+                "coverage": "the given static sites only (ghidra_query action=writes and what it does not cover: computed "
+                            "offsets, block copies, stores outside analysed code); a site counts as a writer when a probed "
+                            "call's base register plus the displacement addressed the field during the window. Up to 200 "
+                            "calls are recorded per site."}
+
     # ---- one driving session per executable, and an optional external game lock ----------------
     def _lock_path(self, exe: Path) -> Path:
         key = hashlib.sha256(os.path.normcase(str(exe)).encode()).hexdigest()[:16]
@@ -383,7 +551,11 @@ class RuntimeRunner:
         with locked(path.with_suffix(".lock"), what="runtime lock"):
             held = _json(path)
             starting = held and time.time() - float(held.get("at", 0)) < 60 and not (self.root / held["session"] / "ready.json").exists()
-            if held and (self._live(held["session"]) or starting):
+            # A session whose target process has exited drives nothing, whatever its worker does.
+            target = _json(self.root / held["session"] / "state.json") if held else {}
+            gone = bool(target.get("pid") and target.get("target_created_ms")) \
+                and not _identity(int(target["pid"]), int(target["target_created_ms"]))
+            if held and not gone and (self._live(held["session"]) or starting):
                 raise PermissionError("%s is driven by runtime session %s of %s (%s) since %s; one session drives a program "
                                       "at a time: read its status, or wait for its detach" % (exe.name, held["session"], held.get("client"),
                                                                                              held.get("harness"), held.get("since")))
@@ -411,6 +583,90 @@ class RuntimeRunner:
         if result.returncode:
             raise PermissionError("the external game lock refused %s (exit %d): %s"
                                   % (action, result.returncode, (result.stdout + result.stderr).strip()[-1500:]))
+
+
+_X64_ARGUMENTS = ("rcx", "rdx", "r8", "r9")
+# Registers a callee preserves, by the 64-bit and 32-bit Windows conventions.
+_PRESERVED = {64: {"RBX", "RBP", "RSI", "RDI", "R12", "R13", "R14", "R15"}, 32: {"EBX", "EBP", "ESI", "EDI"}}
+_FAMILY = {"rcx": {"RCX", "ECX"}, "rdx": {"RDX", "EDX"}, "r8": {"R8", "R8D"}, "r9": {"R9", "R9D"}}
+
+
+def _argument_at_return(listing: list[dict], call: int, source: tuple, bits: int):
+    """How the call's argument is still known once the call has returned, from the listing.
+
+    ("static", va): the caller passed a fixed address (LEA reg, [addr] or PUSH addr);
+    ("reg", name): it copied the argument from a register the callee preserves;
+    ("stack", i): x86, the caller removes its arguments after the call (ADD ESP), so the
+    i-th one is still at [esp + 4i] at the return site. None when none of these holds.
+    """
+    before = [row for row in listing if int(row["address"], 16) < call]
+    after = [row for row in listing if int(row["address"], 16) > call]
+    if source[0] == "reg" and bits == 64:
+        family = _FAMILY.get(source[1], set())
+        for row in reversed(before[-12:]):
+            operands = [part.strip() for part in row["operands"].split(",", 1)]
+            if not operands or operands[0].upper() not in family:
+                continue
+            if row["mnemonic"] == "LEA":
+                fixed = re.fullmatch(r"\[(0x[0-9a-fA-F]+)\]", operands[1].strip()) if len(operands) > 1 else None
+                return ("static", int(fixed.group(1), 16)) if fixed else None
+            if row["mnemonic"] == "MOV" and len(operands) > 1 and operands[1].upper() in _PRESERVED[64]:
+                return ("reg", operands[1].lower())
+            return None
+        return None
+    if source[0] == "stack" and bits == 32:
+        pushes = [row for row in reversed(before[-12:]) if row["mnemonic"] == "PUSH"]
+        if len(pushes) > source[1]:
+            pushed = pushes[source[1]]["operands"].strip()
+            if re.fullmatch(r"0x[0-9a-fA-F]+", pushed):
+                return ("static", int(pushed, 16))
+        if after and after[0]["mnemonic"] == "ADD" and after[0]["operands"].upper().startswith("ESP"):
+            return ("stack", source[1])
+        if len(pushes) > source[1] and pushes[source[1]]["operands"].strip().upper() in _PRESERVED[32]:
+            return ("reg", pushes[source[1]]["operands"].strip().lower())
+    return None
+
+
+def _base_argument(image, entry_rva: int, site_rva: int, base: str):
+    """How a caller passes the store's base register, if the function has not changed it.
+
+    Decodes from the function's entry to the store. ("reg", name): the register is untouched
+    since entry and is an argument register (x64 rcx/rdx/r8/r9, or a 32-bit thiscall ecx);
+    ("stack", i): on x86 it was loaded from the i-th stack argument before the stack moved.
+    None when it was computed some other way.
+    """
+    import capstone
+    decoder = image._decoder()
+    decoder.detail = True
+    code = image.read_rva(entry_rva, site_rva - entry_rva)
+    wide = image.bits == 64
+    depth = 0
+    source = None
+    for instruction in decoder.disasm(code, entry_rva):
+        if instruction.address >= site_rva:
+            break
+        written = {instruction.reg_name(r) for r in instruction.regs_access()[1]}
+        text = "%s %s" % (instruction.mnemonic, instruction.op_str)
+        if base in written:
+            if wide or source is not None:
+                return None
+            loaded = re.fullmatch(r"mov %s, dword ptr \[esp(?: \+ (0x[0-9a-f]+|\d+))?\]" % base, text)
+            if not loaded:
+                return None
+            source = ("stack", (int(loaded.group(1) or "0", 0) + depth - 4) // 4)
+            continue
+        if not wide:
+            if instruction.mnemonic == "push":
+                depth -= 4
+            elif instruction.mnemonic == "pop":
+                depth += 4
+            elif "esp" in written:
+                return None if source is None else source
+    if source is not None:
+        return source if source[1] >= 0 else None
+    if (wide and base in _X64_ARGUMENTS) or (not wide and base == "ecx"):
+        return ("reg", base)
+    return None
 
 
 def runtime(action: str, args: dict | None, settings: dict) -> str:

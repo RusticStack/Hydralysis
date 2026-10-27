@@ -13,16 +13,23 @@ from pathlib import Path
 
 from rusticre.client import Client
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from prepare_fixtures import target_name  # noqa: E402
+
 re = Client()
 ARCHES = ("x64", "x86")
 
 
+MANIFEST: dict = {}
+
+
 def load(out_dir: str) -> dict:
-    return json.loads((Path(out_dir) / "manifest.json").read_text())
+    MANIFEST.update(json.loads((Path(out_dir) / "manifest.json").read_text()))
+    return MANIFEST
 
 
 def target(arch: str, exe: str) -> str:
-    return "fx-%s-%s" % (arch, exe.removesuffix(".exe").replace("_fixture", ""))
+    return target_name(arch + "/" + exe, MANIFEST[arch + "/" + exe])
 
 
 def last_load(name: str, address: str) -> str:
@@ -48,7 +55,76 @@ def check_value_flow(manifest: dict) -> list[str]:
     return failures
 
 
-CHECKS = {"value_flow": check_value_flow}
+class Running:
+    """A fixture process under a RusticRE runtime session; stopped through its stop file."""
+
+    def __init__(self, arch: str, exe: str):
+        build = MANIFEST[arch + "/" + exe]
+        self.build, self.stop_file = build, Path(build["path"]).with_suffix(".stop")
+        self.stop_file.unlink(missing_ok=True)
+        started = re.runtime("spawn", exe=build["path"], sha256=build["sha256"], argv=[str(self.stop_file)],
+                             cwd=str(Path(build["path"]).parent))
+        self.session, self.owner = started["session"], started["owner"]
+        re.runtime("resume", session=self.session, owner=self.owner)
+        modules = re.runtime("modules", session=self.session, limit=50)
+        main = next(m for m in modules["modules"] if m["name"].lower() == Path(build["path"]).name.lower())
+        self.delta = int(main["base"], 16) - int(build["image_base"], 16)
+
+    def live(self, name: str) -> int:
+        """A global's address in the running process (the map's VA moved by the load base)."""
+        return int(self.build["globals"][name], 16) + self.delta
+
+    def call(self, action: str, **options):
+        return re.runtime(action, session=self.session, owner=self.owner, **options)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            re.runtime("detach", session=self.session, owner=self.owner)
+        except Exception as error:  # still report the check
+            print("  detach:", error)
+        self.stop_file.write_text("stop")
+
+
+def check_writers(manifest: dict) -> list[str]:
+    """Item 13: of the static store sites at Config.limit's offset, the live ones writing g_config
+    are exactly those of fx_store, fx_reset and fx_clamp (x86 folds fx_pair into fx_store)."""
+    failures = []
+    for arch in ARCHES:
+        build = manifest[arch + "/flow_fixture.exe"]
+        name, functions = target(arch, "flow_fixture.exe"), build["functions"]
+        names = {}
+        for function, address in functions.items():
+            names.setdefault(int(address, 16), []).append(function)
+        rows = re.query(name, "writes", limit=32, timeout_s=120, offset="0x4")["writes"]
+        expected = {"fx_store", "fx_reset", "fx_clamp"}
+        with Running(arch, "flow_fixture.exe") as running:
+            answer = running.call("writers", target=name, rows=rows, object=hex(running.live("g_config")), offset="0x4",
+                                  size=4, window_s=3)
+        writers = set()
+        for site in answer["writers"]:
+            writers.update(names.get(int(site["site"], 16) - 0, []) or names.get(_entry(name, site["site"]), [site["site"]]))
+        refused = [s for s in answer["sites"] if not s.get("probed")]
+        shared = [s for s in answer["writers"] if s.get("other_objects")]
+        ok = expected <= writers and not (writers - expected - {"fx_pair"})
+        print("%s writers %s: %s; %d of %d sites probed; sites that also wrote other objects: %s"
+              % ("PASS" if ok else "FAIL", arch, sorted(writers), len(answer["sites"]) - len(refused), len(answer["sites"]),
+                 [(s["site"], s["other_objects"]) for s in shared]))
+        for site in refused[:3]:
+            print("   not probed", site["site"], site["reason"][:120])
+        if not ok:
+            failures.append("writers " + arch)
+    return failures
+
+
+def _entry(name: str, site: str) -> int:
+    function = re.try_query(name, "function", site)
+    return int(function["function"]["address"], 16) if function else 0
+
+
+CHECKS = {"value_flow": check_value_flow, "writers": check_writers}
 
 
 def main(argv: list[str]) -> int:

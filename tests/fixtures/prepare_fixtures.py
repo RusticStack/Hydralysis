@@ -1,4 +1,6 @@
-"""Prepare every built fixture as an analysis target (fx-<arch>-<name>) and wait for the jobs.
+"""Prepare every built fixture as an analysis target (fx-<arch>-<name>-<sha8>) and wait for the jobs.
+
+A target name belongs to one build, so a changed fixture gets a new name rather than replacing one.
 
 usage: python tests/fixtures/prepare_fixtures.py <fixtures out dir>   (RUSTICRE_CONFIG selects the root)
 """
@@ -13,13 +15,17 @@ from pathlib import Path
 from rusticre.client import Client
 
 
+def target_name(key: str, build: dict) -> str:
+    arch, exe = key.split("/")
+    return "fx-%s-%s-%s" % (arch, exe.removesuffix(".exe").replace("_fixture", ""), build["sha256"][:8])
+
+
 def main(out_dir: str) -> int:
     manifest = json.loads((Path(out_dir) / "manifest.json").read_text())
     re = Client()
     jobs = {}
     for key, build in manifest.items():
-        arch, exe = key.split("/")
-        target = "fx-%s-%s" % (arch, exe.removesuffix(".exe").replace("_fixture", ""))
+        target = target_name(key, build)
         started = re.call("prepare", exe=build["path"], target=target)
         jobs[target] = started.get("job_id")
         print(target, started.get("state"), started.get("job_id"))

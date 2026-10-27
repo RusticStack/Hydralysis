@@ -163,10 +163,68 @@ def decode_detour(data: bytes, address: int) -> dict | None:
     return None
 
 
-def file_bytes(path: str, rva: int, size: int) -> bytes:
-    """What the module's file on disk holds at an RVA: the original, whatever is patched live."""
+_IMAGES: dict = {}
+
+
+def _image(path: str):
+    """A parsed module file, kept while the file is unchanged (a game exe is tens of MB)."""
     from rusticre.pe import Image
-    return Image(Path(path)).read_rva(rva, size)
+    stat = Path(path).stat()
+    key = (str(path), stat.st_size, stat.st_mtime_ns)
+    if key not in _IMAGES:
+        _IMAGES.clear()
+        _IMAGES[key] = Image(Path(path))
+    return _IMAGES[key]
+
+
+def file_bytes(path: str, rva: int, size: int, load_base: int | None = None) -> bytes:
+    """What the module's file on disk holds at an RVA: the original, whatever is patched live.
+    With load_base, as the loader leaves it there (base relocations applied)."""
+    image = _image(path)
+    return image.read_rva(rva, size) if load_base is None else image.loaded_bytes(rva, size, load_base)
+
+
+# Bytes a probe overwrites at its site (a 5-byte jump, rounded up to whole instructions).
+PROBE_SPAN = 8
+
+
+def _relocated(module: dict, rva: int, expected: list, actual: list) -> bool:
+    """expect is the file's bytes and the live ones differ only by the loader's base relocations."""
+    try:
+        return list(file_bytes(module["path"], rva, len(expected))) == expected \
+            and actual == list(file_bytes(module["path"], rva, len(expected), int(module["base"], 16)))
+    except Exception:  # a module file that cannot be decoded gives no evidence
+        return False
+
+
+def _call_in_span(path: str, rva: int) -> str | None:
+    """A call instruction inside the bytes a probe would overwrite, or None.
+
+    The instrumentation relocates an overwritten call into its trampoline, so the callee
+    returns into it; in testing (Frida 17.24.3, a probe over a call in a loop) such a probe
+    could not be released again. Probe the call's target or the instruction after it.
+    """
+    try:
+        image = _image(path)
+        decoder = image._decoder()
+        code = image.read_rva(rva, PROBE_SPAN + 15)
+    except Exception:  # a module file that cannot be decoded gives no evidence either way
+        return None
+    for instruction in decoder.disasm(code, rva):
+        if instruction.address >= rva + 5:
+            break
+        if instruction.mnemonic.startswith("call"):
+            return "%s %s at rva %#x" % (instruction.mnemonic, instruction.op_str, instruction.address)
+    return None
+
+
+def _inside_function(path: str, rva: int) -> bool:
+    """True when the module's pdata shows rva inside a function, not at its start (x64 only)."""
+    try:
+        bounds = _image(path)._bounds(rva)
+    except Exception:  # not a PE we can read: no pdata evidence
+        return False
+    return bounds is not None and bounds[0] != rva
 
 
 def _expect(text: str) -> list[int]:
@@ -177,12 +235,13 @@ def _expect(text: str) -> list[int]:
 
 
 def _probe_source(module: dict, rva: int, expected: list[int], hook_id: str, limit: int, pause: bool,
-                  captures: list | None = None, sample: dict | None = None, convention: str = "native") -> str:
+                  captures: list | None = None, sample: dict | None = None, convention: str = "native",
+                  instruction: bool = False) -> str:
     parameters = json.dumps({"module": module["path"], "base": module["base"], "rva": rva,
                              "expect": expected, "id": hook_id, "limit": limit, "pause": pause,
                              "captures": [{"arg": c["arg"], "reg": c.get("reg"), "deref": c["deref"], "size": c["size"],
                                            "value_only": c["value_only"], "ptr": c["as"] == "pointer"} for c in (captures or [])],
-                             "sample": sample, "convention": convention})
+                             "sample": sample, "convention": convention, "instruction": instruction})
     return CONTEXT_HELPER + MEMORY_HELPER + r"""const p=PARAMETERS;
 const all=Process.enumerateModules().filter(m=>m.path===p.module);
 if(all.length!==1||all[0].base.toString()!==p.base)throw new Error('module mapping changed before probe installation');
@@ -219,8 +278,7 @@ if(p.sample){setInterval(()=>{send({event:'sample',hook_id:p.id,window_s:p.sampl
 function sampleValue(hexed){const b=new Uint8Array(hexed.match(/../g).map(x=>parseInt(x,16))).buffer,v=new DataView(b);
   switch(p.sample.as){case 'f32':return v.getFloat32(0,true);case 'f64':return v.getFloat64(0,true);case 'i32':return v.getInt32(0,true);
    case 'u32':return v.getUint32(0,true);case 'i16':return v.getInt16(0,true);case 'u16':return v.getUint16(0,true);case 'u8':return v.getUint8(0);default:return b.byteLength>=8?Number(v.getBigUint64(0,true)):v.getUint32(0,true);}}
-const listener=Interceptor.attach(site,{
- onEnter(args){
+function enter(args){
   if(p.sample){agg.count++;const c=captureArgs(args,this.context)[p.sample.capture];
    if(c&&c.hex){const x=sampleValue(c.hex);agg.last=x;agg.min=agg.min===null||x<agg.min?x:agg.min;agg.max=agg.max===null||x>agg.max?x:agg.max;}return;}
   this.capture=hits++<p.limit;
@@ -228,10 +286,14 @@ const listener=Interceptor.attach(site,{
   const context=captureContext(this.context);
   let backtrace=[];try{backtrace=Thread.backtrace(this.context,Backtracer.ACCURATE).slice(0,16).map(a=>a.toString());}catch(e){}
   send({event:p.pause?'break':'enter',hook_id:p.id,hit:hits,thread:this.threadId,
-    address:site.toString(),return_address:this.returnAddress.toString(),context,
+    address:site.toString(),return_address:p.instruction?null:this.returnAddress.toString(),context,
     arguments:Array.from({length:8},(_,i)=>String(argAt(this.context,args,i))),backtrace,captures:captureArgs(args,this.context)});
   if(p.pause)recv('continue:'+p.id,()=>{}).wait();
- },
+ }
+// Inside a function (a store, the instruction after a call) a probe is a plain callback: no
+// invocation is tracked, so nothing waits for that function to return (a main loop never
+// does) and the return address is never touched. At a function entry the return is captured.
+const listener=p.instruction?Interceptor.attach(site,enter):Interceptor.attach(site,{onEnter:enter,
  onLeave(retval){if(this.capture)send({event:'return',hook_id:p.id,thread:this.threadId,value:retval.toString()});}
 });
 send({event:'probe_installed',hook_id:p.id,address:site.toString(),verified_bytes:got});
@@ -412,7 +474,8 @@ class RuntimeAgent:
             if not 1 <= size <= 64 or rva + size > module["size"]:
                 raise ValueError("patch check size must be 1..64 bytes inside the module")
             live = bytes(self.control.exports_sync.read(address, size))
-            original = file_bytes(module["path"], rva, size)
+            # The loader's base relocations are not patches: compare with the bytes as loaded.
+            original = file_bytes(module["path"], rva, size, int(module["base"], 16))
             item = {"name": row.get("name", ""), "module": module["name"], "rva": hex(rva), "address": address,
                     "file_bytes": original.hex(" ").upper(), "live_bytes": live.hex(" ").upper(), "patched": live != original}
             if item["patched"]:
@@ -522,6 +585,9 @@ class RuntimeAgent:
                 raise ValueError("expected bytes extend outside selected module")
             actual = self.control.exports_sync.read(address, len(expected))
             patch = None
+            # expect is the file's bytes; a relocated module holds them with the loader's fixups.
+            if list(actual) != expected and _relocated(module, rva, expected, list(actual)):
+                expected = list(actual)
             if list(actual) != expected:
                 patch = self._patcher(int(address, 16))
                 # accept_patch: expect is the original prologue; the live bytes may differ only by a
@@ -551,12 +617,22 @@ class RuntimeAgent:
             convention = str(args.get("convention") or "native")
             if convention not in ("native", "thiscall", "fastcall"):
                 raise ValueError("convention is native, thiscall or fastcall (the last two for 32-bit x86)")
+            call = _call_in_span(module["path"], rva)
+            if call:
+                raise ValueError("probe refused: the bytes it would overwrite hold a call (%s), which the instrumentation "
+                                 "cannot release again; probe the call's target, or an instruction after the call" % call)
+            # A probe inside a function (a store, a call site) must not hook the return: say so with
+            # instruction=true; on x64 a site that is not the start of a pdata function is one.
+            instruction = bool(args.get("instruction"))
+            if not instruction:
+                instruction = _inside_function(module["path"], rva)
             hook_id = uuid.uuid4().hex
-            source = _probe_source(module, rva, expected, hook_id, limit, action == "break", captures, sample, convention)
+            source = _probe_source(module, rva, expected, hook_id, limit, action == "break", captures, sample, convention,
+                                   instruction)
             handle = self._load(hook_id, source, {"kind": action, "module": module, "rva": hex(rva), "expected_bytes": expected,
                                                   "captures": captures, "sample": sample,
                                                   "convention": convention})
-            return {"hook_id": hook_id, "verified": True, "module": module, "rva": hex(rva),
+            return {"hook_id": hook_id, "verified": True, "module": module, "rva": hex(rva), "instruction": instruction,
                     "address": address, "script_sha256": handle["source_sha256"], "pause_deadline_s": 30 if action == "break" else None,
                     **({"past_patch": patch} if patch else {})}
         if action == "patches":
@@ -596,7 +672,12 @@ class RuntimeAgent:
         entry = self.scripts[script_id]
         if script_id in self.pauses:
             self._continue(script_id)
-        entry["handle"].unload()
+        try:
+            entry["handle"].unload()
+        except Exception as exc:
+            # A script the target's exit (or the session's end) destroyed is already gone.
+            if "destroyed" not in str(exc):
+                raise
         self.scripts.pop(script_id)
 
     def cleanup(self) -> dict:
