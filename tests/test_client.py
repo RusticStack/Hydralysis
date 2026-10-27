@@ -109,3 +109,213 @@ class JsonCommandLine(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EngineRetryPolicy(unittest.TestCase):
+    """hydra.Engine.call against a fake session library: a lost reply is re-sent only if it was a read (spec 4.3)."""
+
+    def setUp(self):
+        import hashlib
+        from unittest.mock import patch
+        import fakehydra
+        from hydralysis import hydra
+        self.fakehydra, self.hydra = fakehydra, hydra
+        self.work = workdir("retry")
+        self.addCleanup(self.work.cleanup)
+        self.root = Path(self.work.name)
+        self.daemon = fakehydra.reset()
+        self.digest = hashlib.sha256(b"owned").hexdigest()
+        self.gpr = self.root / "analysed" / "Owned" / "Owned.gpr"
+        self.daemon.add_project(self.gpr, {"/owned.exe": {"sha256": self.digest}})
+        self.settings = {"root": str(self.root / "data"), "hydra_dir": "x", "hydra_client": "x"}
+        for item in (patch("hydralysis.hydra.load_client", return_value=fakehydra.FakeClientModule),
+                     patch.dict(hydra.Engine._connections, clear=True)):
+            item.start()
+            self.addCleanup(item.stop)
+        self.writer = hydra.Engine(self.settings, role="writer")
+        opened = self.writer.call("open_project", path=str(self.gpr), writable=True)
+        self.program = {"key": self.writer.call("open_program", path="/owned.exe", project=opened["id"], writable=True)["key"],
+                        "project": opened["id"]}
+
+    def sent(self, command, action=None):
+        return [fields for _, name, fields in self.daemon.calls if name == command and
+                (action is None or self.fakehydra.FakeSession._action(fields) == action)]
+
+    def marker(self):
+        from hydralysis import query
+        request = {"id": "m", "action": "overlay_state", "address": "", "limit": 1, "cursor": "", "contains": "",
+                   "timeout_s": 5, "options": {}}
+        return query.run_script(self.writer, self.program, request, 5)[0]["overlay_state"]
+
+    def test_a_dropped_apply_overlays_is_not_resent_and_the_marker_reconciles(self):
+        from hydralysis import workcopy
+        state = {"revision": "r2", "ids": ["e1"]}
+        records = [{"id": "e1", "address": "0x140001000", "options": {"kind": "rename", "name": "renamed"}}]
+        self.daemon.drops.append({"command": "script", "action": "apply_overlays", "when": "after"})
+        with self.assertRaises(self.hydra.EngineError) as caught:
+            workcopy._apply(self.settings, self.writer, self.program, records, state, 5)
+        error = caught.exception
+        self.assertEqual(error.code, "closed")
+        self.assertTrue(error.ambiguous)
+        self.assertTrue(json.loads(str(error))["ambiguous"])
+        self.assertEqual(len(self.sent("script", "apply_overlays")), 1, "the apply was sent again")
+        # The caller reconciles by reading the marker: the engine had applied it, and says so.
+        self.assertEqual(json.loads(self.marker()), state)
+        self.assertEqual(len(self.sent("script", "apply_overlays")), 1)
+
+    def test_a_dropped_apply_that_never_arrived_reconciles_to_the_old_marker(self):
+        from hydralysis import workcopy
+        self.daemon.drops.append({"command": "script", "action": "apply_overlays", "when": "before"})
+        with self.assertRaises(self.hydra.EngineError) as caught:
+            workcopy._apply(self.settings, self.writer, self.program, [], {"revision": "r2"}, 5)
+        self.assertTrue(caught.exception.ambiguous)
+        self.assertEqual(self.sent("script", "apply_overlays"), [])
+        self.assertEqual(self.marker(), "")
+
+    def test_a_mutating_call_is_never_sent_twice(self):
+        key = self.program["key"]
+        for command, fields in (("save", {"program": key}),
+                                ("fork_project", {"project": self.program["project"], "path": str(self.root / "fork")}),
+                                ("edit", {"program": key}), ("rename", {"program": key}),
+                                ("comment", {"program": key}), ("import", {"path": "x.exe"}),
+                                ("script", {"script": "UserScript.java", "program": key}),
+                                ("script", {"script": "RusticQuery.java", "program": key, "args": ["not json"]}),
+                                ("cancel", {"target": 4})):
+            for oserror in (False, True):
+                with self.subTest(command=command, oserror=oserror):
+                    before = len(self.sent(command))
+                    self.daemon.drops.append({"command": command, "when": "before", "oserror": oserror})
+                    with self.assertRaises(self.hydra.EngineError) as caught:
+                        self.writer.call(command, **fields)
+                    self.assertEqual(caught.exception.code, "closed")
+                    self.assertTrue(caught.exception.ambiguous)
+                    # "before": the daemon never saw it; a blind retry would have been the only call it saw.
+                    self.assertEqual(len(self.sent(command)) - before, 0, "the call was sent again")
+                    self.assertFalse(self.daemon.drops)
+
+    def test_a_fork_whose_reply_was_lost_can_be_found_by_its_destination(self):
+        destination = self.root / "fork"
+        self.daemon.drops.append({"command": "fork_project", "when": "after"})
+        with self.assertRaises(self.hydra.EngineError) as caught:
+            self.writer.call("fork_project", project=self.program["project"], path=str(destination))
+        self.assertTrue(caught.exception.ambiguous)
+        self.assertEqual(len(self.sent("fork_project")), 1)
+        self.assertTrue((destination / "Owned.gpr").is_file())
+
+    def test_a_save_whose_reply_was_lost_is_sent_once(self):
+        self.daemon.drops.append({"command": "save", "when": "after"})
+        with self.assertRaises(self.hydra.EngineError) as caught:
+            self.writer.call("save", program=self.program["key"])
+        self.assertTrue(caught.exception.ambiguous)
+        self.assertEqual(len(self.sent("save")), 1)
+
+    def test_a_read_is_sent_again_on_a_new_connection(self):
+        from hydralysis import query
+        sessions = self.daemon.sessions
+        self.daemon.drops.append({"command": "script", "action": "decompile", "when": "after"})
+        request = {"id": "d", "action": "decompile", "address": "0x140001000", "limit": 1, "cursor": "", "contains": "",
+                   "timeout_s": 5, "options": {}}
+        answer, _ = query.run_script(self.writer, self.program, request, 5)
+        self.assertTrue(answer["ok"])
+        self.assertEqual(len(self.sent("script", "decompile")), 2)
+        self.assertGreater(self.daemon.sessions, sessions)
+
+    def test_read_commands_are_retried_through_oserror_and_closed(self):
+        for oserror in (False, True):
+            with self.subTest(oserror=oserror):
+                before = len(self.sent("status"))
+                self.daemon.drops.append({"command": "status", "when": "before", "oserror": oserror})
+                self.assertIn("projects", self.writer.call("status"))
+                self.assertEqual(len(self.sent("status")) - before, 1)
+
+    def test_a_read_that_fails_twice_raises_closed_without_the_ambiguity_flag(self):
+        self.daemon.drops.append({"command": "status", "when": "before", "times": 2})
+        with self.assertRaises(self.hydra.EngineError) as caught:
+            self.writer.call("status")
+        self.assertEqual(caught.exception.code, "closed")
+        self.assertFalse(caught.exception.ambiguous)
+
+    def test_which_commands_are_idempotent(self):
+        idempotent = self.hydra.idempotent
+        for command in ("hello", "health", "status", "open_project", "open_program", "info", "list", "project", "functions", "decompile"):
+            self.assertTrue(idempotent(command), command)
+        for command in ("save", "import", "fork_project", "edit", "rename", "comment", "cancel", "analyze", "frobnicate"):
+            self.assertFalse(idempotent(command), command)
+
+        def script(action, name="RusticQuery.java"):
+            return {"script": name, "args": [json.dumps({"action": action})]}
+        self.assertTrue(idempotent("script", script("decompile")))
+        self.assertTrue(idempotent("script", script("overlay_state")))
+        for action in ("apply_overlays", "type_edit", "anything_new", None):
+            self.assertFalse(idempotent("script", script(action)), action)
+        self.assertFalse(idempotent("script", script("decompile", "RusticSetup.java")))
+        self.assertFalse(idempotent("script", {"script": "RusticQuery.java", "args": []}))
+        self.assertFalse(idempotent("script", {}))
+        big = self.root / "request.json"
+        big.write_text(json.dumps({"action": "decompile"}), encoding="utf-8")
+        self.assertTrue(idempotent("script", {"script": "RusticQuery.java", "args": ["@" + str(big)]}))
+        big.write_text(json.dumps({"action": "apply_overlays"}), encoding="utf-8")
+        self.assertFalse(idempotent("script", {"script": "RusticQuery.java", "args": ["@" + str(big)]}))
+        self.assertFalse(idempotent("script", {"script": "RusticQuery.java", "args": ["@" + str(self.root / "missing.json")]}))
+
+    def test_a_busy_answer_is_parsed_into_the_engine_error(self):
+        self.daemon.replies["open_program"] = self.fakehydra.busy_with_holder(retry_after_ms=2500, held_ms=4200, running=7)
+        before = len(self.sent("open_program"))
+        with self.assertRaises(self.hydra.EngineError) as caught:
+            self.writer.call("open_program", path="/owned.exe", project=self.program["project"])
+        error = caught.exception
+        self.assertEqual(len(self.sent("open_program")) - before, 1, "busy is an answer, not a lost connection: no resend")
+        self.assertEqual(error.code, "busy")
+        self.assertEqual(error.retry_after_ms, 2500)
+        self.assertEqual(error.details["reason"], "lock_wait")
+        self.assertEqual((error.holder_info["client"], error.holder_info["harness"]), (3, "codex"))
+        self.assertEqual(error.held_ms, 4200)
+        self.assertEqual(error.queue["position"], 2)
+        self.assertEqual(error.next, {"cmd": "status"})
+        self.assertFalse(error.ambiguous)
+        payload = json.loads(str(error))
+        self.assertEqual(payload["retryAfterMs"], 2500)
+        self.assertEqual(payload["holderInfo"]["command"], "script")
+        self.assertEqual(payload["heldMs"], 4200)
+        self.assertEqual(payload["queue"]["lane"], "long")
+        self.assertEqual(payload["next"], {"cmd": "status"})
+        self.assertEqual(len(payload["running"]), 5)
+        self.assertEqual(payload["more"], {"running": 2})
+
+    def test_an_error_from_another_reply_does_not_lend_its_retry_hint(self):
+        # Library 1.0.0 keeps one last_response per connection: another thread's reply may replace it.
+        busy = self.fakehydra.busy_with_holder(retry_after_ms=9000)
+        session = self.writer.session()
+        session.last_response = {"ok": False, "error": {**busy, "message": "some other error"}}
+        error = self.writer._error(session, self.fakehydra.FakeClientModule.SessionError(
+            busy["code"], busy["message"], busy["details"]), "open_program")
+        self.assertIsNone(error.retry_after_ms)
+        self.assertEqual(error.holder_info["client"], 3)
+
+    def test_plain_errors_keep_their_shape(self):
+        error = self.hydra.EngineError("not_found", "no program x", {"program": "p1:/x", "suggest": "list"}, "open_program")
+        self.assertEqual(json.loads(str(error)), {"engine_error": "not_found", "message": "no program x", "command": "open_program",
+                                                  "suggest": "list", "program": "p1:/x"})
+        self.assertIsNone(error.retry_after_ms)
+        self.assertIsNone(error.queue)
+        self.assertFalse(error.ambiguous)
+
+    def test_capabilities_is_empty_on_protocol_2_and_never_raises_on_an_older_engine(self):
+        self.assertEqual(self.writer.hello()["protocol"], 2)
+        self.assertEqual(self.writer.capabilities(), {})
+        # An engine whose hello says nothing useful about capabilities, and a library with no hello at all.
+        self.daemon.hello_extra = {"capabilities": None}
+        self.hydra.Engine._connections.clear()
+        self.assertEqual(self.writer.capabilities(), {})
+        del self.writer.session().hello
+        self.assertEqual(self.writer.capabilities(), {})
+        # Capabilities a protocol-2 connection should not carry are not believed.
+        self.daemon.hello_extra = {"capabilities": {"health": 1}}
+        self.hydra.Engine._connections.clear()
+        self.assertEqual(self.writer.capabilities(), {})
+
+    def test_capabilities_of_a_protocol_3_engine(self):
+        self.daemon.hello_extra = {"protocol": 3, "capabilities": {"queueInfo": 1, "health": 2, "odd": "x", "flag": True}}
+        self.hydra.Engine._connections.clear()
+        self.assertEqual(self.writer.capabilities(), {"queueInfo": 1, "health": 2})
+        self.assertNotIn("token", self.writer.hello())

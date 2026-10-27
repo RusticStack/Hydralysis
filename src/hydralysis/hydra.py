@@ -48,20 +48,106 @@ ASSETS = {
 SESSION_MODULE = Path("Ghidra", "Features", "HeadlessSession")
 
 
-class EngineError(RuntimeError):
-    """An ok:false answer from the engine. str() is JSON an agent can act on."""
+LIST_CAP = 5
 
-    def __init__(self, code: str, message: str, details: dict | None = None, command: str = ""):
+# Commands that may be sent again after the connection ended with no reply: they only read, or
+# they open/close what a new connection opens/closes to the same end. Everything else is not
+# retried, because the engine may have applied it before the reply was lost (spec 4.3): save,
+# import, fork_project, edit, rename, comment, analyze, discard_edits, promote_overlay, cancel
+# (a request id means something only on the connection that sent it) and shutdown.
+IDEMPOTENT_COMMANDS = frozenset({
+    "ping", "hello", "health", "status", "projects", "programs", "overlays", "journal",
+    "open_project", "open_program", "switch", "close_project", "close_program", "refresh", "reopen",
+    "project", "list", "info", "functions", "decompile"})
+# RusticQuery actions that do not change the program, even when the call runs as the owner.
+# apply_overlays and type_edit (a dry run only while contained) are deliberately absent.
+READ_ACTIONS = frozenset({
+    "overlay_state", "decompile", "function", "functions", "xrefs", "types", "type", "data", "scan",
+    "variables", "dossier", "blocks", "pcode", "trace", "vcalls", "vtables", "writes", "orphans", "fingerprints"})
+
+
+def _script_action(fields: dict) -> str | None:
+    """The RusticQuery action a `script` call carries, or None when it is not one."""
+    if fields.get("script") != "RusticQuery.java":
+        return None
+    args = fields.get("args") or ()
+    try:
+        body = str(args[0])
+        if body.startswith("@"):
+            body = Path(body[1:]).read_text(encoding="utf-8")
+        action = json.loads(body).get("action")
+    except (IndexError, OSError, ValueError, AttributeError):
+        return None
+    return action if isinstance(action, str) else None
+
+
+def idempotent(command: str, fields: dict | None = None) -> bool:
+    """Whether sending COMMAND again after a lost reply cannot do harm. Unknown means no."""
+    if command == "script":
+        return _script_action(fields or {}) in READ_ACTIONS
+    return command in IDEMPOTENT_COMMANDS
+
+
+def _capped(value, name: str, more: dict):
+    """Lists in an error stay short: five entries, and `more` says how many were left out."""
+    if isinstance(value, list):
+        if len(value) > LIST_CAP:
+            more[name] = len(value) - LIST_CAP
+        return [_capped(item, name, more) for item in value[:LIST_CAP]]
+    if isinstance(value, dict):
+        return {key: _capped(item, name + "." + key if name else key, more) for key, item in value.items()}
+    return value
+
+
+class EngineError(RuntimeError):
+    """An ok:false answer from the engine. str() is JSON an agent can act on.
+
+    Beside `code` and `details` it carries what a v3 engine adds to an error: `retry_after_ms`
+    (`error.retryAfterMs`, a sibling of `details`, present on `busy`), `next` (a ready request),
+    `queue` (`details.queue`), and from `details` the `holderInfo`, `heldMs` and `current` that
+    say who holds what. `ambiguous` (in `details`) means the connection ended while the call was
+    in flight and the engine may have applied it: read the state back before sending it again.
+    """
+
+    def __init__(self, code: str, message: str, details: dict | None = None, command: str = "",
+                 retry_after_ms: int | None = None, next: dict | None = None, queue: dict | None = None):
         self.code = code
+        self.message = message
+        self.command = command
         self.details = details or {}
+        self.retry_after_ms = retry_after_ms
+        self.next = next
+        self.queue = queue if queue is not None else self.details.get("queue")
+        self.holder_info = self.details.get("holderInfo")
+        held = self.details.get("heldMs")
+        if held is None and isinstance(self.holder_info, dict):
+            held = self.holder_info.get("heldMs")
+        self.held_ms = held
         payload = {"engine_error": code, "message": message, "command": command}
         if "output" in self.details and code == "failed":
             # A script that failed to compile says why only in its output.
             payload["output_tail"] = str(self.details["output"])[-2000:]
-        for key in ("holder", "suggest", "suggestion", "alternatives", "reason", "program", "project"):
+        for key in ("holder", "holderInfo", "suggest", "suggestion", "alternatives", "reason", "program", "project",
+                    "current", "running", "ambiguous"):
             if key in self.details:
                 payload[key] = self.details[key]
+        if self.held_ms is not None:
+            payload["heldMs"] = self.held_ms
+        if self.queue is not None:
+            payload["queue"] = self.queue
+        if retry_after_ms is not None:
+            payload["retryAfterMs"] = retry_after_ms
+        if next is not None:
+            payload["next"] = next
+        more: dict = {}
+        payload = _capped(payload, "", more)
+        if more:
+            payload["more"] = more
         super().__init__(json.dumps(payload, ensure_ascii=False))
+
+    @property
+    def ambiguous(self) -> bool:
+        return bool(self.details.get("ambiguous"))
 
 
 def engine_release(directory: Path) -> str | None:
@@ -265,10 +351,47 @@ class Engine:
             except Exception:
                 pass
 
+    @staticmethod
+    def _envelope(session, exc) -> dict:
+        """The whole `error` object of the reply that raised EXC, as far as the library kept it.
+
+        Library 1.0.0 puts only `code`, `message`, `details` and `trace` on SessionError and drops
+        the v3 siblings (`retryAfterMs`, `next`). It does keep the whole reply on `last_response`,
+        which another thread's reply may replace, so it counts only when it is this very error.
+        """
+        error = getattr(exc, "error", None)
+        if isinstance(error, dict):
+            return error
+        reply = getattr(session, "last_response", None)
+        error = reply.get("error") if isinstance(reply, dict) and reply.get("ok") is False else None
+        if isinstance(error, dict) and error.get("code") == exc.code and error.get("message") == exc.message:
+            return error
+        return {}
+
+    def _error(self, session, exc, command: str, ambiguous: bool = False) -> EngineError:
+        envelope = self._envelope(session, exc)
+        details = dict(exc.details or {})
+        message = exc.message
+        if ambiguous:
+            details["ambiguous"] = True
+            message = ("%s; the connection ended while %s was in flight, so the engine may or may not have applied it. "
+                       "Read the state back before sending it again" % (message, command))
+        retry = getattr(exc, "retry_after_ms", None)
+        return EngineError(exc.code, message, details, command,
+                           retry_after_ms=retry if retry is not None else envelope.get("retryAfterMs"),
+                           next=getattr(exc, "next", None) or envelope.get("next"),
+                           queue=getattr(exc, "queue", None))
+
     def call(self, command: str, raw: bool = False, **fields):
-        """A labelled, parallel request. Reconnects once if the daemon went away."""
+        """A labelled, parallel request. A read is sent again once if the daemon went away.
+
+        A call that may have changed something is never sent again: its reply was lost, not its
+        effect. It raises EngineError(code "closed", details.ambiguous true) and the caller
+        reconciles (4.3): re-read the marker, check whether the fork appeared.
+        """
         module = self.module()
         labels = {"client": _IDENTITY["client"], "harness": _IDENTITY["harness"], "parallel": True}
+        retry = idempotent(command, fields)
         for attempt in (0, 1):
             session = self.session()
             try:
@@ -276,15 +399,21 @@ class Engine:
                     return session.call_raw(command, **labels, **fields)
                 return session.call(command, **labels, **fields)
             except module.SessionError as exc:
-                if exc.code == "closed" and attempt == 0:
-                    self.reset()
+                if exc.code != "closed":
+                    raise self._error(session, exc, command) from exc
+                self.reset()
+                if retry and attempt == 0:
                     continue
-                raise EngineError(exc.code, exc.message, exc.details, command) from exc
-            except OSError:
-                if attempt == 0:
-                    self.reset()
+                raise self._error(session, exc, command, ambiguous=not retry) from exc
+            except OSError as exc:
+                self.reset()
+                if retry and attempt == 0:
                     continue
-                raise
+                if retry:
+                    raise
+                raise EngineError("closed", "the connection to the engine failed while %s was in flight (%s), so the engine "
+                                  "may or may not have applied it. Read the state back before sending it again" % (command, exc),
+                                  {"ambiguous": True, "cause": type(exc).__name__}, command) from exc
 
     def send(self, command: str, **fields) -> int:
         """Start a long request without waiting (an import, an export script); see wait/cancel."""
@@ -293,10 +422,12 @@ class Engine:
 
     def wait(self, request_id: int, command: str = ""):
         module = self.module()
+        session = self.session()
         try:
-            return self.session().wait(request_id)
+            return session.wait(request_id)
         except module.SessionError as exc:
-            raise EngineError(exc.code, exc.message, exc.details, command) from exc
+            # send/wait is never retried; a lost connection leaves the outcome unknown unless it was a read.
+            raise self._error(session, exc, command, ambiguous=exc.code == "closed" and not idempotent(command)) from exc
 
     def cancel(self, request_id: int) -> dict:
         return self.call("cancel", target=request_id)
@@ -308,6 +439,19 @@ class Engine:
         info = dict(getattr(self.session(), "hello", {}) or {})
         info.pop("token", None)
         return info
+
+    def capabilities(self) -> dict:
+        """What the engine advertises in hello (name -> version), or {} when it advertises nothing.
+
+        A protocol-2 engine (hydra.2, and hydra.3 as this client's library speaks to it) has no
+        `capabilities`: that is the degraded mode of 7.5, not an error, so an older engine never
+        makes this raise. A client uses a feature only if its name is here.
+        """
+        info = self.hello()
+        found = info.get("capabilities")
+        if not isinstance(found, dict) or (isinstance(info.get("protocol"), int) and info["protocol"] < 3):
+            return {}
+        return {str(name): value for name, value in found.items() if isinstance(value, int) and not isinstance(value, bool)}
 
     def stop(self, force: bool = False) -> dict:
         module = self.module()

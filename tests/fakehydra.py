@@ -27,6 +27,17 @@ class Daemon:
         # What hello reports; tests change it to model an engine upgrade between syncs.
         self.release = {"hydraVersion": "12.3-hydra.2", "ghidraVersion": "12.3"}
         self.fork_copy_ms = 7
+        # What a real hydra.Engine sees through FakeClientModule (see FakeSession):
+        # drops: connection losses to inject, {"command", "when": "before"|"after", "action": a script
+        #   action or None, "times", "oserror": raise ConnectionResetError instead of SessionError}. "after" runs the command in the daemon and then loses the reply.
+        # replies: ok:false envelopes to answer once, by command: the whole `error` object of a reply
+        #   ({"code", "message", "details", "retryAfterMs", "next"}); library 1.0.0 keeps only code,
+        #   message and details on SessionError and the rest on session.last_response.
+        # hello_extra: merged into hello (a protocol-3 engine adds "protocol": 3 and "capabilities").
+        self.drops: list[dict] = []
+        self.replies: dict[str, dict] = {}
+        self.hello_extra: dict = {}
+        self.sessions = 0
 
     def add_project(self, gpr: Path, programs: dict[str, dict]) -> dict:
         gpr.parent.mkdir(parents=True, exist_ok=True)
@@ -63,6 +74,108 @@ def reset() -> Daemon:
     global DAEMON
     DAEMON = Daemon()
     return DAEMON
+
+
+def busy_with_holder(retry_after_ms: int = 1000, held_ms: int = 4200, running: int = 7) -> dict:
+    """A v3 `busy` error object: who holds the program, the queue, and the retry hint beside details."""
+    holder = {"client": 3, "name": "hydralysis", "harness": "codex", "command": "script", "heldMs": held_ms}
+    return {"code": "busy", "message": "program p1:/owned.exe is held by client 3 (hydralysis, codex) script",
+            "details": {"reason": "lock_wait", "holder": "client 3 (hydralysis, codex) script", "holderInfo": holder,
+                        "queue": {"lane": "long", "position": 2, "ahead": 1, "estimatedWaitMs": None, "estimate": True},
+                        "running": ["client %d script X.java" % number for number in range(running)]},
+            "retryAfterMs": retry_after_ms, "next": {"cmd": "status"}}
+
+
+class FakeSession:
+    """The part of the Hydra client library's session that hydra.Engine uses (library 1.0.0).
+
+    It answers through a FakeEngine, so every command that reaches the daemon lands in
+    daemon.calls, a re-sent one twice. A lost reply is injected from daemon.drops: after one the
+    session is closed, the writer has left (changes made in shared mode stay in the daemon), and
+    the Engine must decide whether to send it again.
+    """
+
+    def __init__(self, module, daemon, client="", harness=""):
+        self.module = module
+        self.daemon = daemon
+        self.engine = FakeEngine({}, "session%d" % daemon.sessions)
+        self.engine.daemon = daemon
+        daemon.sessions += 1
+        self._closed = False
+        self.last_response = None
+        self.on_event = None
+        self.hello = {"protocol": 2, **daemon.release, "installId": "fake", **daemon.hello_extra}
+
+    @staticmethod
+    def _action(fields):
+        try:
+            body = fields["args"][0]
+            if body.startswith("@"):
+                body = Path(body[1:]).read_text(encoding="utf-8")
+            return json.loads(body).get("action")
+        except (KeyError, IndexError, OSError, ValueError, AttributeError):
+            return None
+
+    def _lose(self, oserror=False):
+        self._closed = True
+        self.engine.reset()
+        if oserror:
+            raise ConnectionResetError("the connection was reset")
+        raise self.module.SessionError("closed", "the session connection ended")
+
+    def call(self, command, **fields):
+        if self._closed:
+            raise self.module.SessionError("closed", "the session connection ended")
+        labels = {key: fields.pop(key) for key in ("client", "harness", "parallel") if key in fields}
+        drop = next((item for item in self.daemon.drops if item["command"] == command and
+                     item.get("action") in (None, self._action(fields))), None)
+        if drop is not None:
+            drop["times"] = drop.get("times", 1) - 1
+            if drop["times"] <= 0:
+                self.daemon.drops.remove(drop)
+            if drop["when"] == "before":
+                self._lose(drop.get("oserror", False))
+            try:
+                self.engine.call(command, **labels, **fields)
+            except EngineError:
+                pass
+            self._lose(drop.get("oserror", False))
+        reply = self.daemon.replies.pop(command, None)
+        if reply is not None:
+            self.daemon.calls.append((self.engine.role, command, fields))
+            self.last_response = {"id": 1, "ok": False, "error": reply}
+            raise self.module.SessionError(reply["code"], reply["message"], reply.get("details"))
+        try:
+            return self.engine.call(command, **labels, **fields)
+        except EngineError as exc:
+            self.last_response = {"id": 1, "ok": False, "error": {"code": exc.code, "message": exc.message,
+                                                                 "details": exc.details}}
+            raise self.module.SessionError(exc.code, exc.message, exc.details) from exc
+
+    call_raw = call
+
+    def close(self):
+        self._closed = True
+        self.engine.reset()
+
+
+class FakeClientModule:
+    """Stands in for the engine install's ghidra_session.py (hydra.load_client returns it)."""
+
+    class LaunchError(RuntimeError):
+        pass
+
+    class IncompatibleError(LaunchError):
+        pass
+
+    class SessionError(Exception):
+        def __init__(self, code, message, details=None, trace=None):
+            super().__init__("%s: %s" % (code, message))
+            self.code, self.message, self.details, self.trace = code, message, details or {}, trace
+
+    @classmethod
+    def connect(cls, client="", harness="", **_):
+        return FakeSession(cls, DAEMON, client, harness)
 
 
 class FakeEngine:
