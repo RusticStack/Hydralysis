@@ -21,6 +21,17 @@ SERVER_INFO = {"name": "hydralysis", "version": __version__}
 MAX_OUTPUT_BYTES = 128 * 1024
 TOOL_WORKERS = 4
 MAX_OUTSTANDING = 8
+# Two lanes, each with its own workers and its own outstanding budget, so calls that
+# block on the Hydra daemon can never starve or crowd out the offline PE tools.
+FAST_WORKERS = 4
+RETRY_AFTER_MS = 2000
+# Tools that talk to the engine (directly or through a workflow). Everything else is
+# local/offline (PE-only tools and the evidence store) and runs on the fast lane.
+ENGINE_TOOLS = frozenset({"ghidra_run", "ghidra_query", "backend", "prepare", "job", "runtime"})
+
+
+def lane_of(name) -> str:
+    return "engine" if isinstance(name, str) and name in ENGINE_TOOLS else "fast"
 
 
 class Server:
@@ -74,7 +85,8 @@ class Server:
         stdin = stdin if stdin is not None else sys.stdin.buffer
         stdout = stdout if stdout is not None else sys.stdout.buffer
         output_lock = threading.Lock()
-        slots = threading.BoundedSemaphore(MAX_OUTSTANDING)
+        slots = {"fast": threading.BoundedSemaphore(MAX_OUTSTANDING),
+                 "engine": threading.BoundedSemaphore(MAX_OUTSTANDING)}
 
         def write(response, framed):
             if response is not None:
@@ -92,15 +104,18 @@ class Server:
                     response = None
             write(response, framed)
 
-        def work(message, framed):
+        def work(message, framed, lane):
             try:
                 dispatch(message, framed)
             finally:
-                slots.release()
+                slots[lane].release()
 
-        # Keep reading control messages while bounded workers run expensive tools.
-        # A queue bound matters: ThreadPoolExecutor's own queue is unbounded.
-        with ThreadPoolExecutor(max_workers=TOOL_WORKERS, thread_name_prefix="hydralysis") as pool:
+        # Keep reading control messages while bounded workers run tools. Each lane has
+        # a queue bound because ThreadPoolExecutor's own queue is unbounded. Leaving the
+        # with block waits for every accepted call, so shutdown answers them all first.
+        with ThreadPoolExecutor(max_workers=FAST_WORKERS, thread_name_prefix="hydralysis-fast") as fast_pool, \
+                ThreadPoolExecutor(max_workers=TOOL_WORKERS, thread_name_prefix="hydralysis-engine") as engine_pool:
+            pools = {"fast": fast_pool, "engine": engine_pool}
             while True:
                 try:
                     message, framed = _read_envelope(stdin)
@@ -119,12 +134,14 @@ class Server:
                     # Notifications never receive replies or consume a tool slot.
                     continue
                 if message["method"] == "tools/call":
-                    if slots.acquire(blocking=False):
-                        pool.submit(work, message, framed)
+                    lane = lane_of(message["params"].get("name") if "params" in message else None)
+                    if slots[lane].acquire(blocking=False):
+                        pools[lane].submit(work, message, framed, lane)
                     else:
                         write(_tool_result(message["id"],
-                            "Server busy: %d tool calls are outstanding. "
-                            "Wait for a result before retrying this call." % MAX_OUTSTANDING,
+                            "Server busy: %d %s tool calls are outstanding. "
+                            "Retry this call in about %d ms (retryAfterMs=%d), or after a result arrives."
+                            % (MAX_OUTSTANDING, lane, RETRY_AFTER_MS, RETRY_AFTER_MS),
                             error=True), framed)
                 else:
                     dispatch(message, framed)
