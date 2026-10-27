@@ -8,7 +8,7 @@ Register an analysed project in place, or give Hydralysis an executable and expl
 
 ## Upgrading from RusticRE
 
-Version 0.5.0.dev0 is a rename only: no tool, argument or result changed. Old names keep working for this one release, and each one that is actually used is announced once on stderr and listed under `deprecated` by `backend inspect`.
+Version 0.5.0.dev0 renames the project and also makes behaviour changes that are not source compatible: `expect_revision` is now required on every `type_edit` and `revert`, two stock-Ghidra settings are no longer honoured, and some answers gain fields (see the last rows of the table). The 20 tools keep their names. The old names from the rename keep working for this one release, and each one that is actually used is announced once on stderr and listed under `deprecated` by `backend inspect`.
 
 | Was | Now | Still honoured |
 | --- | --- | --- |
@@ -18,6 +18,9 @@ Version 0.5.0.dev0 is a rename only: no tool, argument or result changed. Old na
 | `rusticre.local.json` | `hydralysis.local.json` | yes, if the new file is absent |
 | Data root `%LOCALAPPDATA%\RusticRE` (and the macOS and Linux equivalents) | `Hydralysis` | yes: an existing RusticRE root is used where it is when no Hydralysis root exists. Nothing is moved or copied, so there is one root and one daemon. |
 | MCP server name `rusticre`, tool names `mcp__rusticre__*` in Claude Code | server `hydralysis`, tool names `mcp__hydralysis__*` | no: re-register the server under the new name, and update any allow-lists or prompts that name the old tool prefix |
+| `type_edit` and `revert` without `expect_revision` on the shared view (it was only required on named views) | `expect_revision` is **required on every view**; omitting it fails with `expect_revision_required`, which reports `current_revision`/`view_revision` to retry with | no (breaking): read `view_revision` from `status` or the last answer and pass it as `expect_revision`. A stale revision is rebased when no later edit touched the same subject, otherwise it is rejected with a `conflict` |
+| Status, edit and revert answers; `backend inspect` | gain `view_revision` and `latest_editor` (status also `overlays.latest_editor`); `backend inspect` gains `ignored` and, when non-empty, `deprecated` | additive: existing fields are unchanged, but strict result parsers must accept the new keys |
+| `ghidra_dir` in the config file and the `GHIDRA_INSTALL_DIR` environment variable, used to find an engine | Hydra Engine only (`hydra_dir`, `HYDRALYSIS_HYDRA_DIR`, or the installed engine); a stock Ghidra is never probed or used | no: both settings are ignored and listed under `ignored` by `backend inspect`; point `hydra_dir` at a Hydra Engine install instead |
 
 The engine daemon's instance id and the client attribution prefix stay `rusticre` for this release (`hydra.INSTANCE`), so a daemon a RusticRE install left running is reused instead of a second one being started. The Hydra program option and save comments written into existing projects are unchanged too.
 
