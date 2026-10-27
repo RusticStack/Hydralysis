@@ -73,6 +73,15 @@ def operation_help(component: str = "analysis") -> dict:
             "diff": {"against": "the other build's target (the source)", "against_view": "optional source annotation view; shared by default", "view": "optional destination annotation view; shared by default", "checks": "optional source prologue table; destination candidates require independent review, not ready-to-install checks; runs as a job"},
             "export": {"mode": "decompile/functions/types", "limit": "maximum records, default 100000", "contains": "optional function/type filter", "regex": "optional name/path regex", "start/end": "optional inclusive function VA range", "out": "optional absolute .jsonl output path", "timeout_s": "per-query deadline 1..300", "resume": "existing export job id; source/options identity must match"},
         },
+        "catalog": "backend help and backend status report catalog {epoch, hash}: the epoch counts changes to the advertised tool table and the hash fingerprints it. Running MCP sessions cache the tool list, so after an epoch change restart the harness once; features after epoch 1 arrive only through options and never change the table again",
+        "carriers": {
+            "note": "Where later features live. A carrier whose capability is not implemented answers {not_available: <capability>, message} as a result, not an error, and does nothing. The options objects are free-form in the schema.",
+            "backend action=doctor": "read-only health findings [{id, level, what, why, fix}]; options.sections/verbose; not_available until the doctor ships",
+            "backend action=backups": "options.op = list (default) | verify, plus selectors; lists and re-hashes backups and generations; unfinished candidates are listed, never deleted; not_available until backups ship",
+            "ghidra_run options": "{isolation: private|shared|exclusive, readonly: bool}; validated, then not_available (the script is not run) until the engine reports scriptIsolation; no options = today's contained mode",
+            "job options": "reserved for status/cancel filters of commit and backup jobs (kind, cid); non-empty options answer not_available today",
+            "ghidra_query options": "planned: type_edit kinds commit, commit_revert, rebase, publish, merge, export_bundle, import_bundle (no address needed); status options.show = changes|views|lineage|queue|health; carried by the existing options object, not yet implemented unless listed under actions",
+        },
         "type_persistence": "Edits are full-build-hash-bound overlays replayed only in worker memory. The canonical project is not saved or mutated.",
         "flow_limits": "Recovered high-pcode dependencies and direct-call bindings are evidence, not proof of runtime reachability, complete aliasing, or indirect targets.",
     }

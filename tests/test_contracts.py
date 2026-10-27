@@ -6,11 +6,131 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from hydralysis.api import _settings, call, tool_table
+from hydralysis import api
+from hydralysis.api import _settings, call, catalog, catalog_hash, tool_table
 from hydralysis.cli import main
 from hydralysis.mcp import Server
 
 from support import workdir
+
+# One row per catalog epoch: the SHA-256 of the advertised tool table (api.catalog_hash). Running MCP
+# sessions cache tools/list, so the table may change only by adding the next epoch here AND raising
+# api.CATALOG_EPOCH. Never edit an existing row: that is how a silent schema change would pass.
+# Epoch 0 is the table of Hydralysis 0.5 before the protocol-3 catalog epoch (d0466bc).
+CATALOG_HISTORY = {
+    0: "f2fbf7471829d41e7c2210a2883b10133fd9e5cf4a5824882e519ce12c2f4fde",
+    1: "a16c22e45a57780b88e9bebc91df85ecbe0e3fa115ef18b79a6bebbb10d0086e",
+}
+
+
+class CatalogEpoch(unittest.TestCase):
+    def test_table_matches_its_epoch_so_a_change_needs_a_new_epoch(self):
+        self.assertEqual(api.CATALOG_EPOCH, max(CATALOG_HISTORY), "CATALOG_EPOCH must be the newest epoch in CATALOG_HISTORY")
+        self.assertEqual(len(set(CATALOG_HISTORY.values())), len(CATALOG_HISTORY), "an epoch must change the table")
+        self.assertEqual(catalog_hash(), CATALOG_HISTORY[api.CATALOG_EPOCH],
+                         "the advertised tool table changed without a new catalog epoch: add the next epoch to "
+                         "CATALOG_HISTORY and raise api.CATALOG_EPOCH (running sessions cache tools/list)")
+
+    def test_hash_covers_names_descriptions_and_schemas_and_ignores_key_order(self):
+        base = tool_table()
+        self.assertEqual(catalog_hash(base), catalog_hash())
+        for field in ("name", "description", "inputSchema"):
+            altered = json.loads(json.dumps(base))
+            altered[0][field] = {"type": "object"} if field == "inputSchema" else "changed"
+            self.assertNotEqual(catalog_hash(altered), catalog_hash(), field)
+        reordered = json.loads(json.dumps(base))
+        properties = reordered[0]["inputSchema"]["properties"]
+        reordered[0]["inputSchema"]["properties"] = dict(reversed(list(properties.items())))
+        self.assertEqual(catalog_hash(reordered), catalog_hash())
+        extra = json.loads(json.dumps(base))
+        extra[3]["inputSchema"]["properties"]["added"] = {"type": "string"}
+        self.assertNotEqual(catalog_hash(extra), catalog_hash())
+
+    def test_status_and_help_report_the_catalog(self):
+        expected = {"epoch": api.CATALOG_EPOCH, "hash": catalog_hash()}
+        self.assertEqual(catalog(), expected)
+        with patch("hydralysis.api.load", return_value={}):
+            helped = json.loads(call("backend", {"action": "help"}))
+            self.assertEqual(helped["catalog"], expected)
+            self.assertIn("carriers", helped)
+            self.assertEqual(json.loads(call("backend", {"action": "help", "component": "runtime"}))["catalog"], expected)
+            engine = Mock()
+            engine.call.return_value = {"protocol": 2, "hydraVersion": "x", "projects": [], "programs": [], "clients": []}
+            with patch("hydralysis.api._settings", return_value={}), patch("hydralysis.hydra.Engine", return_value=engine):
+                status = json.loads(call("backend", {"action": "status"}))
+        self.assertEqual(status["catalog"], expected)
+
+    def test_new_surface_rides_options_and_two_enum_values_on_the_same_twenty_tools(self):
+        table = {tool["name"]: tool["inputSchema"]["properties"] for tool in tool_table()}
+        self.assertEqual(list(table), list(api.TOOL_NAMES))
+        for name in ("backend", "ghidra_run", "job", "ghidra_query", "runtime"):
+            self.assertEqual(table[name]["options"], {"type": "object"}, name)
+        self.assertEqual(table["backend"]["action"]["enum"],
+                         ["inspect", "install", "status", "stop", "help", "doctor", "backups"])
+        reply = Server().handle({"id": 1, "method": "tools/list"})
+        self.assertEqual(reply["result"]["tools"], tool_table())
+        self.assertEqual(set(api.OPTION_BAGS), {"ghidra_query", "backend", "ghidra_run", "job", "runtime"})
+
+
+class NotAvailableCarriers(unittest.TestCase):
+    def setUp(self):
+        patcher = patch("hydralysis.api.load", return_value={})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_doctor_and_backups_answer_not_available_without_side_effects(self):
+        with patch("hydralysis.api._settings") as settings, patch("hydralysis.hydra.Engine") as engine:
+            doctor = json.loads(call("backend", {"action": "doctor"}))
+            listed = json.loads(call("backend", {"action": "backups"}))
+            verified = json.loads(call("backend", {"action": "backups", "options": {"op": "verify", "id": "x"}}))
+        settings.assert_not_called()
+        engine.assert_not_called()
+        self.assertEqual(doctor["not_available"], "doctor")
+        self.assertEqual((listed["not_available"], listed["op"]), ("backups", "list"))
+        self.assertEqual(verified["op"], "verify")
+        for reply in (doctor, listed, verified):
+            self.assertIn("not implemented", reply["message"])
+            self.assertEqual(reply["catalog"], catalog())
+            self.assertEqual(reply["tool"], "backend")
+
+    def test_through_mcp_it_is_a_result_not_an_error(self):
+        reply = Server().handle({"id": 1, "method": "tools/call", "params": {
+            "name": "backend", "arguments": {"action": "doctor"}}})
+        self.assertFalse(reply["result"]["isError"])
+        self.assertIn("not_available", reply["result"]["content"][0]["text"])
+
+    def test_options_are_validated_before_anything_else(self):
+        for args in ({"action": "backups", "options": {"op": "delete"}}, {"action": "doctor", "options": []},
+                     {"action": "inspect", "options": "x"}):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                call("backend", args)
+        with self.assertRaisesRegex(ValueError, "backend action must be"):
+            call("backend", {"action": "repair"})
+
+    def test_ghidra_run_options_are_never_silently_ignored(self):
+        with patch("hydralysis.api._settings", return_value={}), patch("hydralysis.userscripts.run", return_value="ran") as run:
+            self.assertEqual(call("ghidra_run", {"target": "t", "script": "s.py"}), "ran")
+            self.assertEqual(call("ghidra_run", {"target": "t", "script": "s.py", "options": {}}), "ran")
+            run.reset_mock()
+            reply = json.loads(call("ghidra_run", {"target": "t", "script": "s.py",
+                                                  "options": {"isolation": "private", "readonly": True}}))
+            self.assertEqual(reply["not_available"], "scriptIsolation")
+            self.assertIn("script was not run", reply["message"])
+            self.assertEqual(reply["options"], ["isolation", "readonly"])
+            for bad in ({"isolation": "other"}, {"readonly": "yes"}, []):
+                with self.subTest(bad=bad), self.assertRaises(ValueError):
+                    call("ghidra_run", {"target": "t", "script": "s.py", "options": bad})
+            run.assert_not_called()
+
+    def test_job_options_are_reserved_and_plain_job_calls_are_unchanged(self):
+        reply = json.loads(call("job", {"options": {"kind": "commit"}}))
+        self.assertEqual((reply["not_available"], reply["options"]), ("jobOptions", ["kind"]))
+        with patch("hydralysis.preparation.status", return_value={"state": "done"}) as status:
+            self.assertEqual(json.loads(call("job", {"id": "setup-0123456789ab"})), {"state": "done"})
+            self.assertEqual(json.loads(call("job", {"id": "setup-0123456789ab", "options": {}})), {"state": "done"})
+        self.assertEqual(status.call_count, 2)
+        with self.assertRaises(ValueError):
+            call("job", {"options": "x"})
 
 
 class AgentContracts(unittest.TestCase):
