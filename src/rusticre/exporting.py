@@ -207,9 +207,11 @@ def _new(settings: dict, target: str, project: dict, identity: dict, selected: d
               "failed": 0, "truncated": 0, "output_bytes": 0, "cancel_requested": False,
               "output_path": selected.get("out") or str(path.parent / (selected["mode"] + ".jsonl")),
               "imports_path": str(path.parent / "imports.json"), "log_path": str(path.parent / "worker.log")}
+    from rusticre import jobowner
+    token = jobowner.issue(record)
     write_json(path, record)
     with locked(path.parent / ".control.lock"):
-        return _launch(path, record, settings)
+        return {**_launch(path, record, settings), "owner_token": token}
 
 
 def status(settings: dict, job_id: str) -> dict:
@@ -223,7 +225,8 @@ def status(settings: dict, job_id: str) -> dict:
         if not alive and not _held(str(path.parent / ".run.lock")):
             record = update(path, state="interrupted", stage="interrupted", error="export worker exited; output preserved; resume this id to continue")
     # Worker settings are internal configuration, not part of every MCP reply.
-    result = {key: value for key, value in record.items() if key != "settings"}
+    from rusticre.jobowner import public
+    result = public({key: value for key, value in record.items() if key != "settings"})
     log = Path(record["log_path"])
     if log.is_file():
         with log.open("rb") as handle:
@@ -232,8 +235,10 @@ def status(settings: dict, job_id: str) -> dict:
     return result
 
 
-def cancel(settings: dict, job_id: str) -> dict:
+def cancel(settings: dict, job_id: str, owner: str = "") -> dict:
+    from rusticre.jobowner import check
     path = job_path(settings, job_id)
+    check(read_json(path), owner)
     record = status(settings, job_id)
     if record.get("state") in ACTIVE:
         update(path, cancel_requested=True, state="cancelling", stage="waiting for the current bounded query")

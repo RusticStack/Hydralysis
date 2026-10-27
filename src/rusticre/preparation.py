@@ -108,10 +108,13 @@ def status(settings: dict, job_id: str = "", limit: int = 20) -> dict:
             tail = handle.read().decode("utf-8", "replace")
         record["progress_tail"] = "\n".join(tail.splitlines()[-12:])
     record["elapsed_s"] = round(record.get("finished_at", time.time()) - record["created_at"], 2)
-    return record
+    from rusticre.jobowner import public
+    return public(record)
 
 
-def cancel(settings: dict, job_id: str) -> dict:
+def cancel(settings: dict, job_id: str, owner: str = "") -> dict:
+    from rusticre.jobowner import check
+    check(read_json(job_path(settings, job_id)), owner)
     record = status(settings, job_id)
     if record["state"] not in ACTIVE:
         return record
@@ -171,7 +174,9 @@ def start_install(settings: dict, component: str = "analysis") -> dict:
         record = {"job_id": job_id, "kind": "install", "component": component, "state": "queued", "stage": "setup",
                   "created_at": time.time(), "install": True,
                   "log_path": str(job_path(settings, job_id).parent / "worker.log")}
-        return _launch(settings, record)
+        from rusticre import jobowner
+        token = jobowner.issue(record)
+        return {**_launch(settings, record), "owner_token": token}
 
 
 _WRAPPERS = (b".bind", b"upx0", b"upx1", b"upx2", b".aspack", b".adata", b".vmp0", b".vmp1", b".themida")
@@ -285,7 +290,9 @@ def prepare(settings: dict, exe: str, target: str = "", timeout_s: int = 3600, i
             index[digest] = job_id
             write_json(index_path, index)
             return record
-        result = _launch(settings, record)
+        from rusticre import jobowner
+        token = jobowner.issue(record)
+        result = {**_launch(settings, record), "owner_token": token}
         index[digest] = job_id
         write_json(index_path, index)
         return result

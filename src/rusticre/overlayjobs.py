@@ -67,6 +67,8 @@ def start(settings: dict, target: str, kind: str, address: str = "", options: di
         record = {"id": job_id, "kind": kind, "target": target, "address": address, "options": options or {},
                   "state": "queued", "created_at": time.time(), "by": hydra.identity(),
                   "log_path": str(path.parent / "worker.log")}
+        from rusticre import jobowner
+        token = jobowner.issue(record)
         write_json(path, record)
         keys = ("root", "hydra_dir", "hydra_client", "java_home", "hydra_idle_s", "hydra_keep_warm_s", "hydra_max_heap",
                 "hydra_allow_unpinned", "hydra", "fork_mode", "fork_max_copy_mb", "forbidden_drives", "targets", "overlay_save_debounce_s")
@@ -77,7 +79,7 @@ def start(settings: dict, target: str, kind: str, address: str = "", options: di
             child = proc.popen([sys.executable, "-m", "rusticre.overlayjobs", str(path)], env=env, stdout=log, stderr=log,
                                **({} if os.name == "nt" else {"start_new_session": True}))
         _update(path, worker_pid=child.pid, worker_started_ms=proc_start(child.pid))
-        return status(settings, job_id)
+        return {**status(settings, job_id), "owner_token": token}
 
 
 def proc_start(pid: int) -> int:
@@ -94,11 +96,14 @@ def status(settings: dict, job_id: str) -> dict:
         record = _update(path, state="interrupted", error="worker exited; the engine rolled back its uncommitted work",
                          finished_at=time.time())
     record["elapsed_s"] = round(record.get("finished_at", time.time()) - record["created_at"], 2)
-    return record
+    from rusticre.jobowner import public
+    return public(record)
 
 
-def cancel(settings: dict, job_id: str) -> dict:
+def cancel(settings: dict, job_id: str, owner: str = "") -> dict:
+    from rusticre.jobowner import check
     path = job_path(settings, job_id)
+    check(read_json(path), owner)
     record = status(settings, job_id)
     if record.get("state") in ACTIVE:
         (path.parent / "cancel.request").write_text("cancel\n", encoding="utf-8")

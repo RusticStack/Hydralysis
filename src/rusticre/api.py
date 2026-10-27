@@ -96,7 +96,7 @@ def tool_table() -> list[dict]:
         tool("sigscan", "Find a byte pattern in executable sections. ?? is a wildcard. Use this to locate a hook site.", {
             "exe": string, "pattern": string, "limit": integer,
         }, ["exe", "pattern"]),
-        tool("prologue", "Verify one prologue or checks[{address,expect (or accepted list),name?}] against one PE build's file bytes; with session, also live bytes and who patched them. Any mismatch fails; nothing is hooked.", {
+        tool("prologue", "Verify one prologue or checks[{address,expect (or a list),name?}] against a PE build's file bytes; with session, live bytes and who patched them. Any mismatch fails.", {
             "exe": string, "address": pe_address, "expect": string,
             "checks": {"type": "array", "items": {"type": "object"}},
             "sha256": string, "image_base": string, "session": string,
@@ -106,7 +106,7 @@ def tool_table() -> list[dict]:
             "note": string, "source": string, "address": string, "prologue": string, "db": string,
             "subsystem": string, "supersedes": integer,
         }, ["target", "build", "kind", "name", "note", "source"]),
-        tool("evidence_list", "Claims, newest first, filtered by target/subsystem/address/build; superseded ones only on request. export=<path.md> writes a subsystem's claims (and .jsonl).", {
+        tool("evidence_list", "Claims, newest first, by target/subsystem/address/build; superseded ones on request. export=<path.md> writes a subsystem (and .jsonl).", {
             "target": string, "limit": integer, "db": string, "subsystem": string, "address": string, "build": string,
             "include_superseded": {"type": "boolean"}, "export": string}),
         tool("ghidra_run", "Run one of your Ghidra scripts on a target's saved analysis, contained (rolled back). No import, no copy.", {
@@ -129,8 +129,8 @@ def tool_table() -> list[dict]:
             "action": {"type": "string", "enum": ["plan", "start", "adopt"]},
             "path": string, "sha256": string, "program": string,
         }),
-        tool("job", "Durable setup/analysis job status, bounded logs or cancellation. An empty id lists recent jobs.", {
-            "action": {"type": "string", "enum": ["status", "cancel"]}, "id": string, "limit": integer,
+        tool("job", "Job status, bounded logs or cancel (needs owner, its start's owner_token). No id lists every client's jobs.", {
+            "action": {"type": "string", "enum": ["status", "cancel"]}, "id": string, "limit": integer, "owner": string,
         }),
         tool("runtime", "Own-process debugging/instrumentation sessions: spawn/attach, modules, memory, verified probes/breakpoints, registers, continue and detach. Use backend help for options.", {
             "action": string, "options": {"type": "object"},
@@ -352,11 +352,11 @@ def _workflow(name: str, args: dict) -> str:
                 raise ValueError("job id is required for cancellation")
             if job_id.startswith("export-"):
                 from rusticre.exporting import cancel as cancel_export
-                return json.dumps(cancel_export(settings, job_id), indent=2)
+                return json.dumps(cancel_export(settings, job_id, str(args.get("owner") or "")), indent=2)
             if job_id.startswith("overlay-"):
                 from rusticre.overlayjobs import cancel as cancel_overlay
-                return json.dumps(cancel_overlay(settings, job_id), indent=2)
-            return json.dumps(cancel(settings, job_id), indent=2)
+                return json.dumps(cancel_overlay(settings, job_id, str(args.get("owner") or "")), indent=2)
+            return json.dumps(cancel(settings, job_id, str(args.get("owner") or "")), indent=2)
         if action != "status":
             raise ValueError("job action must be status or cancel")
         if not job_id:
@@ -377,7 +377,7 @@ def _workflow(name: str, args: dict) -> str:
                               key=lambda item: item.stat().st_mtime_ns, reverse=True)[:limit]
             records.extend(overlay_status(settings, item.parent.name) for item in overlays)
             records.sort(key=lambda item: item.get("created_at", item.get("started_at", 0)), reverse=True)
-            fields = ("id", "job_id", "kind", "component", "state", "stage", "target", "game", "script",
+            fields = ("id", "job_id", "kind", "component", "state", "stage", "target", "game", "script", "owner",
                       "created_at", "started_at", "elapsed_s", "duration_s", "completed", "failed", "complete", "log_path")
             return json.dumps({"jobs": [{key: item[key] for key in fields if key in item} for item in records[:limit]],
                                "detail": "Pass an id to job status for bounded logs and full metadata."}, indent=2)
