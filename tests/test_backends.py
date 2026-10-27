@@ -1,5 +1,6 @@
 import hashlib
 import io
+import json
 import os
 import unittest
 import zipfile
@@ -57,11 +58,41 @@ class BackendSetupTests(unittest.TestCase):
         self.assertEqual(dict(os.environ), before)
         self.assertEqual(backends.read_json(Path(settings["root"]) / "backend.json")["java_home"], str(Path(settings["java_home"]).resolve()))
 
-    def test_stock_ghidra_is_reported_not_used(self):
+    def test_stock_ghidra_given_as_the_engine_is_rejected(self):
         report = self.inspect(self.installed(release=None))
         self.assertFalse(report["ready"])
         self.assertIsNone(report["engine"])
         self.assertTrue(any("stock Ghidra" in item.get("reason", "") for item in report["checks"]))
+
+    def scrubbed_inspect(self, settings, **environment):
+        """Real discovery with no ambient environment: only PATH (emptied) and what the test sets."""
+        with patch.dict(os.environ, {"PATH": "", **environment}, clear=True), patch("hydralysis.backends._children", return_value=[]):
+            return backends.inspect(settings)
+
+    def test_stock_ghidra_settings_are_ignored_and_change_nothing(self):
+        settings = self.installed()
+        bogus = str(self.root / "no-such-ghidra")
+        baseline = self.scrubbed_inspect(settings)
+        self.assertTrue(baseline["ready"], baseline)
+        self.assertEqual(baseline["ignored"], [])
+        observed = self.scrubbed_inspect({**settings, "ghidra_dir": bogus}, GHIDRA_INSTALL_DIR=bogus)
+        self.assertEqual({key: value for key, value in observed.items() if key != "ignored"},
+                         {key: value for key, value in baseline.items() if key != "ignored"})
+        self.assertEqual(sorted(item["setting"] for item in observed["ignored"]), ["GHIDRA_INSTALL_DIR", "ghidra_dir"])
+        for item in observed["ignored"]:
+            self.assertIn("is ignored", item["notice"])
+        self.assertNotIn(bogus, json.dumps(observed["checks"]))
+
+    def test_a_valid_engine_named_only_by_stock_ghidra_settings_is_never_discovered(self):
+        settings = self.installed()
+        engine = settings.pop("hydra_dir")
+        report = self.scrubbed_inspect(settings, GHIDRA_INSTALL_DIR=engine)
+        self.assertIsNone(report["engine"])
+        self.assertFalse(report["ready"])
+        report = self.scrubbed_inspect({**settings, "ghidra_dir": engine})
+        self.assertIsNone(report["engine"])
+        self.assertEqual([item["setting"] for item in report["ignored"]], ["ghidra_dir"])
+        self.assertEqual(report["checks"], [])
 
     def test_unpinned_hydra_release_is_refused_unless_allowed(self):
         settings = self.installed(release="12.4-hydra.1", client_release="12.4-hydra.1")

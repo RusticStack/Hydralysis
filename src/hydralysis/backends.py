@@ -1,8 +1,8 @@
 """Discover or privately install the engines Hydralysis uses, never their MCPs.
 
 Analysis runs on Hydra Engine (pinned release, see hydra.py) with a full JDK.
-A stock Ghidra install is reported, not used: Hydralysis no longer drives
-analyzeHeadless or copies projects into snapshots.
+A stock Ghidra install is never a candidate: it is not probed, opened or used,
+and the old stock-Ghidra settings are ignored with a notice (see `_ignored`).
 """
 
 from __future__ import annotations
@@ -96,9 +96,22 @@ def _native_compatible(path: Path) -> bool:
 def _engine_candidates(settings: dict, root: Path, saved: dict) -> list:
     candidates = [settings.get("hydra_dir"), compat.env("HYDRA_DIR"), saved.get("hydra_dir")]
     candidates += _children(root / "backends", "hydra-[0-9]*")
-    # An older config's ghidra_dir is still examined, so its report says what it is.
-    candidates += [settings.get("ghidra_dir"), os.environ.get("GHIDRA_INSTALL_DIR")]
     return candidates
+
+
+def _ignored(settings: dict) -> list[dict]:
+    """Stock-Ghidra settings a user may still have. They are never read for discovery.
+
+    This is the only place that names them, so the user is told they have no effect.
+    """
+    notices = []
+    for setting, source, present in (("ghidra_dir", "config", settings.get("ghidra_dir")),
+                                     ("GHIDRA_INSTALL_DIR", "environment", os.environ.get("GHIDRA_INSTALL_DIR"))):
+        if present:
+            notices.append({"setting": setting, "source": source,
+                            "notice": "%s (%s) is ignored: Hydralysis runs Hydra Engine only and never uses a stock Ghidra; "
+                                      "use hydra_dir or HYDRALYSIS_HYDRA_DIR to point at an engine" % (setting, source)})
+    return notices
 
 
 def _client_candidates(settings: dict, root: Path, saved: dict, engine: str | None) -> list:
@@ -163,7 +176,7 @@ def inspect(settings: dict) -> dict:
         checks.append({"component": "jdk", "path": str(path), "ready": False,
                        "reason": "full JDK missing or outside the engine's Java bounds (%s+)" % minimum})
     return {"root": str(root), "ready": bool(engine and client and java), "engine": engine, "client": client, "jdk": java,
-            "checks": checks[:12], "pinned_release": hydra.RELEASE, "protocol": hydra.PROTOCOL,
+            "checks": checks[:12], "ignored": _ignored(settings), "pinned_release": hydra.RELEASE, "protocol": hydra.PROTOCOL,
             "portable_install_supported": os.name == "nt" and platform.machine().lower() in ("amd64", "x86_64")}
 
 

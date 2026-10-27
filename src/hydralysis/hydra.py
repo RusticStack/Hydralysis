@@ -100,7 +100,7 @@ def inspect_engine(directory: str | Path, allow_unpinned: bool = False) -> dict:
                   java_max=int(application["application.java.max"]) if application.get("application.java.max") else None)
     if release is None:
         return {**report, "reason": "a stock Ghidra without Hydra's HeadlessSession module; Hydralysis drives Hydra Engine "
-                                    "%s (backend install), never analyzeHeadless" % RELEASE}
+                                    "%s (backend install); a stock Ghidra is never used" % RELEASE}
     if release != RELEASE and not allow_unpinned:
         return {**report, "reason": "Hydra Engine %s; this Hydralysis pins %s (set hydra_allow_unpinned to try it)" % (release, RELEASE)}
     native = path / "Ghidra" / "Features" / "Decompiler" / "os"

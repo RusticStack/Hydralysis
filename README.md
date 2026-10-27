@@ -2,9 +2,9 @@
 
 *Formerly RusticRE.* The GitHub repository keeps the old name until it is renamed; links to it keep working after that.
 
-Twenty reverse-engineering tools for programs you own. One CLI, `hydralysis`, one small MCP server and a Python API over the same operations. Hydra Engine (a headless Ghidra 12.3 session daemon) and an optional runtime engine run behind it; REA and GhidraMCP are not dependencies.
+Twenty reverse-engineering tools for programs you own. One CLI, `hydralysis`, one small MCP server and a Python API over the same operations. Hydra Engine and an optional runtime engine run behind it; REA and GhidraMCP are not dependencies. Hydra Engine is a fork of Ghidra (12.3 DEV, Apache-2.0, with a headless session daemon), so Hydralysis is built on Ghidra's analysis and decompiler, not independent of them. It uses no stock Ghidra and needs none (see [Third-party sources](THIRD_PARTY.md)).
 
-Register an analysed project in place, or give Hydralysis an executable and explicitly prepare its analysis once. Every later question goes to one shared engine that keeps the program open: a warm decompile takes milliseconds, and any number of CLI calls, MCP sessions and scripts share it. Corrections you make (types, names, prototypes) are cited overlays in a working copy; the analysed project itself is never written.
+Register an analysed project in place, or give Hydralysis an executable and explicitly prepare its analysis once. Every later question goes to one shared engine that keeps the program open: a warm decompile takes about a millisecond for a tiny function and tens of milliseconds for a large one (size-dependent; see [Measured, not promised](#measured-not-promised)), and any number of CLI calls, MCP sessions and scripts share it. Corrections you make (types, names, prototypes) are cited overlays in a working copy; the analysed project itself is never written, and nothing yet commits those corrections back to it (see [Correct the analysis](#correct-the-analysis)).
 
 ## Upgrading from RusticRE
 
@@ -93,9 +93,21 @@ Function/xref/type pages and scans disclose truncation and continuation. Default
 
 `type_edit` records cited structures, prototypes, local types, function names, data labels, comments, data definitions and exact-byte-checked function definitions. Batches take up to 200 edits, including a JSON file, and roll back as a unit. `import_types` loads a whole type corpus (JSONL, see [type corpus](docs/type-corpus.md)) as one job and one revertible step. `expect_revision` turns a concurrent edit into a conflict that names its editor.
 
-Edits are bound to the build's hash and applied to a working copy forked from the analysed project. Clients share the default view; `options.view` selects a separate named annotation view, whose edits require the revision reported by status. Views isolate annotations, not access. The working copy is saved in the background after edits pause (`overlay_save_debounce_s`); an unsaved change is replayed from the store, never lost. `revert` removes overlays in one step by rebuilding the working copy. [The protocol](docs/upstream-analysis.md) and `backend help` describe the options.
+Edits are bound to the build's hash and applied to a working copy forked from the analysed project. Clients share the default view; `options.view` selects a separate named annotation view, whose edits require the revision reported by status. Views isolate annotations, not access. The working copy is saved in the background after edits pause (`overlay_save_debounce_s`); an unsaved change is replayed from the store, never lost. `revert` removes overlays in one step by rebuilding the working copy.
+
+**Durability.** Corrections persist in the overlay store under the data root (bound to the build's hash, written atomically, kept across restarts) and are replayed into the working copy. They are not committed into the analysed project, and there is no portable export/import bundle for them yet; both are planned work, not something to rely on today.
+
+**Concurrent edits.** Writers are serialized, never corrupting: Hydralysis takes a per-target lock and the engine holds the program's exclusive lock while one edit applies, so simultaneous edits are applied one at a time. That is not conflict detection. In the shared view `expect_revision` is optional, and without it the last writer wins for the same value. Pass `expect_revision` (read it with `ghidra_query status`) for optimistic concurrency: a stale revision is a conflict that names its editor. Named views require it. Queries run as engine requests that share the engine's long-job slots with imports and exports, so heavy parallel use is something to measure, not assume. [The protocol](docs/upstream-analysis.md) and `backend help` describe the options.
 
 `ghidra-query --target sample --action export --options-file export.json` writes a durable JSONL artifact. Use `job <export-id>` for status/cancel and `{"resume":"<export-id>"}` to continue the same selection. Resume refuses changed builds, source analysis, implementation or overlays. See [export options and limits](docs/exports.md).
+
+## The Ghidra GUI
+
+Stock Ghidra's GUI is not supported: a project saved by Hydra Engine uses a newer database version that Ghidra 12.2 and 12.1.4 cannot open. The Hydra full build (`gradle buildGhidra` in Hydra Engine) includes the GUI and can be opened on a fork (a working copy), never on the analysed project itself. GUI edits made there are **not** imported back into Hydralysis yet; that arrives with durable commit. Until then use the GUI to look, and record corrections through `type_edit`.
+
+## Measured, not promised
+
+Numbers here come from the owner's KotOR baseline and depend on the function and the machine; treat them as examples, not guarantees. A warm decompile measured 0.7-2.1 ms for a 1-byte function and 35-45 ms for a 6.7 KB function. The tool counts in [the tool mapping](docs/tool-mapping.md) are sourced there, with what is still unverified marked.
 
 ## Verify runtime evidence
 
