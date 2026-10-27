@@ -143,8 +143,9 @@ class QueryRunner:
             raise ValueError("use a numeric VA or hexadecimal row cursor, not a symbol name")
         selected = workcopy.with_view(self.target(target), view)
         view = selected["view"]
-        if view != "shared" and action == "type_edit" and "expect_revision" not in options:
-            raise ValueError("a named view edit requires expect_revision; get its revision with ghidra_query status")
+        if action == "type_edit":
+            # Every mutation, on the shared view and on named views, names the revision it read.
+            workcopy.require_revision(self.settings, selected, options.get("expect_revision"), "type_edit")
         if action == "status":
             return json.dumps(_public(self.status(selected)), ensure_ascii=False)
         if action == "stop":
@@ -158,7 +159,10 @@ class QueryRunner:
             return json.dumps(overlayjobs.start(self.settings, selected["name"], "diff", "", options, view=view), ensure_ascii=False)
         if action == "type_edit" and options.get("kind") in BULK_KINDS:
             from hydralysis import overlayjobs
-            return json.dumps(overlayjobs.start(self.settings, selected["name"], "edit", address, options, view=view), ensure_ascii=False)
+            job = overlayjobs.start(self.settings, selected["name"], "edit", address, options, view=view)
+            # The job applies the edit later, under the revision it was started with; report the revision seen now.
+            return json.dumps({**job, "view_revision": workcopy.load_store(self.settings, selected)["revision"]},
+                              ensure_ascii=False)
         if action == "type_edit":
             if address.startswith(("rva:", "va:")):
                 # Overlay records hold plain VAs, so replay never depends on how an edit was typed.
@@ -209,8 +213,9 @@ class QueryRunner:
     def status(self, selected: dict) -> dict:
         hello = self.engine.hello()
         info = {key: hello.get(key) for key in ("protocol", "hydraVersion", "ghidraVersion", "installId", "pid", "startedAt")}
+        overlays = workcopy.summary(self.settings, selected)
         return {"engine": info, "target": {key: selected[key] for key in ("name", "gpr", "program", "sha256", "view")},
-                "overlays": workcopy.summary(self.settings, selected), "identity": hydra.identity()}
+                "view_revision": overlays["view_revision"], "overlays": overlays, "identity": hydra.identity()}
 
     def stop(self, selected: dict) -> dict:
         """Release this process's use of the target's programs; the shared daemon keeps serving others."""

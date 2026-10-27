@@ -24,7 +24,7 @@ import time
 import uuid
 from pathlib import Path
 
-from hydralysis import hydra
+from hydralysis import hydra, revisions
 from hydralysis.analysis import MAX_CORPUS_BYTES, MAX_HISTORY_BYTES, MAX_OVERLAYS, _edit, _overlay_path
 from hydralysis.backends import read_json, write_json
 from hydralysis.locks import locked
@@ -50,7 +50,7 @@ def _store_path(settings: dict, target: dict) -> Path:
 def load_store(settings: dict, target: dict) -> dict:
     path = _store_path(settings, target)
     if not path.is_file():
-        return {"version": 2, "sha256": target["sha256"], "revision": 0, "edits": [], "reverted": []}
+        return {"version": 2, "sha256": target["sha256"], "revision": 0, "edits": [], "reverted": [], "journal": []}
     if path.stat().st_size > MAX_HISTORY_BYTES:
         raise ValueError("overlay history exceeds 20 MiB; preserved for review")
     record = json.loads(path.read_text(encoding="utf-8"))
@@ -66,7 +66,7 @@ def load_store(settings: dict, target: dict) -> dict:
     if len({edit["id"] for edit in clean}) != len(clean):
         raise ValueError("overlay history has duplicate edit identities")
     return {"version": 2, "sha256": target["sha256"], "revision": int(record.get("revision", len(clean))),
-            "edits": clean, "reverted": record.get("reverted", [])}
+            "edits": clean, "reverted": record.get("reverted", []), "journal": revisions.clean_journal(record.get("journal"))}
 
 
 def _save_store(settings: dict, target: dict, store: dict) -> None:
@@ -113,7 +113,9 @@ def _state(settings: dict, target: dict) -> dict:
 def summary(settings: dict, target: dict) -> dict:
     store = load_store(settings, target)
     state = _state(settings, target)
-    return {"revision": store["revision"], "edits": len(store["edits"]), "reverted": len(store["reverted"]),
+    latest = max(store["journal"], key=lambda entry: entry["revision"], default=None)
+    return {"revision": store["revision"], "view_revision": store["revision"], "edits": len(store["edits"]),
+            "latest_editor": {"by": latest["by"], "at": latest["at"]} if latest else None, "reverted": len(store["reverted"]),
             "working_copy": state.get("fork_gpr"), "working_state": state.get("state"),
             "in_sync": bool(state) and state.get("state") == state_text(state_of(store)),
             "saved": bool(state.get("saved_at")) and state.get("saved_at", 0) >= state.get("updated_at", 0),
@@ -235,35 +237,85 @@ def _apply(settings: dict, writer: hydra.Engine, program: dict, records: list[di
     return response
 
 
-def _fork(settings: dict, writer: hydra.Engine, target: dict, source: str, prefix: str) -> dict:
+PHASES = ("master_open", "fork", "copy", "base_upgrade", "open", "replay")
+
+
+class _Phases:
+    """Wall-clock milliseconds per phase of one sync (see `last_sync.phases_ms`)."""
+
+    def __init__(self):
+        self.ms = dict.fromkeys(PHASES, 0.0)
+
+    def add(self, name: str, started: float) -> None:
+        self.ms[name] += (time.monotonic() - started) * 1000
+
+    def report(self, total_s: float) -> dict:
+        out = {name: int(round(value)) for name, value in self.ms.items()}
+        out["total"] = int(round(total_s * 1000))
+        return out
+
+
+def _fork(settings: dict, writer: hydra.Engine, target: dict, source: str, prefix: str,
+          phases: _Phases | None = None) -> dict:
     directory = _directory(settings, target)
     directory.mkdir(parents=True, exist_ok=True)
     destination = directory / (prefix + uuid.uuid4().hex[:10])
     # On one ReFS volume this is a block clone; across volumes (a master on another drive) a full
     # copy, allowed up to fork_max_copy_mb and reported in the sync's fork details.
-    return writer.call("fork_project", project=source, path=str(destination), writable=True,
-                       mode=str(settings.get("fork_mode", "auto")), maxCopyMb=int(settings.get("fork_max_copy_mb", 8192)))
+    started = time.monotonic()
+    forked = writer.call("fork_project", project=source, path=str(destination), writable=True,
+                         mode=str(settings.get("fork_mode", "auto")), maxCopyMb=int(settings.get("fork_max_copy_mb", 8192)))
+    if phases is not None:
+        phases.add("fork", started)
+        phases.ms["copy"] += float(forked.get("copyMs") or 0)
+    return forked
 
 
-def _base(settings: dict, writer: hydra.Engine, target: dict, master: dict, current: dict) -> dict:
+def engine_release(engine: hydra.Engine) -> dict | None:
+    """The engine release a database was written or upgraded by, as far as the engine reports it.
+
+    `hello` carries hydraVersion and ghidraVersion; neither `hello` nor `open_project` reports a
+    database format number (protocol 2), so the release pair stands in for it: one release writes
+    one format. If the engine reports neither, the key has no release part and a base is judged by
+    the master revision alone, as before.
+    """
+    try:
+        hello = engine.hello()
+    except (hydra.EngineError, OSError, AttributeError):
+        return None
+    release = {key: hello.get(key) for key in ("hydraVersion", "ghidraVersion") if hello.get(key)}
+    return release or None
+
+
+def _base(settings: dict, writer: hydra.Engine, target: dict, master: dict, current: dict,
+          phases: _Phases | None = None) -> dict:
     """The master in the engine's current database format, once per master revision.
 
     A project saved by an older Ghidra is upgraded only in a copy (never in place), and
     working copies are forked from this one, so a rebuild after a revert pays a block
     clone and a replay, not another upgrade of the whole program.
+
+    The base is keyed by the master revision and the engine release (hydraVersion and
+    ghidraVersion from hello): another release may write another database format, so a base
+    built by a different release (or by one that did not record it) is rebuilt once.
     """
     from hydralysis.query import open_program
+    release = engine_release(writer)
     base = current.get("base") or {}
-    if base.get("master_revision") == master.get("revision") and Path(base.get("gpr", "")).is_file():
+    if (base.get("master_revision") == master.get("revision") and base.get("engine") == release
+            and Path(base.get("gpr", "")).is_file()):
         return base
     started = time.monotonic()
-    forked = _fork(settings, writer, target, master["id"], "base-")
+    forked = _fork(settings, writer, target, master["id"], "base-", phases)
+    upgrading = time.monotonic()
     try:
         program = open_program(writer, forked["gpr"], target["program"], target["sha256"], writable=True, upgrade=True, refresh=True)
         upgraded = bool(writer.call("info", program=program["key"]).get("changed"))
         if upgraded:
             writer.call("save", program=program["key"], comment="RusticRE base: current database format", wait=600000)
         writer.call("close_project", project=forked["project"])
+        if phases is not None:
+            phases.add("base_upgrade", upgrading)
     except BaseException:
         try:
             writer.call("close_project", project=forked["project"], discard=True)
@@ -271,7 +323,7 @@ def _base(settings: dict, writer: hydra.Engine, target: dict, master: dict, curr
             pass
         shutil.rmtree(Path(forked["gpr"]).parent, ignore_errors=True)
         raise
-    return {"gpr": forked["gpr"], "master_revision": master.get("revision"), "upgraded": upgraded,
+    return {"gpr": forked["gpr"], "master_revision": master.get("revision"), "engine": release, "upgraded": upgraded,
             "seconds": round(time.monotonic() - started, 3),
             "fork": {key: forked.get(key) for key in ("method", "cloned", "bytes", "copyMs")}}
 
@@ -311,15 +363,22 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
     wanted = state_of({"revision": store["revision"] + (1 if extra else 0), "edits": records})
     current = _state(settings, target)
     started = time.monotonic()
+    phases = _Phases()
     try:
+        opening = time.monotonic()
         master = writer.call("open_project", path=target["gpr"])
+        phases.add("master_open", opening)
         how = {"rebuilt": False}
         program = None
         applied = None
         if Path(current.get("fork_gpr", "")).is_file() and current.get("master_revision") == master.get("revision"):
+            opening = time.monotonic()
             program = open_program(writer, current["fork_gpr"], target["program"], target["sha256"],
                                    writable=True, upgrade=True, refresh=True)
+            phases.add("open", opening)
+            opening = time.monotonic()
             held = _prefix_matches(records, _marker(writer, program))
+            phases.add("replay", opening)
             if held is None:
                 program = None
             else:
@@ -327,14 +386,18 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
                 gpr = current["fork_gpr"]
         base = current.get("base") or {}
         if program is None:
-            base = _base(settings, writer, target, master, current)
-            forked = _fork(settings, writer, target, base["gpr"], "w-")
+            base = _base(settings, writer, target, master, current, phases)
+            forked = _fork(settings, writer, target, base["gpr"], "w-", phases)
             gpr = forked["gpr"]
             how = {"rebuilt": True, "fork": {key: forked.get(key) for key in ("method", "cloned", "bytes", "copyMs")}}
+            opening = time.monotonic()
             program = open_program(writer, gpr, target["program"], target["sha256"], writable=True, upgrade=True, refresh=True)
+            phases.add("open", opening)
             pending = records
         if pending or state_text(wanted) != current.get("state"):
+            opening = time.monotonic()
             applied = _apply(settings, writer, program, pending, wanted, timeout_s, target)
+            phases.add("replay", opening)
         retired = list(current.get("retired", []))
         for old in (current.get("fork_gpr"), (current.get("base") or {}).get("gpr")):
             if old and old not in (gpr, base.get("gpr")) and old not in retired:
@@ -345,6 +408,7 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
                  "saved_at": current.get("saved_at") if not how["rebuilt"] else None,
                  "retired": _retire(writer, retired),
                  "last_sync": {**how, "applied_now": len(pending), "seconds": round(time.monotonic() - started, 3),
+                               "phases_ms": phases.report(time.monotonic() - started),
                                **({"import_report": report} if report else {})}}
         write_json(_directory(settings, target) / "state.json", state)
         _start_saver(settings, target)
@@ -442,9 +506,32 @@ def refresh(settings: dict, engine: hydra.Engine, target: dict) -> None:
             pass
 
 
+def require_revision(settings: dict, target: dict, expect: int | None, what: str) -> int:
+    """expect_revision is mandatory for every mutation on every view; the error carries the current one."""
+    if expect is None:
+        current = load_store(settings, target)["revision"]
+        raise RuntimeError(json.dumps(revisions.missing_payload(current, target.get("view", "shared"), what)))
+    return expect
+
+
+def reconcile(store: dict, expect: int, subjects: list[str]) -> dict:
+    """Current, rebased (the stale edit's subjects were untouched since), or a conflict error."""
+    decision = revisions.reconcile(expect, store["revision"], store["journal"], subjects)
+    if decision["outcome"] == "conflict":
+        raise RuntimeError(json.dumps(revisions.conflict_payload(expect, decision, subjects)))
+    return decision
+
+
+def _rebase_report(expect: int, decision: dict) -> dict:
+    rebased = decision["outcome"] == "rebased"
+    return {"rebased": rebased, **({"rebased_from": expect, "subjects_changed_since": decision["subjects_changed_since"]}
+                                   if rebased else {})}
+
+
 def edit(settings: dict, engine: hydra.Engine, target: dict, address: str, options: dict, timeout_s: int) -> dict:
     """Validate, apply and record one cited edit (or batch) with an optimistic revision check."""
     expect = options.pop("expect_revision", None)
+    require_revision(settings, target, expect, "type_edit")
     if options.get("kind") == "import_types":
         digest, size = store_corpus(settings, options.pop("corpus"))
         options.update(corpus_sha256=digest, corpus_bytes=size)
@@ -455,19 +542,19 @@ def edit(settings: dict, engine: hydra.Engine, target: dict, address: str, optio
     clean = {**_edit(record), "by": _attribution(), "at": time.time()}
     with locked(_directory(settings, target) / ".sync.lock", SYNC_LOCK_S, "working copy"):
         store = load_store(settings, target)
-        if expect is not None and expect != store["revision"]:
-            last = store["edits"][-1] if store["edits"] else {}
-            raise RuntimeError(json.dumps({"conflict": "overlay revision changed", "expected_revision": expect,
-                                           "current_revision": store["revision"], "last_edit_by": last.get("by"),
-                                           "suggest": "re-read the target (ghidra_query status), then edit again"}))
+        subjects = revisions.subjects_of(address, clean["options"])
+        decision = reconcile(store, expect, subjects)
         if len(store["edits"]) >= MAX_OVERLAYS:
             raise ValueError("overlay history limit reached; export/review it before adding more edits")
         state = _sync(settings, target, store, timeout_s, extra=[clean])
         store["edits"].append(clean)
         store["revision"] += 1
+        store["journal"] = revisions.append(store["journal"], revisions.journal_entry(
+            store["revision"], "edit", subjects, clean["by"], clean["at"]))
         _save_store(settings, target, store)
     import_report = (state.get("last_sync") or {}).get("import_report")
-    return {"ok": True, "overlay_id": clean["id"], "revision": store["revision"], "by": clean["by"],
+    return {"ok": True, "overlay_id": clean["id"], "revision": store["revision"], "view_revision": store["revision"],
+            **_rebase_report(expect, decision), "by": clean["by"],
             **({"import_report": _summary(import_report)} if import_report else {}),
             "edits_applied": len(options.get("edits", [])) if options.get("kind") == "batch" else 1,
             "working_copy": state["fork_gpr"], "sync": state.get("last_sync"),
@@ -483,19 +570,24 @@ def _summary(report: dict) -> dict:
 
 def revert(settings: dict, target: dict, ids: list[str], expect: int | None = None) -> dict:
     """Undo records in one step. The working copy is rebuilt from the master on next use."""
+    require_revision(settings, target, expect, "revert")
     with locked(_directory(settings, target) / ".sync.lock", SYNC_LOCK_S, "working copy"):
         store = load_store(settings, target)
-        if expect is not None and expect != store["revision"]:
-            raise RuntimeError(json.dumps({"conflict": "overlay revision changed", "expected_revision": expect,
-                                           "current_revision": store["revision"]}))
         wanted = set(ids)
         kept = [edit for edit in store["edits"] if edit["id"] not in wanted and edit.get("batch") not in wanted]
-        removed = [edit["id"] for edit in store["edits"] if edit not in kept]
+        dropped = [edit for edit in store["edits"] if edit not in kept]
+        removed = [edit["id"] for edit in dropped]
         if not removed:
             raise ValueError("no overlay record or batch matches %s" % ", ".join(ids))
+        subjects = sorted({subject for edit in dropped for subject in revisions.subjects_of(edit["address"], edit["options"])})
+        decision = reconcile(store, expect, subjects)
+        who, now = _attribution(), time.time()
         store["edits"] = kept
         store["revision"] += 1
-        store["reverted"] = (store.get("reverted") or []) + [{"ids": removed, "by": _attribution(), "at": time.time()}]
+        store["reverted"] = (store.get("reverted") or []) + [{"ids": removed, "by": who, "at": now}]
+        store["journal"] = revisions.append(store["journal"], revisions.journal_entry(
+            store["revision"], "revert", subjects, who, now))
         _save_store(settings, target, store)
-    return {"ok": True, "reverted": len(removed), "revision": store["revision"],
+    return {"ok": True, "reverted": len(removed), "revision": store["revision"], "view_revision": store["revision"],
+            **_rebase_report(expect, decision),
             "note": "the working copy is rebuilt from the unchanged master on the next query"}

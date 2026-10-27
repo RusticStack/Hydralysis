@@ -78,6 +78,9 @@ class EngineIntegration(unittest.TestCase):
     def ask(self, action, address="", **kwargs):
         return json.loads(self.runner.query("fixture", action, address, **kwargs))
 
+    def revision(self, view=""):
+        return self.ask("status", options={"view": view} if view else {})["view_revision"]
+
     def entry(self):
         listed = self.ask("functions", limit=5)
         self.assertTrue(listed["functions"])
@@ -119,12 +122,39 @@ class EngineIntegration(unittest.TestCase):
         address = self.entry()
         original = self.ask("decompile", address)["function"]["name"]
         edited = json.loads(self.runner.query("fixture", "type_edit", address, timeout_s=300,
-                                              options={"kind": "rename", "name": "integration_named", "source": "integration test"}))
+                                              options={"kind": "rename", "name": "integration_named", "source": "integration test",
+                                                       "expect_revision": self.revision()}))
         self.assertTrue(edited["ok"])
+        self.assertEqual(edited["view_revision"], edited["revision"])
+        self.assertIn("phases_ms", edited["sync"])
         self.assertEqual(self.ask("decompile", address)["function"]["name"], "integration_named")
-        reverted = json.loads(self.runner.query("fixture", "type_edit", options={"kind": "revert", "ids": [edited["overlay_id"]]}))
+        reverted = json.loads(self.runner.query("fixture", "type_edit", options={
+            "kind": "revert", "ids": [edited["overlay_id"]], "expect_revision": self.revision()}))
         self.assertEqual(reverted["reverted"], 1)
         self.assertEqual(self.ask("decompile", address, timeout_s=300)["function"]["name"], original)
+
+    def test_revision_is_mandatory_and_stale_edits_are_subject_aware(self):
+        listed = self.ask("functions", limit=5)["functions"]
+        self.assertGreaterEqual(len(listed), 2)
+        first, second = listed[0]["address"], listed[1]["address"]
+        view = "concurrency-fixture"
+
+        def rename(address, name, revision):
+            return json.loads(self.runner.query("fixture", "type_edit", address, timeout_s=300, options={
+                "kind": "rename", "name": name, "source": "integration test", "view": view, "expect_revision": revision}))
+        with self.assertRaises(RuntimeError) as missing:
+            self.runner.query("fixture", "type_edit", first, options={"kind": "rename", "name": "x", "source": "s", "view": view})
+        self.assertEqual(json.loads(str(missing.exception))["current_revision"], 0)
+        one = rename(first, "concurrency_one", 0)
+        self.assertEqual((one["revision"], one["rebased"]), (1, False))
+        other = rename(second, "concurrency_two", 0)
+        self.assertEqual((other["revision"], other["rebased"], other["rebased_from"]), (2, True, 0))
+        with self.assertRaises(RuntimeError) as clash:
+            rename(first, "concurrency_clash", 0)
+        body = json.loads(str(clash.exception))
+        self.assertEqual((body["current_revision"], body["overlapping"]), (2, ["address:%s" % hex(int(first, 16))]))
+        self.assertEqual(self.ask("decompile", first, options={"view": view})["function"]["name"], "concurrency_one")
+        self.assertEqual(self.revision(view), 2)
 
     def test_cited_data_label_is_visible_and_revertible(self):
         from hydralysis.pe import Image
@@ -132,10 +162,11 @@ class EngineIntegration(unittest.TestCase):
         section = next(s for s in image.sections if not (s.Characteristics & 0x20000000) and s.SizeOfRawData)
         address = hex(image.base + section.VirtualAddress)
         edited = self.ask("type_edit", address, timeout_s=300,
-                          options={"kind": "label", "name": "integration_global", "source": "fixture section table"})
+                          options={"kind": "label", "name": "integration_global", "source": "fixture section table",
+                                   "expect_revision": self.revision()})
         data = self.ask("data", address, options={"table": True})
         self.assertIn("integration_global", [item["name"] for item in data["labels"]])
-        self.ask("type_edit", options={"kind": "revert", "ids": [edited["overlay_id"]]})
+        self.ask("type_edit", options={"kind": "revert", "ids": [edited["overlay_id"]], "expect_revision": self.revision()})
         data = self.ask("data", address, options={"table": True})
         self.assertNotIn("integration_global", [item["name"] for item in data["labels"]])
 

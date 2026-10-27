@@ -24,6 +24,9 @@ class Daemon:
         self.calls: list[tuple[str, str, dict]] = []
         self.lock = threading.RLock()
         self.fail_next: dict[str, EngineError] = {}
+        # What hello reports; tests change it to model an engine upgrade between syncs.
+        self.release = {"hydraVersion": "12.3-hydra.2", "ghidraVersion": "12.3"}
+        self.fork_copy_ms = 7
 
     def add_project(self, gpr: Path, programs: dict[str, dict]) -> dict:
         gpr.parent.mkdir(parents=True, exist_ok=True)
@@ -81,7 +84,7 @@ class FakeEngine:
         self.writable.clear()
 
     def hello(self):
-        return {"protocol": 2, "hydraVersion": "12.3-hydra.2", "ghidraVersion": "12.3", "installId": "fake"}
+        return {"protocol": 2, **self.daemon.release, "installId": "fake"}
 
     def stop(self, force=False):
         return {"stopped": True}
@@ -171,7 +174,8 @@ class FakeEngine:
         for item, entry in source["programs"].items():
             fork["programs"][item]["saved"] = copy.deepcopy(entry["saved"])
         opened = self._open_project(str(gpr), writable=True)
-        return {"project": opened["id"], "gpr": str(gpr), "method": "clone", "cloned": True, "bytes": 1, "copyMs": 1}
+        return {"project": opened["id"], "gpr": str(gpr), "method": "clone", "cloned": True, "bytes": 1,
+                "copyMs": self.daemon.fork_copy_ms}
 
     def _status(self, **_):
         return {"projects": [{"gpr": item["gpr"], "id": item.get("id")} for item in self.daemon.projects.values()

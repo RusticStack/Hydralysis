@@ -37,7 +37,15 @@ class EngineCase(unittest.TestCase):
     def ask(self, action="decompile", address="0x140001000", **kwargs):
         return json.loads(self.runner.query("owned", action, address, **kwargs))
 
+    def revision(self, view=""):
+        return workcopy.load_store(self.settings, workcopy.with_view(self.runner.target("owned"), view))["revision"]
+
     def edit(self, **options):
+        """One cited edit; expect_revision defaults to the view's current revision (pass None to omit it)."""
+        if "expect_revision" not in options:
+            options["expect_revision"] = self.revision(options.get("view", ""))
+        elif options["expect_revision"] is None:
+            del options["expect_revision"]
         return json.loads(self.runner.query("owned", "type_edit", options.pop("address", "0x140001000"),
                                             options={"source": "cited test evidence", **options}))
 
@@ -166,8 +174,8 @@ class Overlays(EngineCase):
         status = json.loads(self.runner.query("owned", "status", options={"view": "alice"}))
         self.assertEqual(status["target"]["view"], "alice")
         self.assertEqual(status["overlays"]["revision"], 0)
-        with self.assertRaisesRegex(ValueError, "requires expect_revision"):
-            self.edit(kind="rename", name="Alice", view="alice")
+        with self.assertRaisesRegex(RuntimeError, "expect_revision_required"):
+            self.edit(kind="rename", name="Alice", view="alice", expect_revision=None)
         self.edit(kind="rename", name="Alice", view="alice", expect_revision=0)
         self.edit(kind="rename", name="Bob", view="bob", expect_revision=0)
         self.assertEqual(self.ask(options={"view": "alice"})["function"]["name"], "Alice")
@@ -176,6 +184,115 @@ class Overlays(EngineCase):
         with self.assertRaisesRegex(RuntimeError, "overlay revision changed"):
             self.edit(kind="rename", name="Stale", view="alice", expect_revision=0)
         self.assertEqual(self.ask(options={"view": "alice"})["function"]["name"], "Alice")
+
+    def test_revision_is_mandatory_on_the_shared_view_and_the_error_carries_it(self):
+        for options in ({"kind": "rename", "name": "Nope"}, {"kind": "revert", "ids": ["0" * 32]},
+                        {"kind": "import_types", "corpus": str(self.corpus())}):
+            with self.subTest(kind=options["kind"]), self.assertRaises(RuntimeError) as raised:
+                self.edit(**options, expect_revision=None)
+            body = json.loads(str(raised.exception))
+            self.assertEqual((body["error"], body["view"], body["current_revision"]), ("expect_revision_required", "shared", 0))
+            self.assertEqual(body["view_revision"], 0)
+        self.assertEqual(self.revision(), 0)
+        self.edit(kind="rename", name="One")
+        with self.assertRaises(RuntimeError) as raised:
+            self.edit(kind="rename", name="Two", expect_revision=None)
+        self.assertEqual(json.loads(str(raised.exception))["current_revision"], 1)
+        with self.assertRaises(RuntimeError) as raised:
+            workcopy.edit(self.settings, fakehydra.FakeEngine(self.settings), self.runner.target("owned"), "0x1",
+                          {"kind": "rename", "name": "Direct", "source": "s"}, 60)
+        self.assertIn("expect_revision_required", str(raised.exception))
+        self.assertEqual(self.revision(), 1)
+
+    def test_every_edit_and_status_answer_reports_view_revision(self):
+        self.assertEqual(json.loads(self.runner.query("owned", "status"))["view_revision"], 0)
+        first = self.edit(kind="rename", name="One")
+        self.assertEqual((first["revision"], first["view_revision"], first["rebased"]), (1, 1, False))
+        status = json.loads(self.runner.query("owned", "status"))
+        self.assertEqual((status["view_revision"], status["overlays"]["view_revision"]), (1, 1))
+        self.assertEqual(status["overlays"]["latest_editor"]["by"], first["by"])
+        reverted = json.loads(self.runner.query("owned", "type_edit", options={
+            "kind": "revert", "ids": [first["overlay_id"]], "expect_revision": 1}))
+        self.assertEqual((reverted["revision"], reverted["view_revision"]), (2, 2))
+        with patch("hydralysis.overlayjobs.start", return_value={"id": "overlay-0123456789ab", "state": "queued"}):
+            job = json.loads(self.runner.query("owned", "type_edit", options={
+                "kind": "import_types", "corpus": str(self.corpus()), "source": "dump", "expect_revision": 2}))
+        self.assertEqual(job["view_revision"], 2)
+
+    def test_a_stale_edit_on_untouched_subjects_is_rebased(self):
+        self.edit(kind="rename", name="One", address="0x140001000")
+        other = self.edit(kind="rename", name="Elsewhere", address="0x140002000", expect_revision=0)
+        self.assertTrue(other["rebased"])
+        self.assertEqual((other["rebased_from"], other["revision"]), (0, 2))
+        self.assertEqual(other["subjects_changed_since"], ["address:0x140001000"])
+        self.assertEqual(self.ask()["function"]["name"], "One")
+        self.assertEqual(self.ask(address="0x140002000")["function"]["name"], "Elsewhere")
+
+    def test_a_stale_edit_on_a_touched_subject_gets_the_subject_aware_conflict(self):
+        one = self.edit(kind="rename", name="One", address="0x140001000")
+        self.edit(kind="comment", comment="note", address="0x140003000")
+        with self.assertRaises(RuntimeError) as raised:
+            self.edit(kind="rename", name="Two", address="0x140001000", expect_revision=0)
+        body = json.loads(str(raised.exception))
+        self.assertEqual(body["conflict"], "overlay revision changed")
+        self.assertEqual((body["expected_revision"], body["current_revision"]), (0, 2))
+        self.assertEqual(body["latest_editor"]["by"], one["by"])
+        self.assertEqual(body["subjects_changed_since"], ["address:0x140001000", "address:0x140003000"])
+        self.assertEqual(body["overlapping"], ["address:0x140001000"])
+        self.assertEqual(self.revision(), 2)
+        self.assertEqual(self.ask()["function"]["name"], "One")
+
+    def test_rebase_applies_to_revert_and_refuses_when_history_is_missing(self):
+        first = self.edit(kind="rename", name="One", address="0x140001000")
+        self.edit(kind="rename", name="Two", address="0x140002000")
+        stale_revert = {"kind": "revert", "ids": [first["overlay_id"]], "expect_revision": 1}
+        reverted = json.loads(self.runner.query("owned", "type_edit", options=stale_revert))
+        self.assertTrue(reverted["rebased"])
+        self.assertEqual(self.ask(address="0x140002000")["function"]["name"], "Two")
+        # A store written before the journal existed cannot prove independence.
+        path = workcopy._store_path(self.settings, self.runner.target("owned"))
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record.pop("journal")
+        path.write_text(json.dumps(record), encoding="utf-8")
+        with self.assertRaises(RuntimeError) as raised:
+            self.edit(kind="rename", name="Late", address="0x140009000", expect_revision=0)
+        body = json.loads(str(raised.exception))
+        self.assertFalse(body["history_complete"])
+        self.assertIn("incomplete", body["reason"])
+
+    def test_a_stale_shared_view_edit_conflicts_like_a_named_one(self):
+        self.edit(kind="rename", name="One")
+        with self.assertRaisesRegex(RuntimeError, "overlay revision changed"):
+            self.edit(kind="rename", name="Two", expect_revision=0)
+
+    def test_sync_reports_stable_phase_timings(self):
+        self.daemon.fork_copy_ms = 41
+        first = self.edit(kind="rename", name="One", view="alice")
+        phases = first["sync"]["phases_ms"]
+        self.assertEqual(sorted(phases), sorted(workcopy.PHASES + ("total",)))
+        self.assertTrue(all(isinstance(value, int) and value >= 0 for value in phases.values()))
+        self.assertEqual(phases["copy"], 82)  # the base fork and the working-copy fork, as the engine reports them
+        second = self.edit(kind="rename", name="Two", view="alice")
+        self.assertFalse(second["sync"]["rebuilt"])
+        self.assertEqual((second["sync"]["phases_ms"]["fork"], second["sync"]["phases_ms"]["copy"]), (0, 0))
+        status = json.loads(self.runner.query("owned", "status", options={"view": "alice"}))
+        self.assertEqual(sorted(status["overlays"]["last_sync"]["phases_ms"]), sorted(phases))
+
+    def test_base_is_rebuilt_when_the_engine_release_changes_and_reused_otherwise(self):
+        self.edit(kind="rename", name="One")
+        base = workcopy._state(self.settings, self.runner.target("owned"))["base"]
+        self.assertEqual(base["engine"], {"hydraVersion": "12.3-hydra.2", "ghidraVersion": "12.3"})
+        self.edit(kind="rename", name="Two")
+        self.assertEqual(workcopy._state(self.settings, self.runner.target("owned"))["base"]["gpr"], base["gpr"])
+        self.daemon.release = {"hydraVersion": "12.3-hydra.3", "ghidraVersion": "12.3"}
+        revert = json.loads(self.runner.query("owned", "type_edit", options={
+            "kind": "revert", "ids": [workcopy.load_store(self.settings, self.runner.target("owned"))["edits"][-1]["id"]],
+            "expect_revision": 2}))
+        self.assertTrue(revert["ok"])
+        self.ask()  # the rebuild after a revert forks from the base
+        rebuilt = workcopy._state(self.settings, self.runner.target("owned"))["base"]
+        self.assertNotEqual(rebuilt["gpr"], base["gpr"])
+        self.assertEqual(rebuilt["engine"]["hydraVersion"], "12.3-hydra.3")
 
     def test_stopping_named_view_keeps_other_views_and_shared_source_open(self):
         self.ask()
@@ -253,7 +370,7 @@ class Overlays(EngineCase):
         self.edit(kind="rename", name="One")
         with self.assertRaisesRegex(RuntimeError, "overlay revision changed") as raised:
             self.edit(kind="rename", name="Two", expect_revision=0)
-        self.assertIn("last_edit_by", str(raised.exception))
+        self.assertIn("latest_editor", str(raised.exception))
         self.assertEqual(self.ask()["function"]["name"], "One")
 
     def test_a_refused_record_leaves_store_and_copy_unchanged(self):
@@ -266,7 +383,7 @@ class Overlays(EngineCase):
     def test_revert_rebuilds_from_the_master_in_one_step(self):
         first = self.edit(kind="rename", name="One")
         self.edit(kind="rename", name="Two")
-        reverted = json.loads(self.runner.query("owned", "type_edit", options={"kind": "revert", "ids": [
+        reverted = json.loads(self.runner.query("owned", "type_edit", options={"kind": "revert", "expect_revision": 2, "ids": [
             workcopy.load_store(self.settings, self.runner.target("owned"))["edits"][-1]["id"]]}))
         self.assertEqual(reverted["reverted"], 1)
         self.assertEqual(self.ask()["function"]["name"], "One")
@@ -294,14 +411,14 @@ class Overlays(EngineCase):
                                            "corpus_sha256": "0" * 64})
         with patch("hydralysis.overlayjobs.start", return_value={"id": "overlay-0123456789ab", "state": "queued"}) as start:
             answer = json.loads(self.runner.query("owned", "type_edit", options={
-                "kind": "import_types", "corpus": str(self.corpus()), "source": "reflection dump"}))
+                "kind": "import_types", "corpus": str(self.corpus()), "source": "reflection dump", "expect_revision": 0}))
         self.assertEqual(answer["id"], "overlay-0123456789ab")
         self.assertEqual(start.call_args.args[2], "edit")
 
     def test_corpus_is_stored_once_under_its_hash_and_recorded_by_hash(self):
         source = self.corpus()
         result = workcopy.edit(self.settings, fakehydra.FakeEngine(self.settings), self.runner.target("owned"), "",
-                               {"kind": "import_types", "corpus": str(source), "source": "dump"}, 60)
+                               {"kind": "import_types", "corpus": str(source), "source": "dump", "expect_revision": 0}, 60)
         self.assertTrue(result["ok"])
         record = workcopy.load_store(self.settings, self.runner.target("owned"))["edits"][0]
         digest = hashlib.sha256(source.read_bytes()).hexdigest()
@@ -312,11 +429,11 @@ class Overlays(EngineCase):
     def test_a_rebuild_that_replays_a_corpus_is_handed_to_a_job(self):
         target = self.runner.target("owned")
         workcopy.edit(self.settings, fakehydra.FakeEngine(self.settings), target, "",
-                      {"kind": "import_types", "corpus": str(self.corpus()), "source": "dump"}, 60)
+                      {"kind": "import_types", "corpus": str(self.corpus()), "source": "dump", "expect_revision": 0}, 60)
         workcopy.edit(self.settings, fakehydra.FakeEngine(self.settings), target, "0x140001000",
-                      {"kind": "rename", "name": "Named", "source": "s"}, 60)
+                      {"kind": "rename", "name": "Named", "source": "s", "expect_revision": 1}, 60)
         last = workcopy.load_store(self.settings, target)["edits"][-1]["id"]
-        workcopy.revert(self.settings, target, [last])
+        workcopy.revert(self.settings, target, [last], 2)
         with patch("hydralysis.overlayjobs.start", return_value={"id": "overlay-0123456789ab", "state": "queued"}):
             with self.assertRaisesRegex(RuntimeError, "overlay-0123456789ab"):
                 self.ask()
