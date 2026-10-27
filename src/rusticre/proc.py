@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -29,8 +30,35 @@ def run(command, **kwargs) -> subprocess.CompletedProcess:
     return subprocess.run(command, **_defaults(kwargs))
 
 
+_children: set[subprocess.Popen] = set()
+_children_changed = threading.Condition()
+_reaper: threading.Thread | None = None
+
+
+def _reap_children() -> None:
+    """Keep background handles until exit, then reap them without blocking callers."""
+    while True:
+        with _children_changed:
+            while not _children:
+                _children_changed.wait()
+            children = tuple(_children)
+        exited = [child for child in children if child.poll() is not None]
+        with _children_changed:
+            _children.difference_update(exited)
+            if _children:
+                _children_changed.wait(timeout=0.25)
+
+
 def popen(command, **kwargs) -> subprocess.Popen:
-    return subprocess.Popen(command, **_defaults(kwargs))
+    global _reaper
+    child = subprocess.Popen(command, **_defaults(kwargs))
+    with _children_changed:
+        _children.add(child)
+        if _reaper is None or not _reaper.is_alive():
+            _reaper = threading.Thread(target=_reap_children, name="rusticre-child-reaper", daemon=True)
+            _reaper.start()
+        _children_changed.notify()
+    return child
 
 
 def identity(pid: int, started_ms: int) -> bool:
