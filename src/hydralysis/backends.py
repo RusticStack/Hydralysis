@@ -20,9 +20,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-from hydralysis import hydra
-from hydralysis import compat
-from hydralysis.localio import read_text as local_read_text
+from hydralysis import compat, durable, hydra
 from hydralysis.locks import LaneLock
 from hydralysis.paths import root_path
 
@@ -38,20 +36,17 @@ ASSETS = {
 
 
 def read_json(path: Path) -> dict:
-    try:
-        value = json.loads(local_read_text(path))
-    except FileNotFoundError:
-        return {}
-    if not isinstance(value, dict):
-        raise ValueError("expected a JSON object in %s" % path)
-    return value
+    """A JSON object record. Sealed files are verified and unsealed; a bad file falls back to its `.bak`.
+
+    A file that was never written reads as {}. A file that exists but has no valid version
+    raises durable.StoreCorrupt (a ValueError, code store_corrupt); it never reads as empty.
+    """
+    return durable.read_sealed(Path(path), default={})
 
 
 def write_json(path: Path, value: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    """Record-bearing write: sealed, previous version kept as `.bak`, atomic and fsynced (durable.py)."""
+    durable.write_sealed(Path(path), value)
 
 
 def sha256(path: Path) -> str:

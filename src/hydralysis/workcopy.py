@@ -24,7 +24,7 @@ import time
 import uuid
 from pathlib import Path
 
-from hydralysis import hydra, revisions
+from hydralysis import durable, hydra, revisions
 from hydralysis.analysis import MAX_CORPUS_BYTES, MAX_HISTORY_BYTES, MAX_OVERLAYS, _edit, _overlay_path
 from hydralysis.backends import read_json, write_json
 from hydralysis.locks import locked
@@ -49,12 +49,14 @@ def _store_path(settings: dict, target: dict) -> Path:
 
 def load_store(settings: dict, target: dict) -> dict:
     path = _store_path(settings, target)
-    if not path.is_file():
-        return {"version": 2, "sha256": target["sha256"], "revision": 0, "edits": [], "reverted": [], "journal": []}
-    if path.stat().st_size > MAX_HISTORY_BYTES:
+    if path.is_file() and path.stat().st_size > MAX_HISTORY_BYTES:
         raise ValueError("overlay history exceeds 20 MiB; preserved for review")
-    record = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(record, dict) or record.get("version") not in (1, 2) or record.get("sha256") != target["sha256"]:
+    # Sealed record: the file, else its previous version (.bak). A store that exists but has no valid
+    # version raises store_corrupt; only a store that was never written reads as "no edits".
+    record = durable.read_sealed(path, default=None, max_bytes=MAX_HISTORY_BYTES + 4096)
+    if record is None:
+        return {"version": 2, "sha256": target["sha256"], "revision": 0, "edits": [], "reverted": [], "journal": []}
+    if record.get("version") not in (1, 2) or record.get("sha256") != target["sha256"]:
         raise ValueError("overlays at %s belong to another build or format; preserve them and use a new target" % path)
     edits = record.get("edits")
     if not isinstance(edits, list) or len(edits) > MAX_OVERLAYS:
@@ -70,14 +72,10 @@ def load_store(settings: dict, target: dict) -> dict:
 
 
 def _save_store(settings: dict, target: dict, store: dict) -> None:
-    payload = json.dumps(store, indent=2).encode("utf-8")
-    if len(payload) > MAX_HISTORY_BYTES:
-        raise ValueError("overlay history would exceed 20 MiB; existing history preserved")
+    # Sealed, previous version kept as .bak, atomic and fsynced (durable.write_sealed).
     path = _store_path(settings, target)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
-    temporary.write_bytes(payload)
-    temporary.replace(path)
+    durable.write_sealed(path, store, max_bytes=MAX_HISTORY_BYTES,
+                         too_large="overlay history would exceed 20 MiB; existing history preserved")
 
 
 def state_of(store: dict) -> dict:
