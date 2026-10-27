@@ -203,6 +203,11 @@ class EngineIntegration(unittest.TestCase):
         self.assertEqual(self.ask("type", options={"path": "/u4", "view": "archive-fixture"})["type"]["length"], 4)
         self.assertEqual(job["result"]["import_report"]["records"], 1)
         self.assertEqual(job["result"]["import_report"]["archive_types"], 1)
+        # A bulk import has one effect: its report, with no per-subject before (drift is by input hash).
+        (record,) = workcopy_store(self, "archive-fixture")["edits"]
+        (effect,) = record["effects"]
+        self.assertEqual((effect["subject"], effect["field"], effect["before"]), ("*", "report", None))
+        self.assertRegex(effect["after"], r"^sha256:[0-9a-f]{64}$")
         mismatch = submit(["/pointer"], 1)
         self.assertEqual(mismatch["state"], "failed", mismatch)
         self.assertIn("differs", mismatch.get("error", "").lower())
@@ -292,6 +297,36 @@ class EngineIntegration(unittest.TestCase):
                                     ranges=[{"start": hex(ranges[0][0]), "end": hex(ranges[0][1])}])
         self.assertEqual({(item["field"], item["before"], item["after"]) for item in resized["effects"]},
                          {("body", body, body), ("name", "effect_recreated", "effect_again")})
+
+    def test_a_bundle_exports_reports_drift_on_a_dry_run_and_applies_as_proposals_on_the_real_engine(self):
+        from hydralysis import annotations
+        address = self.entry()
+        subject = "address:%s" % hex(int(address, 16))
+        original = self.ask("decompile", address, options={"view": "bundle-source"})["function"]["name"]
+        edited = self.edit_in_view(address, kind="rename", name="bundled_name", view="bundle-source")
+        data = self.data_address()
+        self.edit_in_view(data, kind="label", name="bundled_label", view="bundle-source")
+        exported = annotations.export_bundle(self.settings, "fixture", view="bundle-source", path=self.root / "bundles" / "one")
+        bundle = json.loads(Path(exported["path"]).read_text(encoding="utf-8"))
+        self.assertEqual((bundle["program"]["sha256"], bundle["records"][0]["effects"]), (self.prepared["sha256"], edited["effects"]))
+        self.assertTrue(bundle["program"]["language"] and bundle["program"]["compiler"] and bundle["program"]["image_base"])
+        self.assertNotIn(str(self.root), json.dumps(bundle))
+        fresh = annotations.import_bundle(self.settings, "fixture", exported["path"], view="bundle-fresh")
+        self.assertTrue(fresh["ok"], fresh)
+        self.assertEqual((fresh["bundle"]["hash_ok"], fresh["bundle"]["program_sha256_ok"], fresh["base_drift"]), (True, True, []))
+        self.edit_in_view(address, kind="rename", name="somebody_elses_name", view="bundle-drifted")
+        drifted = annotations.import_bundle(self.settings, "fixture", exported["path"], view="bundle-drifted")
+        self.assertEqual(drifted["base_drift"], [{"id": edited["overlay_id"], "subject": subject, "field": "name",
+                                                  "expected": original, "found": "somebody_elses_name"}])
+        applied = annotations.import_bundle(self.settings, "fixture", exported["path"], view="bundle-fresh", apply=True,
+                                            expect_revision=self.revision("bundle-fresh"))
+        self.assertEqual(len(applied["added"]), 2)
+        self.assertEqual(self.ask("decompile", address, options={"view": "bundle-fresh"})["function"]["name"], "bundled_name")
+        records = workcopy_store(self, "bundle-fresh")["edits"]
+        self.assertEqual(records[0]["effects"], edited["effects"])  # the same program: the same before and after
+        self.assertEqual(records[0]["imported_from"]["id"], edited["overlay_id"])
+        again = annotations.import_bundle(self.settings, "fixture", exported["path"], view="bundle-fresh")
+        self.assertEqual((again["would_add"], len(again["already_present"])), ([], 2))
 
     def test_a_data_type_applied_to_data_reports_its_type_before_and_after(self):
         data = self.data_address()
