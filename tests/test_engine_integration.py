@@ -31,49 +31,58 @@ BINARY = _env("INTEGRATION_BINARY") or (
     os.path.join(os.environ.get("SystemRoot", "C:/Windows"), "System32", "whoami.exe") if os.name == "nt" else "")
 
 
+def _prepare(cls, source, label, target):
+    """Prepare SOURCE once under its own data root and daemon; leaves settings, runner and the env patch on CLS."""
+    from hydralysis import preparation, query
+    cls.work = workdir(label)
+    cls.root = Path(cls.work.name)
+    binary = cls.root / "fixture.exe"
+    shutil.copy2(source, binary)
+    cls.settings = {"root": str(cls.root / "data"), "hydra_dir": ENGINE, "hydra_client": CLIENT,
+                    "hydra_idle_s": 600, "overlay_save_debounce_s": 2}
+    if _env("INTEGRATION_JAVA"):
+        cls.settings["java_home"] = _env("INTEGRATION_JAVA")
+    query._keys.clear()
+    env = {"HYDRALYSIS_ROOT": cls.settings["root"], "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+    cls.env = patch.dict(os.environ, env)
+    cls.env.start()
+    job = preparation.prepare(cls.settings, str(binary), target)
+    deadline = time.monotonic() + 600
+    while True:
+        status = preparation.status(cls.settings, job["job_id"])
+        if status["state"] not in preparation.ACTIVE or time.monotonic() > deadline:
+            break
+        time.sleep(1)
+    if status["state"] != "done":
+        raise AssertionError("prepare did not finish: %s" % json.dumps(status)[:3000])
+    cls.prepared = status
+    cls.runner = query.QueryRunner(cls.settings)
+
+
+def _release(cls):
+    from hydralysis import hydra
+    engine = hydra.Engine(cls.settings)
+    try:
+        engine.stop(force=True)
+    finally:
+        # A daemon that ignored the stop must not outlive the test (it holds the work dir).
+        daemon = engine.module().Daemon(str(engine.engine_dir), str(hydra.state_dir(cls.settings)), hydra.INSTANCE)
+        if daemon.jvm_alive() or daemon.read_endpoint():
+            daemon.kill()
+        cls.env.stop()
+        time.sleep(1)
+        cls.work.cleanup()
+
+
 @unittest.skipUnless(ENGINE and CLIENT and BINARY and Path(BINARY).is_file(), "set HYDRALYSIS_INTEGRATION_ENGINE/CLIENT")
 class EngineIntegration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from hydralysis import preparation, query
-        cls.work = workdir("engine")
-        cls.root = Path(cls.work.name)
-        binary = cls.root / "fixture.exe"
-        shutil.copy2(BINARY, binary)
-        cls.settings = {"root": str(cls.root / "data"), "hydra_dir": ENGINE, "hydra_client": CLIENT,
-                        "hydra_idle_s": 600, "overlay_save_debounce_s": 2}
-        if _env("INTEGRATION_JAVA"):
-            cls.settings["java_home"] = _env("INTEGRATION_JAVA")
-        query._keys.clear()
-        env = {"HYDRALYSIS_ROOT": cls.settings["root"], "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
-        cls.env = patch.dict(os.environ, env)
-        cls.env.start()
-        job = preparation.prepare(cls.settings, str(binary), "fixture")
-        deadline = time.monotonic() + 600
-        while True:
-            status = preparation.status(cls.settings, job["job_id"])
-            if status["state"] not in preparation.ACTIVE or time.monotonic() > deadline:
-                break
-            time.sleep(1)
-        if status["state"] != "done":
-            raise AssertionError("prepare did not finish: %s" % json.dumps(status)[:3000])
-        cls.prepared = status
-        cls.runner = query.QueryRunner(cls.settings)
+        _prepare(cls, BINARY, "engine", "fixture")
 
     @classmethod
     def tearDownClass(cls):
-        from hydralysis import hydra
-        engine = hydra.Engine(cls.settings)
-        try:
-            engine.stop(force=True)
-        finally:
-            # A daemon that ignored the stop must not outlive the test (it holds the work dir).
-            daemon = engine.module().Daemon(str(engine.engine_dir), str(hydra.state_dir(cls.settings)), hydra.INSTANCE)
-            if daemon.jvm_alive() or daemon.read_endpoint():
-                daemon.kill()
-            cls.env.stop()
-            time.sleep(1)
-            cls.work.cleanup()
+        _release(cls)
 
     def ask(self, action, address="", **kwargs):
         return json.loads(self.runner.query("fixture", action, address, **kwargs))

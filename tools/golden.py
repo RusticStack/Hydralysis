@@ -676,7 +676,7 @@ def _capture_production(engine, query, program, sha, header, out: Path, args, se
     _log("production path: %d functions, one RusticQuery decompile request each" % len(listed))
     requests = Path(engine.settings["root"]) / "hydra" / "requests"
     writer = CaptureWriter(out, {**header, "options": None, "options_sha256": None,
-                                 "options_note": "RusticQuery.java opens DecompInterface without setOptions: native defaults",
+                                 "options_note": "RusticQuery.java applies DecompileOptions.grabFromProgram (0.5.0 and later; earlier it opened DecompInterface without setOptions, on the native defaults)",
                                  "timeout_s": args.timeout}, args.level)
     began = time.monotonic()
     for index, item in enumerate(listed):

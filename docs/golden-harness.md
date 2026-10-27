@@ -34,13 +34,15 @@ line up.
 
 | `--path` | What runs | Why it exists |
 | --- | --- | --- |
-| `production` | One `RusticQuery.java` `decompile` request per function through the same `query.run_script` the MCP tools and the export job use. `RusticQuery` opens `DecompInterface` without `setOptions`, so the native decompiler runs on its built-in defaults. Hydra only. | This is what agents get today. |
+| `production` | One `RusticQuery.java` `decompile` request per function through the same `query.run_script` the MCP tools and the export job use. Since 0.5.0 `RusticQuery` calls `DecompileOptions.grabFromProgram` (through one helper, before `openProgram`), so it decompiles on the program's own options, as the Ghidra window does. Before 0.5.0 it opened `DecompInterface` without `setOptions` and ran on the native defaults, so a capture made then is not comparable with one made now. Hydra only. | This is what agents get. |
 | `explicit` | `tools/golden/GoldenExport.java`, one script run for the whole program, with `DecompileOptions` set explicitly. `--options-mode fixed` (default) sets a documented list and reads nothing from the program; `--options-mode program` also calls `grabFromProgram`, which is what the Ghidra window does. The header carries every option value and a hash of them. | The same source runs under Hydra's `script` command and under stock `analyzeHeadless`, so two engines are compared with one driver and identical options. |
 
-The two paths do not produce identical C: the options change the output (calling conventions
-printed on the signature, `in_ECX` versus a `this` parameter, array-typed locals). Never diff a
-`production` capture against an `explicit` one for a gate; `diff` refuses unless
-`--allow-mismatch`. Compare like with like.
+The options change the output (calling conventions printed on the signature, `in_ECX` versus a
+`this` parameter, constants in read-only memory folded or left as `DAT_` names). `production` and
+`explicit --options-mode program` use the same options and produce the same C (see
+[Parity](#parity-of-the-production-path-with-the-ghidra-window)); `explicit` with the default
+`--options-mode fixed` reads nothing from the program and differs from both. Never diff captures
+of different options for a gate; `diff` refuses unless `--allow-mismatch`. Compare like with like.
 
 ## Running it
 
@@ -121,6 +123,40 @@ or the text of a WARNING (so "could not recover jumptable" appearing is a change
 decompile path between the two captures fails the gate (`--allow-mismatch` makes it a warning).
 The thresholds are a starting proposal: tune them after the first real merge gate, and write down
 why.
+
+## Parity of the production path with the Ghidra window
+
+`RusticQuery` used to open its decompiler without `setOptions`. The first baselines (2026-10-27,
+Hydra 12.3-hydra.2) showed what that cost, and the comparison that shows it is the easy one to
+get wrong: `explicit` in its default `fixed` mode reads nothing from the program, so it loses the
+calling conventions (`in_ECX` locals instead of `this`) and is the wrong oracle for the window.
+The right one is `explicit --options-mode program`.
+
+Counts only; the C text of a game stays local. KotOR 1 (8,616 functions), hydra-2 engine:
+
+| A | B | identical | changed | failed only in B |
+| --- | --- | ---: | ---: | ---: |
+| `explicit --options-mode program` | `production`, before the change (native defaults) | 7,253 | 1,363 | 0 |
+| `explicit --options-mode program` | `production`, after the change (`grabFromProgram`) | 8,616 | 0 | 0 |
+| `production` before | `production` after | 7,253 | 1,363 | 0 |
+
+All eight public MSVC fixtures (x86 and x64, 3,959 functions in all): after the change `production` and
+`explicit --options-mode program` are identical on every function (the `fixtures` gate passes at 100%).
+
+What the 1,363 changes are: a function whose C read a constant or string from read-only memory.
+Respecting the read-only flag is one of the program's options, off on the native defaults and on in the
+program. On the public fixture it is `df_scale`: `param_1 * DAT_004161c4 - DAT_004161c0` becomes
+`param_1 * 1.5 - 0.25`. The same change turns a copy from a read-only string into
+`builtin_strncpy(...)`, turns array locals that were several 4-byte pieces into one array, and the
+`Globals starting with '_' overlap smaller symbols` warning goes away where the constant is folded.
+The signatures also change: 318 more `__thiscall` and 132 more `__fastcall` signatures (3,055 to 3,373 and 2,238 to
+2,370; the option behind each one was not isolated). Decompile time is unchanged (median 20.0 ms before, 21.3 ms after on this machine's one
+sequential run each; the distributions overlap and a one-off run is not a benchmark).
+
+An engine integration test keeps it so: `tests/test_engine_options.py` decompiles a fixture function
+whose float constants live in `.rdata` and asserts the values are shown, and that a `thiscall` method
+keeps its convention and its `this` parameter. It needs the fixtures built
+(`HYDRALYSIS_INTEGRATION_FIXTURES`), so it skips elsewhere.
 
 ## Tiers
 

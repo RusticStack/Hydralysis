@@ -4,6 +4,7 @@
 // working copy this client owns, keeps its changes; the canonical project is never written.
 import ghidra.app.script.GhidraScript;
 import ghidra.app.decompiler.DecompInterface;
+import ghidra.app.decompiler.DecompileOptions;
 import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.cmd.function.ApplyFunctionSignatureCmd;
 import ghidra.app.util.parser.FunctionSignatureParser;
@@ -59,6 +60,9 @@ public class RusticQuery extends GhidraScript {
         }
         if (found == null) {
             found = new DecompInterface();
+            // Options first, then openProgram: the options (name transformer, payload limit)
+            // are part of what openProgram sets up.
+            applyProgramOptions(found, program);
             if (!found.openProgram(program)) {
                 String message = found.getLastMessage();
                 found.dispose();
@@ -68,9 +72,24 @@ public class RusticQuery extends GhidraScript {
         else {
             Long seen;
             synchronized (POOL_LOCK) { seen = SEEN.get(found); }
-            if (seen == null || seen != program.getModificationNumber()) found.flushCache();
+            if (seen == null || seen != program.getModificationNumber()) {
+                // The program changed since this decompiler last ran: its Decompiler options
+                // (prototype evaluation model, analysis switches) may have changed with it.
+                applyProgramOptions(found, program);
+                found.flushCache();
+            }
         }
         return found;
+    }
+
+    // The one place every decompile entry point gets its options: those the program itself
+    // carries (calling conventions, prototype evaluation model, analysis switches), as the
+    // Ghidra window and a headless decompile use them. A bare DecompInterface runs on the
+    // native defaults and drops calling-convention information from signatures and locals.
+    private static void applyProgramOptions(DecompInterface decompiler, Program program) {
+        DecompileOptions options = new DecompileOptions();
+        options.grabFromProgram(program);
+        decompiler.setOptions(options);
     }
 
     private static void giveBack(Program program, DecompInterface decompiler, boolean healthy) {
