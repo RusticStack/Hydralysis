@@ -109,14 +109,14 @@ def tool_table() -> list[dict]:
         tool("evidence_list", "Claims, newest first, by target/subsystem/address/build; superseded ones on request. export=<path.md> writes a subsystem (and .jsonl).", {
             "target": string, "limit": integer, "db": string, "subsystem": string, "address": string, "build": string,
             "include_superseded": {"type": "boolean"}, "export": string}),
-        tool("ghidra_run", "Run one of your Ghidra scripts on a target's saved analysis, contained (rolled back). No import, no copy.", {
-            "target": string, "script": string,
+        tool("ghidra_run", "Run your Ghidra script on saved analysis; contained and rolled back.", {
+            "target": string, "script": string, "view": string,
             "args": {"type": "array", "items": string},
             "timeout_s": integer,
         }, ["target", "script"]),
-        tool("ghidra_query", "Query saved analysis through the shared warm engine. Numeric VA/rva:/va: addresses; bounded pages via next_cursor. export starts a durable file job. Use backend help for options.", {
+        tool("ghidra_query", "Query saved analysis; pages use next_cursor. address_map imports cited name/hash maps; export starts a job. See backend help.", {
             "target": string,
-            "action": {"type": "string", "enum": ["decompile", "function", "functions", "xrefs", "types", "type", "data", "scan", "variables", "dossier", "blocks", "pcode", "trace", "type_edit", "diff", "vcalls", "vtables", "writes", "orphans", "export", "status", "stop"]},
+            "action": {"type": "string", "enum": ["decompile", "function", "functions", "xrefs", "types", "type", "data", "scan", "variables", "dossier", "blocks", "pcode", "trace", "type_edit", "diff", "vcalls", "vtables", "writes", "orphans", "export", "address_map", "status", "stop"]},
             "address": string, "limit": integer, "cursor": string, "contains": string, "timeout_s": integer,
             "options": {"type": "object"},
         }, ["target"]),
@@ -250,19 +250,39 @@ def call(name: str, args: dict | None) -> str:
                            include_superseded=bool(args.get("include_superseded")))
     target = str(args.get("target") or args.get("game") or "")
     if name == "ghidra_query":
+        settings = _settings()
         if args.get("action") == "export":
             from rusticre.exporting import start
-            return json.dumps(start(_settings(), target, args.get("options")), indent=2)
-        return QueryRunner(_settings()).query(
-            target, str(args.get("action") or "decompile"), str(args.get("address") or ""),
+            return json.dumps(start(settings, target, args.get("options")), indent=2)
+        runner = QueryRunner(settings)
+        if args.get("action") == "address_map":
+            from rusticre.address_maps import import_map
+            options = args.get("options")
+            if not isinstance(options, dict) or set(options) != {"path"} or not isinstance(options["path"], str):
+                raise ValueError("address_map requires options.path to a cited JSON map")
+            return json.dumps(import_map(settings, runner.target(target)["sha256"], options["path"]), indent=2)
+        address = str(args.get("address") or "")
+        resolution = None
+        if address.startswith(("name:", "hash:")):
+            from rusticre.address_maps import resolve
+            resolution = resolve(settings, runner.target(target)["sha256"], address)
+            address = "rva:" + resolution["rva"]
+        result = runner.query(
+            target, str(args.get("action") or "decompile"), address,
             int(args.get("limit", 40)), str(args.get("cursor") or ""), str(args.get("contains") or ""),
             int(args.get("timeout_s", 30)),
             args.get("options"),
         )
+        if resolution:
+            decoded = json.loads(result)
+            decoded["address_resolution"] = resolution
+            return json.dumps(decoded, ensure_ascii=False)
+        return result
     if name == "ghidra_run":
         from rusticre.userscripts import run
         return run(_settings(), target, str(args.get("script") or ""),
-                   [str(item) for item in _list(args.get("args"))], int(args.get("timeout_s") or 600))
+                   [str(item) for item in _list(args.get("args"))], int(args.get("timeout_s") or 600),
+                   args.get("view", ""))
     if name == "ghidra_scripts":
         from rusticre.userscripts import list_scripts
         return list_scripts(load(), target, str(args.get("filter") or ""))
@@ -440,6 +460,10 @@ def _addr(image: Image, args: dict) -> int:
     if "address" not in args:
         raise ValueError("address is required")
     text = str(args["address"]).strip()
+    if text.startswith(("name:", "hash:")):
+        from rusticre.address_maps import resolve
+        image._address_resolution = resolve(_settings(), image.fingerprint()["sha256"], text)
+        return int(image._address_resolution["rva"], 16)
     rva = parse_rva(text, image.base)
     if ":" not in text:
         value = int(text, 0)

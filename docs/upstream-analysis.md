@@ -77,8 +77,8 @@ type/p-code tools:
 | `trace` | Function VA; optional operation/varnode `seed`, direction and budgets |
 | `type_edit` | Cited structure, prototype, local type, typed data, name or comment overlay |
 
-`trace` accepts `options.direction` (`backward` or `forward`), `depth` (1–12),
-`nodes` (1–200), and `functions` (1–4). Omit `seed` to start from the selected
+`trace` accepts `options.direction` (`backward` or `forward`), `depth` (1–32),
+`nodes` (1–200), and `functions` (1–8). Omit `seed` to start from the selected
 instruction and the seed function's returns. To select a particular value,
 copy an operation or varnode ID from `pcode`. IDs cite the function VA,
 instruction VA, operation sequence, or SSA varnode identity. Every reply also
@@ -150,7 +150,8 @@ extent or runtime objects from plausible words. Large defined values are not
 fully materialized. `scan` accepts optional `end`, `mnemonic` and `operand`
 literal filters and visits at most 2,000 listing instructions per page; it
 returns progress and a VA cursor even for a page with no matching instruction.
-Neither action disassembles new code or evaluates an arbitrary regex.
+Neither action disassembles new code. `scan` also accepts a bounded regular
+expression over the decoded mnemonic and operands.
 
 `decompile` retains its 32,000-character interactive default. A reviewed file
 export may explicitly request `options.max_characters` up to 2,097,152. The

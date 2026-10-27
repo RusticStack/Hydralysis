@@ -1,7 +1,9 @@
+import json
 import struct
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from test_pe import image
 
@@ -79,6 +81,98 @@ class WritersRequest(unittest.TestCase):
                     {"rows": [{"site": "0x1"}], "target": "t", "offset": "0x4"}):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 runner._writers("a" * 32, dict(bad), "token", owner)
+
+
+class WriterCleanup(unittest.TestCase):
+    def setUp(self):
+        self.runner = runtime.RuntimeRunner({"root": "unused"})
+        self.pe = SimpleNamespace(base=0x140000000, bits=64, read_rva=lambda *_: b"\x90" * 8)
+        self.query = Mock()
+        self.query.query.return_value = json.dumps({"references": []})
+        self.args = {"target": "fixture", "object": "0x10000", "offset": "0x4", "window_s": 1,
+                     "rows": [{"site": "0x140001000", "instruction": "MOV dword ptr [RAX + 0x4], EDX"},
+                              {"site": "0x140002000", "instruction": "MOV dword ptr [RAX + 0x4], EDX"}]}
+        self.owner = {"exe": str(Path("fixture.exe"))}
+        self.patches = [patch("rusticre.pe.Image", return_value=self.pe),
+                        patch("rusticre.backends.resolved", return_value={}),
+                        patch("rusticre.query.QueryRunner", return_value=self.query),
+                        patch("rusticre.runtime._json", return_value={"sha256": "a" * 64})]
+        for item in self.patches:
+            item.start()
+            self.addCleanup(item.stop)
+
+    def run_writers(self):
+        return self.runner._writers("session", self.args, "owner", self.owner)
+
+    def test_later_lookup_failure_unloads_the_installed_probe(self):
+        self.query.query.side_effect = [json.dumps({"references": []})] * 7 + [RuntimeError("lookup failed")]
+        self.runner.call = Mock(return_value={"hook_id": "first"})
+        with self.assertRaisesRegex(RuntimeError, "lookup failed"):
+            self.run_writers()
+        self.runner.call.assert_any_call("unload", {"session": "session", "owner": "owner", "hook_id": "first"})
+
+    def test_denied_install_is_not_treated_as_a_refused_probe(self):
+        def call(action, args):
+            if action == "observe":
+                if self.runner.call.call_count == 1:
+                    return {"hook_id": "first"}
+                raise PermissionError("owner denied")
+            return {}
+        self.runner.call = Mock(side_effect=call)
+        with self.assertRaisesRegex(PermissionError, "owner denied"):
+            self.run_writers()
+        self.runner.call.assert_any_call("unload", {"session": "session", "owner": "owner", "hook_id": "first"})
+
+    def test_denied_fallback_install_unloads_existing_probe(self):
+        def query(target, action, address, **kwargs):
+            if action == "function":
+                return json.dumps({"function": {"address": "0x140002000"}})
+            if action == "xrefs" and address == "0x140002000":
+                return json.dumps({"references": [{"from": "0x140003000", "type": "CALL"}]})
+            if action == "scan":
+                return json.dumps({"instructions": [{"address": "0x140003005"}]})
+            return json.dumps({"references": []})
+        self.query.query.side_effect = query
+        attempts = iter(({"hook_id": "first"}, ValueError("site refused"), PermissionError("fallback denied")))
+        def call(action, args):
+            if action == "observe":
+                answer = next(attempts)
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+            return {}
+        self.runner.call = Mock(side_effect=call)
+        with patch("rusticre.runtime._base_argument", return_value=("reg", "rcx")), \
+             patch("rusticre.runtime._argument_at_return", return_value=("reg", "rbx")):
+            with self.assertRaisesRegex(PermissionError, "fallback denied"):
+                self.run_writers()
+        self.runner.call.assert_any_call("unload", {"session": "session", "owner": "owner", "hook_id": "first"})
+
+    def test_unload_failure_is_reported_and_other_probes_are_still_unloaded(self):
+        observed = iter(("first", "second"))
+        def call(action, args):
+            if action == "observe":
+                return {"hook_id": next(observed)}
+            if action == "unload" and args["hook_id"] == "first":
+                raise RuntimeError("worker rejected unload")
+            if action == "status":
+                return {"last_sequence": 0, "events": []}
+            return {"modules": []}
+        self.runner.call = Mock(side_effect=call)
+        with patch("rusticre.runtime.time.monotonic", side_effect=[0, 2]):
+            with self.assertRaisesRegex(RuntimeError, "first: RuntimeError: worker rejected unload"):
+                self.run_writers()
+        self.runner.call.assert_any_call("unload", {"session": "session", "owner": "owner", "hook_id": "second"})
+
+    def test_denied_cleanup_and_original_failure_are_both_reported(self):
+        self.query.query.side_effect = [json.dumps({"references": []})] * 7 + [RuntimeError("lookup failed")]
+        def call(action, args):
+            if action == "observe":
+                return {"hook_id": "first"}
+            raise PermissionError("unload denied")
+        self.runner.call = Mock(side_effect=call)
+        with self.assertRaisesRegex(PermissionError, "lookup failed.*first: PermissionError: unload denied"):
+            self.run_writers()
 
 
 if __name__ == "__main__":

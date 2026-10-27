@@ -94,6 +94,10 @@ def serve(connection: socket.socket, secret: str, handler) -> bool:
         error = str(exc).replace(secret, "[redacted]")[:2048]
         response = {"id": request.get("id") if _uuid(request.get("id")) else None,
                     "ok": False, "error": error}
+        if isinstance(exc, PermissionError):
+            response["error_type"] = "PermissionError"
+        elif isinstance(exc, ValueError):
+            response["error_type"] = "ValueError"
         try:
             send(connection, response)
         except (OSError, ValueError):

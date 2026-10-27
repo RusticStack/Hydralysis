@@ -43,7 +43,7 @@ def normalized(options: dict | None) -> dict:
     if options is not None and not isinstance(options, dict):
         raise ValueError("export options must be an object")
     options = dict(options or {})
-    unknown = set(options) - {"mode", "limit", "contains", "timeout_s", "resume", "out", "start", "end", "regex"}
+    unknown = set(options) - {"mode", "limit", "contains", "timeout_s", "resume", "out", "start", "end", "regex", "view"}
     if unknown:
         raise ValueError("unknown export options: " + ", ".join(sorted(unknown)))
     mode = options.get("mode", "decompile")
@@ -58,6 +58,9 @@ def normalized(options: dict | None) -> dict:
     if not isinstance(contains, str) or len(contains) > 256 or "\0" in contains:
         raise ValueError("export contains must be text of at most 256 characters")
     result = {"mode": mode, "limit": count, "contains": contains, "timeout_s": timeout}
+    view = workcopy.with_view({"key": "validation"}, options.get("view", ""))["view"]
+    if view != "shared":
+        result["view"] = view
     for name in ("start", "end"):
         if name in options:
             value = options[name]
@@ -106,13 +109,15 @@ def master_revision(settings: dict, selected: dict) -> str | None:
     return opened.get("revision")
 
 
-def provenance(settings: dict, target: str) -> tuple[dict, dict]:
-    selected = targets.resolve(settings, target)
+def provenance(settings: dict, target: str, view: str = "") -> tuple[dict, dict]:
+    selected = workcopy.with_view(targets.resolve(settings, target), view)
     project = dict(targets.configured(settings)[target])
     result = {"version": 2, "gpr": str(Path(selected["gpr"]).resolve()), "program": selected["program"],
               "sha256": selected["sha256"], "master_revision": master_revision(settings, selected),
               "code_sha256": code_sha256(), "overlay_state": workcopy.expected_state(settings, selected),
               "engine_release": hydra.RELEASE, "query_key": selected["key"]}
+    if selected["view"] != "shared":
+        result["view"] = selected["view"]
     if project.get("exe"):
         stat = Path(project["exe"]).stat()
         result["exe_stat"] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
@@ -172,7 +177,7 @@ def start(settings: dict, target: str, options: dict | None = None) -> dict:
             supplied = {key: value for key, value in options.items() if key != "resume"}
             if any(key not in record["options"] or record["options"][key] != value for key, value in supplied.items()):
                 raise ValueError("resume cannot change the recorded export mode, filter, limit or timeout")
-            project, observed = provenance(settings, target)
+            project, observed = provenance(settings, target, record["options"].get("view", ""))
             if observed != record["provenance"]:
                 raise ValueError("export source/build/code/overlays changed; resume refused; old output preserved")
             from rusticre.export_worker import replay, validate_completed
@@ -182,7 +187,7 @@ def start(settings: dict, target: str, options: dict | None = None) -> dict:
             replay(path, record)
             return _launch(path, record, settings)
     selected = normalized(options)
-    project, identity = provenance(settings, target)
+    project, identity = provenance(settings, target, selected.get("view", ""))
     directory = root_path(settings) / "exports"
     with locked(directory / ".start.lock"):
         for existing in sorted(directory.glob("export-*/job.json"), key=lambda item: item.stat().st_mtime_ns, reverse=True)[:200]:

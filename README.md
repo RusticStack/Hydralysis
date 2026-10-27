@@ -61,11 +61,12 @@ PE tools accept `rva:` or `va:` prefixes; ambiguous bare addresses are refused. 
 Query actions:
 
 - Reading: decompilation, function ranges, paged functions/xrefs/types, type layouts, recovered variables, dossiers, basic blocks, high p-code, decoded-listing scans.
+- Address maps: import cited, build-specific name/hash-to-RVA maps and resolve them through the same address tools. See [address maps](docs/address-maps.md).
 - Value flow: `trace` follows a p-code value backward or forward. It goes through memory: stack slots, stores to a field, out-parameters. It also goes into callers and callees, cheapest path first. `brief` returns only the constants, stops and memory edges it reached. Every step cites its instruction and operation.
 - Virtual calls: `vtables` names the tables and slot that hold a function. `vcalls` lists the call sites of a slot offset and can verify each receiver on p-code.
 - Field writes: `writes` lists the direct stores to a field offset and says what it does not cover.
 - Missed code: `orphans` pages through decoded instructions that no function contains, with what refers to each run's start. Cite one in a `function_create` correction.
-- Two builds: `diff` matches every function of two analysed builds and writes the result as a job. Names and a hook table can then be carried across.
+- Two builds: `diff` proposes function matches and hook-table candidates as a job. Review correspondence independently before using the destination bytes in a hook table; see [cross-build transfer](docs/crossbuild-transfer.md).
 
 Traces report unknown aliasing, indirect calls and runtime reachability; they do not prove source types or feasible paths.
 
@@ -73,9 +74,9 @@ Function/xref/type pages and scans disclose truncation and continuation. Default
 
 ## Correct the analysis
 
-`type_edit` records cited structures, prototypes, local types, names, comments, data definitions and exact-byte-checked function definitions. Batches take up to 200 edits, including a JSON file, and roll back as a unit. `import_types` loads a whole type corpus (JSONL, see [type corpus](docs/type-corpus.md)) as one job and one revertible step. `expect_revision` turns a concurrent edit into a conflict that names its editor.
+`type_edit` records cited structures, prototypes, local types, function names, data labels, comments, data definitions and exact-byte-checked function definitions. Batches take up to 200 edits, including a JSON file, and roll back as a unit. `import_types` loads a whole type corpus (JSONL, see [type corpus](docs/type-corpus.md)) as one job and one revertible step. `expect_revision` turns a concurrent edit into a conflict that names its editor.
 
-Edits are stored once, bound to the build's hash, and applied to a per-target working copy forked from the analysed project. Every client reads the same corrected program. The working copy is saved in the background after edits pause (`overlay_save_debounce_s`); an unsaved change is replayed from the store, never lost. `revert` removes overlays in one step by rebuilding the working copy. [The protocol](docs/upstream-analysis.md) and `backend help` describe the options.
+Edits are bound to the build's hash and applied to a working copy forked from the analysed project. Clients share the default view; `options.view` selects a separate named annotation view, whose edits require the revision reported by status. Views isolate annotations, not access. The working copy is saved in the background after edits pause (`overlay_save_debounce_s`); an unsaved change is replayed from the store, never lost. `revert` removes overlays in one step by rebuilding the working copy. [The protocol](docs/upstream-analysis.md) and `backend help` describe the options.
 
 `ghidra-query --target sample --action export --options-file export.json` writes a durable JSONL artifact. Use `job <export-id>` for status/cancel and `{"resume":"<export-id>"}` to continue the same selection. Resume refuses changed builds, source analysis, implementation or overlays. See [export options and limits](docs/exports.md).
 

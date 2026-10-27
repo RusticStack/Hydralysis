@@ -121,6 +121,19 @@ class EngineIntegration(unittest.TestCase):
         self.assertEqual(reverted["reverted"], 1)
         self.assertEqual(self.ask("decompile", address, timeout_s=300)["function"]["name"], original)
 
+    def test_cited_data_label_is_visible_and_revertible(self):
+        from rusticre.pe import Image
+        image = Image(Path(self.root / "fixture.exe"))
+        section = next(s for s in image.sections if not (s.Characteristics & 0x20000000) and s.SizeOfRawData)
+        address = hex(image.base + section.VirtualAddress)
+        edited = self.ask("type_edit", address, timeout_s=300,
+                          options={"kind": "label", "name": "integration_global", "source": "fixture section table"})
+        data = self.ask("data", address, options={"table": True})
+        self.assertIn("integration_global", [item["name"] for item in data["labels"]])
+        self.ask("type_edit", options={"kind": "revert", "ids": [edited["overlay_id"]]})
+        data = self.ask("data", address, options={"table": True})
+        self.assertNotIn("integration_global", [item["name"] for item in data["labels"]])
+
     def test_adopt_registers_the_prepared_project_in_place(self):
         from rusticre import hydra, targets
         gpr = self.prepared["project"]["gpr"]

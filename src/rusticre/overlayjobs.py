@@ -45,26 +45,29 @@ def _alive(record: dict) -> bool:
     return proc.identity(int(record.get("worker_pid", 0)), int(record.get("worker_started_ms", 0)))
 
 
-def active(settings: dict, target: str) -> dict | None:
+def active(settings: dict, target: str, view: str = "") -> dict | None:
     directory = root_path(settings) / "overlay-jobs"
     for path in sorted(directory.glob("overlay-*/job.json"), key=lambda item: item.stat().st_mtime_ns, reverse=True)[:50]:
         record = status(settings, path.parent.name)
-        if record.get("target") == target and record.get("state") in ACTIVE:
+        if (record.get("target") == target and record.get("view", "") == view
+                and record.get("state") in ACTIVE):
             return record
     return None
 
 
-def start(settings: dict, target: str, kind: str, address: str = "", options: dict | None = None) -> dict:
+def start(settings: dict, target: str, kind: str, address: str = "", options: dict | None = None,
+          view: str = "") -> dict:
     """kind: edit (apply and record one bulk overlay) or sync (rebuild the working copy)."""
     root = root_path(settings)
     with locked(root / "overlay-jobs" / ".start.lock", what="overlay jobs"):
-        running = active(settings, target)
+        view = "" if view == "shared" else view
+        running = active(settings, target, view)
         if running and kind == "sync" and running["kind"] == "sync":
             return {**running, "reused": True}
         job_id = "overlay-" + uuid.uuid4().hex[:12]
         path = job_path(settings, job_id)
         path.parent.mkdir(parents=True)
-        record = {"id": job_id, "kind": kind, "target": target, "address": address, "options": options or {},
+        record = {"id": job_id, "kind": kind, "target": target, "view": view, "address": address, "options": options or {},
                   "state": "queued", "created_at": time.time(), "by": hydra.identity(),
                   "log_path": str(path.parent / "worker.log")}
         from rusticre import jobowner
@@ -78,7 +81,13 @@ def start(settings: dict, target: str, kind: str, address: str = "", options: di
         with Path(record["log_path"]).open("ab") as log:
             child = proc.popen([sys.executable, "-m", "rusticre.overlayjobs", str(path)], env=env, stdout=log, stderr=log,
                                **({} if os.name == "nt" else {"start_new_session": True}))
-        _update(path, worker_pid=child.pid, worker_started_ms=proc_start(child.pid))
+        # A Windows venv launcher may have already started the real worker,
+        # which publishes its own identity before this parent resumes.
+        with locked(path.with_suffix(".lock"), what="overlay job"):
+            current = read_json(path)
+            if current.get("state") == "queued" and not current.get("worker_pid"):
+                current.update(worker_pid=child.pid, worker_started_ms=proc_start(child.pid), updated_at=time.time())
+                write_json(path, current)
         return {**status(settings, job_id), "owner_token": token}
 
 
@@ -128,7 +137,7 @@ def run(path: Path) -> None:
     threading.Thread(target=watch, daemon=True).start()
     _update(path, state="running", worker_pid=os.getpid(), worker_started_ms=proc_start(os.getpid()), started_at=time.time())
     try:
-        selected = targets.resolve(settings, record["target"])
+        selected = workcopy.with_view(targets.resolve(settings, record["target"]), record.get("view", ""))
         engine = hydra.Engine(settings)
         if record["kind"] == "diff":
             from rusticre import crossbuild

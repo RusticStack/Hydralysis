@@ -34,8 +34,10 @@ class Server:
         self.process = subprocess.Popen([sys.executable, "-m", "rusticre", "mcp"], stdin=subprocess.PIPE,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=str(root))
         self.replies: queue.Queue = queue.Queue()
-        threading.Thread(target=self._read, daemon=True).start()
-        threading.Thread(target=self.process.stderr.read, daemon=True).start()
+        self.readers = [threading.Thread(target=self._read, daemon=True),
+                        threading.Thread(target=self.process.stderr.read, daemon=True)]
+        for reader in self.readers:
+            reader.start()
         self.ident = 0
         self.request("initialize", {"protocolVersion": "2025-06-18", "clientInfo": {"name": "transport-test"}})
 
@@ -59,6 +61,10 @@ class Server:
     def close(self):
         self.process.stdin.close()
         self.process.wait(timeout=20)
+        for reader in self.readers:
+            reader.join(timeout=20)
+        self.process.stdout.close()
+        self.process.stderr.close()
 
 
 class RuntimeOverMCP(unittest.TestCase):
@@ -72,16 +78,21 @@ class RuntimeOverMCP(unittest.TestCase):
         cls.digest = hashlib.sha256(Path(cls.exe).read_bytes()).hexdigest()
         cls.head = " ".join("%02X" % byte for byte in Path(cls.exe).read_bytes()[:5])
         cls.server = Server(cls.root)
-        cls.children: list[int] = []
+        cls.children: list[subprocess.Popen | int] = []
 
     @classmethod
     def tearDownClass(cls):
         cls.server.close()
-        for pid in cls.children:
+        for child in cls.children:
             try:
-                os.kill(pid, 9)
+                if isinstance(child, int):
+                    os.kill(child, 9)  # spawned by the worker, not this test process
+                else:
+                    child.kill()
             except OSError:
                 pass
+            if not isinstance(child, int):
+                child.wait(timeout=10)
         # A killed child releases its working directory a moment later on Windows.
         deadline = time.monotonic() + 10
         while Path(cls.work.name).exists() and time.monotonic() < deadline:
@@ -153,7 +164,7 @@ class RuntimeOverMCP(unittest.TestCase):
 
     def test_probe_decodes_captured_arguments_and_samples(self):
         target = subprocess.Popen([self.exe, "-c", "import time;time.sleep(60)"], stdin=subprocess.DEVNULL)
-        self.children.append(target.pid)
+        self.children.append(target)
         session = self.runtime("attach", exe=self.exe, sha256=self.digest, pid=target.pid)["session"]
         try:
             site = {"session": session, "module": Path(self.exe).name, "rva": "0x0", "sha256": self.digest, "expect": self.head}
@@ -172,7 +183,7 @@ class RuntimeOverMCP(unittest.TestCase):
 
     def test_observe_without_hash_names_the_option(self):
         target = subprocess.Popen([self.exe, "-c", "import time;time.sleep(60)"], stdin=subprocess.DEVNULL)
-        self.children.append(target.pid)
+        self.children.append(target)
         session = self.runtime("attach", exe=self.exe, sha256=self.digest, pid=target.pid)["session"]
         text = self.call("runtime", {"action": "observe", "options": {"session": session, "module": Path(self.exe).name,
                                                                          "rva": "0x0", "expect": self.head}}, error=True)
@@ -262,7 +273,7 @@ class PatchedFunctionOverMCP(RuntimeOverMCP):
 
     def attached(self):
         target = subprocess.Popen([self.exe, "-c", "import time;time.sleep(60)"], stdin=subprocess.DEVNULL)
-        self.children.append(target.pid)
+        self.children.append(target)
         return self.runtime("attach", exe=self.exe, sha256=self.digest, pid=target.pid)["session"]
 
     def test_live_patch_is_reported_with_the_file_bytes_and_its_patcher(self):

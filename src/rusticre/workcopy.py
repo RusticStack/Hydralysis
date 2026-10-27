@@ -18,18 +18,29 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import time
 import uuid
 from pathlib import Path
 
 from rusticre import hydra
-from rusticre.analysis import MAX_HISTORY_BYTES, MAX_OVERLAYS, _edit, _overlay_path
+from rusticre.analysis import MAX_CORPUS_BYTES, MAX_HISTORY_BYTES, MAX_OVERLAYS, _edit, _overlay_path
 from rusticre.backends import read_json, write_json
 from rusticre.locks import locked
 from rusticre.paths import root_path
 
 SYNC_LOCK_S = 900
+
+
+def with_view(target: dict, view: str = "") -> dict:
+    """Select a durable annotation namespace without changing the analysed target."""
+    if not isinstance(view, str) or (view and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", view)):
+        raise ValueError("view must be a name of 1..64 letters, digits, dots, dashes or underscores")
+    if not view or view == "shared":
+        return {**target, "view": "shared"}
+    key = hashlib.sha256((target["key"] + "\nview:" + view).encode()).hexdigest()[:16]
+    return {**target, "key": key, "view": view}
 
 
 def _store_path(settings: dict, target: dict) -> Path:
@@ -365,7 +376,7 @@ def heavy(store: dict) -> bool:
 def rebuilding(settings: dict, target: dict) -> dict:
     """A replay of bulk overlays runs as a job; the reader is told which one."""
     from rusticre import overlayjobs
-    job = overlayjobs.start(settings, target["name"], "sync")
+    job = overlayjobs.start(settings, target["name"], "sync", view=target.get("view", ""))
     raise RuntimeError(json.dumps({"working_copy": "synchronizing", "job": job["id"], "state": job["state"],
                                    "suggest": "job status %s; queries answer once it is done" % job["id"]}))
 

@@ -105,12 +105,18 @@ def _created_ms(pid: int) -> int:
             return ticks // 10000 - 11644473600000
         finally:
             kernel.CloseHandle(handle)
+    if sys.platform == "darwin":
+        from rusticre.darwin_process import created_ms
+        return created_ms(pid)
     stat = Path("/proc/%d/stat" % pid).read_text().rsplit(")", 1)[1].split()
     boot = next(int(line.split()[1]) for line in Path("/proc/stat").read_text().splitlines() if line.startswith("btime "))
     return int((boot + int(stat[19]) / os.sysconf("SC_CLK_TCK")) * 1000)
 
 
 def _process_path(pid: int) -> str:
+    if sys.platform == "darwin":
+        from rusticre.darwin_process import process_path
+        return process_path(pid)
     if os.name != "nt":
         return str(Path("/proc/%d/exe" % pid).resolve())
     import ctypes
@@ -657,13 +663,16 @@ class RuntimeAgent:
                 raise RuntimeError("runtime script failed: " + entry["script_error"])
             if metadata.get("kind") in ("observe", "break") and not script.exports_sync.status().get("installed"):
                 raise RuntimeError("runtime probe did not confirm installation")
-        except Exception:
+        except Exception as original:
             try:
                 script.unload()
                 self.scripts.pop(script_id)
-            except Exception:
+            except Exception as cleanup:
                 # Retain ownership for explicit cleanup retry.
                 entry["cleanup_pending"] = True
+                error_type = PermissionError if isinstance(original, PermissionError) or isinstance(cleanup, PermissionError) else RuntimeError
+                raise error_type("runtime script %s failed to load (%s); cleanup failed (%s); "
+                                 "script retained for unload retry" % (script_id, original, cleanup)) from original
             raise
         self.publish()
         return entry

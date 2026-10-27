@@ -119,7 +119,16 @@ class QueryRunner:
               options: dict | None = None) -> str:
         if action not in ACTIONS:
             raise ValueError("unknown saved-analysis query action; use backend help")
-        options = validate_options(action, options)
+        if options is not None and not isinstance(options, dict):
+            raise ValueError("options must be an object")
+        options = dict(options or {})
+        view = options.pop("view", "")
+        supplied_options = options
+        options = validate_options(action, supplied_options)
+        # Batch/corpus normalization constructs a new dict; retain the already
+        # validated revision for the eventual write, including durable jobs.
+        if action == "type_edit" and "expect_revision" in supplied_options:
+            options["expect_revision"] = supplied_options["expect_revision"]
         if not 1 <= limit <= 200 or not 1 <= timeout_s <= 300:
             raise ValueError("limit must be 1..200; timeout_s must be 1..300")
         requires_address = action in ADDRESS_ACTIONS
@@ -132,33 +141,40 @@ class QueryRunner:
             raise ValueError("use a numeric VA or an rva:/va: prefix, not a symbol name")
         if cursor and not re.fullmatch(r"(?:0x)?[0-9a-fA-F]+", cursor):
             raise ValueError("use a numeric VA or hexadecimal row cursor, not a symbol name")
-        selected = self.target(target)
+        selected = workcopy.with_view(self.target(target), view)
+        view = selected["view"]
+        if view != "shared" and action == "type_edit" and "expect_revision" not in options:
+            raise ValueError("a named view edit requires expect_revision; get its revision with ghidra_query status")
         if action == "status":
             return json.dumps(_public(self.status(selected)), ensure_ascii=False)
         if action == "stop":
             return json.dumps(self.stop(selected))
         if action == "type_edit" and options.get("kind") == "revert":
-            return json.dumps(workcopy.revert(self.settings, selected, options["ids"], options.get("expect_revision")))
+            return json.dumps({**workcopy.revert(self.settings, selected, options["ids"], options.get("expect_revision")),
+                               "view": view})
         if action == "diff":
             from rusticre import overlayjobs
+            if view != "shared":
+                raise ValueError("diff currently uses the shared view; named-view cross-build transfer is not supported")
             self.target(options["against"])
             return json.dumps(overlayjobs.start(self.settings, selected["name"], "diff", "", options), ensure_ascii=False)
         if action == "type_edit" and options.get("kind") in BULK_KINDS:
             from rusticre import overlayjobs
-            return json.dumps(overlayjobs.start(self.settings, selected["name"], "edit", address, options), ensure_ascii=False)
+            return json.dumps(overlayjobs.start(self.settings, selected["name"], "edit", address, options, view=view), ensure_ascii=False)
         if action == "type_edit":
             if address.startswith(("rva:", "va:")):
                 # Overlay records hold plain VAs, so replay never depends on how an edit was typed.
                 base = open_program(self.engine, selected["gpr"], selected["program"], selected["sha256"])["image_base"]
                 value = int(address.split(":", 1)[1].removeprefix("0x"), 16)
                 address = hex(int(base, 16) + value if address.startswith("rva:") else value)
-            return json.dumps(_public(workcopy.edit(self.settings, self.engine, selected, address, options, timeout_s)),
+            return json.dumps(_public({**workcopy.edit(self.settings, self.engine, selected, address, options, timeout_s),
+                                       "view": view}),
                               ensure_ascii=False)
         request = {"id": uuid.uuid4().hex, "action": action, "address": address, "limit": limit, "cursor": cursor,
                    "contains": contains, "timeout_s": timeout_s, "options": options, "expected_sha256": selected["sha256"]}
         started = time.monotonic()
         response = self._ask(selected, request, timeout_s)
-        response.update(target=selected["name"], query_s=round(time.monotonic() - started, 3))
+        response.update(target=selected["name"], view=view, query_s=round(time.monotonic() - started, 3))
         if not response.get("ok"):
             raise RuntimeError(json.dumps(_public(response), ensure_ascii=False))
         return json.dumps(_public(response), ensure_ascii=False)
@@ -195,19 +211,39 @@ class QueryRunner:
     def status(self, selected: dict) -> dict:
         hello = self.engine.hello()
         info = {key: hello.get(key) for key in ("protocol", "hydraVersion", "ghidraVersion", "installId", "pid", "startedAt")}
-        return {"engine": info, "target": {key: selected[key] for key in ("name", "gpr", "program", "sha256")},
+        return {"engine": info, "target": {key: selected[key] for key in ("name", "gpr", "program", "sha256", "view")},
                 "overlays": workcopy.summary(self.settings, selected), "identity": hydra.identity()}
 
     def stop(self, selected: dict) -> dict:
         """Release this process's use of the target's programs; the shared daemon keeps serving others."""
         released = []
+        failed = []
+        master = str(Path(selected["gpr"])).lower()
+        working = workcopy._directory(self.settings, selected).resolve()
+
+        def belongs(key):
+            if key[0] != self.engine.key or key[2].lstrip("/") != selected["program"].lstrip("/"):
+                return False
+            if key[1] == master and selected.get("view", "shared") == "shared":
+                return True
+            return Path(key[1]).resolve().is_relative_to(working)
+
         with _keys_guard:
-            entries = [(key, value) for key, value in _keys.items() if key[0] == self.engine.key]
+            entries = [(key, value) for key, value in _keys.items() if belongs(key)]
+        # Several cache entries can refer to one daemon program.
+        groups = {}
         for key, value in entries:
+            groups.setdefault(value["key"], []).append((key, value))
+        for program, group in groups.items():
             try:
-                self.engine.call("close_program", program=value["key"])
-                released.append(value["key"])
-            except hydra.EngineError:
-                pass
-        forget(self.engine)
-        return {"released": released, "note": "the shared engine keeps warm programs for keepWarm seconds"}
+                self.engine.call("close_program", program=program)
+            except hydra.EngineError as exc:
+                failed.append({"program": program, "error": str(exc)})
+                continue
+            released.append(program)
+            with _keys_guard:
+                for key, value in group:
+                    if _keys.get(key) is value:
+                        _keys.pop(key, None)
+        return {"ok": not failed, "released": released, "failed": failed,
+                "note": "the shared engine keeps warm programs for keepWarm seconds"}

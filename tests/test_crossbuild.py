@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+from rusticre.cli import _checks_file
 
 from rusticre import crossbuild
 from support import workdir
@@ -72,21 +75,163 @@ class Matching(unittest.TestCase):
         self.assertNotIn("0x1", pairs)
         self.assertNotIn("0x2", pairs)
 
-    def test_report_names_and_prologue_table(self):
+    def test_transfer_checks_are_review_candidates_not_hook_tables(self):
         with workdir("cross") as folder:
             folder = Path(folder)
             source, destination = self.build()
+            image = FakeImage()
             checks = folder / "checks.json"
-            checks.write_text(json.dumps([{"name": "Load", "address": "rva:0x2000", "expect": "48"},
-                                          {"name": "Gone", "address": "rva:0x4000", "expect": "48"}]))
-            pairs = crossbuild.match(source, destination)
-            result = crossbuild.transfer_checks(str(checks), pairs, destination, folder / "out.json")
-            self.assertEqual((result["placed"], result["unplaced"]), (1, 1))
-            placed = json.loads((folder / "out.json").read_text())["checks"][0]
-            self.assertEqual(placed["address"], "rva:0xa000")
-            self.assertEqual(placed["expect"], "48 89 5C 24 08")
+            checks.write_text(json.dumps({"build_sha256": image.digest, "image_base": hex(image.base), "hooks": [
+                {"offset": "0x2000", "names": ["Load", "Alias"], "prologue": "4889"},
+                {"offset": "0x4000", "names": ["Gone"], "prologue": "4889"}]}))
+            prepared = crossbuild._prepare_checks(str(checks), image)
+            result = crossbuild.transfer_checks(prepared, crossbuild.match(source, destination), source, destination,
+                                               image, image, folder / "out.json")
+            self.assertEqual((result["candidates"], result["unplaced"]), (1, 1))
+            document = json.loads((folder / "out.json").read_text())
+            candidate = document["candidates"][0]
+            self.assertEqual(candidate["address"], "rva:0xa000")
+            self.assertEqual(candidate["names"], ["Load", "Alias"])
+            self.assertEqual(candidate["observed_destination_prologue"], "48 89 " + "90 " * 21 + "90")
+            self.assertTrue(candidate["review_required"])
+            self.assertNotIn("expect", candidate)
+            self.assertNotIn("checks", document)
+            with self.assertRaisesRegex(ValueError, "checks file"):
+                _checks_file(str(folder / "out.json"), None)
             self.assertTrue(crossbuild._named(source["0x1000"]))
             self.assertFalse(crossbuild._named(destination["0x9000"]))
+
+    def test_va_offsets_and_canonical_addresses_resolve_using_source_base(self):
+        with workdir("cross") as folder:
+            path = Path(folder) / "checks.json"
+            image = FakeImage()
+            path.write_text(json.dumps({"image_base": hex(image.base), "hooks": [
+                {"offset": "va:0x402000", "names": ["va"], "prologue": "48 89"},
+                {"address": "rva:0x2000", "name": "rva", "expect": "48 89"}]}))
+            rows = crossbuild._prepare_checks(str(path), image)
+            self.assertEqual([item["rva"] for item in rows], ["0x2000", "0x2000"])
+
+    def test_wrong_build_base_or_bytes_fail_before_candidates(self):
+        with workdir("cross") as folder:
+            path = Path(folder) / "checks.json"
+            image = FakeImage()
+            table = {"build_sha256": image.digest, "image_base": hex(image.base),
+                     "checks": [{"address": "rva:0x2000", "expect": "48 89"}]}
+            for key, bad, error in (("build_sha256", "a" * 64, "hash"), ("image_base", "0x1234", "image_base")):
+                invalid = dict(table, **{key: bad})
+                path.write_text(json.dumps(invalid))
+                with self.assertRaisesRegex(ValueError, error):
+                    crossbuild._prepare_checks(str(path), image)
+            table["checks"][0]["expect"] = "CC"
+            path.write_text(json.dumps(table))
+            with self.assertRaisesRegex(ValueError, "prologue mismatch"):
+                crossbuild._prepare_checks(str(path), image)
+
+    def test_ambiguous_unqualified_address_is_rejected(self):
+        image = FakeImage(base=0x1000, mapped={0x2000, 0x3000})
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            crossbuild._source_rva("0x3000", image, None)
+        self.assertEqual(crossbuild._source_rva("va:0x3000", image, None), 0x2000)
+        self.assertEqual(crossbuild._source_rva("rva:0x3000", image, None), 0x3000)
+
+    def test_job_refuses_invalid_source_before_fingerprinting(self):
+        with workdir("cross") as folder:
+            path = Path(folder) / "checks.json"
+            path.write_text(json.dumps({"hooks": [{"offset": "rva:0x2000", "prologue": "CC"}]}))
+            target = {"name": "fixture", "sha256": "e" * 64, "exe": "fixture.exe"}
+            record = {"target": "destination", "options": {"against": "source", "checks": str(path)}}
+            with patch("rusticre.crossbuild.targets.resolve", return_value=target), \
+                 patch("rusticre.crossbuild._target_image", return_value=FakeImage()), \
+                 patch("rusticre.crossbuild.fingerprints") as fingerprints:
+                with self.assertRaisesRegex(ValueError, "prologue mismatch"):
+                    crossbuild.run({}, record, Path(folder) / "output")
+                fingerprints.assert_not_called()
+
+    def test_unbacked_destination_is_unplaced(self):
+        with workdir("cross") as folder:
+            path = Path(folder) / "checks.json"
+            image = FakeImage()
+            path.write_text(json.dumps([{"address": "rva:0x2000", "expect": "48"}]))
+            prepared = crossbuild._prepare_checks(str(path), image)
+            source, destination = self.build()
+            destination_image = FakeImage(mapped={0x9000})
+            result = crossbuild.transfer_checks(prepared, crossbuild.match(source, destination), source, destination,
+                                               image, destination_image, Path(folder) / "out.json")
+            self.assertEqual((result["candidates"], result["unplaced"]), (0, 1))
+            row = json.loads((Path(folder) / "out.json").read_text())["unplaced"][0]
+            self.assertIn("file-backed", row["reason"])
+
+    def test_overlay_export_preserves_citations_and_requires_review(self):
+        with workdir("cross") as folder:
+            source, destination = self.build()
+            source_target = {"name": "old", "sha256": "a" * 64}
+            dest_target = {"sha256": "b" * 64}
+            record = {"id": "f" * 32, "address": "0x402000", "by": "agent", "at": 123,
+                      "options": {"kind": "signature", "prototype": "int load(int x)", "source": "trace log 12"}}
+            store = {"revision": 3, "edits": [record], "reverted": [{"ids": ["c" * 32]}]}
+            with patch("rusticre.workcopy.load_store", return_value=store):
+                result = crossbuild._export_overlay_candidates({}, source_target, dest_target,
+                          crossbuild.match(source, destination), source, FakeImage(), Path(folder))
+            report = json.loads(Path(result["file"]).read_text())
+            self.assertEqual(report["edits"][0]["source_record"], record)
+            self.assertEqual(report["edits"][0]["candidate"]["destination_address"], "rva:0xa000")
+            self.assertEqual(report["reverted"], store["reverted"])
+            self.assertTrue(report["review_required"])
+
+    def test_fingerprint_cache_tracks_overlay_revision_and_identity(self):
+        with workdir("cross") as folder:
+            target = {"name": "fixture", "sha256": "a" * 64, "key": "target"}
+            store = {"revision": 1, "edits": [{"id": "1" * 32}]}
+            class Runner:
+                def __init__(self, settings, engine):
+                    self.engine = engine
+                def program_for(self, selected):
+                    return "program"
+            def run_script(engine, program, request, timeout):
+                Path(request["options"]["artifact"]).write_text("{}\n")
+                return {"ok": True}, ""
+            with patch("rusticre.crossbuild.targets.resolve", return_value=target), \
+                 patch("rusticre.crossbuild.root_path", return_value=Path(folder)), \
+                 patch("rusticre.crossbuild.fingerprint_code", return_value="code"), \
+                 patch("rusticre.workcopy.load_store", side_effect=lambda *args: store), \
+                 patch("rusticre.query.QueryRunner", Runner), \
+                 patch("rusticre.query.run_script", side_effect=run_script):
+                first = crossbuild.fingerprints({}, "fixture", engine=object())
+                store["revision"] = 2
+                store["edits"] = [{"id": "2" * 32}]
+                second = crossbuild.fingerprints({}, "fixture", engine=object())
+            self.assertNotEqual(first, second)
+            self.assertTrue(first.is_file() and second.is_file())
+
+    def test_target_image_checks_registered_hash_and_requires_executable(self):
+        with self.assertRaisesRegex(ValueError, "registered executable"):
+            crossbuild._target_image({"name": "source", "sha256": "f" * 64})
+        with patch("rusticre.crossbuild.Image", return_value=FakeImage()):
+            with self.assertRaisesRegex(ValueError, "registered build hash"):
+                crossbuild._target_image({"name": "source", "exe": "fake.exe", "sha256": "f" * 64})
+
+
+class FakeImage:
+    def __init__(self, base=0x400000, mapped=None):
+        self.base = base
+        self.digest = "e" * 64
+        self.mapped = mapped if mapped is not None else {0x1000, 0x2000, 0x3000, 0x4000, 0x9000, 0xa000, 0xb000, 0xc000}
+
+    def fingerprint(self):
+        return {"sha256": self.digest, "image_base": hex(self.base)}
+
+    def rva_to_offset(self, rva):
+        return rva if rva in self.mapped else None
+
+    def _available(self, rva):
+        if self.rva_to_offset(rva) is None:
+            raise ValueError("outside file-backed sections")
+        return 24
+
+    def read_rva(self, rva, size):
+        if size > self._available(rva):
+            raise ValueError("outside file-backed sections")
+        return (b"\x48\x89" + b"\x90" * 22)[:size]
 
 
 if __name__ == "__main__":

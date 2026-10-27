@@ -88,6 +88,15 @@ class ProbeGuards(RuntimeCase):
         self.script.unload.assert_called_once()
         self.assertFalse(self.agent.scripts)
 
+    def test_failed_install_cleanup_reports_retained_script_id(self):
+        self.script.load.side_effect = ValueError("install refused")
+        self.script.unload.side_effect = PermissionError("unload denied")
+        with self.assertRaisesRegex(PermissionError, "install refused.*cleanup failed.*unload denied") as caught:
+            self.agent.handle("observe", self.site())
+        script_id = next(iter(self.agent.scripts))
+        self.assertIn(script_id, str(caught.exception))
+        self.assertTrue(self.agent.scripts[script_id]["cleanup_pending"])
+
     def test_breakpoint_waits_for_typed_continue_message(self):
         source = _probe_source(self.module, 0x1000, _expect("55 48 89 E5 90"), "hook", 2, True)
         self.assertIn("recv('continue:'+p.id", source)
@@ -226,6 +235,37 @@ class LifecycleAndBounds(RuntimeCase):
 
 
 class HostRuntimeContracts(RuntimeCase):
+    def test_typed_read_resolves_struct_and_enum_from_the_requested_view(self):
+        runner = runtime.RuntimeRunner({"root": str(self.root)})
+        query = Mock()
+        query.query.side_effect = [json.dumps({"type": {"path": "/Config", "length": 4,
+            "fields": [{"field": "mode", "offset": 0, "name": "Mode", "length": 4,
+                        "kind": "EnumDB", "path": "/Mode"}]}}),
+            json.dumps({"type": {"values": [{"value": "0x2", "name": "active"}]}})]
+        args = {"type": "/Config", "target": "fixture", "view": "experiment"}
+        with patch("rusticre.query.QueryRunner", return_value=query), patch("rusticre.backends.resolved", return_value={}):
+            layout = runner._layout(args)
+        self.assertEqual(query.query.call_args_list[0].kwargs["options"], {"path": "/Config", "view": "experiment"})
+        self.assertEqual(query.query.call_args_list[1].kwargs["options"], {"path": "/Mode", "view": "experiment"})
+        self.assertEqual(layout["layout"][0]["names"], {"2": "active"})
+        self.assertNotIn("view", args)
+
+    def test_worker_error_type_reaches_runtime_caller(self):
+        session_id = "c" * 32
+        runner = runtime.RuntimeRunner({"root": str(self.root)})
+        directory = runner.root / session_id
+        directory.mkdir()
+        (directory / "ready.json").write_text(json.dumps({"pid": 500, "started_ms": 88}))
+        for error_type, expected in (("PermissionError", PermissionError), ("ValueError", ValueError), ("unknown", RuntimeError)):
+            with self.subTest(error_type=error_type), patch("rusticre.runtime._identity", return_value=True), \
+                 patch("rusticre.runtime.ipc_request", return_value={"ok": False, "error": "denied", "error_type": error_type}):
+                with self.assertRaisesRegex(expected, "denied"):
+                    runner.call("modules", {"session": session_id})
+        with patch("rusticre.runtime._identity", return_value=True), \
+             patch("rusticre.runtime.ipc_request", side_effect=PermissionError("socket denied")):
+            with self.assertRaisesRegex(PermissionError, "socket denied"):
+                runner.call("modules", {"session": session_id})
+
     def test_host_uses_authenticated_ipc_without_publishing_hot_files(self):
         session_id = "c" * 32
         runner = runtime.RuntimeRunner({"root": str(self.root)})
@@ -429,6 +469,7 @@ class LocalIPC(unittest.TestCase):
             connection.sendall(struct.pack("!I", runtime_ipc.MAX_FRAME + 1))
             response = runtime_ipc.receive(connection)
         self.assertFalse(response["ok"])
+        self.assertEqual(response["error_type"], "ValueError")
         handler.assert_not_called()
         response = runtime_ipc.request(endpoint, "b" * 32, "read", {}, 1)
         self.assertFalse(response["ok"])
@@ -443,8 +484,16 @@ class LocalIPC(unittest.TestCase):
         response = runtime_ipc.request(endpoint, "b" * 32, "read", {}, 1)
         self.assertFalse(response["ok"])
         self.assertIn("[redacted]", response["error"])
+        self.assertEqual(response["error_type"], "ValueError")
         self.assertNotIn(endpoint["token"], json.dumps(response))
         self.assertTrue(runtime_ipc.request(endpoint, "c" * 32, "status", {}, 1)["ok"])
+
+    def test_permission_error_type_is_preserved_over_ipc(self):
+        endpoint = self.server(Mock(side_effect=PermissionError("probe denied")), count=1)
+        response = runtime_ipc.request(endpoint, "b" * 32, "observe", {}, 1)
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["error_type"], "PermissionError")
+        self.assertEqual(response["error"], "probe denied")
 
     def test_absolute_deadline_stops_drip_frames_and_handler_wait(self):
         # Each byte arrives inside a per-recv timeout; only a total deadline

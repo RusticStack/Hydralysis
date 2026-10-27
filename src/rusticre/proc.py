@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -61,6 +62,14 @@ def identity(pid: int, started_ms: int) -> bool:
             return abs(actual_ms - started_ms) <= 2
         finally:
             kernel.CloseHandle(handle)
+    if sys.platform == "darwin":
+        from rusticre.darwin_process import created_ms
+        try:
+            return created_ms(pid) == started_ms
+        except PermissionError:
+            raise
+        except OSError:
+            return False
     try:
         # Linux /proc identity, without an optional process-management dependency.
         stat = Path("/proc/%d/stat" % pid).read_text().rsplit(")", 1)[1].split()

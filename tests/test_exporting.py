@@ -7,7 +7,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from rusticre import exporting
+from rusticre import exporting, targets, workcopy
 from rusticre import export_worker
 from rusticre.backends import read_json
 
@@ -84,6 +84,39 @@ class ExportTests(unittest.TestCase):
     def rows(self, path):
         output = Path(read_json(path)["output_path"])
         return [json.loads(line) for line in output.read_text().splitlines()]
+
+    def test_named_view_export_passes_view_to_queries_and_binds_resume_to_its_history(self):
+        selected = targets.resolve(self.settings, "fixture")
+        alice = workcopy.with_view(selected, "alice")
+        shared = workcopy.with_view(selected)
+
+        def add_edit(target, edit_id):
+            store = workcopy.load_store(self.settings, target)
+            store["edits"].append({"id": edit_id * 32, "address": "0x401000",
+                                   "options": {"kind": "rename", "name": "Named", "source": "evidence"}})
+            store["revision"] += 1
+            workcopy._save_store(self.settings, target, store)
+
+        add_edit(alice, "a")
+        path = self.make(view="alice")
+        record, runner = self.run_job(path)
+        self.assertEqual(record["state"], "done")
+        self.assertEqual(record["provenance"]["view"], "alice")
+        self.assertTrue(all(options["options"]["view"] == "alice" for _, options in runner.calls))
+        add_edit(shared, "b")
+        with patch("rusticre.exporting._launch") as launch:
+            resumed = exporting.start(self.settings, "fixture", {"resume": record["id"]})
+        self.assertTrue(resumed["reused"])
+        launch.assert_not_called()
+        with self.assertRaisesRegex(ValueError, "cannot change"):
+            exporting.start(self.settings, "fixture", {"resume": record["id"], "view": "bob"})
+        add_edit(alice, "c")
+        with self.assertRaisesRegex(ValueError, "overlays changed"):
+            exporting.start(self.settings, "fixture", {"resume": record["id"]})
+
+    def test_invalid_export_view_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "view must be"):
+            exporting.normalized({"view": "../wrong"})
 
     def test_worker_streams_c_and_hashes_outside_the_job_response(self):
         path = self.make()

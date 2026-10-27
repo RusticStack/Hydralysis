@@ -15,7 +15,8 @@ Every pair names its method and confidence; what stays unmatched is new (only
 in the destination) or gone (only in the source). The job writes the full report
 as JSONL, a summary, a type corpus of names to transfer (applied as one
 import_types overlay: revertible in one step), and, given a prologue table for
-the source, the same table re-addressed for the destination.
+the source, review-required destination candidates with their provenance.
+A candidate is not evidence that it is the same function or a hook-ready check.
 """
 
 from __future__ import annotations
@@ -27,6 +28,8 @@ from collections import defaultdict
 from pathlib import Path
 
 from rusticre import targets
+from rusticre.pe import Image
+from rusticre.prologue import format_bytes, matches, parse_expect
 from rusticre.paths import root_path
 
 CONFIDENCE = {"exact": 1.0, "shape": 0.9, "anchors": 0.8, "callees": 0.8, "strings": 0.75, "callgraph": 0.7, "callers": 0.6}
@@ -43,21 +46,29 @@ def fingerprint_code() -> str:
 
 def fingerprints(settings: dict, name: str, engine=None) -> Path:
     """The target's fingerprint file, computed once per build and fingerprint code."""
-    from rusticre import hydra
+    from rusticre import hydra, workcopy
+    from rusticre.locks import locked
     from rusticre.query import QueryRunner, run_script
     selected = targets.resolve(settings, name)
+    state = workcopy.state_of(workcopy.load_store(settings, selected))
     directory = root_path(settings) / "fingerprints"
     directory.mkdir(parents=True, exist_ok=True)
-    path = directory / ("%s-%s-%s.jsonl" % (selected["sha256"][:16], selected["key"], fingerprint_code()))
-    if path.is_file():
-        return path
-    runner = QueryRunner(settings, engine or hydra.Engine(settings))
-    program = runner.program_for(selected)
-    request = {"id": "fp", "action": "fingerprints", "address": "", "limit": 1, "cursor": "", "contains": "",
-               "timeout_s": 4 * 3600, "options": {"artifact": str(path)}, "expected_sha256": selected["sha256"]}
-    response, _ = run_script(runner.engine, program, request, 4 * 3600)
-    if not response.get("ok") or not path.is_file():
-        raise RuntimeError("fingerprints for %s failed: %s" % (name, response.get("error")))
+    state_key = "%s-%s" % (state["revision"], state["ids_sha256"][:16])
+    path = directory / ("%s-%s-%s-%s.jsonl" %
+                        (selected["sha256"][:16], selected["key"], fingerprint_code(), state_key))
+    with locked(path.with_suffix(".lock"), timeout_s=5, what="fingerprint"):
+        if workcopy.state_of(workcopy.load_store(settings, selected)) != state:
+            raise RuntimeError("overlays changed before fingerprinting; retry the diff")
+        if not path.is_file():
+            runner = QueryRunner(settings, engine or hydra.Engine(settings))
+            program = runner.program_for(selected)
+            request = {"id": "fp", "action": "fingerprints", "address": "", "limit": 1, "cursor": "", "contains": "",
+                       "timeout_s": 4 * 3600, "options": {"artifact": str(path)}, "expected_sha256": selected["sha256"]}
+            response, _ = run_script(runner.engine, program, request, 4 * 3600)
+            if not response.get("ok") or not path.is_file():
+                raise RuntimeError("fingerprints for %s failed: %s" % (name, response.get("error")))
+        if workcopy.state_of(workcopy.load_store(settings, selected)) != state:
+            raise RuntimeError("overlays changed during fingerprinting; retry the diff")
     return path
 
 
@@ -199,8 +210,22 @@ def run(settings: dict, record: dict, output: Path) -> dict:
     """Diff source -> destination; record holds source, destination and options."""
     started = time.monotonic()
     source_name, destination_name = record["options"]["against"], record["target"]
+    checks = record["options"].get("checks")
+    prepared = source_image = destination_image = None
+    source_target = targets.resolve(settings, source_name)
+    destination_target = targets.resolve(settings, destination_name)
+    if checks:
+        source_image = _target_image(source_target)
+        destination_image = _target_image(destination_target)
+        prepared = _prepare_checks(checks, source_image)
+    from rusticre import workcopy
+    source_state = workcopy.state_of(workcopy.load_store(settings, source_target))
+    destination_state = workcopy.state_of(workcopy.load_store(settings, destination_target))
     source = load(fingerprints(settings, source_name))
     destination = load(fingerprints(settings, destination_name))
+    if (workcopy.state_of(workcopy.load_store(settings, source_target)) != source_state or
+            workcopy.state_of(workcopy.load_store(settings, destination_target)) != destination_state):
+        raise RuntimeError("overlays changed during diff; retry with stable overlays")
     pairs = match(source, destination)
     output.mkdir(parents=True, exist_ok=True)
     counts = defaultdict(int)
@@ -218,7 +243,8 @@ def run(settings: dict, record: dict, output: Path) -> dict:
                                          "destination_name": destination[other]["name"]}) + "\n")
                 if _named(row) and not _named(destination[other]):
                     names.append({"kind": "function", "address": "rva:" + other, "name": row["name"].replace("::", "_"),
-                                  "comment": "from %s %s (%s, confidence %.1f)" % (source_name, rva, method, CONFIDENCE[method])})
+                                  "comment": "REVIEW candidate from %s sha256:%s rva:%s (%s, confidence %.2f); verify correspondence"
+                                             % (source_name, source_target["sha256"], rva, method, confidence(method, row))})
             else:
                 counts["gone"] += 1
                 report.write(json.dumps({"source": rva, "status": "gone", "name": row["name"]}) + "\n")
@@ -234,26 +260,192 @@ def run(settings: dict, record: dict, output: Path) -> dict:
                "destination_functions": len(destination), "matched": len(pairs), **dict(counts),
                "names_to_transfer": len(names), "seconds": round(time.monotonic() - started, 1),
                "files": {"diff": str(output / "diff.jsonl"), "names_corpus": str(output / "names.jsonl")}}
-    checks = record["options"].get("checks")
+    overlay_report = _export_overlay_candidates(settings, source_target, destination_target, pairs, source, source_image, output)
+    if overlay_report:
+        summary["overlays"] = overlay_report
     if checks:
-        summary["checks"] = transfer_checks(checks, pairs, destination, output / "checks-destination.json")
+        summary["checks"] = transfer_checks(prepared, pairs, source, destination, source_image, destination_image,
+                                            output / "checks-destination.json")
+    if (workcopy.state_of(workcopy.load_store(settings, source_target)) != source_state or
+            workcopy.state_of(workcopy.load_store(settings, destination_target)) != destination_state):
+        raise RuntimeError("overlays changed during diff; retry with stable overlays")
     (output / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return summary
 
 
-def transfer_checks(path: str, pairs: dict, destination: dict, out: Path) -> dict:
-    """A source prologue table, re-addressed for the destination with its current prologues."""
-    rows = json.loads(Path(path).read_text(encoding="utf-8-sig"))
-    rows = rows.get("checks", rows) if isinstance(rows, dict) else rows
-    placed, missing = [], []
-    for row in rows:
-        address = str(row.get("address", ""))
-        rva = "0x%x" % int(address.split(":", 1)[1] if ":" in address else address, 16)
-        if rva in pairs:
-            other, method = pairs[rva]
-            placed.append({"name": row.get("name", ""), "address": "rva:" + other, "expect": destination[other]["prologue"],
-                           "source_address": "rva:" + rva, "method": method, "confidence": CONFIDENCE[method]})
-        else:
-            missing.append({"name": row.get("name", ""), "source_address": "rva:" + rva})
-    out.write_text(json.dumps({"checks": placed, "unplaced": missing}, indent=2), encoding="utf-8")
-    return {"rows": len(rows), "placed": len(placed), "unplaced": len(missing), "file": str(out)}
+def _export_overlay_candidates(settings: dict, source_target: dict, destination_target: dict,
+                               pairs: dict, source: dict, source_image: Image | None, output: Path) -> dict | None:
+    """Export the cited source records for review, never apply them to another build."""
+    from rusticre import workcopy
+    store = workcopy.load_store(settings, source_target)
+    if not store["edits"] and not store["reverted"]:
+        return None
+    if source_image is None and source_target.get("exe"):
+        source_image = _target_image(source_target)
+    exported = []
+    for edit in store["edits"]:
+        item = {"source_record": edit, "review_required": True}
+        address = edit.get("address")
+        if address and source_image:
+            try:
+                rva = int(address, 16) - source_image.base
+            except ValueError:
+                rva = -1
+            key = "0x%x" % rva if rva >= 0 else ""
+            if key in pairs and key in source:
+                other, method = pairs[key]
+                item["candidate"] = {"source_address": "rva:" + key, "destination_address": "rva:" + other,
+                                     "method": method, "confidence": confidence(method, source[key])}
+        exported.append(item)
+    report = {"kind": "crossbuild-overlay-review", "review_required": True,
+              "source_sha256": source_target["sha256"], "destination_sha256": destination_target["sha256"],
+              "source_view": source_target.get("view", "shared"), "source_revision": store["revision"],
+              "edits": exported, "reverted": store["reverted"],
+              "instructions": "Original cited records are source-build evidence only. Independently verify "
+                              "destination correspondence and type layouts before creating destination edits. "
+                              "Reverted entries contain audit metadata, not the removed record bodies."}
+    path = output / "overlays-source-review.json"
+    path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    return {"file": str(path), "active": len(exported), "reverted_events": len(store["reverted"]),
+            "review_required": True}
+
+
+def _target_image(target: dict) -> Image:
+    """Require the actual executable when accepting a hook table, not just a project hash."""
+    if not target.get("exe"):
+        raise ValueError("cross-build checks need the registered executable for %s" % target["name"])
+    image = Image(Path(target["exe"]))
+    if image.fingerprint()["sha256"].lower() != target["sha256"].lower():
+        raise ValueError("target %s executable does not match its registered build hash" % target["name"])
+    return image
+
+
+def _number(value, label: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError("%s must be a non-negative number" % label)
+    try:
+        result = value if isinstance(value, int) else int(value, 0)
+    except (TypeError, ValueError):
+        raise ValueError("%s must be a non-negative number" % label) from None
+    if result < 0:
+        raise ValueError("%s must be a non-negative number" % label)
+    return result
+
+
+def _source_rva(value, image: Image, kind: str | None) -> int:
+    if isinstance(value, str) and ":" in value:
+        prefix, value = value.split(":", 1)
+        prefix = prefix.lower()
+        if prefix not in ("rva", "va"):
+            raise ValueError("address must use rva: or va:")
+        if kind and kind != prefix:
+            raise ValueError("address prefix conflicts with offset_kind")
+        kind = prefix
+    number = _number(value, "source address")
+    if kind not in (None, "rva", "va"):
+        raise ValueError("offset_kind must be rva or va")
+    if kind == "rva":
+        return number
+    if kind == "va":
+        if number < image.base:
+            raise ValueError("source VA is below the image base")
+        return number - image.base
+    # An unqualified legacy offset is usable only when precisely one interpretation
+    # is file-backed. Both can be valid in unusually large or low-base images.
+    candidates = {rva for rva in (number, number - image.base) if rva >= 0 and image.rva_to_offset(rva) is not None}
+    if len(candidates) != 1:
+        raise ValueError("source address is ambiguous or outside file-backed sections; specify rva: or va:")
+    return next(iter(candidates))
+
+
+def _prepare_checks(path: str, image: Image) -> list[dict]:
+    """Validate the whole source table against its selected immutable build first."""
+    filename = Path(path)
+    if filename.stat().st_size > 1024 * 1024:
+        raise ValueError("checks file must be at most 1 MiB")
+    value = json.loads(filename.read_text(encoding="utf-8-sig"))
+    envelope = value if isinstance(value, dict) else {}
+    rows = envelope.get("checks", envelope.get("hooks")) if envelope else value
+    if not isinstance(rows, list) or not 1 <= len(rows) <= 200:
+        raise ValueError("cross-build checks need 1..200 rows in checks[] or hooks[]")
+    declared = envelope.get("build_sha256", envelope.get("sha256"))
+    if declared is not None:
+        if not isinstance(declared, str) or len(declared) != 64 or any(c not in "0123456789abcdefABCDEF" for c in declared):
+            raise ValueError("declared build hash must be the full 64-hex SHA-256")
+        if declared.lower() != image.fingerprint()["sha256"].lower():
+            raise ValueError("source table build hash does not match the registered executable")
+    if "image_base" in envelope and _number(envelope["image_base"], "image_base") != image.base:
+        raise ValueError("source table image_base does not match the registered executable")
+    kind = envelope.get("offset_kind")
+    prepared = []
+    total = 0
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError("source check %d must be an object" % index)
+        if ("address" in row) == ("offset" in row):
+            raise ValueError("source check %d needs exactly one address or offset" % index)
+        rva = _source_rva(row.get("address", row.get("offset")), image, kind)
+        expected = row.get("expect", row.get("prologues", row.get("prologue")))
+        alternatives = expected if isinstance(expected, list) else [expected]
+        if not 1 <= len(alternatives) <= 16:
+            raise ValueError("source check %d needs 1..16 expected prologues" % index)
+        patterns = [parse_expect(item) for item in alternatives]
+        if max(map(len, patterns)) > 4096:
+            raise ValueError("source check %d exceeds 4096 bytes" % index)
+        total += sum(map(len, patterns))
+        if total > 65536:
+            raise ValueError("source checks exceed 65536 total bytes")
+        actual = image.read_rva(rva, max(map(len, patterns)))
+        match = next((pattern for pattern in patterns if matches(actual, pattern)), None)
+        if match is None:
+            raise ValueError("source check %d prologue mismatch at rva:%#x" % (index, rva))
+        names = row.get("names", row.get("name", ""))
+        if isinstance(names, str):
+            names = [names] if names else []
+        if not isinstance(names, list) or any(not isinstance(name, str) for name in names):
+            raise ValueError("source check %d names must be strings" % index)
+        prepared.append({"rva": "0x%x" % rva, "names": names, "record": row,
+                         "source_prologue": format_bytes(actual[:len(match)]),
+                         "source_pattern_has_wildcards": any(byte is None for byte in match)})
+    return prepared
+
+
+def transfer_checks(prepared: list[dict], pairs: dict, source: dict, destination: dict,
+                    source_image: Image, destination_image: Image, out: Path) -> dict:
+    """Write evidence-bearing candidates, never a hook-ready prologue table.
+
+    Destination bytes describe the candidate and cannot prove the correspondence.
+    A reviewer must independently establish it and create a separate checks table.
+    """
+    candidates, missing = [], []
+    for item in prepared:
+        rva = item["rva"]
+        common = {"name": item["names"][0] if item["names"] else "", "names": item["names"],
+                  "source_address": "rva:" + rva, "source_record": item["record"],
+                  "source_prologue": item["source_prologue"],
+                  "source_pattern_has_wildcards": item["source_pattern_has_wildcards"]}
+        if rva not in pairs:
+            missing.append(common)
+            continue
+        other, method = pairs[rva]
+        try:
+            length = min(24, destination_image._available(int(other, 16)))
+            if length <= 0:
+                raise ValueError("no file-backed destination bytes")
+            actual = destination_image.read_rva(int(other, 16), length)
+        except ValueError:
+            missing.append({**common, "proposed_destination": "rva:" + other,
+                            "method": method, "reason": "destination has no file-backed prologue"})
+            continue
+        candidates.append({**common, "address": "rva:" + other,
+                           "observed_destination_prologue": format_bytes(actual),
+                           "method": method, "confidence": confidence(method, source[rva]),
+                           "review_required": True})
+    document = {"kind": "crossbuild-hook-candidates", "review_required": True,
+                "source_build": source_image.fingerprint(), "destination_build": destination_image.fingerprint(),
+                "candidates": candidates, "unplaced": missing,
+                "instructions": "Independently verify each correspondence and its destination bytes, cite the evidence, "
+                                "then create a separate prologue checks table. These candidates are not hook-ready."}
+    out.write_text(json.dumps(document, indent=2), encoding="utf-8")
+    return {"rows": len(prepared), "candidates": len(candidates), "unplaced": len(missing),
+            "review_required": True, "file": str(out)}

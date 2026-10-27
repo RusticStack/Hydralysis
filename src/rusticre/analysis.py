@@ -14,7 +14,7 @@ from pathlib import Path
 
 ADVANCED_ACTIONS = frozenset(("types", "type", "variables", "dossier", "blocks", "pcode", "trace", "type_edit", "data", "scan", "diff",
                               "vcalls", "vtables", "writes", "orphans"))
-_TYPE_KINDS = frozenset(("struct", "signature", "variable", "apply", "rename", "comment",
+_TYPE_KINDS = frozenset(("struct", "signature", "variable", "apply", "rename", "label", "comment",
                          "function_create", "function_body", "function_delete", "batch", "import_types"))
 # Bulk kinds run as durable jobs: they can take minutes on a large program.
 BULK_KINDS = frozenset(("import_types",))
@@ -140,7 +140,7 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
         kind_fields = {
             "struct": {"path", "size", "fields"}, "signature": {"prototype"},
             "variable": {"variable", "type", "name"}, "apply": {"type"},
-            "rename": {"name"}, "comment": {"comment"},
+            "rename": {"name"}, "label": {"name"}, "comment": {"comment"},
             "function_create": {"expect", "ranges", "name"},
             "function_body": {"expect", "ranges", "name"},
             "function_delete": {"expect"},
@@ -156,7 +156,7 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
             return _corpus(out, _record)
         required = {
             "struct": ("path",), "signature": ("prototype",), "variable": ("variable", "type"),
-            "apply": ("type",), "rename": ("name",), "comment": ("comment",),
+            "apply": ("type",), "rename": ("name",), "label": ("name",), "comment": ("comment",),
             "function_create": (), "function_body": (), "function_delete": (),
         }[kind]
         for name in ("path", "prototype", "variable", "type", "name", "comment"):

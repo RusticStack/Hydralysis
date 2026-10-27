@@ -93,6 +93,9 @@ class Image:
         )
         line += "\n# bits %d image_base %s entry_rva %s" % (info["bits"], info["image_base"], info["entry_point_rva"])
         line += "\n# instruction/reference/string addresses are RVAs; pass them as rva:0x... to any RusticRE tool"
+        if getattr(self, "_address_resolution", None):
+            import json
+            line += "\n# address map evidence: " + json.dumps(self._address_resolution, ensure_ascii=False)
         if info["analysis_warnings"]:
             line += "\n# CAUTION: possible packed/wrapped or unusual image: " + "; ".join(info["analysis_warnings"])
             line += ". Verify the analysed project's executable SHA-256 before trusting decompiler text."

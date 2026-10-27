@@ -51,6 +51,14 @@ def process_start_ms(pid: int) -> int:
             return ticks // 10000 - 11644473600000
         finally:
             kernel.CloseHandle(handle)
+    if sys.platform == "darwin":
+        from rusticre.darwin_process import created_ms
+        try:
+            return created_ms(pid)
+        except PermissionError:
+            raise
+        except (OSError, ValueError):
+            return 0
     try:
         process = Path("/proc/%d/stat" % pid).read_text().rsplit(")", 1)[1].split()
         if process[0] == "Z":

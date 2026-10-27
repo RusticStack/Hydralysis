@@ -70,6 +70,7 @@ def main(argv: list[str] | None = None) -> int:
 
     grun = sub.add_parser("ghidra-run")
     grun.add_argument("--target", required=True)
+    grun.add_argument("--view", default="", help="named annotation view (default: shared)")
     grun.add_argument("script")
     grun.add_argument("script_args", nargs="*")
     grun.add_argument("--timeout", type=int, default=600)
@@ -81,7 +82,7 @@ def main(argv: list[str] | None = None) -> int:
     query = sub.add_parser("ghidra-query", help="Warm read-only Ghidra query; numeric addresses are VAs")
     query.add_argument("--target", required=True)
     query.add_argument("address", nargs="?", default="")
-    query.add_argument("--action", choices=sorted({"decompile", "function", "functions", "xrefs", "status", "stop", "export"} | ADVANCED_ACTIONS), default="decompile")
+    query.add_argument("--action", choices=sorted({"decompile", "function", "functions", "xrefs", "status", "stop", "export", "address_map"} | ADVANCED_ACTIONS), default="decompile")
     query.add_argument("--limit", type=int, default=40)
     query.add_argument("--cursor", default="")
     query.add_argument("--contains", default="")
@@ -170,7 +171,7 @@ def _pair(args: argparse.Namespace) -> tuple[str, dict]:
     if command == "ghidra_run":
         return "ghidra_run", {
             "target": args.target, "script": args.script, "args": args.script_args,
-            "timeout_s": args.timeout,
+            "timeout_s": args.timeout, "view": args.view,
         }
     if command == "ghidra_scripts":
         return command, {"target": args.target, "filter": args.filter}

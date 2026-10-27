@@ -250,11 +250,15 @@ class RuntimeRunner:
                 _stop(ready)
                 raise TimeoutError("runtime request timed out; worker retired; target state unknown; log=%s"
                                    % (directory / "worker.log")) from exc
+            except PermissionError:
+                raise
             except OSError as exc:
                 raise RuntimeError("runtime IPC failed: errno=%s winerror=%s; log=%s: %s"
                                    % (exc.errno, getattr(exc, "winerror", None), directory / "worker.log", exc)) from exc
             if not response.get("ok"):
-                raise RuntimeError(json.dumps(response))
+                error_type = {"PermissionError": PermissionError, "ValueError": ValueError}.get(
+                    response.get("error_type"), RuntimeError)
+                raise error_type(json.dumps(response))
             if action == "detach":
                 self._release(owner.get("exe", ""), session_id)
             return response["result"]
@@ -347,9 +351,11 @@ class RuntimeRunner:
         from rusticre.backends import resolved
         from rusticre.query import QueryRunner
         name, target = str(args.pop("type")), str(args.pop("target", "") or "")
+        view = args.pop("view", "")
         if not target:
             raise ValueError("read with type needs options.target: the analysis target that defines the type")
-        answer = json.loads(QueryRunner(resolved(self.settings)).query(target, "type", options={"path": name}, limit=200))
+        selection = {"view": view} if view else {}
+        answer = json.loads(QueryRunner(resolved(self.settings)).query(target, "type", options={"path": name, **selection}, limit=200))
         described = answer["type"]
         layout, enums = [], {}
         for field in described.get("fields", []):
@@ -359,7 +365,7 @@ class RuntimeRunner:
             if field.get("kind") == "EnumDB" and field.get("length") in (1, 2, 4, 8) and len(enums) < 32:
                 if field["path"] not in enums:
                     members = json.loads(QueryRunner(resolved(self.settings)).query(
-                        target, "type", options={"path": field["path"]}, limit=200)).get("type", {}).get("values", [])
+                        target, "type", options={"path": field["path"], **selection}, limit=200)).get("type", {}).get("values", [])
                     enums[field["path"]] = {str(int(str(item["value"]), 0)): item["name"] for item in members}
                 row.update({"enum": row["type"], "type": "u%d" % (8 * field["length"]), "names": enums[field["path"]]})
             layout.append(row)
@@ -369,6 +375,35 @@ class RuntimeRunner:
         return {"layout": layout, "size": max(1, min(4096, size)), "type_name": described.get("path")}
 
     def _writers(self, session_id: str, args: dict, token: str, owner: dict) -> dict:
+        probes = {}
+        primary = None
+        try:
+            result = self._collect_writers(session_id, args, token, owner, probes)
+        except BaseException as exc:
+            primary = exc
+
+        failures = []
+        for hook_id in probes:
+            try:
+                self.call("unload", {"session": session_id, "owner": token, "hook_id": hook_id})
+            except Exception as exc:
+                failures.append((hook_id, exc))
+        if failures:
+            detail = "; ".join("%s: %s: %s" % (hook, type(exc).__name__, exc) for hook, exc in failures)
+            message = "writer probe cleanup failed (%s); inspect the session and retry unloading the listed probes" % detail
+            if primary is not None:
+                if not isinstance(primary, Exception):
+                    primary.add_note(message)
+                    raise primary.with_traceback(primary.__traceback__)
+                message = "%s: %s; %s" % (type(primary).__name__, primary, message)
+            error_type = PermissionError if isinstance(primary, PermissionError) or any(
+                isinstance(exc, PermissionError) for _, exc in failures) else RuntimeError
+            raise error_type(message) from primary
+        if primary is not None:
+            raise primary.with_traceback(primary.__traceback__)
+        return result
+
+    def _collect_writers(self, session_id: str, args: dict, token: str, owner: dict, probes: dict) -> dict:
         """Which static store sites write one live object's field during a window.
 
         rows are what ghidra_query action=writes returned (site/rva and instruction). Each site
@@ -398,7 +433,7 @@ class RuntimeRunner:
         digest = str(_json(self.root / session_id / "ready.json").get("sha256", ""))
         query = QueryRunner(resolved(self.settings))
         driver = {"session": session_id, "owner": token}
-        probes, report = {}, []
+        report = []
         for row in rows:
             site = int(str(row.get("site") or "0"), 16) if row.get("site") else image.base + int(str(row.get("rva")), 16)
             rva = site - image.base
@@ -424,7 +459,7 @@ class RuntimeRunner:
                 entry.update({"probed": True, "via": "site", "base": base, "calls": 0, "wrote": 0, "other_objects": []})
                 report.append(entry)
                 continue
-            except (ValueError, RuntimeError, PermissionError) as exc:
+            except ValueError as exc:
                 refused = str(exc)[:300]
             # Too little room for a probe (a short setter ends right after its store): when the
             # base register is still one of the function's arguments, probe its direct call sites
@@ -474,7 +509,7 @@ class RuntimeRunner:
                     hook = self.call("observe", {**driver, "module": exe.name, "rva": hex(back - image.base), "sha256": digest,
                                                  "expect": image.read_rva(back - image.base, _PROBE_SPAN).hex(" ").upper(),
                                                  "limit": 200, "instruction": True, **({"capture": [capture]} if capture else {})})
-                except (ValueError, RuntimeError, PermissionError):
+                except ValueError:
                     continue
                 probes[hook["hook_id"]] = entry
                 entry.setdefault("returns", {})[hook["hook_id"]] = list(known)
@@ -492,7 +527,7 @@ class RuntimeRunner:
         deadline = time.monotonic() + window
         while probes and time.monotonic() < deadline:
             time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
-        try:
+        if probes:
             while probes:
                 status = self.call("status", {"session": session_id, "after": cursor, "limit": 200})
                 for event in status.get("events", []):
@@ -517,12 +552,6 @@ class RuntimeRunner:
                 cursor = status.get("next_after", cursor)
                 if not status.get("truncated"):
                     break
-        finally:
-            for hook_id in probes:
-                try:
-                    self.call("unload", {**driver, "hook_id": hook_id})
-                except (ValueError, RuntimeError):
-                    pass
         return {"object": hex(obj), "offset": hex(offset), "size": size, "window_s": window,
                 "writers": [entry for entry in report if entry.get("wrote")], "sites": report,
                 "coverage": "the given static sites only (ghidra_query action=writes and what it does not cover: computed "

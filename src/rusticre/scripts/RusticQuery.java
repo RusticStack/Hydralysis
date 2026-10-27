@@ -146,6 +146,18 @@ public class RusticQuery extends GhidraScript {
         String cursor = text(req, "cursor");
         Address addr = address(cursor.isEmpty() ? text(req, "address") : cursor);
         out.addProperty("selected_address", "0x" + addr);
+        JsonArray labels = new JsonArray();
+        var symbols = currentProgram.getSymbolTable().getSymbols(addr);
+        for (var symbol : symbols) {
+            if (labels.size() >= 64 || System.nanoTime() >= deadline) break;
+            JsonObject label = new JsonObject();
+            label.addProperty("name", clip(symbol.getName(true), 512));
+            label.addProperty("source", symbol.getSource().toString());
+            label.addProperty("primary", symbol.isPrimary());
+            labels.add(label);
+        }
+        out.add("labels", labels);
+        out.addProperty("labels_truncated", symbols.length > labels.size());
         var defined = currentProgram.getListing().getDefinedDataContaining(addr);
         JsonObject opts = options(req);
         boolean table = opts.has("table") && opts.get("table").getAsBoolean();
@@ -2103,7 +2115,11 @@ public class RusticQuery extends GhidraScript {
             } else {
                 Address addr = address(addressText);
                 Function function = currentProgram.getFunctionManager().getFunctionContaining(addr);
-                if (kind.equals("apply")) DataUtilities.createData(currentProgram, addr, resolveType(text(opts, "type")), -1, DataUtilities.ClearDataMode.CHECK_FOR_SPACE);
+                if (kind.equals("label")) {
+                    if (!currentProgram.getMemory().contains(addr)) throw new IllegalArgumentException("label address must be in mapped program memory");
+                    currentProgram.getSymbolTable().createLabel(addr, text(opts, "name"), SourceType.USER_DEFINED);
+                }
+                else if (kind.equals("apply")) DataUtilities.createData(currentProgram, addr, resolveType(text(opts, "type")), -1, DataUtilities.ClearDataMode.CHECK_FOR_SPACE);
                 else if (kind.equals("comment")) currentProgram.getListing().setComment(addr, ghidra.program.model.listing.CommentType.PLATE, text(opts, "comment") + "\nsource: " + text(opts, "source"));
                 else {
                     if (function == null) throw new IllegalArgumentException("no function contains edit address");

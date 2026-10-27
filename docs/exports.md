@@ -15,17 +15,18 @@ Then use the same CLI/MCP path:
 ```text
 rusticre ghidra-query --target sample --action export --options-file F:/work/export-options.json
 rusticre job export-0123456789ab
-rusticre job export-0123456789ab --action cancel
+rusticre job export-0123456789ab --action cancel --owner <owner_token>
 ```
 
 The Python API is `exporting.start(settings, target, options)`;
 `exporting.status(settings, id)` and `exporting.cancel(settings, id)` operate
 on the returned `export-...` identity. Modes are `decompile`, `functions` and
 `types`. Options accept `limit` (1–100,000 records, default 100,000), optional
-literal name/path `contains`, per-query `timeout_s` (1–300, default 30), and
-`resume`. Records stream under `<root>/exports/<id>/<mode>.jsonl`, alongside
-`imports.json`, `job.json` and a durable worker log. There is no arbitrary output
-path or shell command parameter. Identical active/completed requests reuse the
+literal name/path `contains` or `regex`, inclusive function VA `start`/`end`,
+an absolute `.jsonl` output path `out`, per-query `timeout_s` (1–300, default 30),
+and `resume`. By default records stream under `<root>/exports/<id>/<mode>.jsonl`,
+alongside `imports.json`, `job.json` and a durable worker log. A custom `out`
+must have an existing parent and cannot be inside a Ghidra project. Identical active/completed requests reuse the
 existing job instead of launching duplicate exports.
 
 ## Progress and truthful completion

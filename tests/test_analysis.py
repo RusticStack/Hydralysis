@@ -40,6 +40,15 @@ class AdvancedBudgets(unittest.TestCase):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 validate_options("type_edit", options)
 
+    def test_data_label_requires_a_name_and_a_cited_source(self):
+        label = {"kind": "label", "name": "global_fixture", "source": "fixture map:17"}
+        self.assertEqual(validate_options("type_edit", label), label)
+        for bad in ({"kind": "label", "name": "global_fixture"},
+                    {"kind": "label", "source": "fixture map:17"},
+                    {**label, "prototype": "void f()"}):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                validate_options("type_edit", bad)
+
     def test_structure_layout_and_nested_aliases_are_validated(self):
         options = {"kind": "struct", "source": "fixture header:3", "path": "/RusticRE/Header", "size": 8,
                    "fields": [{"offset": 0, "type": "int", "name": "count", "length": 4}]}

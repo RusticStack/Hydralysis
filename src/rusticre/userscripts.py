@@ -15,7 +15,7 @@ import time
 import uuid
 from pathlib import Path
 
-from rusticre import hydra, targets
+from rusticre import hydra, targets, workcopy
 from rusticre.backends import read_json, write_json
 from rusticre.paths import root_path
 
@@ -44,9 +44,9 @@ def _stage(settings: dict, source: Path) -> str:
     return source.name
 
 
-def run(settings: dict, target: str, script: str, args: list[str], timeout_s: int = 600) -> str:
+def run(settings: dict, target: str, script: str, args: list[str], timeout_s: int = 600, view: str = "") -> str:
     from rusticre.query import QueryRunner
-    selected = targets.resolve(settings, target)
+    selected = workcopy.with_view(targets.resolve(settings, target), view)
     name = script if script.endswith((".java", ".py")) else script + ".java"
     if not _SCRIPT.fullmatch(name):
         raise ValueError("script must be a simple .java or .py file name")
@@ -62,7 +62,7 @@ def run(settings: dict, target: str, script: str, args: list[str], timeout_s: in
     program = runner.program_for(selected)
     job_id = "job-%s" % uuid.uuid4().hex[:12]
     started = time.time()
-    record = {"job_id": job_id, "kind": "script", "target": target, "script": name, "args": args,
+    record = {"job_id": job_id, "kind": "script", "target": target, "view": selected["view"], "script": name, "args": args,
               "started_at": started, "created_at": started, "program": program["key"], "state": "running"}
     jobs = root_path(settings) / "jobs"
     write_json(jobs / (job_id + ".json"), record)
@@ -77,8 +77,8 @@ def run(settings: dict, target: str, script: str, args: list[str], timeout_s: in
     write_json(jobs / (job_id + ".json"), record)
     if record["state"] != "done":
         raise RuntimeError("script job %s failed: %s" % (job_id, record["error"]))
-    return ("job=%s target=%s script=%s mode=%s state=done duration=%ss%s\n--- script output ---\n%s"
-            % (job_id, target, name, record["mode"], record["duration_s"],
+    return ("job=%s target=%s view=%s script=%s mode=%s state=done duration=%ss%s\n--- script output ---\n%s"
+            % (job_id, target, selected["view"], name, record["mode"], record["duration_s"],
                " (output truncated)" if record.get("truncated") else "", record["output"] or "(no script output)"))
 
 

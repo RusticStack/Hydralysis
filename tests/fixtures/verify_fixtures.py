@@ -209,11 +209,12 @@ def check_diff(manifest: dict) -> list[str]:
             if not got or got[0] not in want or not partner_ok:
                 wrong.append("%s: %s" % (name, got))
         moved_table = json.loads(Path(summary["checks"]["file"]).read_text())
-        transferred = moved_table["checks"]
+        transferred = moved_table["candidates"]
         misplaced = [row["name"] for row in transferred if
                      names_two.get(int(row["address"].removeprefix("rva:"), 16)) != row["name"]]
         unplaced = sorted(row.get("name", str(row)) if isinstance(row, dict) else str(row) for row in moved_table["unplaced"])
-        ok = not wrong and not misplaced and unplaced == ["df_removed"]
+        ok = (not wrong and not misplaced and unplaced == ["df_removed"] and moved_table["review_required"]
+              and all(row["review_required"] and "expect" not in row for row in transferred))
         print("%s diff %s: %d matched, same %s moved %s changed %s new %s gone %s; wrong %s; table: %d placed, misplaced %s, unplaced %s"
               % ("PASS" if ok else "FAIL", arch, summary["matched"], summary.get("same", 0), summary.get("moved", 0),
                  summary.get("changed", 0), summary.get("new", 0), summary.get("gone", 0), wrong, len(transferred),

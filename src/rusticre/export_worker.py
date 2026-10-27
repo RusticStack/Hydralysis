@@ -124,7 +124,7 @@ def frozen(record: dict):
     project = settings["targets"][target]
     if code_sha256() != identity["code_sha256"]:
         raise Paused("query/export implementation changed during export; old output preserved")
-    selected = targets.resolve(settings, target)
+    selected = workcopy.with_view(targets.resolve(settings, target), record["options"].get("view", ""))
     if master_revision(settings, selected) != identity["master_revision"]:
         raise Paused("master project was saved during export; old output preserved")
     if workcopy.expected_state(settings, selected) != identity["overlay_state"]:
@@ -203,6 +203,9 @@ def body_hash(response: dict, image: Image | None) -> dict:
 
 
 def _query(runner, record, action, **kwargs):
+    view = record["options"].get("view", "")
+    if view:
+        kwargs["options"] = {**kwargs.get("options", {}), "view": view}
     for attempt in range(2):
         try:
             response = json.loads(runner.query(record["target"], action, **kwargs))
@@ -248,7 +251,7 @@ def run(path: Path, generation: str, runner_factory=QueryRunner):
             finish(state="cancelled", stage="cancelled before backend queries", complete=False)
             return
         update(path, state="running", stage="validating saved analysis", worker_pid=os.getpid(), worker_started_ms=process_start_ms(os.getpid()))
-        _, observed = provenance(record["settings"], record["target"])
+        _, observed = provenance(record["settings"], record["target"], record["options"].get("view", ""))
         if observed != record["provenance"]:
             raise Paused("export source/build/code/overlays changed before worker startup")
         if read_json(path).get("cancel_requested"):
