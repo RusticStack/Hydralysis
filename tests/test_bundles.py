@@ -38,7 +38,8 @@ class Export(Bundles):
         self.assertEqual(bundle["program"]["sha256"], self.digest)
         self.assertEqual((bundle["program"]["name"], bundle["program"]["image_base"]), ("/owned.exe", "0x140000000"))
         self.assertEqual({key: bundle["base"][key] for key in ("lineage", "generation")}, {"lineage": "", "generation": 0})
-        self.assertEqual(bundle["base"]["engine"], {"hydraVersion": "12.3-hydra.2", "ghidraVersion": "12.3"})
+        # What the engine reported at export time, whichever release the fake models (never a pinned literal).
+        self.assertEqual(bundle["base"]["engine"], {key: self.daemon.release[key] for key in ("hydraVersion", "ghidraVersion")})
         self.assertEqual((bundle["store"]["view"], bundle["store"]["revision"]), ("shared", 2))
         self.assertEqual(bundle["store"]["ids_sha256"], workcopy._digest_of([one["overlay_id"], two["overlay_id"]]))
         first = bundle["records"][0]
@@ -65,7 +66,7 @@ class Export(Bundles):
         store["edits"].append(workcopy._clean_record({
             "id": "c" * 32, "address": "", "by": {"client": "C:\\Users\\someone\\x", "harness": "codex", "user": "alice"},
             "at": 1.0, "options": {"kind": "import_types", "source": "corpus", "corpus_sha256": "a" * 64, "corpus_bytes": 9,
-                                   "corpus_input": "D:\\Games\\KOTOR\\types.jsonl"}}, 2, 2))
+                                   "corpus_input": "D:\\Games\\Samplegame\\types.jsonl"}}, 2, 2))
         store["edits"].append(workcopy._clean_record({
             "id": "d" * 32, "address": "", "at": 2.0, "options": {
                 "kind": "batch", "source": "b", "input_file": "C:\\Users\\someone\\batch.json", "input_file_sha256": "b" * 64,
@@ -73,7 +74,7 @@ class Export(Bundles):
         store["revision"] = 4
         workcopy._save_store(self.settings, self.target, store)
         text = json.dumps(self.export()["bundle"])
-        for forbidden in ("C:\\\\", "D:\\\\", "someone", "alice", "KOTOR", str(self.root).replace("\\", "\\\\")):
+        for forbidden in ("C:\\\\", "D:\\\\", "someone", "alice", "Samplegame", str(self.root).replace("\\", "\\\\")):
             self.assertNotIn(forbidden, text)
         bundle = json.loads(text)
         bulk = next(record for record in bundle["records"] if record["kind"] == "import_types")
