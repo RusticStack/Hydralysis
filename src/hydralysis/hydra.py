@@ -50,9 +50,13 @@ SESSION_MODULE = Path("Ghidra", "Features", "HeadlessSession")
 
 
 LIST_CAP = 5
-# What an error never shortens: `next` is a ready request (a capped args list would be a different request),
-# `queue` and `retryAfterMs` are the engine's own queue and retry structures, small by construction.
-UNCAPPED = frozenset({"next", "queue", "retryAfterMs"})
+# What an error never shortens: `next` is a ready request (a capped args list would be a different request)
+# and `retryAfterMs` is a number. `queue` is the engine's own queue structure: it is not cut to LIST_CAP (the
+# position and the waiting clients are what a caller needs to judge how long to wait), but it is not unbounded
+# either, because that it is "small by construction" was never verified against a real engine: its lists keep
+# at most QUEUE_CAP entries and `more` says how many were left out (key `queue.waiting`, like any capped list).
+UNCAPPED = frozenset({"next", "retryAfterMs"})
+QUEUE_CAP = 64
 
 # Commands that may be sent again after the connection ended with no reply: they only read, or
 # they open/close what a new connection opens/closes to the same end. Everything else is not
@@ -103,14 +107,14 @@ def idempotent(command: str, fields: dict | None = None) -> bool:
     return command in IDEMPOTENT_COMMANDS
 
 
-def _capped(value, name: str, more: dict):
-    """Lists in an error stay short: five entries, and `more` says how many were left out."""
+def _capped(value, name: str, more: dict, cap: int = LIST_CAP):
+    """Lists in an error stay short: `cap` entries (five by default), and `more` says how many were left out."""
     if isinstance(value, list):
-        if len(value) > LIST_CAP:
-            more[name] = len(value) - LIST_CAP
-        return [_capped(item, name, more) for item in value[:LIST_CAP]]
+        if len(value) > cap:
+            more[name] = len(value) - cap
+        return [_capped(item, name, more, cap) for item in value[:cap]]
     if isinstance(value, dict):
-        return {key: _capped(item, name + "." + key if name else key, more) for key, item in value.items()}
+        return {key: _capped(item, name + "." + key if name else key, more, cap) for key, item in value.items()}
     return value
 
 
@@ -118,7 +122,10 @@ class EngineError(RuntimeError):
     """An ok:false answer from the engine. str() is JSON an agent can act on.
 
     Lists in the payload are capped at LIST_CAP entries plus a `more` map, except the UNCAPPED keys
-    (`next`, `queue`, `retryAfterMs`): a ready request must reach the caller exactly as the engine sent it.
+    (`next`, `retryAfterMs`): a ready request must reach the caller exactly as the engine sent it. The lists
+    of `queue` are capped at QUEUE_CAP (64) entries, with the count left out in `more["queue.waiting"]` (or
+    `queue.<key>`), so a pathological engine reply cannot reach the caller unbounded. `self.queue` keeps the
+    structure as the engine sent it; only the JSON text in str() is bounded.
 
     Beside `code` and `details` it carries what a v3 engine adds to an error: `retry_after_ms`
     (`error.retryAfterMs`, a sibling of `details`, present on `busy`), `next` (a ready request),
@@ -158,7 +165,8 @@ class EngineError(RuntimeError):
         if next is not None:
             payload["next"] = next
         more: dict = {}
-        payload = {key: item if key in UNCAPPED else _capped(item, key, more) for key, item in payload.items()}
+        payload = {key: item if key in UNCAPPED else _capped(item, key, more, QUEUE_CAP if key == "queue" else LIST_CAP)
+                   for key, item in payload.items()}
         if more:
             payload["more"] = more
         super().__init__(json.dumps(payload, ensure_ascii=False))

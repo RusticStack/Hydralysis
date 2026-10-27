@@ -311,6 +311,27 @@ class EngineRetryPolicy(unittest.TestCase):
         self.assertEqual(payload["more"], {"running": 3})
         self.assertEqual(error.next, ready)
 
+    def test_a_pathological_queue_is_bounded_while_next_stays_whole(self):
+        waiting = [{"client": number} for number in range(500)]
+        ready = {"cmd": "script", "script": "RusticQuery.java", "args": ["a%d" % number for number in range(100)]}
+        error = self.hydra.EngineError("busy", "held", {}, "script", retry_after_ms=1500, next=ready,
+                                       queue={"position": 400, "lane": "long", "waiting": waiting})
+        payload = json.loads(str(error))
+        self.assertEqual(self.hydra.QUEUE_CAP, 64)
+        self.assertEqual(payload["queue"]["waiting"], waiting[:64])  # bounded, the first 64 in engine order
+        self.assertEqual((payload["queue"]["position"], payload["queue"]["lane"]), (400, "long"))
+        self.assertEqual(payload["more"], {"queue.waiting": 500 - 64})
+        self.assertEqual(payload["next"], ready)  # next is still exact: 100 args, no `more` entry for it
+        self.assertEqual(payload["retryAfterMs"], 1500)
+        self.assertEqual(error.queue["waiting"], waiting)  # the attribute is the engine's structure, unchanged
+        # exactly at the cap nothing is cut and nothing is reported
+        exact = self.hydra.EngineError("busy", "held", {}, "script", queue={"waiting": waiting[:64]})
+        self.assertEqual(json.loads(str(exact))["queue"]["waiting"], waiting[:64])
+        self.assertNotIn("more", json.loads(str(exact)))
+        # a queue that comes from details.queue is bounded the same way
+        nested = self.hydra.EngineError("busy", "held", {"queue": {"waiting": waiting}}, "script")
+        self.assertEqual(len(json.loads(str(nested))["queue"]["waiting"]), 64)
+
     def test_a_stale_idle_connection_is_pinged_before_a_mutating_call_and_replaced_if_dead(self):
         save = lambda: self.writer.call("save", program=self.program["key"])
         # A mutating call on a connection that was just used is not probed, and a read never is.
