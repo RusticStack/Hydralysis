@@ -20,6 +20,7 @@ import re
 import shutil
 import sys
 import threading
+import time
 import zipfile
 from pathlib import Path
 
@@ -49,6 +50,9 @@ SESSION_MODULE = Path("Ghidra", "Features", "HeadlessSession")
 
 
 LIST_CAP = 5
+# What an error never shortens: `next` is a ready request (a capped args list would be a different request),
+# `queue` and `retryAfterMs` are the engine's own queue and retry structures, small by construction.
+UNCAPPED = frozenset({"next", "queue", "retryAfterMs"})
 
 # Commands that may be sent again after the connection ended with no reply: they only read, or
 # they open/close what a new connection opens/closes to the same end. Everything else is not
@@ -59,6 +63,17 @@ IDEMPOTENT_COMMANDS = frozenset({
     "ping", "hello", "health", "status", "projects", "programs", "overlays", "journal",
     "open_project", "open_program", "switch", "close_project", "close_program", "refresh", "reopen",
     "project", "list", "info", "functions", "decompile"})
+# Retry policy judgement (N4/N5): close_project, refresh, switch and reopen stay retryable. They converge on
+# the same end state however many times they run, so a lost reply cannot be made worse by a resend, and the
+# one harm is a retry that answers not_found/unknown project after the first close landed, which the caller
+# reads as "already closed" (workcopy passes discard=True). Calling them ambiguous would fail syncs that the
+# next attempt would have completed. A mutation that does NOT converge (save, fork, edit, import) is never here.
+#
+# Idle connection probe: a socket that went stale while idle (a daemon restart) is only found when the
+# first call is sent. For a call that may mutate, that would be reported as ambiguous although nothing was
+# sent. After STALE_S of idleness a `ping` (a read, answered inline by the engine) goes first.
+STALE_S = 30.0
+
 # RusticQuery actions that do not change the program, even when the call runs as the owner.
 # apply_overlays and type_edit (a dry run only while contained) are deliberately absent.
 READ_ACTIONS = frozenset({
@@ -102,6 +117,9 @@ def _capped(value, name: str, more: dict):
 class EngineError(RuntimeError):
     """An ok:false answer from the engine. str() is JSON an agent can act on.
 
+    Lists in the payload are capped at LIST_CAP entries plus a `more` map, except the UNCAPPED keys
+    (`next`, `queue`, `retryAfterMs`): a ready request must reach the caller exactly as the engine sent it.
+
     Beside `code` and `details` it carries what a v3 engine adds to an error: `retry_after_ms`
     (`error.retryAfterMs`, a sibling of `details`, present on `busy`), `next` (a ready request),
     `queue` (`details.queue`), and from `details` the `holderInfo`, `heldMs` and `current` that
@@ -140,7 +158,7 @@ class EngineError(RuntimeError):
         if next is not None:
             payload["next"] = next
         more: dict = {}
-        payload = _capped(payload, "", more)
+        payload = {key: item if key in UNCAPPED else _capped(item, key, more) for key, item in payload.items()}
         if more:
             payload["more"] = more
         super().__init__(json.dumps(payload, ensure_ascii=False))
@@ -296,6 +314,7 @@ class Engine:
     """One connection per process and root, shared by every thread."""
 
     _connections: dict[str, object] = {}
+    _used: dict[str, float] = {}  # connection key -> time.monotonic() when it last carried a call
     _guard = threading.Lock()
 
     def __init__(self, settings: dict, role: str = "reader", start: bool = True):
@@ -345,6 +364,7 @@ class Engine:
     def reset(self) -> None:
         with self._guard:
             session = self._connections.pop(self.key, None)
+            self._used.pop(self.key, None)
         if session is not None:
             try:
                 session.close()
@@ -382,6 +402,28 @@ class Engine:
                            next=getattr(exc, "next", None) or envelope.get("next"),
                            queue=getattr(exc, "queue", None))
 
+    def _probe(self, session, module):
+        """Ping a connection that was idle for STALE_S before a call that may mutate; reconnect if it is dead."""
+        now = time.monotonic()
+        with self._guard:
+            idle = now - self._used.get(self.key, now)
+            self._used[self.key] = now
+        if idle < STALE_S:
+            return session
+        try:
+            session.call("ping", client=_IDENTITY["client"], harness=_IDENTITY["harness"], parallel=True)
+            return session
+        except module.SessionError as exc:
+            if exc.code != "closed":
+                return session
+        except OSError:
+            pass
+        self.reset()
+        session = self.session()
+        with self._guard:
+            self._used[self.key] = time.monotonic()
+        return session
+
     def call(self, command: str, raw: bool = False, **fields):
         """A labelled, parallel request. A read is sent again once if the daemon went away.
 
@@ -394,6 +436,11 @@ class Engine:
         retry = idempotent(command, fields)
         for attempt in (0, 1):
             session = self.session()
+            if not retry and attempt == 0:
+                session = self._probe(session, module)
+            else:
+                with self._guard:
+                    self._used[self.key] = time.monotonic()
             try:
                 if raw:
                     return session.call_raw(command, **labels, **fields)

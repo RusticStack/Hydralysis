@@ -222,6 +222,9 @@ class FakeEngine:
                 raise failure
             return getattr(self, "_" + command)(**fields)
 
+    def _ping(self, **_):
+        return {"pong": True}
+
     def _open_project(self, path, writable=False, **_):
         norm = self.daemon._norm(path)
         if norm not in self.daemon.projects:

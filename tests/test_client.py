@@ -107,10 +107,6 @@ class JsonCommandLine(unittest.TestCase):
         self.assertIn("PROLOGUE MISMATCH", answer["error"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class EngineRetryPolicy(unittest.TestCase):
     """hydra.Engine.call against a fake session library: a lost reply is re-sent only if it was a read (spec 4.3)."""
 
@@ -300,6 +296,47 @@ class EngineRetryPolicy(unittest.TestCase):
         self.assertIsNone(error.queue)
         self.assertFalse(error.ambiguous)
 
+    def test_a_ready_request_in_next_survives_the_list_cap_unchanged(self):
+        ready = {"cmd": "script", "script": "RusticQuery.java", "args": ["a%d" % number for number in range(8)],
+                 "queue": [1, 2, 3, 4, 5, 6, 7]}
+        waiting = [{"client": number} for number in range(9)]
+        error = self.hydra.EngineError("busy", "held", {"running": list(range(8))}, "script", retry_after_ms=1500,
+                                       next=ready, queue={"position": 2, "waiting": waiting})
+        payload = json.loads(str(error))
+        self.assertEqual(payload["next"], ready)  # not shortened to 5 args, and no `more` entry for it
+        self.assertEqual(len(payload["next"]["args"]), 8)
+        self.assertEqual(payload["queue"]["waiting"], waiting)
+        self.assertEqual(payload["retryAfterMs"], 1500)
+        self.assertEqual(len(payload["running"]), 5)  # other lists are still capped
+        self.assertEqual(payload["more"], {"running": 3})
+        self.assertEqual(error.next, ready)
+
+    def test_a_stale_idle_connection_is_pinged_before_a_mutating_call_and_replaced_if_dead(self):
+        save = lambda: self.writer.call("save", program=self.program["key"])
+        # A mutating call on a connection that was just used is not probed, and a read never is.
+        self.writer.call("list", project=self.program["project"])
+        save()
+        self.assertEqual(self.sent("ping"), [])
+        # Idle past STALE_S and the socket is dead: the ping finds it, the call goes to a new connection and
+        # is sent exactly once, and nothing is reported as ambiguous although the old connection was gone.
+        self.hydra.Engine._used[self.writer.key] -= self.hydra.STALE_S + 1
+        self.daemon.drops.append({"command": "ping", "when": "before"})
+        sessions, saves = self.daemon.sessions, len(self.sent("save"))
+        save()
+        self.assertEqual(self.daemon.sessions, sessions + 1)
+        self.assertEqual(len(self.sent("save")) - saves, 1)
+        # An idle connection that is alive is pinged once and kept.
+        self.hydra.Engine._used[self.writer.key] -= self.hydra.STALE_S + 1
+        sessions, saves, pings = self.daemon.sessions, len(self.sent("save")), len(self.sent("ping"))
+        save()
+        self.assertEqual((self.daemon.sessions, len(self.sent("ping")) - pings, len(self.sent("save")) - saves),
+                         (sessions, 1, 1))
+        # A read after a long idle is not probed: it is retried anyway.
+        self.hydra.Engine._used[self.writer.key] -= self.hydra.STALE_S + 1
+        pings = len(self.sent("ping"))
+        self.writer.call("list", project=self.program["project"])
+        self.assertEqual(len(self.sent("ping")), pings)
+
     def test_capabilities_is_empty_on_protocol_2_and_never_raises_on_an_older_engine(self):
         self.assertEqual(self.writer.hello()["protocol"], 2)
         self.assertEqual(self.writer.capabilities(), {})
@@ -319,3 +356,7 @@ class EngineRetryPolicy(unittest.TestCase):
         self.hydra.Engine._connections.clear()
         self.assertEqual(self.writer.capabilities(), {"queueInfo": 1, "health": 2})
         self.assertNotIn("token", self.writer.hello())
+
+
+if __name__ == "__main__":
+    unittest.main()
