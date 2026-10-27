@@ -85,7 +85,8 @@ public class RusticQuery extends GhidraScript {
     // The one place every decompile entry point gets its options: those the program itself
     // carries (calling conventions, prototype evaluation model, analysis switches), as the
     // Ghidra window and a headless decompile use them. A bare DecompInterface runs on the
-    // native defaults and drops calling-convention information from signatures and locals.
+    // native defaults: constants in read-only memory stay DAT_ names, array locals are split
+    // and fewer functions get a __thiscall or __fastcall signature.
     private static void applyProgramOptions(DecompInterface decompiler, Program program) {
         DecompileOptions options = new DecompileOptions();
         options.grabFromProgram(program);

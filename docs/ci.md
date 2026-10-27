@@ -56,6 +56,9 @@ The script itself lives under `.github/`, outside the scanned roots, because it 
 - **ReFS-only claims cannot be validated here.** Hosted runners use NTFS. Anything that depends on ReFS
   (Dev Drive behaviour, block cloning, the speed of a project copy on a ReFS volume) is not checked by this CI and
   must not be claimed from a green run. Those claims stay local, measured on the Dev Drive, and are labelled as such.
+- **The options-parity test is not run in CI.** `tests/test_engine_options.py` is the only engine test that fails
+  on the old `RusticQuery` options, and it needs MSVC-built fixtures (`HYDRALYSIS_INTEGRATION_FIXTURES`). The
+  hosted job runs `test_engine_integration.py` only, so a regression of that fix is caught locally, not by a green run.
 - **No game data.** CI never sees a game binary, a decompile of one, or a golden baseline. The golden harness
   (`docs/golden-harness.md`) runs in CI only through its synthetic unit tests. Capturing and diffing real baselines
   stays a local step.
