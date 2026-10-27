@@ -1030,8 +1030,6 @@ NOT_A_RECORD = {  # (file, function, kind) -> why
 }
 
 FOLLOW_UP = {  # (file, function, kind) -> (category, note)
-    ("analysis.py", "save_overlay", "write_bytes"): ("record", "legacy v1 overlay store; no production caller (tests only)"),
-    ("analysis.py", "save_overlay", "Path.replace"): ("record", "legacy v1 overlay store; no production caller (tests only)"),
     ("hydra.py", "sync_scripts", "write_bytes"): ("artifact", "engine script staging"),
     ("hydra.py", "sync_scripts", "Path.replace"): ("artifact", "engine script staging"),
     ("hydra.py", "install", "Path.rename"): ("artifact", "engine install directory rename"),
@@ -1140,13 +1138,13 @@ class WriteGate(unittest.TestCase):
 
     def test_the_follow_up_table_is_counted(self):
         records = [key for key, (category, _) in FOLLOW_UP.items() if category == "record"]
-        # Y0e moved hydra.write_daemon_config, runtime._write and runtime_worker._write onto durable (six rows gone).
-        # What is left: the two rows of the legacy analysis.save_overlay (Y1 deletes it, then 0 / 22 / 24) and the
-        # artifact sites that are not records.
-        self.assertEqual(len(records), 2)
-        self.assertEqual(len(FOLLOW_UP), 24)
-        self.assertEqual(sum(COUNTS.get(key, 1) for key in FOLLOW_UP), 26)
-        self.assertEqual(sorted(key[:2] for key in records), [("analysis.py", "save_overlay")] * 2)
+        # Y0e moved hydra.write_daemon_config, runtime._write and runtime_worker._write onto durable (six rows gone);
+        # Y1 deleted the legacy analysis.save_overlay (its two rows). What is left is the artifact sites that are
+        # not records: no record-bearing writer stands outside durable.
+        self.assertEqual(len(records), 0)
+        self.assertEqual(len(FOLLOW_UP), 22)
+        self.assertEqual(sum(COUNTS.get(key, 1) for key in FOLLOW_UP), 24)
+        self.assertEqual(sorted(key[:2] for key in records), [])
 
 
 if __name__ == "__main__":

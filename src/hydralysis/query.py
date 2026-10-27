@@ -147,11 +147,12 @@ class QueryRunner:
             # Every mutation, on the shared view and on named views, names the revision it read.
             workcopy.require_revision(self.settings, selected, options.get("expect_revision"), "type_edit")
         if action == "status":
-            return json.dumps(_public(self.status(selected)), ensure_ascii=False)
+            return json.dumps(_public(self.status(selected, options, limit)), ensure_ascii=False)
         if action == "stop":
             return json.dumps(self.stop(selected))
         if action == "type_edit" and options.get("kind") == "revert":
-            return json.dumps({**workcopy.revert(self.settings, selected, options["ids"], options.get("expect_revision")),
+            return json.dumps({**workcopy.revert(self.settings, selected, options["ids"], options.get("expect_revision"),
+                                                 bool(options.get("cascade", False))),
                                "view": view})
         if action == "diff":
             from hydralysis import overlayjobs
@@ -210,7 +211,12 @@ class QueryRunner:
             return response
         raise RuntimeError("program could not be reopened")
 
-    def status(self, selected: dict) -> dict:
+    def status(self, selected: dict, options: dict | None = None, limit: int = 40) -> dict:
+        options = options or {}
+        if options.get("show") == "changes":
+            # What changed in this view: its records with their subject record (effects) and commit state.
+            return {"target": {key: selected[key] for key in ("name", "program", "sha256", "view")},
+                    **workcopy.changes(self.settings, selected, options.get("since", 0), options.get("state", "all"), limit)}
         hello = self.engine.hello()
         info = {key: hello.get(key) for key in ("protocol", "hydraVersion", "ghidraVersion", "installId", "pid", "startedAt")}
         overlays = workcopy.summary(self.settings, selected)

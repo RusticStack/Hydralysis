@@ -114,5 +114,52 @@ class Journal(unittest.TestCase):
         self.assertEqual(journal_entry(1, "revert", many, ALICE, 1.0)["subjects"], [WILDCARD])
 
 
+class SubjectRecord(unittest.TestCase):
+    """The effect and field vocabulary of store v3, and which records rest on which (revert with dependents)."""
+
+    @staticmethod
+    def record(ident, seq, address, kind="rename", effects=None, **options):
+        return {"id": ident, "seq": seq, "address": address, "options": {"kind": kind, "source": "s", **options},
+                "effects": effects}
+
+    def test_every_field_kind_of_the_vocabulary_is_accepted_and_nothing_else(self):
+        for field in ("name", "label:g", "comment:plate", "signature", "type", "variable:local_8", "definition", "body",
+                      "existence", "report"):
+            with self.subTest(field=field):
+                self.assertEqual(len(revisions.clean_effects([{"subject": "address:0x1", "field": field, "before": None,
+                                                              "after": "x"}])), 1)
+        for field in ("", "names", "comments:plate", "Name"):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                revisions.clean_effects([{"subject": "address:0x1", "field": field, "before": "a", "after": "b"}])
+
+    def test_a_chain_is_the_later_pending_records_of_the_same_subject_and_field(self):
+        records = [self.record("a", 1, "0x10", name="A"), self.record("b", 2, "0x10", name="B"),
+                   self.record("c", 3, "0x20", name="C"), self.record("d", 4, "0x10", kind="comment", comment="x"),
+                   self.record("e", 5, "0x10", name="E")]
+        self.assertEqual(revisions.dependents(records, {"a"}), ["b", "e"])  # the comment is another field
+        self.assertEqual(revisions.dependents(records, {"e"}), [])
+        self.assertEqual(revisions.dependents(records, {"c"}), [])
+        self.assertEqual(revisions.dependents(records, {"b"}), ["e"])
+
+    def test_the_closure_follows_a_batch_that_touches_two_subjects(self):
+        batch = self.record("b2", 2, "", kind="batch",
+                            edits=[{"address": "0x10", "options": {"kind": "rename", "name": "X"}},
+                                   {"address": "0x20", "options": {"kind": "rename", "name": "Y"}}])
+        records = [self.record("a", 1, "0x10", name="A"), batch, self.record("c", 3, "0x20", name="C")]
+        self.assertEqual(revisions.dependents(records, {"a"}), ["b2", "c"])
+
+    def test_committed_records_are_not_dependents_and_reports_are_not_a_chain(self):
+        records = [self.record("a", 1, "0x10", name="A"), self.record("b", 2, "0x10", name="B")]
+        self.assertEqual(revisions.dependents(records, {"a"}, committed={"b"}), [])
+        imports = [self.record("i1", 1, "", kind="import_types"), self.record("i2", 2, "", kind="import_types")]
+        self.assertEqual(revisions.dependents(imports, {"i1"}), [])
+
+    def test_effects_win_over_options_when_a_record_has_them(self):
+        effects = [{"subject": "address:0x10", "field": "name", "before": "FUN_10", "after": "A"}]
+        record = self.record("a", 1, "0x10", name="A", effects=effects)
+        self.assertEqual(revisions.touches(record), {("address:0x10", "name")})
+        self.assertEqual(revisions.touches({**record, "effects": None}), {("address:0x10", "name")})
+
+
 if __name__ == "__main__":
     unittest.main()

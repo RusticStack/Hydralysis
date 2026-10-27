@@ -130,3 +130,107 @@ def missing_payload(revision: int, view: str, what: str) -> dict:
     return {"error": "expect_revision_required", "view": view, "current_revision": revision, "view_revision": revision,
             "message": "%s requires expect_revision on every view, including the shared one" % what,
             "suggest": "retry with expect_revision=%d (the view's current revision), or read it with ghidra_query status" % revision}
+
+
+# --------------------------------------------------------------------------- subject record (store v3)
+#
+# One record (an edit) carries `effects`: [{subject, field, before, after}], what it changed and what was
+# there before. `subject` is a coarse subject string of `subjects_of`; `field` names the aspect of it:
+#   name, label:<name>, comment:<type>, signature, type, variable:<name>, definition, body, existence, report
+# `before` and `after` are canonical text (a name, a comment, a prototype, a type's display name,
+# "sha256:<hex>" of a structure definition, "absent" for none); a bulk import has one effect
+# {"*", "report", None, "sha256:<report>"} and its drift is checked by input hash instead.
+
+FIELD_KINDS = ("name", "label", "comment", "signature", "type", "variable", "definition", "body", "existence", "report")
+ABSENT = "absent"
+REPORT = "report"
+MAX_EFFECTS = 4096
+_EFFECT_KEYS = frozenset(("subject", "field", "before", "after"))
+
+
+def field_kind(field: str) -> str:
+    return str(field).split(":", 1)[0]
+
+
+def clean_effects(raw) -> list[dict] | None:
+    """A stored or engine-reported effect list, validated; None stays None (a v2 record). Malformed is an error."""
+    if raw is None:
+        return None
+    if not isinstance(raw, list) or len(raw) > MAX_EFFECTS:
+        raise ValueError("effects must be a list of at most %d entries" % MAX_EFFECTS)
+    clean = []
+    for item in raw:
+        if not isinstance(item, dict) or set(item) != _EFFECT_KEYS:
+            raise ValueError("an effect is {subject, field, before, after}")
+        if not isinstance(item["subject"], str) or not item["subject"]:
+            raise ValueError("an effect needs a subject string")
+        if not isinstance(item["field"], str) or field_kind(item["field"]) not in FIELD_KINDS:
+            raise ValueError("unknown effect field %r" % (item["field"],))
+        for side in ("before", "after"):
+            if item[side] is not None and not isinstance(item[side], str):
+                raise ValueError("effect %s of %s must be text or null" % (side, item["subject"]))
+        clean.append({key: item[key] for key in ("subject", "field", "before", "after")})
+    return clean
+
+
+def fields_of(address: str, options: dict) -> list[tuple[str, str]]:
+    """The (subject, field) pairs a record touches, from its options alone (what `effects` reports once applied)."""
+    kind = options.get("kind")
+    if kind in _BULK_KINDS:
+        return [(WILDCARD, REPORT)]
+    if kind == "batch":
+        found: list[tuple[str, str]] = []
+        for child in options.get("edits", []):
+            for pair in fields_of(child.get("address", ""), child.get("options", {})):
+                if pair not in found:
+                    found.append(pair)
+        return found
+    if kind == "struct":
+        return [("type:" + options.get("path", ""), "definition")]
+    where = _address(address) if address else None
+    if where is None:
+        return []
+    return {"rename": [(where, "name")], "label": [(where, "label:" + options.get("name", ""))],
+            "comment": [(where, "comment:plate")], "signature": [(where, "signature")], "apply": [(where, "type")],
+            "variable": [(where, "variable:" + options.get("variable", ""))],
+            "function_create": [(where, "existence"), (where, "body"), (where, "name")],
+            "function_body": [(where, "body")] + ([(where, "name")] if options.get("name") else []),
+            "function_delete": [(where, "existence"), (where, "body"), (where, "name")]}.get(kind, [])
+
+
+def touches(record: dict) -> set[tuple[str, str]]:
+    """(subject, field) pairs of a stored record: its effects when it has them, else what its options imply."""
+    effects = record.get("effects")
+    if effects:
+        return {(item["subject"], item["field"]) for item in effects}
+    return set(fields_of(record.get("address", ""), record.get("options", {})))
+
+
+def dependents(records: list[dict], selected: set[str], committed: set[str] = frozenset()) -> list[str]:
+    """Ids of the pending records, after the selected ones, whose `before` rests on a selected record's `after`.
+
+    A record depends on an earlier one when both touch the same (subject, field): removing the earlier leaves the later
+    with a `before` the analyst never saw (it equals the removed record's `after`). Bulk reports have no `before`
+    to go stale and are not a chain. The result is closed (a record pulled in has dependents of its own).
+    """
+    chain = sorted((record for record in records if record["id"] not in committed), key=lambda record: record["seq"])
+    taken = set(selected)
+    found: list[str] = []
+    changed = True
+    while changed:
+        changed = False
+        for record in chain:
+            if record["id"] in taken:
+                continue
+            mine = {pair for pair in touches(record) if pair[1] != REPORT}
+            if not mine:
+                continue
+            for earlier in chain:
+                if earlier["id"] not in taken or earlier["seq"] >= record["seq"]:
+                    continue
+                if mine & {pair for pair in touches(earlier) if pair[1] != REPORT}:
+                    taken.add(record["id"])
+                    found.append(record["id"])
+                    changed = True
+                    break
+    return sorted(found, key=lambda ident: next(record["seq"] for record in chain if record["id"] == ident))

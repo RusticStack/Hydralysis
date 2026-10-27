@@ -47,41 +47,184 @@ def _store_path(settings: dict, target: dict) -> Path:
     return _overlay_path(root_path(settings), target["key"])
 
 
+STORE_VERSION = 3
+DEFAULT_BASE = {"lineage": "", "generation": 0}
+
+
+def _store_record(path: Path) -> dict | None:
+    """The sealed store record, or None when no store was ever written.
+
+    A version-3 file is read with require_seal=True: one whose seal was stripped is `store_corrupt`, not a
+    "pre-seal" record. A version-1 or -2 file may still be unsealed; its first write seals it.
+    """
+    limit = MAX_HISTORY_BYTES + 4096
+    kind, value, _ = durable.inspect_file(path, limit)
+    if kind == "sealed":
+        return value
+    if kind == "unsealed":
+        if value.get("version") in (1, 2):
+            return value
+        # Not the previous version either: a stripped seal is tampering or truncation, and must not be answered
+        # from an older sealed copy as if nothing happened.
+        backup = durable.backup_path(path)
+        raise durable.StoreCorrupt(path, backup, {path.name: "no seal (a version-3 store is always sealed)",
+                                                  backup.name: "not tried"})
+    # Missing, zero-length, torn or mis-sealed: the previous version (.bak), else store_corrupt (or None: never written).
+    return durable.read_sealed(path, default=None, max_bytes=limit)
+
+
+def _clean_record(item: dict, position: int, previous_seq: int) -> dict:
+    """One stored record as a v3 record. A record without effects (v1, v2) keeps `effects: null` and `before_unknown`."""
+    if not isinstance(item, dict):
+        raise ValueError("overlay history holds a record that is not an object")
+    clean = _edit({key: item[key] for key in ("id", "address", "options") if key in item})
+    clean.update({key: item[key] for key in ("by", "at", "batch") if key in item})
+    seq = item.get("seq", position + 1)
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq <= previous_seq:
+        raise ValueError("overlay record %s has a sequence number out of order" % clean["id"])
+    clean["seq"] = seq
+    effects = revisions.clean_effects(item.get("effects"))
+    clean["effects"] = effects
+    if effects is None or item.get("before_unknown"):
+        clean["before_unknown"] = True
+    for key in ("imported_from", "merged_from"):
+        if key in item:
+            clean[key] = item[key]
+    return clean
+
+
+def _clean_commits(raw) -> list[dict]:
+    """The committed-id set (D32): one entry per cid, `ids` authoritative, `ids_sha256` over the sorted ids."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("overlay commits must be a list")
+    seen, clean = set(), []
+    for entry in raw:
+        if (not isinstance(entry, dict) or not isinstance(entry.get("cid"), str) or not isinstance(entry.get("ids"), list)
+                or any(not isinstance(item, str) for item in entry["ids"])):
+            raise ValueError("an overlay commit entry needs a cid and a list of ids")
+        if entry["cid"] in seen:
+            raise ValueError("overlay commits repeat cid %s" % entry["cid"])
+        seen.add(entry["cid"])
+        digest = _digest_of(sorted(entry["ids"]))
+        if "ids_sha256" in entry and entry["ids_sha256"] != digest:
+            raise ValueError("overlay commit %s does not match its ids_sha256" % entry["cid"])
+        clean.append({**entry, "ids_sha256": digest, "reverted": bool(entry.get("reverted", False))})
+    return clean
+
+
+def _empty_store(sha256: str) -> dict:
+    return {"version": STORE_VERSION, "sha256": sha256, "revision": 0, "base": dict(DEFAULT_BASE), "edits": [],
+            "reverted": [], "journal": [], "commits": [], "archived": [], "stale": None}
+
+
 def load_store(settings: dict, target: dict) -> dict:
+    """The store in its version-3 shape. A v1 or v2 file upgrades in memory (its `version` still says what was read)
+    and on disk at its first write, which keeps the old file once as `.v1.bak` or `.v2.bak`."""
     path = _store_path(settings, target)
     if path.is_file() and path.stat().st_size > MAX_HISTORY_BYTES:
         raise ValueError("overlay history exceeds 20 MiB; preserved for review")
     # Sealed record: the file, else its previous version (.bak). A store that exists but has no valid
     # version raises store_corrupt; only a store that was never written reads as "no edits".
-    record = durable.read_sealed(path, default=None, max_bytes=MAX_HISTORY_BYTES + 4096)
+    record = _store_record(path)
     if record is None:
-        return {"version": 2, "sha256": target["sha256"], "revision": 0, "edits": [], "reverted": [], "journal": []}
-    if record.get("version") not in (1, 2) or record.get("sha256") != target["sha256"]:
+        return _empty_store(target["sha256"])
+    if record.get("version") not in (1, 2, STORE_VERSION) or record.get("sha256") != target["sha256"]:
         raise ValueError("overlays at %s belong to another build or format; preserve them and use a new target" % path)
     edits = record.get("edits")
     if not isinstance(edits, list) or len(edits) > MAX_OVERLAYS:
         raise ValueError("overlay history must contain at most %d records" % MAX_OVERLAYS)
-    clean = []
-    for item in edits:
-        meta = {key: item[key] for key in ("by", "at", "batch") if key in item}
-        clean.append({**_edit({key: item[key] for key in ("id", "address", "options") if key in item}), **meta})
+    clean, previous = [], 0
+    for position, item in enumerate(edits):
+        clean.append(_clean_record(item, position, previous))
+        previous = clean[-1]["seq"]
     if len({edit["id"] for edit in clean}) != len(clean):
         raise ValueError("overlay history has duplicate edit identities")
-    return {"version": 2, "sha256": target["sha256"], "revision": int(record.get("revision", len(clean))),
-            "edits": clean, "reverted": record.get("reverted", []), "journal": revisions.clean_journal(record.get("journal"))}
+    base = record.get("base") if isinstance(record.get("base"), dict) else dict(DEFAULT_BASE)
+    archived = record.get("archived")
+    stale = record.get("stale")
+    return {"version": record["version"], "sha256": target["sha256"], "revision": int(record.get("revision", len(clean))),
+            "base": base, "edits": clean, "reverted": record.get("reverted", []),
+            "journal": revisions.clean_journal(record.get("journal")), "commits": _clean_commits(record.get("commits")),
+            "archived": archived if isinstance(archived, list) else [], "stale": stale if isinstance(stale, str) else None}
+
+
+def _stored_version(path: Path) -> int | None:
+    """The `version` of the file at PATH without parsing it all (it is the first key of every writer)."""
+    try:
+        with path.open("rb") as handle:
+            head = handle.read(8192)
+    except OSError:
+        return None
+    found = re.search(rb'"version"\s*:\s*(\d+)', head)
+    if found:
+        return int(found.group(1))
+    _, value, _ = durable.inspect_file(path, MAX_HISTORY_BYTES + 4096)
+    return value.get("version") if value else None
+
+
+def _keep_old_format(path: Path) -> None:
+    """Migration: the first write over a v1 or v2 file keeps it, once, as `<file>.v<N>.bak`."""
+    if not path.is_file():
+        return
+    old = _stored_version(path)
+    if old in (1, 2):
+        backup = path.with_name("%s.v%d.bak" % (path.name, old))
+        if not backup.exists():
+            durable.atomic_write(backup, path.read_bytes(), point="v%d_backup" % old)
+
+
+def _v3(store: dict, target: dict) -> dict:
+    """The record to write: the store in its v3 form, whatever shape the caller holds (a v2 dict upgrades)."""
+    edits, previous = [], 0
+    for position, item in enumerate(store.get("edits", [])):
+        edit = _clean_record(item, position, previous)
+        previous = edit["seq"]
+        edits.append(edit)
+    base = store.get("base") if isinstance(store.get("base"), dict) else dict(DEFAULT_BASE)
+    return {"version": STORE_VERSION, "sha256": store.get("sha256", target["sha256"]), "revision": store["revision"],
+            "base": base, "edits": edits, "reverted": store.get("reverted") or [], "journal": store.get("journal") or [],
+            "commits": _clean_commits(store.get("commits")), "archived": store.get("archived") or [],
+            "stale": store.get("stale")}
 
 
 def _save_store(settings: dict, target: dict, store: dict) -> None:
-    # Sealed, previous version kept as .bak, atomic and fsynced (durable.write_sealed).
+    # Version 3, sealed, previous version kept as .bak, atomic and fsynced (durable.write_sealed); a v1 or v2
+    # file is kept once as .v1.bak or .v2.bak before it is replaced.
     path = _store_path(settings, target)
-    durable.write_sealed(path, store, max_bytes=MAX_HISTORY_BYTES,
+    record = _v3(store, target)
+    _keep_old_format(path)
+    durable.write_sealed(path, record, max_bytes=MAX_HISTORY_BYTES,
                          too_large="overlay history would exceed 20 MiB; existing history preserved")
 
 
+def committed_ids(store: dict) -> set[str]:
+    """Ids of the records in a live commit (D32). Reverted commits do not count: their records are pending again."""
+    found: set[str] = set()
+    for entry in store.get("commits") or []:
+        if not entry.get("reverted"):
+            found.update(entry["ids"])
+    return found
+
+
+def pending_of(store: dict) -> list[dict]:
+    """The records the working copy replays: every record not in a live commit, in `seq` (store) order."""
+    committed = committed_ids(store)
+    return [edit for edit in store["edits"] if edit["id"] not in committed]
+
+
+def _digest_of(ids) -> str:
+    return hashlib.sha256("\n".join(ids).encode()).hexdigest()
+
+
 def state_of(store: dict) -> dict:
-    ids = [edit["id"] for edit in store["edits"]]
-    return {"revision": store["revision"], "edits": len(ids),
-            "ids_sha256": hashlib.sha256("\n".join(ids).encode()).hexdigest()}
+    """The overlay marker of 4.2: the pending list plus the base and the committed set it was built on."""
+    ids = [edit["id"] for edit in pending_of(store)]
+    base = store.get("base") or DEFAULT_BASE
+    return {"revision": store["revision"], "edits": len(ids), "ids_sha256": _digest_of(ids),
+            "base": {"lineage": base.get("lineage", ""), "generation": base.get("generation", 0)},
+            "committed_sha256": _digest_of(sorted(committed_ids(store)))}
 
 
 def state_text(state: dict) -> str:
@@ -90,14 +233,15 @@ def state_text(state: dict) -> str:
 
 
 def has_overlays(settings: dict, target: dict) -> bool:
-    return _store_path(settings, target).is_file() and bool(load_store(settings, target)["edits"])
+    # durable.exists: a store whose main file is gone but whose .bak is intact still has overlays.
+    return durable.exists(_store_path(settings, target)) and bool(pending_of(load_store(settings, target)))
 
 
 def expected_state(settings: dict, target: dict) -> str | None:
-    if not _store_path(settings, target).is_file():
+    if not durable.exists(_store_path(settings, target)):
         return None
     store = load_store(settings, target)
-    return state_text(state_of(store)) if store["edits"] else None
+    return state_text(state_of(store)) if pending_of(store) else None
 
 
 def _directory(settings: dict, target: dict) -> Path:
@@ -112,7 +256,9 @@ def summary(settings: dict, target: dict) -> dict:
     store = load_store(settings, target)
     state = _state(settings, target)
     latest = max(store["journal"], key=lambda entry: entry["revision"], default=None)
+    pending = pending_of(store)
     return {"revision": store["revision"], "view_revision": store["revision"], "edits": len(store["edits"]),
+            "pending": len(pending), "committed": len(store["edits"]) - len(pending),
             "latest_editor": {"by": latest["by"], "at": latest["at"]} if latest else None, "reverted": len(store["reverted"]),
             "working_copy": state.get("fork_gpr"), "working_state": state.get("state"),
             "in_sync": bool(state) and state.get("state") == state_text(state_of(store)),
@@ -120,6 +266,24 @@ def summary(settings: dict, target: dict) -> dict:
             "last_sync": state.get("last_sync"),
             "recent": [{"id": edit["id"], "address": edit["address"], "kind": edit["options"].get("kind"),
                         "by": edit.get("by"), "at": edit.get("at")} for edit in store["edits"][-10:]]}
+
+
+def changes(settings: dict, target: dict, since: int = 0, state: str = "all", limit: int = 40) -> dict:
+    """The view's records after revision SINCE (by `seq`), each with its effects and whether a live commit holds it."""
+    store = load_store(settings, target)
+    committed = committed_ids(store)
+    rows = []
+    for edit in store["edits"]:
+        mine = "committed" if edit["id"] in committed else "pending"
+        if edit["seq"] <= since or state not in ("all", mine):
+            continue
+        rows.append({"seq": edit["seq"], "id": edit["id"], "address": edit["address"], "kind": edit["options"].get("kind"),
+                     "source": edit["options"].get("source"), "by": edit.get("by"), "at": edit.get("at"), "state": mine,
+                     "effects": edit["effects"], **({"before_unknown": True} if edit.get("before_unknown") else {})})
+    page = rows[:limit]
+    return {"view_revision": store["revision"], "since": since, "state": state, "changes": page,
+            "truncated": len(rows) > len(page), **({"next_since": page[-1]["seq"]} if len(rows) > len(page) else {}),
+            "archived_commits": len(store.get("archived") or [])}
 
 
 def _attribution() -> dict:
@@ -336,15 +500,30 @@ def _marker(engine: hydra.Engine, program: dict) -> dict | None:
     return json.loads(text) if text else None
 
 
-def _prefix_matches(records: list[dict], marker: dict | None) -> int | None:
-    """How many leading records the program already holds, or None if it diverged."""
+def _prefix_matches(records: list[dict], marker: dict | None, wanted: dict | None = None) -> int | None:
+    """How many leading PENDING records the program already holds, or None if it diverged.
+
+    `wanted` is the marker the store asks for (state_of): the program must also have been built on the same base
+    (lineage, generation) and the same committed set, so a program built before a commit never matches after it
+    (its records would be applied twice). A marker without `base` is a v2 marker: it matches only generation 0
+    with an empty committed set.
+    """
     if not marker:
         return 0
-    count = int(marker.get("edits", -1))
-    if not 0 <= count <= len(records):
+    if wanted is not None:
+        base = marker.get("base")
+        if base is None:
+            if wanted["base"] != DEFAULT_BASE or wanted["committed_sha256"] != _digest_of([]):
+                return None
+        elif base != wanted["base"]:
+            return None
+        if marker.get("committed_sha256", _digest_of([])) != wanted["committed_sha256"]:
+            return None
+    count = marker.get("edits", -1)
+    if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= len(records):
         return None
     ids = [record["id"] for record in records[:count]]
-    return count if hashlib.sha256("\n".join(ids).encode()).hexdigest() == marker.get("ids_sha256") else None
+    return count if _digest_of(ids) == marker.get("ids_sha256") else None
 
 
 def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list[dict] | None = None) -> dict:
@@ -357,8 +536,9 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
     """
     from hydralysis.query import forget, open_program
     writer = hydra.Engine(settings, role="writer")
-    records = store["edits"] + (extra or [])
-    wanted = state_of({"revision": store["revision"] + (1 if extra else 0), "edits": records})
+    records = pending_of(store) + (extra or [])
+    wanted = state_of({**store, "revision": store["revision"] + (1 if extra else 0),
+                       "edits": store["edits"] + (extra or [])})
     current = _state(settings, target)
     started = time.monotonic()
     phases = _Phases()
@@ -375,7 +555,7 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
                                    writable=True, upgrade=True, refresh=True)
             phases.add("open", opening)
             opening = time.monotonic()
-            held = _prefix_matches(records, _marker(writer, program))
+            held = _prefix_matches(records, _marker(writer, program), wanted)
             phases.add("replay", opening)
             if held is None:
                 program = None
@@ -410,6 +590,9 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
                                **({"import_report": report} if report else {})}}
         write_json(_directory(settings, target) / "state.json", state)
         _start_saver(settings, target)
+        if extra:
+            # What each record changed and what was there before, as the engine saw it (store v3 `effects`).
+            return {**state, "effects": {item["id"]: item.get("effects") for item in (applied or {}).get("effects") or []}}
         return state
     finally:
         # Disconnecting keeps the committed changes in the daemon (shared mode);
@@ -483,7 +666,7 @@ def repair(settings: dict, engine: hydra.Engine, target: dict, timeout_s: int = 
 
 def heavy(store: dict) -> bool:
     from hydralysis.analysis import BULK_KINDS
-    return any(edit["options"].get("kind") in BULK_KINDS for edit in store["edits"])
+    return any(edit["options"].get("kind") in BULK_KINDS for edit in pending_of(store))
 
 
 def rebuilding(settings: dict, target: dict) -> dict:
@@ -545,8 +728,15 @@ def edit(settings: dict, engine: hydra.Engine, target: dict, address: str, optio
         if len(store["edits"]) >= MAX_OVERLAYS:
             raise ValueError("overlay history limit reached; export/review it before adding more edits")
         state = _sync(settings, target, store, timeout_s, extra=[clean])
-        store["edits"].append(clean)
+        # The subject record: what this edit changed and what was there before. An engine whose script does not
+        # report effects leaves the record without them (`before_unknown`): it still replays, it cannot be drift-checked.
+        effects = (state.get("effects") or {}).get(clean["id"])
+        clean["effects"] = revisions.clean_effects(effects)
+        if clean["effects"] is None:
+            clean["before_unknown"] = True
         store["revision"] += 1
+        clean["seq"] = max(store["revision"], max((item["seq"] for item in store["edits"]), default=0) + 1)
+        store["edits"].append(clean)
         store["journal"] = revisions.append(store["journal"], revisions.journal_entry(
             store["revision"], "edit", subjects, clean["by"], clean["at"]))
         _save_store(settings, target, store)
@@ -555,7 +745,8 @@ def edit(settings: dict, engine: hydra.Engine, target: dict, address: str, optio
             **_rebase_report(expect, decision), "by": clean["by"],
             **({"import_report": _summary(import_report)} if import_report else {}),
             "edits_applied": len(options.get("edits", [])) if options.get("kind") == "batch" else 1,
-            "working_copy": state["fork_gpr"], "sync": state.get("last_sync"),
+            "working_copy": state["fork_gpr"], "sync": state.get("last_sync"), "seq": clean["seq"],
+            **({"effects": clean["effects"]} if clean["effects"] is not None else {"before_unknown": True}),
             "persistence": "cited, build-bound overlay applied to the working copy; the canonical project is unchanged"}
 
 
@@ -566,17 +757,43 @@ def _summary(report: dict) -> dict:
                                              "failures_total", "category")} | {"unresolved_top": report.get("unresolved", [])[:10]}
 
 
-def revert(settings: dict, target: dict, ids: list[str], expect: int | None = None) -> dict:
-    """Undo records in one step. The working copy is rebuilt from the master on next use."""
+def _selected(store: dict, ids: list[str]) -> list[dict]:
+    wanted = set(ids)
+    return [edit for edit in store["edits"] if edit["id"] in wanted or edit.get("batch") in wanted]
+
+
+def revert(settings: dict, target: dict, ids: list[str], expect: int | None = None, cascade: bool = False) -> dict:
+    """Undo records in one step. The working copy is rebuilt from the master on next use.
+
+    A record that a live commit holds is refused (`already_committed`): undo it with a new inverse edit or a
+    commit revert. A record whose removal would leave a later pending record on the same (subject, field) with a
+    stale `before` is refused (`has_dependents`, the later ids named); `cascade` removes those as well.
+    """
     require_revision(settings, target, expect, "revert")
     with locked(_directory(settings, target) / ".sync.lock", SYNC_LOCK_S, "working copy"):
         store = load_store(settings, target)
-        wanted = set(ids)
-        kept = [edit for edit in store["edits"] if edit["id"] not in wanted and edit.get("batch") not in wanted]
-        dropped = [edit for edit in store["edits"] if edit not in kept]
-        removed = [edit["id"] for edit in dropped]
-        if not removed:
+        dropped = _selected(store, ids)
+        if not dropped:
             raise ValueError("no overlay record or batch matches %s" % ", ".join(ids))
+        committed = committed_ids(store)
+        held = [edit["id"] for edit in dropped if edit["id"] in committed]
+        if held:
+            raise RuntimeError(json.dumps({"error": "already_committed", "ids": held, "current_revision": store["revision"],
+                                           "suggest": "a committed record is history: undo it with a new inverse edit, or revert the commit"}))
+        later = revisions.dependents(store["edits"], {edit["id"] for edit in dropped}, committed)
+        if later and not cascade:
+            raise RuntimeError(json.dumps({"error": "has_dependents", "ids": later, "reverting": [edit["id"] for edit in dropped],
+                                           "current_revision": store["revision"],
+                                           "suggest": "later records of the same subject and field rest on these; revert them "
+                                                      "first, or pass cascade:true to revert the whole chain"}))
+        if later:
+            dropped = dropped + [edit for edit in store["edits"] if edit["id"] in set(later)]
+            # A batch always goes whole.
+            dropped = dropped + [edit for edit in _selected(store, [edit["batch"] for edit in dropped if edit.get("batch")])
+                                 if edit not in dropped]
+        dropped_ids = {edit["id"] for edit in dropped}
+        kept = [edit for edit in store["edits"] if edit["id"] not in dropped_ids]
+        removed = [edit["id"] for edit in store["edits"] if edit["id"] in dropped_ids]
         subjects = sorted({subject for edit in dropped for subject in revisions.subjects_of(edit["address"], edit["options"])})
         decision = reconcile(store, expect, subjects)
         who, now = _attribution(), time.time()
@@ -587,5 +804,6 @@ def revert(settings: dict, target: dict, ids: list[str], expect: int | None = No
             store["revision"], "revert", subjects, who, now))
         _save_store(settings, target, store)
     return {"ok": True, "reverted": len(removed), "revision": store["revision"], "view_revision": store["revision"],
+            **({"cascaded": [ident for ident in removed if ident in set(later)]} if later else {}),
             **_rebase_report(expect, decision),
             "note": "the working copy is rebuilt from the unchanged master on the next query"}

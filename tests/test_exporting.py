@@ -92,9 +92,10 @@ class ExportTests(unittest.TestCase):
 
         def add_edit(target, edit_id):
             store = workcopy.load_store(self.settings, target)
-            store["edits"].append({"id": edit_id * 32, "address": "0x401000",
-                                   "options": {"kind": "rename", "name": "Named", "source": "evidence"}})
             store["revision"] += 1
+            store["edits"].append({"id": edit_id * 32, "address": "0x401000", "seq": store["revision"],
+                                   "effects": None, "before_unknown": True,
+                                   "options": {"kind": "rename", "name": "Named", "source": "evidence"}})
             workcopy._save_store(self.settings, target, store)
 
         add_edit(alice, "a")

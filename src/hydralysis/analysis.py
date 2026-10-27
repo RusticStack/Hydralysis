@@ -52,12 +52,12 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
         raise ValueError("options must be an object")
     allowed = {
         "decompile": {"max_characters"}, "data": {"table"}, "scan": {"end", "mnemonic", "operand", "regex"},
-        "types": set(), "type": {"path"}, "variables": set(), "dossier": set(),
+        "status": {"show", "since", "state"}, "types": set(), "type": {"path"}, "variables": set(), "dossier": set(),
         "blocks": set(), "pcode": {"nodes"}, "diff": {"against", "against_view", "checks"}, "vtables": set(),
         "vcalls": {"offset", "receiver_from", "receiver_type", "receiver_global", "vtable"},
         "writes": {"offset", "receiver_type"}, "orphans": {"referenced_only"},
         "trace": {"seed", "direction", "depth", "nodes", "functions", "argument", "brief", "callers", "debug"},
-        "type_edit": {"kind", "source", "path", "size", "fields", "prototype", "variable", "type", "name", "comment", "expect", "ranges", "edits", "file", "expect_revision", "ids", "corpus", "category", "archive", "paths"} | (_BATCH_PROVENANCE | _CORPUS_RECORD | _ARCHIVE_RECORD if _record else set()),
+        "type_edit": {"kind", "source", "path", "size", "fields", "prototype", "variable", "type", "name", "comment", "expect", "ranges", "edits", "file", "expect_revision", "ids", "cascade", "corpus", "category", "archive", "paths"} | (_BATCH_PROVENANCE | _CORPUS_RECORD | _ARCHIVE_RECORD if _record else set()),
     }
     if action not in allowed:
         if options:
@@ -127,13 +127,24 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
                 out["argument"] = _integer(out["argument"], "argument", 0, 15)
             if "brief" in out and not isinstance(out["brief"], bool):
                 raise ValueError("brief must be a boolean")
+    elif action == "status":
+        if "show" in out and out["show"] != "changes":
+            raise ValueError("status show must be changes")
+        if ("since" in out or "state" in out) and out.get("show") != "changes":
+            raise ValueError("status since and state belong to show=changes")
+        if "since" in out:
+            _integer(out["since"], "since", 0, 2**31)
+        if "state" in out and out["state"] not in ("pending", "committed", "all"):
+            raise ValueError("status state must be pending, committed or all")
     elif action == "type_edit":
         kind = out.get("kind")
         if "expect_revision" in out:
             _integer(out["expect_revision"], "expect_revision", 0, 2**31)
         if kind == "revert":
-            if set(out) - {"kind", "ids", "expect_revision", "source"}:
-                raise ValueError("revert takes ids (overlay or batch ids) and optional expect_revision")
+            if set(out) - {"kind", "ids", "expect_revision", "source", "cascade"}:
+                raise ValueError("revert takes ids (overlay or batch ids), optional expect_revision and cascade")
+            if "cascade" in out and not isinstance(out["cascade"], bool):
+                raise ValueError("cascade must be a boolean")
             ids = out.get("ids")
             if not isinstance(ids, list) or not 1 <= len(ids) <= MAX_OVERLAYS or any(
                     not isinstance(item, str) or not re.fullmatch(r"[0-9a-f]{32}", item) for item in ids):
@@ -347,47 +358,3 @@ def _edit(value: dict) -> dict:
     if not isinstance(edit_id, str) or not re.fullmatch(r"[0-9a-f]{32}", edit_id):
         raise ValueError("overlay id must be 32 lowercase hexadecimal characters")
     return {"id": edit_id, "address": address, "options": options}
-
-
-def load_overlays(root: str | Path, target_key: str, sha256: str) -> list[dict]:
-    """Read saved assertions. A changed build must never inherit stale types."""
-    expected = _digest(sha256)
-    path = _overlay_path(root, target_key)
-    if not path.is_file():
-        return []
-    with path.open("rb") as handle:
-        data = handle.read(MAX_HISTORY_BYTES + 1)
-    if len(data) > MAX_HISTORY_BYTES:
-        raise ValueError("overlay history exceeds 20 MiB; preserved for review")
-    record = json.loads(data.decode("utf-8"))
-    if not isinstance(record, dict) or record.get("version") != 1 or record.get("sha256") != expected:
-        raise ValueError("type overlays belong to another build or format; preserve them and use a new target")
-    edits = record.get("edits")
-    if not isinstance(edits, list) or len(edits) > MAX_OVERLAYS:
-        raise ValueError("overlay history must contain at most 4096 records")
-    clean = [_edit(edit) for edit in edits]
-    if len({edit["id"] for edit in clean}) != len(clean):
-        raise ValueError("overlay history has duplicate edit identities")
-    return clean
-
-
-def save_overlay(root: str | Path, target_key: str, sha256: str, edit: dict) -> dict:
-    """Append only AFTER the Java edit succeeded, while holding the target lock."""
-    expected = _digest(sha256)
-    clean = _edit(edit)
-    edits = load_overlays(root, target_key, expected)
-    if any(item["id"] == clean["id"] for item in edits):
-        if next(item for item in edits if item["id"] == clean["id"]) != clean:
-            raise ValueError("overlay id already records a different edit")
-        return clean
-    if len(edits) >= MAX_OVERLAYS:
-        raise ValueError("overlay history limit reached; export/review it before adding more edits")
-    payload = json.dumps({"version": 1, "sha256": expected, "edits": edits + [clean]}, indent=2).encode("utf-8")
-    if len(payload) > MAX_HISTORY_BYTES:
-        raise ValueError("overlay history would exceed 20 MiB; existing history preserved")
-    path = _overlay_path(root, target_key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(".tmp")
-    temporary.write_bytes(payload)
-    temporary.replace(path)
-    return clean
