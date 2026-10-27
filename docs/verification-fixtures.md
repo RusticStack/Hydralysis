@@ -55,6 +55,10 @@ Items checked elsewhere:
   function found by `orphans` was created, decompiled and reverted on KotOR 1; `thiscall`
   argument mapping and register captures were checked live on KotOR 1.
 
+The later [Cyberpunk 2.5 bounded verification](verification-nct-2.5.md)
+records adoption and a value-flow trace through MCP, with the remaining
+real-game acceptance gaps and limits on the evidence.
+
 ## Several harnesses at once (item 15)
 
 Three Haiku 5.5 agents ran as separate harnesses against one data root at the same time,
