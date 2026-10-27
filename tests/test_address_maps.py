@@ -49,6 +49,7 @@ class AddressMaps(unittest.TestCase):
         result = address_maps.import_map(self.settings, self.digest, self.file([{"name": "a", "rva": "0x100"}]))
         path = Path(result["path"])
         record = json.loads(path.read_text(encoding="utf-8"))
+        record.pop("seal", None)  # a hand edit that also strips the seal; a stale seal is store_corrupt (test_durable)
         record["entries"][0]["rva"] = "0x200"
         path.write_text(json.dumps(record), encoding="utf-8")
         with self.assertRaisesRegex(ValueError, "provenance"):
