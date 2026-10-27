@@ -262,8 +262,180 @@ def check_vcalls(manifest: dict) -> list[str]:
     return failures
 
 
+def check_sample(manifest: dict) -> list[str]:
+    """Item 12: fx_tick(Config *, float dt) runs once per ~50 ms frame with dt in
+    {0.25, 0.375, 0.5, 0.625}. A sampled probe on dt (xmm1 on x64, stack argument 1 on x86)
+    reports the rate and exactly that range, one summary per window, not an event per call."""
+    import time
+    failures = []
+    for arch in ARCHES:
+        build = manifest[arch + "/flow_fixture.exe"]
+        base = int(build["image_base"], 16)
+        rva = int(build["functions"]["fx_tick"], 16) - base
+        capture = {"reg": "xmm1", "as": "f32", "label": "dt"} if arch == "x64" else {"arg": 1, "as": "f32", "label": "dt"}
+        with Running(arch, "flow_fixture.exe") as running:
+            probe = running.call("observe", module=Path(build["path"]).name, rva=hex(rva), sha256=build["sha256"],
+                                 expect=re.read(build["path"], "rva:%#x" % rva, 8).hex(" ").upper(), limit=10,
+                                 capture=[capture], sample={"window_s": 3, "capture": 0})
+            time.sleep(10)
+            events = [((e.get("message") or {}).get("payload") or {}) for e in running.call("status", limit=200)["events"]]
+            running.call("unload", hook_id=probe["hook_id"])
+        samples = [e for e in events if e.get("event") == "sample"]
+        calls = [e for e in events if e.get("event") == "enter"]
+        full = [x for x in samples if x.get("count")]
+        ok = (len(samples) >= 2 and not calls and all(12 <= x["rate"] <= 21 for x in full)
+              and all(abs(x["min"] - 0.25) < 1e-6 and abs(x["max"] - 0.625) < 1e-6 for x in full))
+        print("%s sample %s: %d summaries, %d per-call events; %s"
+              % ("PASS" if ok else "FAIL", arch, len(samples), len(calls),
+                 [(round(x["rate"], 1), x["min"], x["max"]) for x in samples]))
+        if not ok:
+            failures.append("sample " + arch)
+    return failures
+
+
+class McpClient:
+    """The real stdio MCP server (rusticre mcp), driven as an agent's client would."""
+
+    def __init__(self):
+        import os
+        import subprocess
+        self.process = subprocess.Popen([sys.executable, "-m", "rusticre", "mcp"], stdin=subprocess.PIPE,
+                                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=dict(os.environ),
+                                        text=True, encoding="utf-8")
+        self.next = 0
+        self.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                    "clientInfo": {"name": "verify_fixtures", "version": "1"}})
+        self.process.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n")
+        self.process.stdin.flush()
+
+    def request(self, method: str, params: dict) -> dict:
+        self.next += 1
+        self.process.stdin.write(json.dumps({"jsonrpc": "2.0", "id": self.next, "method": method, "params": params}) + "\n")
+        self.process.stdin.flush()
+        while True:
+            line = self.process.stdout.readline()
+            if not line:
+                raise RuntimeError("the MCP server closed its output")
+            message = json.loads(line)
+            if message.get("id") == self.next:
+                return message
+
+    def tool(self, name: str, **arguments):
+        answer = self.request("tools/call", {"name": name, "arguments": arguments})
+        result = answer.get("result") or {}
+        text = "".join(part.get("text", "") for part in result.get("content", []))
+        if result.get("isError") or "error" in answer:
+            raise RuntimeError("%s failed over MCP: %s" % (name, text or answer.get("error")))
+        return json.loads(text) if text.lstrip()[:1] in "{[" else text
+
+    def close(self):
+        self.process.stdin.close()
+        self.process.wait(timeout=30)
+
+
+def check_mcp_typed_read(manifest: dict) -> list[str]:
+    """Items 5 and 14 over the MCP transport: import a type for Config into the fixture's
+    analysis, spawn the fixture, and read g_config through that type. The program keeps
+    mode == 2, limit in 0..100 and a growing speed."""
+    import time
+    failures = []
+    corpus = Path(manifest["x64/flow_fixture.exe"]["path"]).parent.parent / "config-corpus.jsonl"
+    corpus.write_text(json.dumps({"kind": "struct", "name": "Config", "size": 12, "fields": [
+        {"name": "mode", "offset": 0, "type": "int32"}, {"name": "limit", "offset": 4, "type": "int32"},
+        {"name": "speed", "offset": 8, "type": "float"}]}) + "\n", encoding="utf-8")
+    for arch in ARCHES:
+        build = manifest[arch + "/flow_fixture.exe"]
+        name = target(arch, "flow_fixture.exe")
+        mcp = McpClient()
+        try:
+            job = mcp.tool("ghidra_query", target=name, action="type_edit", timeout_s=120,
+                           options={"kind": "import_types", "corpus": str(corpus), "category": "/fixture",
+                                    "source": "flow_fixture.c struct Config"})
+            while job.get("state") in ("queued", "running"):
+                time.sleep(1)
+                job = mcp.tool("job", id=job["id"])
+            stop = Path(build["path"]).with_suffix(".stop")
+            stop.unlink(missing_ok=True)
+            started = mcp.tool("runtime", action="spawn", options={"exe": build["path"], "sha256": build["sha256"],
+                                                                   "argv": [str(stop)], "cwd": str(Path(build["path"]).parent)})
+            session, owner = started["session"], started["owner"]
+            mcp.tool("runtime", action="resume", options={"session": session, "owner": owner})
+            modules = mcp.tool("runtime", action="modules", options={"session": session, "limit": 50})["modules"]
+            main = next(m for m in modules if m["name"].lower() == Path(build["path"]).name.lower())
+            address = int(build["globals"]["g_config"], 16) - int(build["image_base"], 16) + int(main["base"], 16)
+            reads = []
+            for _ in range(2):
+                time.sleep(1)
+                reads.append({f["name"]: f.get("value") for f in mcp.tool(
+                    "runtime", action="read", options={"session": session, "address": hex(address), "type": "Config",
+                                                       "target": name})["fields"]})
+            mcp.tool("runtime", action="detach", options={"session": session, "owner": owner})
+            stop.write_text("stop")
+        finally:
+            mcp.close()
+        ok = (job.get("state") == "done" and all(r["mode"] == 2 and 0 <= r["limit"] <= 100 for r in reads)
+              and reads[1]["speed"] > reads[0]["speed"] > 0)
+        print("%s mcp_typed_read %s: import %s; reads %s" % ("PASS" if ok else "FAIL", arch, job.get("state"), reads))
+        if not ok:
+            failures.append("mcp_typed_read " + arch)
+    return failures
+
+
+def check_ledger(manifest: dict) -> list[str]:
+    """Item 9: a claim derived on build 1 (df_limit's threshold, from its decompile) is
+    superseded by its re-derivation on build 2 (found through the diff), and the subsystem
+    export lists the build 2 claim with its source and the build 1 claim as superseded."""
+    import re as regex
+    import time
+    failures = []
+    arch = "x64"
+    one, two = manifest[arch + "/diff1.exe"], manifest[arch + "/diff2.exe"]
+    database = Path(one["path"]).parent.parent / "ledger-check.db"
+    database.unlink(missing_ok=True)
+    out = database.with_suffix(".md")
+
+    def threshold(name, address):
+        code = re.query(name, "decompile", address)["c"]
+        line = next(text.strip() for text in code.splitlines() if "if (" in text and "<" in text)
+        return int(regex.findall(r"0x[0-9a-f]+|\b\d+\b", line)[0], 0), line
+
+    first = one["functions"]["df_limit"]
+    old_value, old_line = threshold(target(arch, "diff1.exe"), first)
+    stored = re.call("evidence_add", db=str(database), target="diff-fixture", build=one["sha256"][:16], kind="constant",
+                     name="df_limit threshold", note="clamps to %d" % old_value, address="va:" + first,
+                     source="decompile %s: %s" % (first, old_line), subsystem="limits")
+    old_id = int(regex.search(r"claim (\d+)", stored).group(1))
+    job = re.query(target(arch, "diff2.exe"), "diff", timeout_s=120, against=target(arch, "diff1.exe"))
+    while True:
+        status = re.call("job", id=job["id"])
+        if status["state"] not in ("queued", "running"):
+            break
+        time.sleep(1)
+    source_rva = "0x%x" % (int(first, 16) - int(one["image_base"], 16))
+    with open(status["result"]["files"]["diff"], encoding="utf-8") as handle:
+        moved = next(json.loads(line) for line in handle if json.loads(line).get("source") == source_rva)
+    second = "0x%x" % (int(moved["destination"], 16) + int(two["image_base"], 16))
+    new_value, new_line = threshold(target(arch, "diff2.exe"), second)
+    re.call("evidence_add", db=str(database), target="diff-fixture", build=two["sha256"][:16], kind="constant",
+            name="df_limit threshold", note="clamps to %d" % new_value, address="va:" + second,
+            source="decompile %s: %s (diff %s, %s)" % (second, new_line, moved["status"], moved["method"]),
+            subsystem="limits", supersedes=old_id)
+    exported = re.call("evidence_list", db=str(database), target="diff-fixture", subsystem="limits", export=str(out))
+    text = out.read_text(encoding="utf-8")
+    current, superseded = text.split("## Superseded")
+    ok = (old_value == 100 and new_value == 250 and exported["current"] == 1 and exported["superseded"] == 1
+          and "clamps to 250" in current and new_line in current and "#%d" % (old_id + 1) in superseded
+          and second == two["functions"]["df_limit"])
+    print("%s ledger %s: %d -> %d at %s (map %s); export current %d, superseded %d"
+          % ("PASS" if ok else "FAIL", arch, old_value, new_value, second, two["functions"]["df_limit"],
+             exported["current"], exported["superseded"]))
+    if not ok:
+        failures.append("ledger " + arch)
+    return failures
+
+
 CHECKS = {"value_flow": check_value_flow, "writers": check_writers, "hooked": check_hooked, "diff": check_diff,
-          "vcalls": check_vcalls}
+          "vcalls": check_vcalls, "sample": check_sample, "mcp_typed_read": check_mcp_typed_read, "ledger": check_ledger}
 
 
 def main(argv: list[str]) -> int:
