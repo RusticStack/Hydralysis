@@ -29,7 +29,7 @@ from pathlib import Path
 from rusticre import targets
 from rusticre.paths import root_path
 
-CONFIDENCE = {"exact": 1.0, "shape": 0.9, "anchors": 0.8, "callees": 0.8, "callgraph": 0.7, "callers": 0.6}
+CONFIDENCE = {"exact": 1.0, "shape": 0.9, "anchors": 0.8, "callees": 0.8, "strings": 0.75, "callgraph": 0.7, "callers": 0.6}
 _DEFAULT_NAME = ("FUN_", "LAB_", "thunk_FUN_", "SUB_")
 
 
@@ -79,6 +79,23 @@ def _unique(rows: dict[str, dict], key) -> dict:
     return {value: items[0] for value, items in groups.items() if len(items) == 1}
 
 
+def identical_code(a: dict, b: dict) -> bool:
+    """The same code, wherever it sits: equal bytes, or the same instruction shape (addresses
+    masked) with the same size, strings, imports and constants. A call displacement or a
+    RIP-relative offset that only moved with the layout is not a change."""
+    if a["bytes"] == b["bytes"]:
+        return True
+    return (a["shape"] == b["shape"] and a["size"] == b["size"] and a["strings"] == b["strings"]
+            and a["imports"] == b["imports"] and a["constants"] == b["constants"])
+
+
+def _string_prefixes(row: dict) -> tuple | None:
+    """A changed function usually keeps nearly the same strings ("build one" -> "build two"):
+    the digests of the first 12 characters of each string of at least 12 (fingerprint heads)."""
+    heads = row.get("heads") or []
+    return tuple(heads) if heads else None
+
+
 def _similar(a: dict, b: dict, ratio: float = 0.3) -> bool:
     small, large = sorted((a["size"], b["size"]))
     return large == 0 or (large - small) / large <= ratio
@@ -107,6 +124,7 @@ def match(source: dict[str, dict], destination: dict[str, dict]) -> dict[str, tu
     phase("anchors", lambda row: (tuple(row["strings"]), tuple(row["imports"])) if row["strings"] or len(row["imports"]) >= 2 else None, _similar)
     phase("anchors", lambda row: (tuple(row["constants"]), row["instructions"] // 4) if len(row["constants"]) >= 2 else None, _similar)
     phase("shape", lambda row: row["shape"] if row["instructions"] >= 12 else None, _similar)
+    phase("strings", _string_prefixes, lambda a, b: _similar(a, b, 0.9))
     # Call graph: the k-th callee of a matched pair, when both are unmatched and alike.
     for _ in range(8):
         added = 0
@@ -140,7 +158,9 @@ def match(source: dict[str, dict], destination: dict[str, dict]) -> dict[str, tu
         for callee in row["callees"]:
             callers_of[callee].add(rva)
     for _ in range(4):
-        added = 0
+        # Proposals first: a destination function claimed by two unmatched source functions is
+        # nobody's (a removed function must not take the place of a changed one).
+        proposals: dict[str, list[str]] = defaultdict(list)
         for rva, row in source.items():
             if rva in pairs:
                 continue
@@ -153,8 +173,11 @@ def match(source: dict[str, dict], destination: dict[str, dict]) -> dict[str, tu
                            if callee in destination and callee not in taken and _similar(row, destination[callee], 0.35)}
                 candidates = options if candidates is None else candidates & options
             if candidates and len(candidates) == 1:
-                other = candidates.pop()
-                pairs[rva] = (other, "callers")
+                proposals[candidates.pop()].append(rva)
+        added = 0
+        for other, claimants in proposals.items():
+            if len(claimants) == 1:
+                pairs[claimants[0]] = (other, "callers")
                 taken.add(other)
                 added += 1
         if not added:
@@ -186,7 +209,7 @@ def run(settings: dict, record: dict, output: Path) -> dict:
         for rva, row in source.items():
             if rva in pairs:
                 other, method = pairs[rva]
-                same = row["bytes"] == destination[other]["bytes"]
+                same = identical_code(row, destination[other])
                 status = ("same" if rva == other else "moved") if same else "changed"
                 counts[status] += 1
                 counts["by_" + method] += 1

@@ -1588,6 +1588,7 @@ public class RusticQuery extends GhidraScript {
                 StringBuilder raw = new StringBuilder(), shape = new StringBuilder();
                 TreeSet<String> strings = new TreeSet<>(), imports = new TreeSet<>(), constants = new TreeSet<>();
                 List<String> callees = new ArrayList<>();
+                List<String> heads = new ArrayList<>();
                 int instructions = 0;
                 for (var instruction : listing.getInstructions(function.getBody(), true)) {
                     instructions++;
@@ -1621,7 +1622,11 @@ public class RusticQuery extends GhidraScript {
                             var data = listing.getDefinedDataAt(to);
                             if (data != null && data.hasStringValue() && strings.size() < 16) {
                                 Object value = data.getValue();
-                                if (value != null) strings.add(digest(value.toString()));
+                                if (value != null) {
+                                    strings.add(digest(value.toString()));
+                                    // A changed function often keeps nearly the same text: its head.
+                                    if (value.toString().length() >= 12) heads.add(digest(value.toString().substring(0, 12)));
+                                }
                             }
                         }
                     }
@@ -1638,6 +1643,7 @@ public class RusticQuery extends GhidraScript {
                 row.addProperty("bytes", digest(raw.toString()));
                 row.addProperty("shape", digest(shape.toString()));
                 JsonArray a = new JsonArray(); strings.forEach(a::add); row.add("strings", a);
+                JsonArray h = new JsonArray(); heads.forEach(h::add); row.add("heads", h);
                 JsonArray b = new JsonArray(); imports.forEach(b::add); row.add("imports", b);
                 JsonArray c = new JsonArray(); constants.forEach(c::add); row.add("constants", c);
                 JsonArray d = new JsonArray(); callees.forEach(d::add); row.add("callees", d);

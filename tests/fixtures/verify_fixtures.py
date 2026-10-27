@@ -124,7 +124,106 @@ def _entry(name: str, site: str) -> int:
     return int(function["function"]["address"], 16) if function else 0
 
 
-CHECKS = {"value_flow": check_value_flow, "writers": check_writers}
+def check_hooked(manifest: dict) -> list[str]:
+    """Item 4: fx_hooked is detoured live (to fx_detour) by the fixture itself. patches flags it,
+    names the detour, and leaves unpatched functions clean (relocated 32-bit code included);
+    the static tools read the file's original bytes; a probe with accept_patch works past it."""
+    failures = []
+    for arch in ARCHES:
+        build = manifest[arch + "/flow_fixture.exe"]
+        exe, functions, base = build["path"], build["functions"], int(build["image_base"], 16)
+        rva = {name: int(address, 16) - base for name, address in functions.items()}
+        original = re.read(exe, "rva:%#x" % rva["fx_hooked"], 16)
+        static = re.check_prologues(exe, [{"name": "fx_hooked", "address": "rva:%#x" % rva["fx_hooked"],
+                                           "expect": original.hex(" ").upper()}], sha256=build["sha256"])
+        scanned = re.sigscan(exe, original[:12].hex(" ").upper())
+        with Running(arch, "flow_fixture.exe") as running:
+            rows = [{"module": Path(exe).name, "rva": hex(rva[name]), "name": name, "size": 16}
+                    for name in ("fx_hooked", "fx_detour", "fx_flow", "fx_tick")]
+            live = running.call("patches", rows=rows, sha256=build["sha256"])
+            flagged = {row["name"]: row for row in live["rows"]}
+            detour = (flagged["fx_hooked"].get("patch") or {}).get("detour")
+            probe = running.call("observe", module=Path(exe).name, rva=hex(rva["fx_hooked"]), sha256=build["sha256"],
+                                 expect=original[:8].hex(" ").upper(), accept_patch=True, limit=3,
+                                 capture=[{"arg": 0, "as": "u32", "label": "value"}] if arch == "x64" else
+                                 [{"arg": 0, "as": "u32", "label": "value"}])
+            import time
+            time.sleep(1)
+            events = running.call("status", limit=20)["events"]
+            entered = [e for e in events if ((e.get("message") or {}).get("payload") or {}).get("event") == "enter"]
+        detour_at = int(detour, 16) - running.delta if detour else 0
+        ok = (flagged["fx_hooked"]["patched"] and detour_at == int(functions["fx_detour"], 16)
+              and not any(flagged[name]["patched"] for name in ("fx_detour", "fx_flow", "fx_tick"))
+              and static["matched"] and "rva:%#x" % rva["fx_hooked"] in scanned and probe.get("past_patch") and entered)
+        print("%s hooked %s: patched %s detour %s (fx_detour %s), clean %s, static prologue %s, sigscan finds it %s, "
+              "probe past the detour %s with %d calls"
+              % ("PASS" if ok else "FAIL", arch, flagged["fx_hooked"]["patched"], hex(detour_at), functions["fx_detour"],
+                 [name for name in ("fx_detour", "fx_flow", "fx_tick") if not flagged[name]["patched"]], static["matched"],
+                 "rva:%#x" % rva["fx_hooked"] in scanned, bool(probe.get("past_patch")), len(entered)))
+        if not ok:
+            failures.append("hooked " + arch)
+    return failures
+
+
+IDENTICAL = {"df_parse", "df_checksum", "df_format", "df_scale", "df_lookup", "df_walk", "df_render", "df_mix"}
+CHANGED = {"df_limit", "df_banner"}
+
+
+def check_diff(manifest: dict) -> list[str]:
+    """Items 2 and 7: build 1 -> build 2 places every df_ function with the right status
+    (identical code same/moved, df_limit and df_banner changed, df_added new, df_removed
+    gone), and build 1's prologue table, re-addressed, lands on the right functions."""
+    import time
+    failures = []
+    for arch in ARCHES:
+        one, two = manifest[arch + "/diff1.exe"], manifest[arch + "/diff2.exe"]
+        base = int(one["image_base"], 16)
+        names_one = {int(a, 16) - base: n for n, a in one["functions"].items()}
+        names_two = {int(a, 16) - base: n for n, a in two["functions"].items()}
+        table = Path(one["path"]).with_suffix(".checks.json")
+        table.write_text(json.dumps({"checks": [
+            {"name": name, "address": "rva:%#x" % (int(address, 16) - base),
+             "expect": re.read(one["path"], "rva:%#x" % (int(address, 16) - base), 12).hex(" ").upper()}
+            for name, address in sorted(one["functions"].items())]}))
+        job = re.query(target(arch, "diff2.exe"), "diff", timeout_s=120, against=target(arch, "diff1.exe"), checks=str(table))
+        while True:
+            status = re.call("job", id=job["id"])
+            if status["state"] not in ("queued", "running"):
+                break
+            time.sleep(1)
+        summary = status["result"] if "result" in status else status
+        found, wrong = {}, []
+        with open(summary["files"]["diff"], encoding="utf-8") as handle:
+            for line in handle:
+                row = json.loads(line)
+                source = int(row["source"].removeprefix("rva:"), 16) if "source" in row else None
+                destination = int(row["destination"].removeprefix("rva:"), 16) if "destination" in row else None
+                name = names_one.get(source) or names_two.get(destination)
+                if name:
+                    found[name] = (row["status"], names_two.get(destination) if destination is not None else None)
+        for name in IDENTICAL | CHANGED | {"df_removed", "df_added"}:
+            want = ("same", "moved") if name in IDENTICAL else ("changed",) if name in CHANGED else \
+                ("gone",) if name == "df_removed" else ("new",)
+            got = found.get(name)
+            partner_ok = name in ("df_removed", "df_added") or (got and got[1] == name)
+            if not got or got[0] not in want or not partner_ok:
+                wrong.append("%s: %s" % (name, got))
+        moved_table = json.loads(Path(summary["checks"]["file"]).read_text())
+        transferred = moved_table["checks"]
+        misplaced = [row["name"] for row in transferred if
+                     names_two.get(int(row["address"].removeprefix("rva:"), 16)) != row["name"]]
+        unplaced = sorted(row.get("name", str(row)) if isinstance(row, dict) else str(row) for row in moved_table["unplaced"])
+        ok = not wrong and not misplaced and unplaced == ["df_removed"]
+        print("%s diff %s: %d matched, same %s moved %s changed %s new %s gone %s; wrong %s; table: %d placed, misplaced %s, unplaced %s"
+              % ("PASS" if ok else "FAIL", arch, summary["matched"], summary.get("same", 0), summary.get("moved", 0),
+                 summary.get("changed", 0), summary.get("new", 0), summary.get("gone", 0), wrong, len(transferred),
+                 misplaced, unplaced))
+        if not ok:
+            failures.append("diff " + arch)
+    return failures
+
+
+CHECKS = {"value_flow": check_value_flow, "writers": check_writers, "hooked": check_hooked, "diff": check_diff}
 
 
 def main(argv: list[str]) -> int:

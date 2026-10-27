@@ -11,10 +11,10 @@ from support import workdir
 
 
 def row(rva, *, bytes_="b", shape="s", size=64, instructions=20, strings=(), imports=(), constants=(), callees=(),
-        name=None, source="DEFAULT", prologue="48 89 5C 24 08"):
+        name=None, source="DEFAULT", prologue="48 89 5C 24 08", heads=()):
     return {"rva": rva, "name": name or "FUN_" + rva[2:], "source": source, "size": size, "instructions": instructions,
             "bytes": bytes_, "shape": shape, "strings": list(strings), "imports": list(imports),
-            "constants": list(constants), "callees": list(callees), "prologue": prologue}
+            "constants": list(constants), "callees": list(callees), "prologue": prologue, "heads": list(heads)}
 
 
 class Matching(unittest.TestCase):
@@ -45,6 +45,32 @@ class Matching(unittest.TestCase):
         source = {r["rva"]: r for r in (row("0x1", bytes_="x"), row("0x2", bytes_="x"))}
         destination = {r["rva"]: r for r in (row("0x9", bytes_="x"),)}
         self.assertEqual(crossbuild.match(source, destination), {})
+
+    def test_code_that_only_moved_is_identical(self):
+        before = row("0x1", bytes_="call+0x10", shape="s", strings=("x",))
+        self.assertTrue(crossbuild.identical_code(before, row("0x9", bytes_="call+0x40", shape="s", strings=("x",))))
+        self.assertFalse(crossbuild.identical_code(before, row("0x9", bytes_="call+0x40", shape="s", strings=("y",))))
+        self.assertFalse(crossbuild.identical_code(before, row("0x9", bytes_="other", shape="t", strings=("x",))))
+
+    def test_a_changed_function_keeps_its_string_head_and_a_removed_one_takes_no_place(self):
+        main_a = row("0x100", bytes_="main", shape="main", callees=("0x1", "0x2"), size=200, instructions=60)
+        main_b = row("0x900", bytes_="main", shape="main", callees=("0x9",), size=200, instructions=60)
+        banner_a = row("0x1", bytes_="b1", shape="t1", size=8, instructions=2, strings=("h1",), heads=("diff fixture",))
+        removed = row("0x2", bytes_="r", shape="r", size=31, instructions=9)
+        banner_b = row("0x9", bytes_="b2", shape="t2", size=41, instructions=9, strings=("h2",), heads=("diff fixture",))
+        pairs = crossbuild.match({r["rva"]: r for r in (main_a, banner_a, removed)},
+                                 {r["rva"]: r for r in (main_b, banner_b)})
+        self.assertEqual(pairs["0x1"], ("0x9", "strings"))
+        self.assertNotIn("0x2", pairs)
+
+    def test_a_destination_claimed_by_two_callers_candidates_is_nobodys(self):
+        main_a = row("0x100", bytes_="main", shape="main", callees=("0x1", "0x2"), size=200, instructions=60)
+        main_b = row("0x900", bytes_="main", shape="main", callees=("0x9",), size=200, instructions=60)
+        one, two = row("0x1", bytes_="p", shape="p", size=30), row("0x2", bytes_="q", shape="q", size=32)
+        only = row("0x9", bytes_="z", shape="z", size=31)
+        pairs = crossbuild.match({r["rva"]: r for r in (main_a, one, two)}, {r["rva"]: r for r in (main_b, only)})
+        self.assertNotIn("0x1", pairs)
+        self.assertNotIn("0x2", pairs)
 
     def test_report_names_and_prologue_table(self):
         with workdir("cross") as folder:
