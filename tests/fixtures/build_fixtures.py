@@ -44,6 +44,15 @@ def symbols(map_path: Path) -> tuple[dict, dict]:
                 functions[name] = "0x%x" % int(match.group(2), 16)
             elif not match.group(3) and name.startswith("g_"):
                 data[name] = "0x%x" % int(match.group(2), 16)
+            mangled = re.fullmatch(r"\?(g_\w+)@@3.*", match.group(1))
+            if mangled and not match.group(3):
+                data[mangled.group(1)] = "0x%x" % int(match.group(2), 16)
+            cpp = re.fullmatch(r"\?\?_7(\w+)@@6B@", match.group(1))
+            method = re.fullmatch(r"\?(\w+)@(\w+)@@U.*", match.group(1))
+            if cpp:
+                data[cpp.group(1) + "::vftable"] = "0x%x" % int(match.group(2), 16)
+            elif method and match.group(3):
+                functions[method.group(2) + "::" + method.group(1)] = "0x%x" % int(match.group(2), 16)
     return functions, data
 
 

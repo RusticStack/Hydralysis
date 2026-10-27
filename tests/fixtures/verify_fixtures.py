@@ -223,7 +223,47 @@ def check_diff(manifest: dict) -> list[str]:
     return failures
 
 
-CHECKS = {"value_flow": check_value_flow, "writers": check_writers, "hooked": check_hooked, "diff": check_diff}
+def check_vcalls(manifest: dict) -> list[str]:
+    """Item 10: calls through Shape slot 1 (sides). vtables names Square::vftable for
+    Square::sides; vcalls with that vtable names the implementation; the call through
+    g_square verifies with receiver_global, the one through fx_make_shape's result with
+    receiver_from, and the folded fx_sides_of/fx_gadget_run tail call is listed with its
+    receiver a parameter (its callers decide the class), verified by neither."""
+    failures = []
+    for arch in ARCHES:
+        build = manifest[arch + "/vcall_fixture.exe"]
+        name, functions, data = target(arch, "vcall_fixture.exe"), build["functions"], build["globals"]
+        slot = "0x8" if arch == "x64" else "0x4"
+        owner = {}
+        for function, address in functions.items():
+            owner.setdefault(int(address, 16), function)
+        tables = re.query(name, "vtables", functions["Square::sides"])["vtables"]
+        in_square = any(int(t["table"], 16) == int(data["Square::vftable"], 16) and t["offset"] == slot for t in tables)
+        implementation = re.query(name, "vcalls", limit=50, timeout_s=300, offset=slot,
+                                  vtable=data["Square::vftable"]).get("implementation", {})
+        target_ok = int(implementation.get("target") or "0", 16) == int(functions["Square::sides"], 16)
+
+        def sites(**verify):
+            rows = re.query(name, "vcalls", limit=50, timeout_s=300, offset=slot, **verify)["callers"]
+            return [r for r in rows if r.get("function") and int(r["function"], 16) in owner]
+
+        by_global = {owner[int(r["function"], 16)] for r in sites(receiver_global=data["g_square"]) if r.get("verified")}
+        by_maker = {owner[int(r["function"], 16)] for r in sites(receiver_from=functions["fx_make_shape"]) if r.get("verified")}
+        listed = sites()
+        folded = [r for r in listed if owner[int(r["function"], 16)] in ("fx_sides_of", "fx_gadget_run")]
+        tail = bool(folded) and all(r.get("receiver_parameter") == 0 for r in folded)
+        ok = in_square and target_ok and by_global == {"fx_sides_global"} and by_maker == {"fx_sides_made"} and tail
+        print("%s vcalls %s: Square::sides in Square::vftable at %s %s; implementation %s; receiver_global verifies %s; "
+              "receiver_from verifies %s; sites %s; folded tail call with parameter receiver %s"
+              % ("PASS" if ok else "FAIL", arch, slot, in_square, target_ok, sorted(by_global), sorted(by_maker),
+                 sorted({owner[int(r["function"], 16)] + (" (tail)" if r.get("tail_call") else "") for r in listed}), tail))
+        if not ok:
+            failures.append("vcalls " + arch)
+    return failures
+
+
+CHECKS = {"value_flow": check_value_flow, "writers": check_writers, "hooked": check_hooked, "diff": check_diff,
+          "vcalls": check_vcalls}
 
 
 def main(argv: list[str]) -> int:

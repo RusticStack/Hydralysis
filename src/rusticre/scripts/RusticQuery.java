@@ -1294,7 +1294,11 @@ public class RusticQuery extends GhidraScript {
             if ((++scanned & 0xffff) == 0) monitor.checkCancelled();
             var instruction = iterator.next();
             next = instruction.getMaxAddress().next();
-            if (!instruction.getFlowType().isCall() || !instruction.getFlowType().isComputed()) continue;
+            // A virtual call, or a tail call that jumps through the slot (jmp [reg + n]; a switch
+            // table jump has an index register, so it never has exactly a base and a displacement).
+            var flow = instruction.getFlowType();
+            boolean tail = flow.isJump() && flow.isComputed() && !flow.isCall();
+            if (!(flow.isCall() && flow.isComputed()) && !tail) continue;
             boolean match = false;
             for (int i = 0; i < instruction.getNumOperands() && !match; i++) {
                 Object[] parts = instruction.getOpObjects(i);
@@ -1312,10 +1316,16 @@ public class RusticQuery extends GhidraScript {
             row.addProperty("site", "0x" + instruction.getAddress());
             row.addProperty("instruction", clip(instruction.toString(), 256));
             if (caller != null) { row.addProperty("function", "0x" + caller.getEntryPoint()); row.addProperty("function_name", clip(caller.getName(), 256)); }
+            if (tail) row.addProperty("tail_call", true);
             if (caller != null && (receiverFrom != null || !receiverType.isEmpty() || receiverGlobal != null)) {
                 String evidence = receiver(caller, instruction.getAddress(), offset, receiverFrom, receiverType, receiverGlobal, deadline);
                 row.addProperty("verified", evidence != null);
                 if (evidence != null) { row.addProperty("receiver", evidence); verified++; }
+            }
+            // A receiver that is one of the function's parameters is decided by its callers.
+            if (caller != null) {
+                Integer parameter = receiverParameter(caller, instruction.getAddress(), offset, deadline);
+                if (parameter != null) row.addProperty("receiver_parameter", parameter);
             }
             rows.add(row);
         }
@@ -1326,6 +1336,28 @@ public class RusticQuery extends GhidraScript {
         out.addProperty("truncated", more);
         if (more && next != null) out.addProperty("next_cursor", "0x" + next);
         out.addProperty("provenance", "listing scan for indirect calls through [register + offset]; verified means the decompiler's call target is LOAD(LOAD(receiver) + offset) with the receiver from receiver_from's result or typed receiver_type");
+    }
+
+    // The parameter slot the receiver of this vcall comes from, or null.
+    private Integer receiverParameter(Function caller, Address site, long offset, long deadline) {
+        try {
+            HighFunction high = decompile(caller, deadline).getHighFunction();
+            for (var iterator = high.getPcodeOps(site); iterator.hasNext(); ) {
+                PcodeOpAST call = iterator.next();
+                if (call.getOpcode() != PcodeOp.CALLIND) continue;
+                PcodeOp load = strip(call.getInput(0)).getDef();
+                if (load == null || load.getOpcode() != PcodeOp.LOAD) continue;
+                Varnode table = strip(load.getInput(1));
+                PcodeOp add = table.getDef();
+                if (add != null && (add.getOpcode() == PcodeOp.INT_ADD || add.getOpcode() == PcodeOp.PTRSUB) && add.getInput(1).isConstant())
+                    table = strip(add.getInput(0));
+                PcodeOp vtableLoad = table.getDef();
+                if (vtableLoad == null || vtableLoad.getOpcode() != PcodeOp.LOAD) continue;
+                Varnode object = strip(vtableLoad.getInput(1));
+                if (object.getHigh() instanceof HighParam parameter) return parameter.getSlot();
+            }
+        } catch (Exception refused) { }
+        return null;
     }
 
     // Why this site calls through the receiver's vtable, or null.
@@ -1349,6 +1381,10 @@ public class RusticQuery extends GhidraScript {
                     table = strip(add.getInput(0));
                 }
                 if (seen != offset) continue;
+                // A global object's vtable pointer read straight from its first field (the
+                // decompiler shows it as the memory word itself, with no LOAD).
+                if (global != null && table.getAddress().isMemoryAddress() && table.getAddress().equals(global))
+                    return "receiver is the object at 0x" + global + " (its vtable pointer read directly)";
                 PcodeOp vtableLoad = table.getDef();
                 if (vtableLoad == null || vtableLoad.getOpcode() != PcodeOp.LOAD) continue;
                 Varnode object = strip(vtableLoad.getInput(1));
