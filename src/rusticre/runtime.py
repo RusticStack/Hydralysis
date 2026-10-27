@@ -95,14 +95,9 @@ def _environment(settings: dict, create: bool = True) -> dict:
     env = dict(os.environ)
     env["RUSTICRE_TARGET_ENV_RESTORE"] = json.dumps({key: os.environ.get(key) for key in WORKER_ONLY})
     env["TEMP"] = env["TMP"] = env["TMPDIR"] = str(temp)
-    package_root = str(Path(__file__).resolve().parent.parent)
     # The worker ignores the user site (so no other frida shadows the pinned one), but it
     # needs RusticRE's own dependencies from wherever this process found them.
-    import capstone
-    import pefile
-    dependencies = sorted({str(Path(module.__file__).resolve().parent.parent) if module.__name__ == "capstone"
-                           else str(Path(module.__file__).resolve().parent) for module in (capstone, pefile)})
-    env["PYTHONPATH"] = os.pathsep.join([str(site), package_root, *dependencies])
+    env["PYTHONPATH"] = proc.worker_path(str(site))
     env["PYTHONNOUSERSITE"] = "1"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     return env

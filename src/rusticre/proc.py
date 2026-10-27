@@ -106,3 +106,15 @@ def terminate_tree(child: subprocess.Popen) -> None:
         import signal
         os.killpg(child.pid, signal.SIGKILL)
     child.wait(timeout=30)
+
+
+def worker_path(*first: str) -> str:
+    """PYTHONPATH for a RusticRE worker that ignores the user site: the given folders, the
+    package, and RusticRE's own dependencies from wherever this process found them."""
+    from pathlib import Path
+    import capstone
+    import pefile
+    package = str(Path(__file__).resolve().parent.parent)
+    dependencies = sorted({str(Path(module.__file__).resolve().parent.parent) if module.__name__ == "capstone"
+                           else str(Path(module.__file__).resolve().parent) for module in (capstone, pefile)})
+    return os.pathsep.join([*first, package, *dependencies])

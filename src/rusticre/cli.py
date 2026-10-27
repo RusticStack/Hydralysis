@@ -106,6 +106,7 @@ def main(argv: list[str] | None = None) -> int:
     job.add_argument("id", nargs="?", default="")
     job.add_argument("--action", choices=("status", "cancel"), default="status")
     job.add_argument("--limit", type=int, default=20)
+    job.add_argument("--owner", default="", help="the owner_token the job's start returned (needed to cancel it)")
 
     runtime = sub.add_parser("runtime", help="Generic runtime debugging/instrumentation; backend help documents options")
     runtime.add_argument("action")
@@ -153,7 +154,7 @@ def _pair(args: argparse.Namespace) -> tuple[str, dict]:
         return command, {"exe": args.exe, "target": args.target, "timeout_s": args.timeout, "install": args.install,
                          "action": "plan" if args.plan else "start"}
     if command == "job":
-        return command, {"action": args.action, "id": args.id, "limit": args.limit}
+        return command, {"action": args.action, "id": args.id, "limit": args.limit, "owner": args.owner}
     if command == "runtime":
         return command, {"action": args.action, "options": _options(args)}
     if command == "evidence_add":

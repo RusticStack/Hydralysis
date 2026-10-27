@@ -133,7 +133,8 @@ def _launch(path: Path, record: dict, settings: dict) -> dict:
     record = update(path, state="queued", stage="starting", generation=generation, cancel_requested=False,
                     worker_pid=0, worker_started_ms=0, error="", queued_at=time.time())
     env = dict(os.environ)
-    env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
+    # The user site is ignored; RusticRE's own dependencies come from where this process found them.
+    env["PYTHONPATH"] = proc.worker_path()
     env["RUSTICRE_HARNESS"] = hydra.identity()["harness"]
     env["PYTHONNOUSERSITE"] = "1"
     env["PYTHONDONTWRITEBYTECODE"] = "1"

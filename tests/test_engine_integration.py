@@ -99,6 +99,17 @@ class EngineIntegration(unittest.TestCase):
         warm = [self.ask("decompile", address)["query_s"] for _ in range(3)]
         self.assertLess(min(warm), 1.0)
 
+    def test_a_bulk_export_runs_in_its_own_worker(self):
+        # The export worker ignores the user site; it must still find RusticRE's dependencies.
+        from rusticre import exporting
+        job = exporting.start(self.settings, "fixture", {"mode": "decompile", "limit": 5})
+        deadline = time.monotonic() + 300
+        while job["state"] in exporting.ACTIVE and time.monotonic() < deadline:
+            time.sleep(1)
+            job = exporting.status(self.settings, job["id"])
+        self.assertEqual(job["state"], "done", job.get("log_tail", "")[-2000:])
+        self.assertEqual(job["succeeded"], 5)
+
     def test_overlay_edit_read_and_revert(self):
         address = self.entry()
         original = self.ask("decompile", address)["function"]["name"]
