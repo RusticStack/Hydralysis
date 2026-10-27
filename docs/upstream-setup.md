@@ -1,6 +1,6 @@
 # Upstream setup and lifecycle research
 
-Inspected with `gh` and shallow reference checkouts outside RusticRE. No
+Inspected with `gh` and shallow reference checkouts outside Hydralysis. No
 upstream bridge, MCP server or implementation was copied into this repository.
 
 - REA at [`f196ebf80665107aedc16892af25a1e1f9f26f43`](https://github.com/morluto/rea/tree/f196ebf80665107aedc16892af25a1e1f9f26f43):
@@ -9,7 +9,7 @@ upstream bridge, MCP server or implementation was copied into this repository.
   [`GhidraInstallationPolicy.ts`](https://github.com/morluto/rea/blob/f196ebf80665107aedc16892af25a1e1f9f26f43/src/ghidra/GhidraInstallationPolicy.ts#L36-L127)
   derives JDK bounds from the installation's own properties. Its
   [`GhidraLauncher.ts`](https://github.com/morluto/rea/blob/f196ebf80665107aedc16892af25a1e1f9f26f43/src/ghidra/GhidraLauncher.ts#L805-L884)
-  constructs a new import and deletes the temporary project. RusticRE keeps
+  constructs a new import and deletes the temporary project. Hydralysis keeps
   explicit preparation separate from read-only queries so repeated questions
   reuse saved analysis.
 - GhidraMCP at [`1e980252087b2479a21b9ca6d82d5829538651a7`](https://github.com/LaurieWired/GhidraMCP/tree/1e980252087b2479a21b9ca6d82d5829538651a7):
@@ -17,12 +17,12 @@ upstream bridge, MCP server or implementation was copied into this repository.
   documents headless binary import and persistent `--project` storage.
   [`headless.py:185–243`](https://github.com/LaurieWired/GhidraMCP/blob/1e980252087b2479a21b9ca6d82d5829538651a7/src/ghidra_mcp/headless.py#L185-L243)
   opens/creates the project, imports only absent programs, and analyses newly
-  imported or not-yet-analysed programs. RusticRE implements its lifecycle with
+  imported or not-yet-analysed programs. Hydralysis implements its lifecycle with
   its own headless scripts rather than installing that extension/PyGhidra MCP.
 
 Since 0.4.0 analysis runs on [Hydra Engine](https://github.com/RusticStack/hydra-engine)
 release 12.3-hydra.2, a Ghidra 12.3 build with a headless session daemon that
-keeps programs open between requests and serves several clients. RusticRE
+keeps programs open between requests and serves several clients. Hydralysis
 admits that pinned release and its pinned client (`hydra.py`), validates the
 engine and the client's protocol version, and selects a full JDK satisfying
 the installation's declared Java bounds. Other releases are reported as

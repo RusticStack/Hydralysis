@@ -5,10 +5,10 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import Mock, patch
 
-from rusticre.api import call
-from rusticre.cli import main
-from rusticre.mcp import Server
-from rusticre.pe import parse_rva
+from hydralysis.api import call
+from hydralysis.cli import main
+from hydralysis.mcp import Server
+from hydralysis.pe import parse_rva
 
 
 class MappedImage:
@@ -35,14 +35,14 @@ class ExplicitAddressTests(unittest.TestCase):
 
     def test_ambiguous_plain_pe32_entry_address_refuses_before_inspection(self):
         image = MappedImage()
-        with patch("rusticre.api._image", return_value=image):
+        with patch("hydralysis.api._image", return_value=image):
             with self.assertRaisesRegex(ValueError, "(?i)ambiguous"):
                 call("inspect", {"address": "0x51d5a2"})
         image.inspect.assert_not_called()
 
     def test_explicit_entry_rva_and_equivalent_va_reach_same_bytes(self):
         image = MappedImage()
-        with patch("rusticre.api._image", return_value=image):
+        with patch("hydralysis.api._image", return_value=image):
             by_rva = call("inspect", {"address": "rva:0x51d5a2"})
             by_va = call("inspect", {"address": "va:0x91d5a2"})
         self.assertEqual(by_rva, "inspected RVA 0x51d5a2")
@@ -51,19 +51,19 @@ class ExplicitAddressTests(unittest.TestCase):
 
     def test_plain_low_rva_and_unambiguous_va_remain_compatible(self):
         image = MappedImage(mapped=(0x1000,))
-        with patch("rusticre.api._image", return_value=image):
+        with patch("hydralysis.api._image", return_value=image):
             self.assertEqual(call("inspect", {"address": "0x1000"}), "inspected RVA 0x1000")
             self.assertEqual(call("inspect", {"address": "0x401000"}), "inspected RVA 0x1000")
 
     def test_plain_high_rva_with_no_valid_va_interpretation_stays_rva(self):
         image = MappedImage(mapped=(0x51D5A2,))
-        with patch("rusticre.api._image", return_value=image):
+        with patch("hydralysis.api._image", return_value=image):
             self.assertEqual(call("inspect", {"address": "0x51d5a2"}), "inspected RVA 0x51d5a2")
 
     def test_cli_and_mcp_share_ambiguity_refusal_and_explicit_address(self):
         image = MappedImage()
         server = Server()
-        with patch("rusticre.api._image", return_value=image):
+        with patch("hydralysis.api._image", return_value=image):
             error_text = io.StringIO()
             with redirect_stderr(error_text):
                 self.assertEqual(main(["inspect", "--exe", "unused", "0x51d5a2"]), 1)

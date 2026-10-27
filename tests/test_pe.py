@@ -5,8 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from rusticre.pe import Image, _file_version
-from rusticre.prologue import compare, find_pattern, matches, parse_expect
+from hydralysis.pe import Image, _file_version
+from hydralysis.prologue import compare, find_pattern, matches, parse_expect
 
 
 def image(text=b"\x90" * 31 + b"\xc3", *, name=b".text", machine=0x14C, virtual_size=0x100):

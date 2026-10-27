@@ -1,13 +1,13 @@
 import unittest
 from unittest.mock import patch
 
-from rusticre import jobowner
+from hydralysis import jobowner
 
 
 class JobOwners(unittest.TestCase):
     def test_only_the_starting_client_cancels(self):
         record = {"id": "overlay-1"}
-        with patch("rusticre.hydra.identity", return_value={"client": "rusticre:1", "harness": "codex"}):
+        with patch("hydralysis.hydra.identity", return_value={"client": "rusticre:1", "harness": "codex"}):
             token = jobowner.issue(record)
         jobowner.check(record)                      # the process that started it
         jobowner._TOKENS.clear()                    # another client: a new process

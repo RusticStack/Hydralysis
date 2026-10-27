@@ -1,6 +1,6 @@
 /* Two builds of one program for the cross-build checks (docs/verification-fixtures.md).
    Build 1 is the default; build 2 is -DV2. Ground truth comes from each build's linker
-   map (build_fixtures.py), never from names RusticRE could read:
+   map (build_fixtures.py), never from names Hydralysis could read:
      same      df_parse, df_checksum, df_format, df_scale, df_lookup, df_walk  identical code
      moved     df_render, df_mix                    identical code, placed elsewhere in V2
      changed   df_limit (threshold), df_banner (string and an extra call)

@@ -7,9 +7,9 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from rusticre import exporting, targets, workcopy
-from rusticre import export_worker
-from rusticre.backends import read_json
+from hydralysis import exporting, targets, workcopy
+from hydralysis import export_worker
+from hydralysis.backends import read_json
 
 from support import workdir
 
@@ -59,13 +59,13 @@ class ExportTests(unittest.TestCase):
         self.settings = {"root": str(self.root / "root"), "hydra_dir": str(self.root / "hydra"), "targets": {"fixture": self.project}}
         # The engine computes the master's revision; a save there changes it.
         self.revision = "rev-1"
-        for name in ("rusticre.exporting.master_revision", "rusticre.export_worker.master_revision"):
+        for name in ("hydralysis.exporting.master_revision", "hydralysis.export_worker.master_revision"):
             patcher = patch(name, side_effect=lambda settings, selected: self.revision)
             patcher.start()
             self.addCleanup(patcher.stop)
 
     def make(self, **options):
-        with patch("rusticre.exporting._launch", side_effect=lambda path, record, settings: record):
+        with patch("hydralysis.exporting._launch", side_effect=lambda path, record, settings: record):
             result = exporting.start(self.settings, "fixture", options)
         path = exporting.job_path(self.settings, result["id"])
         exporting.update(path, generation="test", state="interrupted")
@@ -77,7 +77,7 @@ class ExportTests(unittest.TestCase):
             runner = FakeRunner(settings, **kwargs)
             instances.append(runner)
             return runner
-        with patch("rusticre.export_worker.Image", return_value=None), redirect_stdout(io.StringIO()):
+        with patch("hydralysis.export_worker.Image", return_value=None), redirect_stdout(io.StringIO()):
             export_worker.run(path, "test", runner_factory=factory)
         return read_json(path), instances[0]
 
@@ -104,7 +104,7 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(record["provenance"]["view"], "alice")
         self.assertTrue(all(options["options"]["view"] == "alice" for _, options in runner.calls))
         add_edit(shared, "b")
-        with patch("rusticre.exporting._launch") as launch:
+        with patch("hydralysis.exporting._launch") as launch:
             resumed = exporting.start(self.settings, "fixture", {"resume": record["id"]})
         self.assertTrue(resumed["reused"])
         launch.assert_not_called()
@@ -159,7 +159,7 @@ class ExportTests(unittest.TestCase):
 
     def test_busy_backend_retries_once_then_pauses_without_skipping_rows(self):
         path = self.make()
-        with patch("rusticre.export_worker.time.sleep"):
+        with patch("hydralysis.export_worker.time.sleep"):
             record, runner = self.run_job(path, busy=True)
         self.assertEqual(record["state"], "paused")
         self.assertIn("one retry", record["error"])
@@ -173,7 +173,7 @@ class ExportTests(unittest.TestCase):
             if str(changes.get("stage", "")).startswith("exporting "):
                 raise KeyboardInterrupt("simulated worker death after fsync")
             return actual_update(path, **changes)
-        with patch("rusticre.export_worker.update", side_effect=crash), self.assertRaises(KeyboardInterrupt):
+        with patch("hydralysis.export_worker.update", side_effect=crash), self.assertRaises(KeyboardInterrupt):
             self.run_job(path)
         self.assertEqual(read_json(path)["completed"], 0)
         self.assertEqual(len(self.rows(path)), 1)
@@ -212,7 +212,7 @@ class ExportTests(unittest.TestCase):
             if str(changes.get("stage", "")).startswith("exporting "):
                 actual_update(path, cancel_requested=True, state="cancelling")
             return result
-        with patch("rusticre.export_worker.update", side_effect=cancel_after_row):
+        with patch("hydralysis.export_worker.update", side_effect=cancel_after_row):
             record, runner = self.run_job(path)
         self.assertEqual(record["state"], "cancelled")
         self.assertEqual(len(self.rows(path)), 1)
@@ -225,7 +225,7 @@ class ExportTests(unittest.TestCase):
         before = output.read_bytes()
         self.analysis.write_bytes(b"new saved analysis")
         self.revision = "rev-2"
-        with patch("rusticre.exporting._launch") as launch, self.assertRaisesRegex(ValueError, "changed"):
+        with patch("hydralysis.exporting._launch") as launch, self.assertRaisesRegex(ValueError, "changed"):
             exporting.start(self.settings, "fixture", {"resume": record["id"]})
         launch.assert_not_called()
         self.assertEqual(output.read_bytes(), before)
@@ -237,7 +237,7 @@ class ExportTests(unittest.TestCase):
         with output.open("ab") as handle:
             handle.write(b'{"torn":')
         before = output.read_bytes()
-        with patch("rusticre.exporting._launch") as launch, self.assertRaisesRegex(ValueError, "torn"):
+        with patch("hydralysis.exporting._launch") as launch, self.assertRaisesRegex(ValueError, "torn"):
             exporting.start(self.settings, "fixture", {"resume": record["id"]})
         launch.assert_not_called()
         self.assertEqual(output.read_bytes(), before)
@@ -250,7 +250,7 @@ class ExportTests(unittest.TestCase):
                 exporting.start(self.settings, "fixture", {"resume": record["id"], **extra})
 
     def test_duplicate_active_start_returns_existing_job(self):
-        with patch("rusticre.exporting._launch", side_effect=lambda path, record, settings: record) as launch:
+        with patch("hydralysis.exporting._launch", side_effect=lambda path, record, settings: record) as launch:
             first = exporting.start(self.settings, "fixture", {})
             second = exporting.start(self.settings, "fixture", {})
         self.assertEqual(first["id"], second["id"])
@@ -260,7 +260,7 @@ class ExportTests(unittest.TestCase):
     def test_dead_worker_is_reported_interrupted_without_losing_progress(self):
         path = self.make()
         record = exporting.update(path, state="running", queued_at=time.time() - 10, worker_pid=555, worker_started_ms=77)
-        with patch("rusticre.exporting.process_start_ms", return_value=0):
+        with patch("hydralysis.exporting.process_start_ms", return_value=0):
             status = exporting.status(self.settings, record["id"])
         self.assertEqual(status["state"], "interrupted")
         self.assertIn("resume", status["error"])
@@ -279,7 +279,7 @@ class ExportTests(unittest.TestCase):
     def test_queued_cancel_does_not_create_imports_or_query_runner(self):
         path = self.make()
         exporting.update(path, state="cancelling", cancel_requested=True)
-        with patch("rusticre.export_worker.imports") as imports, patch("rusticre.export_worker.QueryRunner") as runner:
+        with patch("hydralysis.export_worker.imports") as imports, patch("hydralysis.export_worker.QueryRunner") as runner:
             export_worker.run(path, "test", runner_factory=runner)
         self.assertEqual(read_json(path)["state"], "cancelled")
         self.assertIn("finished_at", read_json(path))
@@ -288,14 +288,14 @@ class ExportTests(unittest.TestCase):
 
     def test_nonobject_options_are_rejected_before_source_access(self):
         for options in ([], [["mode", "types"]], "decompile"):
-            with self.subTest(options=options), patch("rusticre.exporting.provenance") as source, self.assertRaisesRegex(ValueError, "object"):
+            with self.subTest(options=options), patch("hydralysis.exporting.provenance") as source, self.assertRaisesRegex(ValueError, "object"):
                 exporting.start(self.settings, "fixture", options)
             source.assert_not_called()
 
     def test_resuming_completed_valid_output_does_not_launch_again(self):
         path = self.make(limit=2)
         record, _ = self.run_job(path)
-        with patch("rusticre.exporting._launch") as launch:
+        with patch("hydralysis.exporting._launch") as launch:
             resumed = exporting.start(self.settings, "fixture", {"resume": record["id"]})
         launch.assert_not_called()
         self.assertTrue(resumed["reused"])
@@ -310,7 +310,7 @@ class ExportTests(unittest.TestCase):
         rows[0]["result"]["c"] = "int changed(void) { return 99; }\n"
         output.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
         before = output.read_bytes()
-        with patch("rusticre.exporting._launch") as launch, self.assertRaisesRegex(ValueError, "C SHA-256 mismatch"):
+        with patch("hydralysis.exporting._launch") as launch, self.assertRaisesRegex(ValueError, "C SHA-256 mismatch"):
             exporting.start(self.settings, "fixture", {"resume": record["id"]})
         launch.assert_not_called()
         self.assertEqual(output.read_bytes(), before)
@@ -324,7 +324,7 @@ class ExportTests(unittest.TestCase):
         output.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
         before = output.read_bytes()
         for options in ({"resume": record["id"]}, {}):
-            with self.subTest(options=options), patch("rusticre.exporting._launch") as launch, self.assertRaisesRegex(ValueError, "output SHA-256 mismatch"):
+            with self.subTest(options=options), patch("hydralysis.exporting._launch") as launch, self.assertRaisesRegex(ValueError, "output SHA-256 mismatch"):
                 exporting.start(self.settings, "fixture", options)
             launch.assert_not_called()
             self.assertEqual(output.read_bytes(), before)
@@ -337,7 +337,7 @@ class ExportTests(unittest.TestCase):
         saved["source"] = "changed source while retaining the same build hash"
         imports.write_text(json.dumps(saved), encoding="utf-8")
         before = imports.read_bytes()
-        with patch("rusticre.exporting._launch") as launch, self.assertRaisesRegex(ValueError, "imports SHA-256 mismatch"):
+        with patch("hydralysis.exporting._launch") as launch, self.assertRaisesRegex(ValueError, "imports SHA-256 mismatch"):
             exporting.start(self.settings, "fixture", {"resume": record["id"]})
         launch.assert_not_called()
         self.assertEqual(imports.read_bytes(), before)
@@ -352,7 +352,7 @@ class ExportTests(unittest.TestCase):
                 imports = Path(record["imports_path"])
                 imports.write_text(content, encoding="utf-8")
                 before = imports.read_bytes()
-                with patch("rusticre.exporting._launch") as launch, self.assertRaisesRegex(ValueError, message):
+                with patch("hydralysis.exporting._launch") as launch, self.assertRaisesRegex(ValueError, message):
                     exporting.start(self.settings, "fixture", {"resume": record["id"]})
                 launch.assert_not_called()
                 self.assertEqual(imports.read_bytes(), before)
@@ -363,7 +363,7 @@ class ExportTests(unittest.TestCase):
                 path = self.make(mode=mode)
                 record, _ = self.run_job(path)
                 self.assertTrue(all("c_sha256" not in row for row in self.rows(path)))
-                with patch("rusticre.exporting._launch") as launch:
+                with patch("hydralysis.exporting._launch") as launch:
                     reused = exporting.start(self.settings, "fixture", {"resume": record["id"]})
                 launch.assert_not_called()
                 self.assertTrue(reused["reused"])

@@ -1,5 +1,7 @@
 # Verification on fixtures with known answers
 
+> Historical record: written when this project was called RusticRE (command `rusticre`, variables `RUSTICRE_*`, tool prefix `mcp__rusticre__*`). It is kept as written; the names are `hydralysis`, `HYDRALYSIS_*` and `mcp__hydralysis__*` now.
+
 The capabilities RusticRE promises (the sixteen items of the "only RE server" work, PR #6)
 are checked here on small programs whose answers are known exactly, for both x64 and
 32-bit x86, instead of on one game's data. Each fixture is built by MSVC without a PDB,

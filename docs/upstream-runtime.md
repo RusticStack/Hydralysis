@@ -3,7 +3,7 @@
 The reference inspected was `morluto/rea` at
 `f196ebf80665107aedc16892af25a1e1f9f26f43`, using `gh` and the external
 reference checkout `F:\dev-cache\ref-repos\rusticre-rea-reference`. No REA
-implementation, MCP process or package is a RusticRE runtime dependency.
+implementation, MCP process or package is a Hydralysis runtime dependency.
 
 The upstream [Frida workflow](https://github.com/morluto/rea/blob/f196ebf80665107aedc16892af25a1e1f9f26f43/docs/frida-instrumentation.md)
 loads an optional native binding, enumerates processes, attaches or spawns a
@@ -13,7 +13,7 @@ expose eight lifecycle tools. The [session manager](https://github.com/morluto/r
 tracks the selected process, paused spawn and acquired provider resources.
 Those are useful semantics, not a reason to register eight more MCP tools.
 
-RusticRE implements one generic `runtime` operation family in its own Python
+Hydralysis implements one generic `runtime` operation family in its own Python
 worker. The optional backend is the pinned Frida Python package, installed
 under the configured development root. Setup reads the official pinned-version
 [PyPI metadata](https://pypi.org/pypi/frida/17.24.3/json), records wheel hashes,
@@ -110,7 +110,7 @@ merely to establish generic runtime behavior.
 
 The coordinator's `runtime_fixture.exe` was exercised through `RuntimeRunner`
 with the optional backend installed under
-`F:\dev-cache\rusticre\complete-20261024`. The successful bounded harness
+`F:\dev-cacheusticre\complete-20261024`. The successful bounded harness
 log is `runtime-integration-smoke-v5-ipc.log`; full observations and fixture SHA-256
 are in `runtime-integration-results.json`. It verified paused spawn, explicit
 PID attach, module bytes, mismatch refusal, observed arguments/registers/return

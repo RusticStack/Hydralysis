@@ -10,13 +10,13 @@ import sys
 import unittest
 from pathlib import Path
 
-from rusticre import evidence
+from hydralysis import evidence
 from support import REPOSITORY, workdir
 
 WRITER = """
 import sys
 from pathlib import Path
-from rusticre.evidence import add_claim
+from hydralysis.evidence import add_claim
 for index in range(int(sys.argv[3])):
     add_claim(Path(sys.argv[1]), game="cp", build="2.5", kind="function", name="%s-%d" % (sys.argv[2], index),
               note="written concurrently", source="test", subsystem="vehicles")
@@ -34,7 +34,7 @@ class Ledger(unittest.TestCase):
         return evidence.add_claim(self.db, **values)
 
     def test_concurrent_writers_all_land(self):
-        env = dict(os.environ, PYTHONPATH=str(REPOSITORY / "src"), RUSTICRE_HARNESS="writer")
+        env = dict(os.environ, PYTHONPATH=str(REPOSITORY / "src"), HYDRALYSIS_HARNESS="writer")
         writers = [subprocess.Popen([sys.executable, "-c", WRITER, str(self.db), "w%d" % index, "40"], env=env,
                                     stdin=subprocess.DEVNULL, stderr=subprocess.PIPE) for index in range(4)]
         for writer in writers:

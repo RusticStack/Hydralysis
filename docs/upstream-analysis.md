@@ -1,6 +1,6 @@
 # Saved-analysis capabilities and upstream research
 
-Inspected upstream through `gh` and local reference checkouts outside RusticRE.
+Inspected upstream through `gh` and local reference checkouts outside Hydralysis.
 REA revision: `f196ebf80665107aedc16892af25a1e1f9f26f43`.
 GhidraMCP revision: `1e980252087b2479a21b9ca6d82d5829538651a7`.
 No upstream implementation was copied into this repository or installed as a
@@ -13,7 +13,7 @@ REA's
 [type inspection](https://github.com/morluto/rea/blob/f196ebf80665107aedc16892af25a1e1f9f26f43/bridge/ghidra/ReaGhidraBridge.java#L1170-L1258)
 reads category-path type identities and typed program data, with explicit
 limitations on source authority. This is materially different from guessing
-an object's layout from a function name. RusticRE now exposes bounded `types`
+an object's layout from a function name. Hydralysis now exposes bounded `types`
 and `type` query actions, including fields, offsets, lengths, enum values,
 pointees, arrays and typedef bases. `variables` reports the decompiler's
 recovered local/parameter types and storage, marked as recovered rather than
@@ -32,7 +32,7 @@ GhidraMCP's
 [variable and function type operations](https://github.com/LaurieWired/GhidraMCP/blob/1e980252087b2479a21b9ca6d82d5829538651a7/extension/src/main/java/com/lauriewired/ghidramcp/core/GhidraAnalysisService.java#L544-L603)
 use `HighFunctionDBUtil`, a C signature parser and Ghidra commands. Its
 [transaction wrapper](https://github.com/LaurieWired/GhidraMCP/blob/1e980252087b2479a21b9ca6d82d5829538651a7/extension/src/main/java/com/lauriewired/ghidramcp/core/GhidraAnalysisService.java#L684-L709)
-commits only a successful action. RusticRE uses those public Ghidra APIs with
+commits only a successful action. Hydralysis uses those public Ghidra APIs with
 its own validation and a different persistence model: cited overlays outside
 the canonical project.
 

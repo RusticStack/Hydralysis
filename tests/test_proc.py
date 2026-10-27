@@ -7,7 +7,7 @@ import unittest
 import warnings
 from pathlib import Path
 
-from rusticre import proc
+from hydralysis import proc
 from support import workdir
 
 
@@ -36,7 +36,7 @@ class BackgroundProcessLifetime(unittest.TestCase):
         with workdir("child-lifetime") as work:
             marker = Path(work) / "done.txt"
             worker = "import time, pathlib, sys; time.sleep(0.5); pathlib.Path(sys.argv[1]).write_text('done')"
-            launcher = ("import gc, subprocess, sys; from rusticre import proc; "
+            launcher = ("import gc, subprocess, sys; from hydralysis import proc; "
                         "proc.popen([sys.executable, '-c', sys.argv[1], sys.argv[2]], "
                         "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); gc.collect()")
             result = subprocess.run([sys.executable, "-W", "always::ResourceWarning", "-c", launcher, worker, str(marker)],

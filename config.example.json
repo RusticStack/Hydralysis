@@ -1,11 +1,11 @@
 {
-  "root": "F:/dev-cache/rusticre",
+  "root": "D:/hydralysis-data",
   "java_home": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot",
   "hydra_max_heap": "12G",
   "hydra_idle_s": 7200,
   "hydra_keep_warm_s": 3600,
   "overlay_save_debounce_s": 600,
-  "evidence": "F:/dev-cache/rusticre/evidence.db",
+  "evidence": "D:/hydralysis-data/evidence.db",
   "runtime_lock_check": [],
   "targets": {
     "sample": {

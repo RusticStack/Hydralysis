@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from rusticre.analysis import load_overlays, save_overlay, validate_options
+from hydralysis.analysis import load_overlays, save_overlay, validate_options
 
 from support import workdir
 
@@ -199,7 +199,7 @@ class DurableOverlays(unittest.TestCase):
         small = self.root / "overlays" / "small.json"
         before = small.read_bytes()
         new = {"address": "0x401020", "options": {"kind": "comment", "comment": "other", "source": "audit:2"}}
-        with patch("rusticre.analysis.MAX_HISTORY_BYTES", len(before) + 32):
+        with patch("hydralysis.analysis.MAX_HISTORY_BYTES", len(before) + 32):
             with self.assertRaisesRegex(ValueError, "20 MiB"):
                 save_overlay(self.root, "small", self.sha, new)
         self.assertEqual(small.read_bytes(), before)

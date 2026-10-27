@@ -120,14 +120,14 @@ class Session:
 
     def read(self, address: int, size: int) -> list[int]:
         # The module as loaded: RVAs map through the PE section table, like the real loader.
-        from rusticre.pe import Image
+        from hydralysis.pe import Image
         rva = address - BASE
         try:
             chunk = bytearray(Image(Path(self.exe)).read_rva(rva, size))
         except Exception:
             chunk = bytearray(Path(self.exe).read_bytes()[rva:rva + size])
-        # RUSTICRE_FAKE_PATCH="0x1000=E9 FB FF FF FF": a detour another tool wrote, live only (RVA).
-        patch = os.environ.get("RUSTICRE_FAKE_PATCH", "")
+        # HYDRALYSIS_FAKE_PATCH="0x1000=E9 FB FF FF FF": a detour another tool wrote, live only (RVA).
+        patch = os.environ.get("HYDRALYSIS_FAKE_PATCH", "")
         if patch:
             offset, text = patch.split("=", 1)
             data = bytes.fromhex(text)
@@ -161,7 +161,7 @@ class Device:
         pass
 
     def attach(self, pid):
-        from rusticre.runtime_worker import _process_path
+        from hydralysis.runtime_worker import _process_path
         return Session(pid, _process_path(pid))
 
 

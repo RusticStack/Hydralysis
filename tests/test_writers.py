@@ -7,9 +7,9 @@ from unittest.mock import Mock, patch
 
 from test_pe import image
 
-from rusticre import runtime
-from rusticre.runtime_decode import normalize
-from rusticre.runtime_worker import _probe_source
+from hydralysis import runtime
+from hydralysis.runtime_decode import normalize
+from hydralysis.runtime_worker import _probe_source
 
 
 class LoadedBytes(unittest.TestCase):
@@ -65,7 +65,7 @@ class ProbeForms(unittest.TestCase):
         self.assertIn("p.instruction?Interceptor.attach(site,enter)", self.source(True))
 
     def test_a_call_inside_the_probed_bytes_is_found(self):
-        from rusticre import runtime_worker
+        from hydralysis import runtime_worker
         pe = image(b"\x48\x8d\x0d\x00\x00\x00\x00\xe8\x00\x00\x00\x00\xc3", machine=0x8664)
         pe.bits = 64
         with patch.object(runtime_worker, "_image", return_value=pe):
@@ -93,10 +93,10 @@ class WriterCleanup(unittest.TestCase):
                      "rows": [{"site": "0x140001000", "instruction": "MOV dword ptr [RAX + 0x4], EDX"},
                               {"site": "0x140002000", "instruction": "MOV dword ptr [RAX + 0x4], EDX"}]}
         self.owner = {"exe": str(Path("fixture.exe"))}
-        self.patches = [patch("rusticre.pe.Image", return_value=self.pe),
-                        patch("rusticre.backends.resolved", return_value={}),
-                        patch("rusticre.query.QueryRunner", return_value=self.query),
-                        patch("rusticre.runtime._json", return_value={"sha256": "a" * 64})]
+        self.patches = [patch("hydralysis.pe.Image", return_value=self.pe),
+                        patch("hydralysis.backends.resolved", return_value={}),
+                        patch("hydralysis.query.QueryRunner", return_value=self.query),
+                        patch("hydralysis.runtime._json", return_value={"sha256": "a" * 64})]
         for item in self.patches:
             item.start()
             self.addCleanup(item.stop)
@@ -142,8 +142,8 @@ class WriterCleanup(unittest.TestCase):
                 return answer
             return {}
         self.runner.call = Mock(side_effect=call)
-        with patch("rusticre.runtime._base_argument", return_value=("reg", "rcx")), \
-             patch("rusticre.runtime._argument_at_return", return_value=("reg", "rbx")):
+        with patch("hydralysis.runtime._base_argument", return_value=("reg", "rcx")), \
+             patch("hydralysis.runtime._argument_at_return", return_value=("reg", "rbx")):
             with self.assertRaisesRegex(PermissionError, "fallback denied"):
                 self.run_writers()
         self.runner.call.assert_any_call("unload", {"session": "session", "owner": "owner", "hook_id": "first"})
@@ -159,7 +159,7 @@ class WriterCleanup(unittest.TestCase):
                 return {"last_sequence": 0, "events": []}
             return {"modules": []}
         self.runner.call = Mock(side_effect=call)
-        with patch("rusticre.runtime.time.monotonic", side_effect=[0, 2]):
+        with patch("hydralysis.runtime.time.monotonic", side_effect=[0, 2]):
             with self.assertRaisesRegex(RuntimeError, "first: RuntimeError: worker rejected unload"):
                 self.run_writers()
         self.runner.call.assert_any_call("unload", {"session": "session", "owner": "owner", "hook_id": "second"})

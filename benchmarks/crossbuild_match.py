@@ -4,7 +4,7 @@ import math
 import platform
 import statistics
 import time
-from rusticre.crossbuild import match
+from hydralysis.crossbuild import match
 
 N = 50000
 REPEATS = 11

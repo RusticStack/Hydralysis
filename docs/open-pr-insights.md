@@ -1,5 +1,7 @@
 # KotOR and SWTOR usage reviews: requirements before removing the old MCPs
 
+> Historical record: written when this project was called RusticRE (command `rusticre`, variables `RUSTICRE_*`, tool prefix `mcp__rusticre__*`). It is kept as written; the names are `hydralysis`, `HYDRALYSIS_*` and `mcp__hydralysis__*` now.
+
 Reviewed on 2026-10-25 using `gh`: PR bodies, every issue comment, changed
 documents, commit lists, review lists and inline review comments. The requested
 PRs are in **RusticRE**, rather than in the two game repositories:

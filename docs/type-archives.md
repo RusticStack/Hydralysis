@@ -12,7 +12,7 @@ and optional named view determine which working copy receives the types; the
 canonical analysed project remains unchanged. Named views require the expected
 revision as for other edits.
 
-RusticRE copies the archive into its own data root, records the full SHA-256 and
+Hydralysis copies the archive into its own data root, records the full SHA-256 and
 size in the cited overlay, and checks the stored bytes on each replay. The
 source archive is not needed for replay. A whole-archive import requires equivalent
 data organizations. To select up to 200 exact type paths from an archive with a

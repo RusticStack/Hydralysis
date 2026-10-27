@@ -5,7 +5,9 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-.rusticre/
+.hydralysis/
 *.db
-rusticre.local.json
+hydralysis.local.json
 test-work/
+.rusticre/
+rusticre.local.json

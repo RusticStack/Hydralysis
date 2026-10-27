@@ -1,5 +1,5 @@
 ---
-name: rusticre-ghidra
+name: hydralysis-ghidra
 description: Decompile, trace or correct an already analysed Ghidra project without re-importing the binary. Use when inspect is not enough and you need decompiler text, value flow or types.
 ---
 

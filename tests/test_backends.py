@@ -6,7 +6,7 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from rusticre import backends
+from hydralysis import backends
 
 from support import workdir
 
@@ -43,14 +43,14 @@ class BackendSetupTests(unittest.TestCase):
         return {"root": str(self.root / "data"), "hydra_dir": str(engine), "hydra_client": str(client), "java_home": str(java)}
 
     def inspect(self, settings):
-        with patch.dict(os.environ, {}, clear=True), patch("rusticre.backends._children", return_value=[]), \
-                patch("rusticre.backends.shutil.which", return_value=None):
+        with patch.dict(os.environ, {}, clear=True), patch("hydralysis.backends._children", return_value=[]), \
+                patch("hydralysis.backends.shutil.which", return_value=None):
             return backends.inspect(settings)
 
     def test_reuses_existing_backend_without_download_or_machine_environment_change(self):
         settings = self.installed()
         before = dict(os.environ)
-        with patch("rusticre.backends._download") as download:
+        with patch("hydralysis.backends._download") as download:
             observed = backends.ensure(settings, install=True)
         download.assert_not_called()
         self.assertEqual(observed["hydra_dir"], str(Path(settings["hydra_dir"]).resolve()))
@@ -78,15 +78,15 @@ class BackendSetupTests(unittest.TestCase):
     def test_resolved_names_what_is_missing_and_never_installs(self):
         settings = self.installed()
         settings["java_home"] = str(self.root / "missing-jdk")
-        with patch.dict(os.environ, {}, clear=True), patch("rusticre.backends._children", return_value=[]), \
-                patch("rusticre.backends.shutil.which", return_value=None), patch("rusticre.backends._download") as download:
+        with patch.dict(os.environ, {}, clear=True), patch("hydralysis.backends._children", return_value=[]), \
+                patch("hydralysis.backends.shutil.which", return_value=None), patch("hydralysis.backends._download") as download:
             with self.assertRaisesRegex(ValueError, "jdk missing"):
                 backends.resolved(settings)
         download.assert_not_called()
 
     def test_install_is_required_when_discovery_is_not_ready(self):
         report = {"ready": False, "root": str(self.root), "portable_install_supported": True}
-        with patch("rusticre.backends.inspect", return_value=report), patch("rusticre.backends._download") as download:
+        with patch("hydralysis.backends.inspect", return_value=report), patch("hydralysis.backends._download") as download:
             with self.assertRaisesRegex(ValueError, "required"):
                 backends.ensure({"root": str(self.root)})
         download.assert_not_called()
@@ -99,7 +99,7 @@ class BackendSetupTests(unittest.TestCase):
     def test_download_checks_digest_before_archive_can_be_used(self):
         body = b"not a matching backend archive"
         asset = {"url": "https://example.invalid/backend.zip", "size": len(body), "sha256": "0" * 64}
-        with patch("rusticre.backends.urllib.request.urlopen", return_value=io.BytesIO(body)):
+        with patch("hydralysis.backends.urllib.request.urlopen", return_value=io.BytesIO(body)):
             with self.assertRaisesRegex(ValueError, "SHA256"):
                 backends._download(asset, self.root)
         self.assertFalse((self.root / "backend.zip").exists())
@@ -108,7 +108,7 @@ class BackendSetupTests(unittest.TestCase):
     def test_verified_download_is_cached_without_second_network_request(self):
         body = b"verified official asset fixture"
         asset = {"url": "https://example.invalid/backend.zip", "size": len(body), "sha256": hashlib.sha256(body).hexdigest()}
-        with patch("rusticre.backends.urllib.request.urlopen", return_value=io.BytesIO(body)) as request:
+        with patch("hydralysis.backends.urllib.request.urlopen", return_value=io.BytesIO(body)) as request:
             path = backends._download(asset, self.root)
             self.assertEqual(backends._download(asset, self.root), path)
         self.assertEqual(request.call_count, 1)

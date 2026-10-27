@@ -7,7 +7,7 @@ types, plus `this` types and names for functions. It runs as a durable job (`job
 overlay (`kind=revert`) removes every type and binding it made.
 
 ```text
-rusticre ghidra-query --target game --action type_edit --options-file import.json
+hydralysis ghidra-query --target game --action type_edit --options-file import.json
 import.json: {"kind": "import_types", "corpus": "F:/work/types.jsonl",
               "category": "/reflection", "source": "reflection dump of build 1.2.3 (sha256 ...)"}
 ```
@@ -41,7 +41,7 @@ embedded parent) is skipped and reported.
 
 ## Where a corpus comes from
 
-RusticRE contains no reader for any one engine's reflection format. A project converts its
+Hydralysis contains no reader for any one engine's reflection format. A project converts its
 own dump: the records above are enough for RTTI-style class/property/enum dumps, `.h`
 headers turned into records, or facts from a project's engine map (a field the reflection
 does not list, a vtable address). Function addresses are not in most reflection dumps; a

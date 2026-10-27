@@ -3,7 +3,7 @@
 Paste this as it is.
 
 ```text
-I made RusticRE to replace the REA and Ghidra MCPs. I use those today while
+I made Hydralysis to replace the REA and Ghidra MCPs. I use those today while
 building Night City Together, the SWTOR preservation project, and the KotOR
 remaster. REA loads on the order of 200 tools, Android and browser and
 firmware included, and smaller models die before they do any real work. I
@@ -18,7 +18,7 @@ The three projects are on this machine and on GitHub. Night City Together is
 the Cyberpunk co-op mod. SWTOR-origins is the preservation and private-server
 work. kotor-remaster is the KotOR reverse engineering and the new engine.
 Use gh, and read them locally if you need to see how an agent actually
-struggled. Do not turn RusticRE into a feature of any of them.
+struggled. Do not turn Hydralysis into a feature of any of them.
 
 The failures matter as much as the calls that worked. These are the ones I
 already hit, and I want you to treat a timeout or a dead session as a reason
@@ -39,10 +39,10 @@ Ghidra servers at once. A smaller server I did register was still unused,
 because the old command was easier to type. KotOR's exe is packed, so a
 decompiler that does not notice that spends its time on noise.
 
-The objective: make RusticRE the tool you would trust if you were the agent
+The objective: make Hydralysis the tool you would trust if you were the agent
 doing that work tomorrow. Research what REA and Ghidra were actually used
 for, what timed out or killed the session, and what was loaded and never
-touched. Use RusticRE yourself. Where a call is clumsy, slow, or missing,
+touched. Use Hydralysis yourself. Where a call is clumsy, slow, or missing,
 change it and open a pull request against main. A tool that is correct but
 times out, or that agents will not reach for, is not done.
 

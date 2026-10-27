@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import fakehydra
-from rusticre import query, targets, workcopy
+from hydralysis import hydra, query, targets, workcopy
 from support import workdir
 
 
@@ -26,8 +26,8 @@ class EngineCase(unittest.TestCase):
         self.daemon.add_project(self.gpr, {"/owned.exe": {"sha256": self.digest}})
         self.settings = {"root": str(self.root / "data"), "hydra_dir": "x", "hydra_client": "x",
                          "targets": {"owned": {"gpr": str(self.gpr), "program": "/owned.exe", "exe": str(self.exe)}}}
-        patches = [patch("rusticre.hydra.Engine", fakehydra.FakeEngine),
-                   patch("rusticre.workcopy._start_saver")]
+        patches = [patch("hydralysis.hydra.Engine", fakehydra.FakeEngine),
+                   patch("hydralysis.workcopy._start_saver")]
         for item in patches:
             item.start()
             self.addCleanup(item.stop)
@@ -45,7 +45,7 @@ class EngineCase(unittest.TestCase):
 class Queries(EngineCase):
     def test_user_script_receives_the_selected_named_view(self):
         from unittest.mock import Mock
-        from rusticre import userscripts
+        from hydralysis import userscripts
         folder = self.root / "scripts"
         folder.mkdir()
         (folder / "Inspect.java").write_text("// fixture", encoding="utf-8")
@@ -53,7 +53,7 @@ class Queries(EngineCase):
         runner = Mock()
         runner.program_for.return_value = {"key": "program-key"}
         runner.engine.call.return_value = {"mode": "contained", "output": "ok"}
-        with patch("rusticre.query.QueryRunner", return_value=runner), patch("rusticre.userscripts._stage", return_value="Inspect.java"):
+        with patch("hydralysis.query.QueryRunner", return_value=runner), patch("hydralysis.userscripts._stage", return_value="Inspect.java"):
             userscripts.run(self.settings, "owned", "Inspect.java", [], view="alice")
         selected = runner.program_for.call_args.args[0]
         self.assertEqual(selected["view"], "alice")
@@ -62,12 +62,12 @@ class Queries(EngineCase):
     def test_user_script_view_is_forwarded_from_mcp_and_cli(self):
         import contextlib
         import io
-        from rusticre import api, cli
-        with patch("rusticre.api._settings", return_value=self.settings), \
-             patch("rusticre.userscripts.run", return_value="done") as run:
+        from hydralysis import api, cli
+        with patch("hydralysis.api._settings", return_value=self.settings), \
+             patch("hydralysis.userscripts.run", return_value="done") as run:
             api.call("ghidra_run", {"target": "owned", "script": "Inspect", "view": "alice"})
         self.assertEqual(run.call_args.args[-1], "alice")
-        with patch("rusticre.cli.call", return_value="done") as call, contextlib.redirect_stdout(io.StringIO()):
+        with patch("hydralysis.cli.call", return_value="done") as call, contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cli.main(["ghidra-run", "--target", "owned", "--view", "alice", "Inspect"]), 0)
         self.assertEqual(call.call_args.args[1]["view"], "alice")
 
@@ -199,7 +199,7 @@ class Overlays(EngineCase):
                 continue  # Empty selects the backwards-compatible shared view.
             with self.subTest(view=view), self.assertRaises(ValueError):
                 self.runner.query("owned", "status", options={"view": view})
-        with patch("rusticre.overlayjobs.start", return_value={"id": "overlay-0123456789ab"}) as start:
+        with patch("hydralysis.overlayjobs.start", return_value={"id": "overlay-0123456789ab"}) as start:
             self.runner.query("owned", "diff", options={"view": "alice", "against": "owned", "against_view": "bob"})
             self.assertEqual(start.call_args.kwargs["view"], "alice")
             self.assertEqual(start.call_args.args[4]["against_view"], "bob")
@@ -207,7 +207,7 @@ class Overlays(EngineCase):
             self.runner.query("owned", "diff", options={"against": "owned", "against_view": "../escape"})
 
     def test_bulk_job_and_rebuild_keep_the_named_view(self):
-        with patch("rusticre.overlayjobs.start", return_value={"id": "overlay-0123456789ab", "state": "queued"}) as start:
+        with patch("hydralysis.overlayjobs.start", return_value={"id": "overlay-0123456789ab", "state": "queued"}) as start:
             self.runner.query("owned", "type_edit", options={"kind": "import_types", "view": "alice",
                               "expect_revision": 0, "corpus": str(self.corpus()), "source": "reflection dump"})
             self.assertEqual(start.call_args.kwargs["view"], "alice")
@@ -217,14 +217,14 @@ class Overlays(EngineCase):
             self.assertEqual(start.call_args.kwargs["view"], "alice")
 
     def test_overlay_worker_resolves_and_edits_the_requested_view(self):
-        from rusticre import overlayjobs
-        with patch("rusticre.overlayjobs.proc.popen", return_value=type("Child", (), {"pid": 1111})()), \
-             patch("rusticre.overlayjobs.proc_start", return_value=4444):
+        from hydralysis import overlayjobs
+        with patch("hydralysis.overlayjobs.proc.popen", return_value=type("Child", (), {"pid": 1111})()), \
+             patch("hydralysis.overlayjobs.proc_start", return_value=4444):
             job = overlayjobs.start(self.settings, "owned", "edit", "0x140001000",
                                     {"kind": "rename", "name": "Alice", "source": "test", "expect_revision": 0},
                                     view="alice")
-        with patch("rusticre.overlayjobs.threading.Thread"), \
-             patch("rusticre.workcopy.edit", return_value={"ok": True}) as edit:
+        with patch("hydralysis.overlayjobs.threading.Thread"), \
+             patch("hydralysis.workcopy.edit", return_value={"ok": True}) as edit:
             overlayjobs.run(overlayjobs.job_path(self.settings, job["id"]))
         self.assertEqual(edit.call_args.args[2]["view"], "alice")
         self.assertEqual(edit.call_args.args[2]["key"], workcopy.with_view(self.runner.target("owned"), "alice")["key"])
@@ -234,7 +234,7 @@ class Overlays(EngineCase):
         result = self.edit(kind="rename", name="Named")
         self.assertEqual(result["revision"], 1)
         self.assertTrue(result["sync"]["rebuilt"])
-        self.assertEqual(result["by"]["client"].split(":")[0], "rusticre")
+        self.assertEqual(result["by"]["client"].split(":")[0], hydra.ATTRIBUTION)
         answer = self.ask()
         self.assertEqual(answer["function"]["name"], "Named")
         self.assertEqual(answer["overlays"]["revision"], 1)
@@ -286,13 +286,13 @@ class Overlays(EngineCase):
         return path
 
     def test_type_import_validates_and_runs_as_a_job(self):
-        from rusticre.analysis import validate_options
+        from hydralysis.analysis import validate_options
         with self.assertRaisesRegex(ValueError, "absolute path"):
             validate_options("type_edit", {"kind": "import_types", "corpus": "types.jsonl", "source": "s"})
         with self.assertRaisesRegex(ValueError, "corpus_sha256"):
             validate_options("type_edit", {"kind": "import_types", "corpus": str(self.corpus()), "source": "s",
                                            "corpus_sha256": "0" * 64})
-        with patch("rusticre.overlayjobs.start", return_value={"id": "overlay-0123456789ab", "state": "queued"}) as start:
+        with patch("hydralysis.overlayjobs.start", return_value={"id": "overlay-0123456789ab", "state": "queued"}) as start:
             answer = json.loads(self.runner.query("owned", "type_edit", options={
                 "kind": "import_types", "corpus": str(self.corpus()), "source": "reflection dump"}))
         self.assertEqual(answer["id"], "overlay-0123456789ab")
@@ -317,7 +317,7 @@ class Overlays(EngineCase):
                       {"kind": "rename", "name": "Named", "source": "s"}, 60)
         last = workcopy.load_store(self.settings, target)["edits"][-1]["id"]
         workcopy.revert(self.settings, target, [last])
-        with patch("rusticre.overlayjobs.start", return_value={"id": "overlay-0123456789ab", "state": "queued"}):
+        with patch("hydralysis.overlayjobs.start", return_value={"id": "overlay-0123456789ab", "state": "queued"}):
             with self.assertRaisesRegex(RuntimeError, "overlay-0123456789ab"):
                 self.ask()
 

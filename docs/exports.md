@@ -13,9 +13,9 @@ For example, save these options as `F:/work/export-options.json`:
 Then use the same CLI/MCP path:
 
 ```text
-rusticre ghidra-query --target sample --action export --options-file F:/work/export-options.json
-rusticre job export-0123456789ab
-rusticre job export-0123456789ab --action cancel --owner <owner_token>
+hydralysis ghidra-query --target sample --action export --options-file F:/work/export-options.json
+hydralysis job export-0123456789ab
+hydralysis job export-0123456789ab --action cancel --owner <owner_token>
 ```
 
 The Python API is `exporting.start(settings, target, options)`;

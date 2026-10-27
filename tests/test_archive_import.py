@@ -2,7 +2,7 @@ import hashlib
 import unittest
 from pathlib import Path
 
-from rusticre import analysis, workcopy
+from hydralysis import analysis, workcopy
 from support import workdir
 
 

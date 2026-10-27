@@ -1,5 +1,7 @@
 # Workflow verification, 2026-10-25
 
+> Historical record: written when this project was called RusticRE (command `rusticre`, variables `RUSTICRE_*`, tool prefix `mcp__rusticre__*`). It is kept as written; the names are `hydralysis`, `HYDRALYSIS_*` and `mcp__hydralysis__*` now.
+
 This report covers the 0.3.0 implementation. The [earlier report](verification.md)
 and [KotOR/SWTOR PR reports](open-pr-insights.md) describe historical sessions;
 their timings and findings are not measurements reproduced by this run.

@@ -1,4 +1,4 @@
-# Continuing the KotOR remaster with RusticRE
+# Continuing the KotOR remaster with Hydralysis
 
 Audit date: 2026-10-24. Read-only inspection of
 `E:\Projects\kotor-remaster\kotor-remaster`, verified by `gh` as
@@ -16,7 +16,7 @@ already has 10,849 internal functions decompiled. The
 records exact body ranges, assembly/body/pseudocode hashes and 663 functions
 with disjoint ranges. Continue from that analysed project and evidence ledger;
 an older baseline can lack the recovered functions. Do not repeat a whole-game
-import/decompile simply because RusticRE now owns preparation.
+import/decompile simply because Hydralysis now owns preparation.
 
 Use the current P0 report and completed recon findings for status. Older unchecked
 items in `MASTER_PLAN.md` still list Bearing/MDX questions that the later
@@ -24,12 +24,12 @@ items in `MASTER_PLAN.md` still list Bearing/MDX questions that the later
 
 ## Concrete work to tool capability
 
-“Implemented” below means the corresponding RusticRE code path exists. It does
+“Implemented” below means the corresponding Hydralysis code path exists. It does
 not assert that an original-game scene, native handler, visual effect or runtime
 hook has been verified by this audit. Fixture and integration results belong in
 the central verification report.
 
-| Pending project work and source | RusticRE operations needed | Coverage and boundary |
+| Pending project work and source | Hydralysis operations needed | Coverage and boundary |
 | --- | --- | --- |
 | Native dispatcher semantics for ACTION 700/469 argument slot 2; [script recon:157–183](https://github.com/KelpHect/kotor-remaster/blob/28e5806f5b4b468d7c28d6bda28252cce7c660ea/docs/recon/09_SCRIPTS.md#L157-L183) | `ghidra_query` actions `dossier`, `variables`, `pcode`, bounded forward/backward `trace`, `type`/`type_edit`; checked runtime `observe` for arguments/return values | Static operations and cited type overlays implemented. Native handler semantics still require a scoped evidence run. NCS bytecode/source decompilation remains the project's own compiler/parser work, distinct from x86 C decompilation. |
 | Complete action/VM behavior, including actions not exercised by shipped scripts; [VM conformance plan:171–191](https://github.com/KelpHect/kotor-remaster/blob/28e5806f5b4b468d7c28d6bda28252cce7c660ea/docs/MASTER_PLAN.md#L171-L191) | `runtime` attach/spawn, verified `observe`/`break`, `read`, threads, bounded event retrieval; deliberate authored script for custom state serialization | Observation and entry-break controls implemented; a deterministic original-versus-new-VM differential harness is still project code. Tool access alone does not implement all 772 actions or prove their side effects. |
@@ -38,8 +38,8 @@ the central verification report.
 | Fresh-module area-RIM precedence and `streamwaves` request order; [P0 handoff:113–119](https://github.com/KelpHect/kotor-remaster/blob/28e5806f5b4b468d7c28d6bda28252cce7c660ea/docs/P0_REPORT.md#L113-L119) | Hash/byte-checked resource-entry probes, bounded runtime events and custom request decoding | Generic probe/session support implemented. The missing gameplay scene and exact request ordering are not measured here. The project's existing VFS comparator remains the oracle. |
 | Dialogue-camera object state; [camera recon:170–186](https://github.com/KelpHect/kotor-remaster/blob/28e5806f5b4b468d7c28d6bda28252cce7c660ea/docs/recon/12_COORDS_OPEN_ITEMS.md#L170-L186) | Static trace to the constructor/update; verified `break`, threads/context, validated object-memory `read` and observation | Implemented generic primitives. A dialogue/cutscene scenario is still needed; the document distinguishes controller fields from camera fields, so the agent must preserve object identity instead of transplanting an offset by name. |
 | Multi-group geometry and supermodel visual chains; [P0 handoff:124–132](https://github.com/KelpHect/kotor-remaster/blob/28e5806f5b4b468d7c28d6bda28252cce7c660ea/docs/P0_REPORT.md#L124-L132) | Static type/flow inspection and checked runtime probes around model loading; synthetic fixtures and image comparisons outside the RE server | Generic RE primitives implemented. Synthetic scene construction, rendering and perceptual comparison remain project validation. The shipped MDX corpus is already accounted for; this is not a reason to re-decompile the game. |
-| Build an actual mesh/depth/material/animation renderer; [P0 handoff:108–112](https://github.com/KelpHect/kotor-remaster/blob/28e5806f5b4b468d7c28d6bda28252cce7c660ea/docs/P0_REPORT.md#L108-L112) | Evidence queries about original behavior; normal C++/shader implementation, GPU validation and frame capture | RusticRE supplies evidence, not the renderer implementation. The source currently clears/draws ImGui only: [Vulkan:964–1005](https://github.com/KelpHect/kotor-remaster/blob/28e5806f5b4b468d7c28d6bda28252cce7c660ea/engine/src/render/VulkanBackend.cpp#L964-L1005), [GL:159–182](https://github.com/KelpHect/kotor-remaster/blob/28e5806f5b4b468d7c28d6bda28252cce7c660ea/engine/src/render/GlBackend.cpp#L159-L182). apitrace/Mesa/GPU capture are separate backends, not currently installed or controlled by RusticRE's setup. |
-| Asset/archive/save round trips, coordinate validation and caches; [tool inventory:11–33](https://github.com/KelpHect/kotor-remaster/blob/28e5806f5b4b468d7c28d6bda28252cce7c660ea/tools/README.md#L11-L33) | Existing project parsers/tests plus native RE queries when a format or precedence rule lacks evidence | Keep KEY/BIFF/RIM/ERF/GFF/2DA/TLK/NCS/MDL-specific parsers and converters in the project. They are not new RusticRE MCP tools. The agent runs ordinary code/tests alongside RusticRE. |
+| Build an actual mesh/depth/material/animation renderer; [P0 handoff:108–112](https://github.com/KelpHect/kotor-remaster/blob/28e5806f5b4b468d7c28d6bda28252cce7c660ea/docs/P0_REPORT.md#L108-L112) | Evidence queries about original behavior; normal C++/shader implementation, GPU validation and frame capture | Hydralysis supplies evidence, not the renderer implementation. The source currently clears/draws ImGui only: [Vulkan:964–1005](https://github.com/KelpHect/kotor-remaster/blob/28e5806f5b4b468d7c28d6bda28252cce7c660ea/engine/src/render/VulkanBackend.cpp#L964-L1005), [GL:159–182](https://github.com/KelpHect/kotor-remaster/blob/28e5806f5b4b468d7c28d6bda28252cce7c660ea/engine/src/render/GlBackend.cpp#L159-L182). apitrace/Mesa/GPU capture are separate backends, not currently installed or controlled by Hydralysis's setup. |
+| Asset/archive/save round trips, coordinate validation and caches; [tool inventory:11–33](https://github.com/KelpHect/kotor-remaster/blob/28e5806f5b4b468d7c28d6bda28252cce7c660ea/tools/README.md#L11-L33) | Existing project parsers/tests plus native RE queries when a format or precedence rule lacks evidence | Keep KEY/BIFF/RIM/ERF/GFF/2DA/TLK/NCS/MDL-specific parsers and converters in the project. They are not new Hydralysis MCP tools. The agent runs ordinary code/tests alongside Hydralysis. |
 
 ## Generic workflow for the next investigation
 
@@ -67,7 +67,7 @@ the central verification report.
 
 The implemented runtime `break` pauses at a verified function-entry interceptor
 with an automatic pause deadline; it is not a full instruction-step/hardware
-data-watchpoint debugger. RusticRE accepts structured probe operations rather
+data-watchpoint debugger. Hydralysis accepts structured probe operations rather
 than arbitrary runtime scripts, so every built-in installation goes through
 the exact-byte gate. Existing project-owned runtime harnesses remain separate
 code with their own evidence and validation requirements.
@@ -76,4 +76,4 @@ Generic setup, cached analysis, typed overlays and bounded flow/runtime queries
 remove the need to install REA/Ghidra MCPs for their covered operations. That
 does not establish completed native-handler semantics, deterministic game replay,
 renderer parity or a playable engine. No KotOR-specific tooling is added to the
-RusticRE server by this audit.
+Hydralysis server by this audit.

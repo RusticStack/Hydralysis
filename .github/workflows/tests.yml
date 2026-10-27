@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   unit:
-    # RusticRE targets Windows PEs on Windows hosts; the engine integration tests stay local.
+    # Hydralysis targets Windows PEs on Windows hosts; the engine integration tests stay local.
     runs-on: windows-latest
     strategy:
       fail-fast: false
@@ -26,5 +26,5 @@ jobs:
       - name: Unit tests
         env:
           PYTHONPATH: src
-          RUSTICRE_TEST_ROOT: ${{ runner.temp }}\rusticre-tests
+          HYDRALYSIS_TEST_ROOT: ${{ runner.temp }}\hydralysis-tests
         run: python -m unittest discover -s tests -v

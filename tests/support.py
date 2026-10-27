@@ -1,6 +1,6 @@
 """Test work directories live under an explicit root, never the ambient TEMP.
 
-RUSTICRE_TEST_ROOT selects it; the default is test-work/ in the repository
+HYDRALYSIS_TEST_ROOT selects it; the default is test-work/ in the repository
 (ignored by git). Ghidra refuses dot-prefixed path components, so the default is
 dot-free on every host.
 """
@@ -16,7 +16,7 @@ REPOSITORY = Path(__file__).resolve().parent.parent
 
 
 def test_root() -> Path:
-    root = Path(os.environ.get("RUSTICRE_TEST_ROOT") or REPOSITORY / "test-work").resolve()
+    root = Path(os.environ.get("HYDRALYSIS_TEST_ROOT") or os.environ.get("RUSTICRE_TEST_ROOT") or REPOSITORY / "test-work").resolve()
     root.mkdir(parents=True, exist_ok=True)
     return root
 

@@ -6,10 +6,10 @@ import json
 import os
 from pathlib import Path
 
-from rusticre.api import call
-from rusticre.config import load
-from rusticre.pe import Image
-from rusticre.preparation import plan
+from hydralysis.api import call
+from hydralysis.config import load
+from hydralysis.pe import Image
+from hydralysis.preparation import plan
 
 
 def verify(path: Path, settings: dict) -> dict:

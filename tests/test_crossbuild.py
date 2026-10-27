@@ -7,9 +7,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from rusticre.cli import _checks_file
+from hydralysis.cli import _checks_file
 
-from rusticre import crossbuild
+from hydralysis import crossbuild
 from support import workdir
 
 
@@ -80,9 +80,9 @@ class Matching(unittest.TestCase):
                        for name, digest in (("source", "a"), ("destination", "b"))}
             store = {"revision": 0, "edits": [], "reverted": []}
             record = {"target": "destination", "options": {"against": "source"}}
-            with patch("rusticre.crossbuild.targets.resolve", side_effect=lambda settings, name: targets[name]), \
-                 patch("rusticre.crossbuild.fingerprints", side_effect=lambda settings, name, view="": folder / (name + ".jsonl")), \
-                 patch("rusticre.workcopy.load_store", return_value=store):
+            with patch("hydralysis.crossbuild.targets.resolve", side_effect=lambda settings, name: targets[name]), \
+                 patch("hydralysis.crossbuild.fingerprints", side_effect=lambda settings, name, view="": folder / (name + ".jsonl")), \
+                 patch("hydralysis.workcopy.load_store", return_value=store):
                 result = crossbuild.run({}, record, folder / "output")
             result_row = json.loads((folder / "output" / "diff.jsonl").read_text().splitlines()[0])
             self.assertEqual((result_row["method"], result_row["status"]), ("anchors", "incomplete"))
@@ -174,9 +174,9 @@ class Matching(unittest.TestCase):
             path.write_text(json.dumps({"hooks": [{"offset": "rva:0x2000", "prologue": "CC"}]}))
             target = {"name": "fixture", "sha256": "e" * 64, "exe": "fixture.exe"}
             record = {"target": "destination", "options": {"against": "source", "checks": str(path)}}
-            with patch("rusticre.crossbuild.targets.resolve", return_value=target), \
-                 patch("rusticre.crossbuild._target_image", return_value=FakeImage()), \
-                 patch("rusticre.crossbuild.fingerprints") as fingerprints:
+            with patch("hydralysis.crossbuild.targets.resolve", return_value=target), \
+                 patch("hydralysis.crossbuild._target_image", return_value=FakeImage()), \
+                 patch("hydralysis.crossbuild.fingerprints") as fingerprints:
                 with self.assertRaisesRegex(ValueError, "prologue mismatch"):
                     crossbuild.run({}, record, Path(folder) / "output")
                 fingerprints.assert_not_called()
@@ -203,7 +203,7 @@ class Matching(unittest.TestCase):
             record = {"id": "f" * 32, "address": "0x402000", "by": "agent", "at": 123,
                       "options": {"kind": "signature", "prototype": "int load(int x)", "source": "trace log 12"}}
             store = {"revision": 3, "edits": [record], "reverted": [{"ids": ["c" * 32]}]}
-            with patch("rusticre.workcopy.load_store", return_value=store):
+            with patch("hydralysis.workcopy.load_store", return_value=store):
                 result = crossbuild._export_overlay_candidates({}, source_target, dest_target,
                           crossbuild.match(source, destination), source, FakeImage(), Path(folder))
             report = json.loads(Path(result["file"]).read_text())
@@ -224,12 +224,12 @@ class Matching(unittest.TestCase):
             def run_script(engine, program, request, timeout):
                 Path(request["options"]["artifact"]).write_text("{}\n")
                 return {"ok": True}, ""
-            with patch("rusticre.crossbuild.targets.resolve", return_value=target), \
-                 patch("rusticre.crossbuild.root_path", return_value=Path(folder)), \
-                 patch("rusticre.crossbuild.fingerprint_code", return_value="code"), \
-                 patch("rusticre.workcopy.load_store", side_effect=lambda *args: store), \
-                 patch("rusticre.query.QueryRunner", Runner), \
-                 patch("rusticre.query.run_script", side_effect=run_script):
+            with patch("hydralysis.crossbuild.targets.resolve", return_value=target), \
+                 patch("hydralysis.crossbuild.root_path", return_value=Path(folder)), \
+                 patch("hydralysis.crossbuild.fingerprint_code", return_value="code"), \
+                 patch("hydralysis.workcopy.load_store", side_effect=lambda *args: store), \
+                 patch("hydralysis.query.QueryRunner", Runner), \
+                 patch("hydralysis.query.run_script", side_effect=run_script):
                 first = crossbuild.fingerprints({}, "fixture", engine=object())
                 other_view = crossbuild.fingerprints({}, "fixture", engine=object(), view="alice")
                 store["revision"] = 2
@@ -252,9 +252,9 @@ class Matching(unittest.TestCase):
                 seen.append((target["name"], target["view"]))
                 return {"revision": 0, "edits": [], "reverted": []}
             record = {"target": "destination", "view": "alice", "options": {"against": "source", "against_view": "bob"}}
-            with patch("rusticre.crossbuild.targets.resolve", side_effect=lambda settings, name: targets[name]), \
-                 patch("rusticre.crossbuild.fingerprints", side_effect=lambda settings, name, view="": folder / (name + ".jsonl")) as fingerprints, \
-                 patch("rusticre.workcopy.load_store", side_effect=store):
+            with patch("hydralysis.crossbuild.targets.resolve", side_effect=lambda settings, name: targets[name]), \
+                 patch("hydralysis.crossbuild.fingerprints", side_effect=lambda settings, name, view="": folder / (name + ".jsonl")) as fingerprints, \
+                 patch("hydralysis.workcopy.load_store", side_effect=store):
                 summary = crossbuild.run({}, record, folder / "output")
             self.assertEqual((summary["source_view"], summary["destination_view"]), ("bob", "alice"))
             self.assertIn(("source", "bob"), seen)
@@ -264,7 +264,7 @@ class Matching(unittest.TestCase):
     def test_target_image_checks_registered_hash_and_requires_executable(self):
         with self.assertRaisesRegex(ValueError, "registered executable"):
             crossbuild._target_image({"name": "source", "sha256": "f" * 64})
-        with patch("rusticre.crossbuild.Image", return_value=FakeImage()):
+        with patch("hydralysis.crossbuild.Image", return_value=FakeImage()):
             with self.assertRaisesRegex(ValueError, "registered build hash"):
                 crossbuild._target_image({"name": "source", "exe": "fake.exe", "sha256": "f" * 64})
 

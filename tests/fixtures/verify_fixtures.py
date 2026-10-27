@@ -2,7 +2,7 @@
 
 usage: python tests/fixtures/verify_fixtures.py <fixtures out dir> [check ...]
 Each check prints PASS/FAIL with its evidence; the exit status is the number of failures.
-RUSTICRE_CONFIG selects the data root the fixtures were prepared in (prepare_fixtures.py).
+HYDRALYSIS_CONFIG selects the data root the fixtures were prepared in (prepare_fixtures.py).
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ import json
 import sys
 from pathlib import Path
 
-from rusticre.client import Client
+from hydralysis.client import Client
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from prepare_fixtures import target_name  # noqa: E402
@@ -56,7 +56,7 @@ def check_value_flow(manifest: dict) -> list[str]:
 
 
 class Running:
-    """A fixture process under a RusticRE runtime session; stopped through its stop file."""
+    """A fixture process under a Hydralysis runtime session; stopped through its stop file."""
 
     def __init__(self, arch: str, exe: str):
         build = MANIFEST[arch + "/" + exe]
@@ -295,12 +295,12 @@ def check_sample(manifest: dict) -> list[str]:
 
 
 class McpClient:
-    """The real stdio MCP server (rusticre mcp), driven as an agent's client would."""
+    """The real stdio MCP server (hydralysis mcp), driven as an agent's client would."""
 
     def __init__(self):
         import os
         import subprocess
-        self.process = subprocess.Popen([sys.executable, "-m", "rusticre", "mcp"], stdin=subprocess.PIPE,
+        self.process = subprocess.Popen([sys.executable, "-m", "hydralysis", "mcp"], stdin=subprocess.PIPE,
                                         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=dict(os.environ),
                                         text=True, encoding="utf-8")
         self.next = 0

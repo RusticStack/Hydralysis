@@ -1,6 +1,6 @@
 # Hardware watchpoints and stepping: safety research
 
-RusticRE does not yet provide hardware data watchpoints or CPU instruction
+Hydralysis does not yet provide hardware data watchpoints or CPU instruction
 stepping. Its existing cooperative `break` action pauses in an instrumentation
 callback; it is not an operating-system debugger and must not be described as
 single-step support.
@@ -41,7 +41,7 @@ for the unrelated-exception and disconnect tests had SHA-256
 
 The local research scripts include `smoke.py`, `disconnect_test.py`,
 `occupied_test.py`, and `frida32_probe.py` in the directory above. They are
-experiments for disposable owned fixtures, not RusticRE's supported interface.
+experiments for disposable owned fixtures, not Hydralysis's supported interface.
 In particular, the deliberately unsafe unload test must never be run on a game.
 
 ## Requirements before exposing the capability
@@ -79,7 +79,7 @@ exits, while
 [`DebugSetProcessKillOnExit(FALSE)`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-debugsetprocesskillonexit)
 requests detachment instead. That setting alone does not establish that a
 previously programmed hardware slot is cleared when the controller dies; the
-linked documentation does not make that guarantee. Coexistence with RusticRE's
+linked documentation does not make that guarantee. Coexistence with Hydralysis's
 Frida session, target-owned exception handling, cancellation and both x86 and
 x64 also require fixture tests before choosing that backend.
 

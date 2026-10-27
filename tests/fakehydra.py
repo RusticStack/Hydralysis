@@ -1,6 +1,6 @@
 """An in-process stand-in for Hydra Engine's daemon, for unit tests.
 
-It models what RusticRE relies on, not Ghidra: projects opened by path, programs
+It models what Hydralysis relies on, not Ghidra: projects opened by path, programs
 with a SHA-256 and an overlay marker, contained (rolled back) versus owner script
 runs, forks that copy a project's state, saves, and shared-mode changes that stay
 in the daemon after their writer disconnects. RusticQuery requests are answered
@@ -14,7 +14,7 @@ import json
 import threading
 from pathlib import Path
 
-from rusticre.hydra import EngineError
+from hydralysis.hydra import EngineError
 
 
 class Daemon:
@@ -63,7 +63,7 @@ def reset() -> Daemon:
 
 
 class FakeEngine:
-    """The interface RusticRE uses from hydra.Engine."""
+    """The interface Hydralysis uses from hydra.Engine."""
 
     def __init__(self, settings: dict, role: str = "reader"):
         self.settings = settings

@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from rusticre import address_maps, api
+from hydralysis import address_maps, api
 from support import workdir
 
 

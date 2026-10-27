@@ -9,8 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from rusticre import runtime, runtime_ipc
-from rusticre.runtime_worker import CONTROL, MEMORY_HELPER, RuntimeAgent, _expect, _probe_source, _ready_record, _read
+from hydralysis import runtime, runtime_ipc
+from hydralysis.runtime_worker import CONTROL, MEMORY_HELPER, RuntimeAgent, _expect, _probe_source, _ready_record, _read
 
 from support import workdir
 
@@ -164,7 +164,7 @@ class LifecycleAndBounds(RuntimeCase):
         self.agent.pauses["hook"] = 0
         self.agent.paused_spawn = True
         self.agent.target_created_ms = 77
-        with patch("rusticre.runtime_worker._created_ms", return_value=77):
+        with patch("hydralysis.runtime_worker._created_ms", return_value=77):
             result = self.agent.cleanup()
         self.assertEqual(calls, ["continue", "unload", "detach", "resume"])
         self.assertEqual(result["target_state"], "unknown")
@@ -185,14 +185,14 @@ class LifecycleAndBounds(RuntimeCase):
     def test_changed_spawn_pid_is_not_resumed(self):
         self.agent.paused_spawn = True
         self.agent.target_created_ms = 77
-        with patch("rusticre.runtime_worker._created_ms", return_value=99), self.assertRaisesRegex(RuntimeError, "identity changed"):
+        with patch("hydralysis.runtime_worker._created_ms", return_value=99), self.assertRaisesRegex(RuntimeError, "identity changed"):
             self.agent.cleanup()
         self.device.resume.assert_not_called()
 
     def test_attach_path_is_checked_before_injection(self):
         self.agent.session = None
         initial = {"exe": str(self.binary), "sha256": self.digest, "action": "attach", "pid": 123, "argv": []}
-        with patch("rusticre.runtime_worker._process_path", return_value=str(self.root / "other.exe")), self.assertRaisesRegex(ValueError, "path differs"):
+        with patch("hydralysis.runtime_worker._process_path", return_value=str(self.root / "other.exe")), self.assertRaisesRegex(ValueError, "path differs"):
             self.agent.startup(initial)
         self.device.attach.assert_not_called()
 
@@ -200,7 +200,7 @@ class LifecycleAndBounds(RuntimeCase):
         attached = Mock()
         self.device.attach.return_value = attached
         initial = {"exe": str(self.binary), "sha256": self.digest, "action": "attach", "pid": 123, "argv": []}
-        with patch("rusticre.runtime_worker._process_path", return_value=str(self.binary)), patch("rusticre.runtime_worker._created_ms", side_effect=[77, 99]), self.assertRaisesRegex(ValueError, "identity changed during attach"):
+        with patch("hydralysis.runtime_worker._process_path", return_value=str(self.binary)), patch("hydralysis.runtime_worker._created_ms", side_effect=[77, 99]), self.assertRaisesRegex(ValueError, "identity changed during attach"):
             self.agent.startup(initial)
         attached.detach.assert_called_once()
         attached.create_script.assert_not_called()
@@ -212,7 +212,7 @@ class LifecycleAndBounds(RuntimeCase):
         error = PermissionError(13, "cannot query target identity")
         error.winerror = 5
         initial = {"exe": str(self.binary), "sha256": self.digest, "action": "attach", "pid": 123, "argv": []}
-        with patch("rusticre.runtime_worker._process_path", return_value=str(self.binary)), patch("rusticre.runtime_worker._created_ms", side_effect=[77, error]), self.assertRaisesRegex(RuntimeError, "errno=13 winerror=5"):
+        with patch("hydralysis.runtime_worker._process_path", return_value=str(self.binary)), patch("hydralysis.runtime_worker._created_ms", side_effect=[77, error]), self.assertRaisesRegex(RuntimeError, "errno=13 winerror=5"):
             self.agent.startup(initial)
         attached.detach.assert_called_once()
         attached.create_script.assert_not_called()
@@ -222,7 +222,7 @@ class LifecycleAndBounds(RuntimeCase):
         self.agent.session.create_script.return_value = self.agent.control
         self.agent.control.exports_sync.info.return_value = {"pid": 123, "main": self.module}
         initial = {"exe": str(self.binary), "sha256": self.digest, "action": "attach", "pid": 123, "argv": []}
-        with patch("rusticre.runtime_worker._process_path", return_value=str(self.binary)), patch("rusticre.runtime_worker._created_ms", return_value=77):
+        with patch("hydralysis.runtime_worker._process_path", return_value=str(self.binary)), patch("hydralysis.runtime_worker._created_ms", return_value=77):
             observation = self.agent.startup(initial)
         self.agent.control.exports_sync.info.assert_called_with(str(self.binary))
         self.assertEqual(observation["target"]["main"]["path"], str(self.binary))
@@ -243,7 +243,7 @@ class HostRuntimeContracts(RuntimeCase):
                         "kind": "EnumDB", "path": "/Mode"}]}}),
             json.dumps({"type": {"values": [{"value": "0x2", "name": "active"}]}})]
         args = {"type": "/Config", "target": "fixture", "view": "experiment"}
-        with patch("rusticre.query.QueryRunner", return_value=query), patch("rusticre.backends.resolved", return_value={}):
+        with patch("hydralysis.query.QueryRunner", return_value=query), patch("hydralysis.backends.resolved", return_value={}):
             layout = runner._layout(args)
         self.assertEqual(query.query.call_args_list[0].kwargs["options"], {"path": "/Config", "view": "experiment"})
         self.assertEqual(query.query.call_args_list[1].kwargs["options"], {"path": "/Mode", "view": "experiment"})
@@ -257,12 +257,12 @@ class HostRuntimeContracts(RuntimeCase):
         directory.mkdir()
         (directory / "ready.json").write_text(json.dumps({"pid": 500, "started_ms": 88}))
         for error_type, expected in (("PermissionError", PermissionError), ("ValueError", ValueError), ("unknown", RuntimeError)):
-            with self.subTest(error_type=error_type), patch("rusticre.runtime._identity", return_value=True), \
-                 patch("rusticre.runtime.ipc_request", return_value={"ok": False, "error": "denied", "error_type": error_type}):
+            with self.subTest(error_type=error_type), patch("hydralysis.runtime._identity", return_value=True), \
+                 patch("hydralysis.runtime.ipc_request", return_value={"ok": False, "error": "denied", "error_type": error_type}):
                 with self.assertRaisesRegex(expected, "denied"):
                     runner.call("modules", {"session": session_id})
-        with patch("rusticre.runtime._identity", return_value=True), \
-             patch("rusticre.runtime.ipc_request", side_effect=PermissionError("socket denied")):
+        with patch("hydralysis.runtime._identity", return_value=True), \
+             patch("hydralysis.runtime.ipc_request", side_effect=PermissionError("socket denied")):
             with self.assertRaisesRegex(PermissionError, "socket denied"):
                 runner.call("modules", {"session": session_id})
 
@@ -273,7 +273,7 @@ class HostRuntimeContracts(RuntimeCase):
         directory.mkdir()
         endpoint = {"port": 4444, "token": "a" * 64}
         (directory / "ready.json").write_text(json.dumps({"pid": 500, "started_ms": 88, "ipc": endpoint}))
-        with patch("rusticre.runtime._identity", return_value=True), patch("rusticre.runtime._write") as files, patch("rusticre.runtime.ipc_request", return_value={"ok": True, "result": {"modules": []}}) as rpc:
+        with patch("hydralysis.runtime._identity", return_value=True), patch("hydralysis.runtime._write") as files, patch("hydralysis.runtime.ipc_request", return_value={"ok": True, "result": {"modules": []}}) as rpc:
             result = runner.call("modules", {"session": session_id})
         self.assertEqual(result, {"modules": []})
         self.assertEqual(rpc.call_args.args[0], endpoint)
@@ -289,19 +289,19 @@ class HostRuntimeContracts(RuntimeCase):
     def test_permission_errors_report_exact_details_instead_of_missing_mailbox(self):
         error = PermissionError(13, "access denied", str(self.root / "response.json"))
         error.winerror = 5
-        with patch("rusticre.runtime.local_read_text", side_effect=error), self.assertRaisesRegex(RuntimeError, "errno=13 winerror=5"):
+        with patch("hydralysis.runtime.local_read_text", side_effect=error), self.assertRaisesRegex(RuntimeError, "errno=13 winerror=5"):
             runtime._json(self.root / "response.json")
-        with patch("rusticre.runtime_worker.local_read_text", side_effect=error), self.assertRaisesRegex(RuntimeError, "errno=13 winerror=5"):
+        with patch("hydralysis.runtime_worker.local_read_text", side_effect=error), self.assertRaisesRegex(RuntimeError, "errno=13 winerror=5"):
             _read(self.root / "request.json")
 
     def test_live_status_uses_in_memory_snapshot_not_rewritten_state_file(self):
-        with patch("rusticre.runtime_worker._read", side_effect=PermissionError("state file should not be read")):
+        with patch("hydralysis.runtime_worker._read", side_effect=PermissionError("state file should not be read")):
             result = self.agent.handle("status", {})
         self.assertEqual(result["pid"], self.agent.pid)
 
     def test_inspect_has_no_filesystem_or_install_side_effects(self):
         settings = {"root": str(self.root / "missing-root")}
-        with patch("rusticre.runtime.proc.run") as run:
+        with patch("hydralysis.runtime.proc.run") as run:
             report = runtime.inspect(settings)
         self.assertFalse(report["ready"])
         self.assertIn("backend action=install component=runtime", report["reason"])
@@ -311,7 +311,7 @@ class HostRuntimeContracts(RuntimeCase):
 
     def test_missing_backend_fails_fast_for_every_action_that_needs_it(self):
         runner = runtime.RuntimeRunner({"root": str(self.root / "no-backend")})
-        with patch("rusticre.runtime.proc.run") as run, patch("rusticre.runtime.proc.popen") as launch:
+        with patch("hydralysis.runtime.proc.run") as run, patch("hydralysis.runtime.proc.popen") as launch:
             for action, args in (("processes", {}),
                                  ("spawn", {"exe": str(self.binary), "sha256": self.digest}),
                                  ("attach", {"exe": str(self.binary), "sha256": self.digest, "pid": 4})):
@@ -329,21 +329,21 @@ class HostRuntimeContracts(RuntimeCase):
                  ("spawn", {"exe": str(self.binary), "sha256": self.digest, "env": {"A": 1}}, "options.env"),
                  ("spawn", {"exe": str(self.binary), "sha256": self.digest, "working_dir": "x"}, "unknown spawn options"),
                  ("attach", {"exe": str(self.binary), "sha256": self.digest, "cwd": str(self.root)}, "unknown attach options"))
-        with patch("rusticre.runtime.proc.popen") as launch:
+        with patch("hydralysis.runtime.proc.popen") as launch:
             for action, args, message in cases:
                 with self.subTest(args=args), self.assertRaisesRegex(ValueError, message):
                     runner.call(action, args)
         launch.assert_not_called()
 
     def test_spawned_target_gets_the_callers_environment_not_the_workers(self):
-        from rusticre.runtime_worker import target_environment
+        from hydralysis.runtime_worker import target_environment
         restore = json.dumps({"TEMP": "C:/caller-temp", "PYTHONPATH": None})
-        with patch.dict("os.environ", {"RUSTICRE_TARGET_ENV_RESTORE": restore, "TEMP": "worker-temp",
+        with patch.dict("os.environ", {"HYDRALYSIS_TARGET_ENV_RESTORE": restore, "TEMP": "worker-temp",
                                        "PYTHONPATH": "worker-site"}):
             env = target_environment({"MESA_LOADER_DRIVER_OVERRIDE": "zink"})
         self.assertEqual(env["TEMP"], "C:/caller-temp")
         self.assertNotIn("PYTHONPATH", env)
-        self.assertNotIn("RUSTICRE_TARGET_ENV_RESTORE", env)
+        self.assertNotIn("HYDRALYSIS_TARGET_ENV_RESTORE", env)
         self.assertEqual(env["MESA_LOADER_DRIVER_OVERRIDE"], "zink")
 
     def test_setup_passes_hashes_and_explicit_target_without_global_install(self):
@@ -354,7 +354,7 @@ class HostRuntimeContracts(RuntimeCase):
                                                                       "path": str(site / "frida" / "__init__.py")}), stderr="")]
         metadata = {"urls": [{"packagetype": "bdist_wheel", "digests": {"sha256": "a" * 64}}]}
         from io import BytesIO
-        with patch("rusticre.runtime.proc.run", side_effect=responses) as run, patch("rusticre.runtime.urllib.request.urlopen", return_value=BytesIO(json.dumps(metadata).encode())):
+        with patch("hydralysis.runtime.proc.run", side_effect=responses) as run, patch("hydralysis.runtime.urllib.request.urlopen", return_value=BytesIO(json.dumps(metadata).encode())):
             result = runtime.setup(settings)
         self.assertEqual(result["state"], "ready")
         self.assertFalse(result["reused"])
@@ -370,7 +370,7 @@ class HostRuntimeContracts(RuntimeCase):
         site = self.root / "runtime-root2" / "runtime-backend" / ("frida-" + runtime.FRIDA_VERSION)
         site.mkdir(parents=True)
         elsewhere = json.dumps({"version": runtime.FRIDA_VERSION, "path": str(self.root / "site-packages" / "frida" / "__init__.py")})
-        with patch("rusticre.runtime.proc.run", return_value=SimpleNamespace(returncode=0, stdout=elsewhere, stderr="")),                 self.assertRaisesRegex(RuntimeError, "incomplete"):
+        with patch("hydralysis.runtime.proc.run", return_value=SimpleNamespace(returncode=0, stdout=elsewhere, stderr="")),                 self.assertRaisesRegex(RuntimeError, "incomplete"):
             runtime.setup(settings)
 
     def test_an_idle_ended_session_says_so_and_how_to_continue(self):
@@ -386,7 +386,7 @@ class HostRuntimeContracts(RuntimeCase):
 
     def test_invalid_sessions_and_target_builds_do_not_launch_worker(self):
         runner = runtime.RuntimeRunner({"root": str(self.root / "sessions")})
-        with patch("rusticre.runtime.proc.popen") as launch:
+        with patch("hydralysis.runtime.proc.popen") as launch:
             for action, args in (("read", {"session": "../foreign"}),
                                  ("spawn", {"exe": str(self.binary), "sha256": "1" * 64}),
                                  ("attach", {"exe": str(self.binary), "sha256": self.digest, "pid": 0})):
@@ -514,7 +514,7 @@ class LocalIPC(unittest.TestCase):
 
     def test_request_identity_and_endpoint_are_validated_without_remote_urls(self):
         for endpoint in ({"port": 0, "token": "a" * 64}, {"port": 10, "token": "bad"}):
-            with self.subTest(endpoint=endpoint), patch("rusticre.runtime_ipc.socket.create_connection") as connect, self.assertRaises(ValueError):
+            with self.subTest(endpoint=endpoint), patch("hydralysis.runtime_ipc.socket.create_connection") as connect, self.assertRaises(ValueError):
                 runtime_ipc.rpc(endpoint, {"id": "b" * 32}, 1)
             connect.assert_not_called()
         def wrong_id(connection):

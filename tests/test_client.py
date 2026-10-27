@@ -7,8 +7,8 @@ from pathlib import Path
 from support import workdir
 from test_pe import image
 
-from rusticre import cli
-from rusticre.client import Client, RusticError, parse
+from hydralysis import cli
+from hydralysis.client import Client, RusticError, parse
 
 
 class LibraryAPI(unittest.TestCase):
@@ -50,12 +50,12 @@ class LibraryAPI(unittest.TestCase):
     def test_engine_refusals_are_structured(self):
         from unittest.mock import patch
         refusal = RuntimeError(json.dumps({"ok": False, "error_kind": "not_found", "error": "no analysed function"}))
-        with patch("rusticre.client.api.call", side_effect=refusal):
+        with patch("hydralysis.client.api.call", side_effect=refusal):
             self.assertIsNone(self.re.try_query("t", "function", "0x1"))
             with self.assertRaises(RusticError) as caught:
                 self.re.query("t", "function", "0x1")
         self.assertEqual(caught.exception.result["error_kind"], "not_found")
-        with patch("rusticre.client.api.call", side_effect=RuntimeError(json.dumps({"ok": False, "error_kind": "timeout"}))),                 self.assertRaises(RusticError):
+        with patch("hydralysis.client.api.call", side_effect=RuntimeError(json.dumps({"ok": False, "error_kind": "timeout"}))),                 self.assertRaises(RusticError):
             self.re.try_query("t", "decompile", "0x1")
 
     def test_parse_leaves_text_answers_alone(self):

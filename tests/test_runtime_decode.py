@@ -3,7 +3,7 @@
 import struct
 import unittest
 
-from rusticre import runtime_decode as decode
+from hydralysis import runtime_decode as decode
 
 
 class Decoding(unittest.TestCase):
@@ -57,7 +57,7 @@ class Decoding(unittest.TestCase):
         self.assertEqual(row["value"], "0x4a4cb70")
 
     def test_the_probe_carries_its_calling_convention(self):
-        from rusticre.runtime_worker import _probe_source
+        from hydralysis.runtime_worker import _probe_source
         captures = decode.normalize([{"arg": 0, "as": "pointer"}])
         source = _probe_source({"path": "x.exe", "base": "0x400000"}, 0x1000, [0x55, 0x8B, 0xEC, 0x83, 0xEC], "a" * 32,
                                5, False, captures, None, "thiscall")

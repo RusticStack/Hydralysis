@@ -1,5 +1,7 @@
 # Cyberpunk 2.5: saved-project and value-flow check
 
+> Historical record: written when this project was called RusticRE (command `rusticre`, variables `RUSTICRE_*`, tool prefix `mcp__rusticre__*`). It is kept as written; the names are `hydralysis`, `HYDRALYSIS_*` and `mcp__hydralysis__*` now.
+
 This is a record of a bounded check on an existing user-owned project, not a
 game-specific feature or a claim that every acceptance gate has passed. The
 [requested checks](https://github.com/RusticStack/RusticRE/pull/6#issuecomment-6397988372)

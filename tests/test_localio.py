@@ -5,8 +5,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from rusticre import localio
-from rusticre.backends import read_json
+from hydralysis import localio
+from hydralysis.backends import read_json
 
 from support import workdir
 
@@ -72,7 +72,7 @@ class LocalMetadataReadTests(unittest.TestCase):
         filename = self.root / "denied.json"
         kernel = Mock()
         kernel.CreateFileW.return_value = ctypes.c_void_p(-1).value
-        with patch("rusticre.localio._kernel", return_value=kernel), patch("ctypes.get_last_error", return_value=5):
+        with patch("hydralysis.localio._kernel", return_value=kernel), patch("ctypes.get_last_error", return_value=5):
             with self.assertRaises(PermissionError) as caught:
                 read_json(filename)
         self.assertEqual(caught.exception.winerror, 5)

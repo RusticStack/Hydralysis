@@ -29,9 +29,9 @@ BUDGET_S = 10
 class Server:
     def __init__(self, root: Path, **extra):
         env = dict(os.environ)
-        env.pop("RUSTICRE_CONFIG", None)
-        env.update(RUSTICRE_ROOT=str(root), PYTHONPATH=str(REPOSITORY / "src"), **extra)
-        self.process = subprocess.Popen([sys.executable, "-m", "rusticre", "mcp"], stdin=subprocess.PIPE,
+        env.pop("HYDRALYSIS_CONFIG", None)
+        env.update(HYDRALYSIS_ROOT=str(root), PYTHONPATH=str(REPOSITORY / "src"), **extra)
+        self.process = subprocess.Popen([sys.executable, "-m", "hydralysis", "mcp"], stdin=subprocess.PIPE,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env, cwd=str(root))
         self.replies: queue.Queue = queue.Queue()
         self.readers = [threading.Thread(target=self._read, daemon=True),
@@ -129,7 +129,7 @@ class RuntimeOverMCP(unittest.TestCase):
     def test_spawn_session_lifecycle_honours_cwd_and_env(self):
         target = self.root / "game-dir"
         target.mkdir()
-        proof = "import os,time;open('cwd-proof.txt','w').write(os.getcwd()+'|'+os.environ.get('RRE_PROOF','')+'|'+os.environ.get('RUSTICRE_TARGET_ENV_RESTORE','none'));time.sleep(60)"
+        proof = "import os,time;open('cwd-proof.txt','w').write(os.getcwd()+'|'+os.environ.get('RRE_PROOF','')+'|'+os.environ.get('HYDRALYSIS_TARGET_ENV_RESTORE','none'));time.sleep(60)"
         started = self.runtime("spawn", exe=self.exe, sha256=self.digest, argv=["-c", proof],
                                cwd=str(target), env={"RRE_PROOF": "from-caller"})
         session = started["session"]
@@ -205,12 +205,12 @@ class TwoHarnessesOneGame(unittest.TestCase):
         shutil.copytree(FAKE_FRIDA, cls.root / "runtime-backend" / "frida-17.24.3" / "frida")
         cls.exe = str(Path(sys.executable).resolve())
         cls.digest = hashlib.sha256(Path(cls.exe).read_bytes()).hexdigest()
-        cls.first = Server(cls.root, RUSTICRE_HARNESS="harness-a")
-        cls.second = Server(cls.root, RUSTICRE_HARNESS="harness-b")
+        cls.first = Server(cls.root, HYDRALYSIS_HARNESS="harness-a")
+        cls.second = Server(cls.root, HYDRALYSIS_HARNESS="harness-b")
         refuse = cls.root / "refuse.json"
         refuse.write_text(json.dumps({"runtime_lock_check": [sys.executable, "-c", "import sys; print('held by agent-x'); sys.exit(2)"]}))
         shutil.copytree(FAKE_FRIDA, cls.root / "locked-root" / "runtime-backend" / "frida-17.24.3" / "frida")
-        cls.locked = Server(cls.root / "locked-root", RUSTICRE_CONFIG=str(refuse), RUSTICRE_HARNESS="harness-c")
+        cls.locked = Server(cls.root / "locked-root", HYDRALYSIS_CONFIG=str(refuse), HYDRALYSIS_HARNESS="harness-c")
         cls.target = subprocess.Popen([cls.exe, "-c", "import time;time.sleep(60)"], stdin=subprocess.DEVNULL)
 
     @classmethod
@@ -268,7 +268,7 @@ class PatchedFunctionOverMCP(RuntimeOverMCP):
         cls.exe = str(exe)
         cls.digest = hashlib.sha256(exe.read_bytes()).hexdigest()
         cls.head = " ".join("%02X" % byte for byte in exe.read_bytes()[:5])
-        cls.server = Server(cls.root, RUSTICRE_FAKE_PATCH="%#x=E9 FB FF FF FF" % cls.site)
+        cls.server = Server(cls.root, HYDRALYSIS_FAKE_PATCH="%#x=E9 FB FF FF FF" % cls.site)
         cls.children = []
 
     def attached(self):

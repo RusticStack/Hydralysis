@@ -1,8 +1,8 @@
 """End to end on the real engine: prepare, query, overlays, revert, adopt.
 
-Runs only when RUSTICRE_INTEGRATION_ENGINE names a Hydra install and
-RUSTICRE_INTEGRATION_CLIENT its ghidra_session.py (optionally
-RUSTICRE_INTEGRATION_JAVA a JDK and RUSTICRE_INTEGRATION_BINARY a small PE;
+Runs only when HYDRALYSIS_INTEGRATION_ENGINE (or RUSTICRE_INTEGRATION_ENGINE) names a Hydra install and
+HYDRALYSIS_INTEGRATION_CLIENT its ghidra_session.py (optionally
+HYDRALYSIS_INTEGRATION_JAVA a JDK and HYDRALYSIS_INTEGRATION_BINARY a small PE;
 the default is Windows' whoami.exe). Everything lives in its own data root, with
 its own daemon, which is stopped at the end.
 """
@@ -20,27 +20,32 @@ from unittest.mock import patch
 
 from support import workdir
 
-ENGINE = os.environ.get("RUSTICRE_INTEGRATION_ENGINE")
-CLIENT = os.environ.get("RUSTICRE_INTEGRATION_CLIENT")
-BINARY = os.environ.get("RUSTICRE_INTEGRATION_BINARY") or (
+def _env(name):
+    """HYDRALYSIS_<name>, else the old RUSTICRE_<name>."""
+    return os.environ.get("HYDRALYSIS_" + name) or os.environ.get("RUSTICRE_" + name)
+
+
+ENGINE = _env("INTEGRATION_ENGINE")
+CLIENT = _env("INTEGRATION_CLIENT")
+BINARY = _env("INTEGRATION_BINARY") or (
     os.path.join(os.environ.get("SystemRoot", "C:/Windows"), "System32", "whoami.exe") if os.name == "nt" else "")
 
 
-@unittest.skipUnless(ENGINE and CLIENT and BINARY and Path(BINARY).is_file(), "set RUSTICRE_INTEGRATION_ENGINE/CLIENT")
+@unittest.skipUnless(ENGINE and CLIENT and BINARY and Path(BINARY).is_file(), "set HYDRALYSIS_INTEGRATION_ENGINE/CLIENT")
 class EngineIntegration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        from rusticre import preparation, query
+        from hydralysis import preparation, query
         cls.work = workdir("engine")
         cls.root = Path(cls.work.name)
         binary = cls.root / "fixture.exe"
         shutil.copy2(BINARY, binary)
         cls.settings = {"root": str(cls.root / "data"), "hydra_dir": ENGINE, "hydra_client": CLIENT,
                         "hydra_idle_s": 600, "overlay_save_debounce_s": 2}
-        if os.environ.get("RUSTICRE_INTEGRATION_JAVA"):
-            cls.settings["java_home"] = os.environ["RUSTICRE_INTEGRATION_JAVA"]
+        if _env("INTEGRATION_JAVA"):
+            cls.settings["java_home"] = _env("INTEGRATION_JAVA")
         query._keys.clear()
-        env = {"RUSTICRE_ROOT": cls.settings["root"], "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+        env = {"HYDRALYSIS_ROOT": cls.settings["root"], "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
         cls.env = patch.dict(os.environ, env)
         cls.env.start()
         job = preparation.prepare(cls.settings, str(binary), "fixture")
@@ -57,7 +62,7 @@ class EngineIntegration(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        from rusticre import hydra
+        from hydralysis import hydra
         engine = hydra.Engine(cls.settings)
         try:
             engine.stop(force=True)
@@ -100,8 +105,8 @@ class EngineIntegration(unittest.TestCase):
         self.assertLess(min(warm), 1.0)
 
     def test_a_bulk_export_runs_in_its_own_worker(self):
-        # The export worker ignores the user site; it must still find RusticRE's dependencies.
-        from rusticre import exporting
+        # The export worker ignores the user site; it must still find Hydralysis's dependencies.
+        from hydralysis import exporting
         job = exporting.start(self.settings, "fixture", {"mode": "decompile", "limit": 5})
         deadline = time.monotonic() + 300
         while job["state"] in exporting.ACTIVE and time.monotonic() < deadline:
@@ -122,7 +127,7 @@ class EngineIntegration(unittest.TestCase):
         self.assertEqual(self.ask("decompile", address, timeout_s=300)["function"]["name"], original)
 
     def test_cited_data_label_is_visible_and_revertible(self):
-        from rusticre.pe import Image
+        from hydralysis.pe import Image
         image = Image(Path(self.root / "fixture.exe"))
         section = next(s for s in image.sections if not (s.Characteristics & 0x20000000) and s.SizeOfRawData)
         address = hex(image.base + section.VirtualAddress)
@@ -135,7 +140,7 @@ class EngineIntegration(unittest.TestCase):
         self.assertNotIn("integration_global", [item["name"] for item in data["labels"]])
 
     def test_gdt_archive_import_and_revert(self):
-        from rusticre import overlayjobs
+        from hydralysis import overlayjobs
         archive = Path(ENGINE) / "Ghidra/Features/Base/data/pcodetest/EmuTesting.gdt"
         self.assertTrue(archive.is_file(), str(archive))
         def submit(paths, revision):
@@ -165,7 +170,7 @@ class EngineIntegration(unittest.TestCase):
             self.ask("type", options={"path": "/u4", "view": "archive-fixture"})
 
     def test_adopt_registers_the_prepared_project_in_place(self):
-        from rusticre import hydra, targets
+        from hydralysis import hydra, targets
         gpr = self.prepared["project"]["gpr"]
         result = targets.adopt(self.settings, hydra.Engine(self.settings), str(Path(gpr).parent),
                                expected=self.prepared["sha256"], target="adopted-fixture")

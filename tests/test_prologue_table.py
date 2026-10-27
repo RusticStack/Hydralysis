@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import Mock
 
-from rusticre.prologue import compare_table, parse_expect
+from hydralysis.prologue import compare_table, parse_expect
 
 
 def fixture_image(size=32):
@@ -66,7 +66,7 @@ class PrologueTables(unittest.TestCase):
 
     def test_envelope_image_base_makes_legacy_offsets_unambiguous(self):
         import json
-        from rusticre.cli import _checks_file
+        from hydralysis.cli import _checks_file
         from support import workdir
         with workdir() as folder:
             path = __import__("pathlib").Path(folder) / "table.json"

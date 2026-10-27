@@ -2,7 +2,7 @@
 
 A target name belongs to one build, so a changed fixture gets a new name rather than replacing one.
 
-usage: python tests/fixtures/prepare_fixtures.py <fixtures out dir>   (RUSTICRE_CONFIG selects the root)
+usage: python tests/fixtures/prepare_fixtures.py <fixtures out dir>   (HYDRALYSIS_CONFIG selects the root)
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import sys
 import time
 from pathlib import Path
 
-from rusticre.client import Client
+from hydralysis.client import Client
 
 
 def target_name(key: str, build: dict) -> str:

@@ -10,7 +10,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from rusticre.mcp import MAX_OUTSTANDING, MAX_OUTPUT_BYTES, Server, _read_message
+from hydralysis.mcp import MAX_OUTSTANDING, MAX_OUTPUT_BYTES, Server, _read_message
 
 
 def request(ident, method, params=None):
@@ -39,7 +39,7 @@ class ObservedOutput(io.BytesIO):
 class TransportTests(unittest.TestCase):
     def run_server(self, payload):
         result = subprocess.run(
-            [sys.executable, "-m", "rusticre", "mcp"],
+            [sys.executable, "-m", "hydralysis", "mcp"],
             input=payload, capture_output=True, timeout=20,
         )
         self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", errors="replace"))
@@ -102,7 +102,7 @@ class TransportTests(unittest.TestCase):
         messages.append(request("list", "tools/list"))
         messages.append(request("ping", "ping"))
         worker = threading.Thread(target=Server().serve, args=(io.BytesIO(lines(messages)), output))
-        with patch("rusticre.mcp.call", slow):
+        with patch("hydralysis.mcp.call", slow):
             worker.start()
             try:
                 self.assertTrue(output.ping.wait(3), "ping blocked behind slow calls")
@@ -123,7 +123,7 @@ class TransportTests(unittest.TestCase):
 
     def test_large_unicode_tool_result_is_bounded_and_reports_loss(self):
         value = "HEAD" + "\U0001f680" * MAX_OUTPUT_BYTES + "TAIL"
-        with patch("rusticre.mcp.call", return_value=value):
+        with patch("hydralysis.mcp.call", return_value=value):
             response = Server().handle(request(1, "tools/call", {"name": "fingerprint"}))
         result = response["result"]
         text = result["content"][0]["text"]
