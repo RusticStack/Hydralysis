@@ -29,6 +29,8 @@ class EffectsEngine(fakehydra.FakeEngine):
         if body.startswith("@"):
             body = Path(body[1:]).read_text(encoding="utf-8")
         request = json.loads(body)
+        if request.get("action") == "annotation_probe":
+            return self._probe(program, request, result)
         if request.get("action") != "apply_overlays":
             return result
         out = json.loads(result["output"])
@@ -51,6 +53,24 @@ class EffectsEngine(fakehydra.FakeEngine):
             before_names[address] = options["name"]
         out["effects"] = rows
         self.daemon.pre_apply_names[program] = before_names
+        return {**result, "output": json.dumps(out) + "\n"}
+
+
+    def _probe(self, program, request, result):
+        """annotation_probe for the names of the fake program (everything else is absent)."""
+        names = self._view(self._program(program))["names"]
+        values = []
+        for item in request["options"]["probes"]:
+            row = {"subject": item["subject"], "field": item["field"]}
+            if item["subject"] == "*":
+                pass
+            elif item["field"] == "name":
+                address = item["subject"].removeprefix("address:")
+                row["value"] = names.get(address, "FUN_" + address.removeprefix("0x"))
+            else:
+                row["value"] = "absent"
+            values.append(row)
+        out = {**json.loads(result["output"]), "values": values}
         return {**result, "output": json.dumps(out) + "\n"}
 
 

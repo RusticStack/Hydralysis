@@ -580,7 +580,7 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
     from hydralysis.query import forget, open_program
     writer = hydra.Engine(settings, role="writer")
     records = pending_of(store) + (extra or [])
-    wanted = state_of({**store, "revision": store["revision"] + (1 if extra else 0),
+    wanted = state_of({**store, "revision": store["revision"] + len(extra or []),
                        "edits": store["edits"] + (extra or [])})
     current = _state(settings, target)
     started = time.monotonic()
@@ -793,6 +793,45 @@ def edit(settings: dict, engine: hydra.Engine, target: dict, address: str, optio
             "working_copy": state["fork_gpr"], "sync": state.get("last_sync"), "seq": clean["seq"],
             **({"effects": clean["effects"]} if clean["effects"] is not None else {"before_unknown": True}),
             "persistence": "cited, build-bound overlay applied to the working copy; the canonical project is unchanged"}
+
+
+def add_proposals(settings: dict, engine: hydra.Engine, target: dict, records: list[dict], expect: int | None,
+                  timeout_s: int, imported_from: dict) -> dict:
+    """Add RECORDS (id, address, options, optional effects) to a view as pending proposals, atomically.
+
+    The engine applies them all in one owner transaction first (a record it refuses leaves the view unchanged),
+    then the store takes them, one revision and one journal entry each, with the effects of THIS view's program
+    (what the engine reports here, not what the author saw). Each carries `imported_from` (the bundle and the
+    record it came from). Used by bundle import; the same locking, rebase and cap rules as `edit`.
+    """
+    require_revision(settings, target, expect, "import_bundle")
+    clean = []
+    for record in records:
+        item = _edit({key: record[key] for key in ("id", "address", "options") if key in record})
+        clean.append({**item, "by": _attribution(), "at": time.time(),
+                      "imported_from": {**imported_from, "id": record.get("source_id", record["id"]),
+                                        "by": record.get("source_by"), "at": record.get("source_at")}})
+    subjects = sorted({subject for item in clean for subject in revisions.subjects_of(item["address"], item["options"])})
+    with locked(_directory(settings, target) / ".sync.lock", SYNC_LOCK_S, "working copy"):
+        store = load_store(settings, target)
+        decision = reconcile(store, expect, subjects)
+        if len(store["edits"]) + len(clean) > MAX_OVERLAYS:
+            raise ValueError("overlay history limit reached; export/review it before adding more edits")
+        state = _sync(settings, target, store, timeout_s, extra=clean)
+        effects = state.get("effects") or {}
+        for item in clean:
+            item["effects"] = revisions.clean_effects(effects.get(item["id"]))
+            if item["effects"] is None:
+                item["before_unknown"] = True
+            store["revision"] += 1
+            item["seq"] = max(store["revision"], max((edit["seq"] for edit in store["edits"]), default=0) + 1)
+            store["edits"].append(item)
+            store["journal"] = revisions.append(store["journal"], revisions.journal_entry(
+                store["revision"], "edit", revisions.subjects_of(item["address"], item["options"]), item["by"], item["at"]))
+        _save_store(settings, target, store)
+    return {"ok": True, "added": [item["id"] for item in clean], "revision": store["revision"],
+            "view_revision": store["revision"], **_rebase_report(expect, decision), "working_copy": state["fork_gpr"],
+            "sync": state.get("last_sync")}
 
 
 def _summary(report: dict) -> dict:
