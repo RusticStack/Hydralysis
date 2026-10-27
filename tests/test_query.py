@@ -193,14 +193,18 @@ class Overlays(EngineCase):
         self.assertEqual(self.ask(options={"view": "bob"})["function"]["name"], "Bob")
         self.assertEqual(sum(command == "open_program" for _, command, _ in self.daemon.calls), opened_before)
 
-    def test_named_view_rejects_invalid_names_and_unimplemented_crossbuild(self):
+    def test_named_view_rejects_invalid_names_and_routes_crossbuild_views(self):
         for view in ("../escape", "", 123, "a" * 65):
             if view == "":
                 continue  # Empty selects the backwards-compatible shared view.
             with self.subTest(view=view), self.assertRaises(ValueError):
                 self.runner.query("owned", "status", options={"view": view})
-        with self.assertRaisesRegex(ValueError, "named-view cross-build"):
-            self.runner.query("owned", "diff", options={"view": "alice", "against": "owned"})
+        with patch("rusticre.overlayjobs.start", return_value={"id": "overlay-0123456789ab"}) as start:
+            self.runner.query("owned", "diff", options={"view": "alice", "against": "owned", "against_view": "bob"})
+            self.assertEqual(start.call_args.kwargs["view"], "alice")
+            self.assertEqual(start.call_args.args[4]["against_view"], "bob")
+        with self.assertRaises(ValueError):
+            self.runner.query("owned", "diff", options={"against": "owned", "against_view": "../escape"})
 
     def test_bulk_job_and_rebuild_keep_the_named_view(self):
         with patch("rusticre.overlayjobs.start", return_value={"id": "overlay-0123456789ab", "state": "queued"}) as start:

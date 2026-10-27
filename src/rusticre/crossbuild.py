@@ -44,12 +44,12 @@ def fingerprint_code() -> str:
     return hashlib.sha256(text[start:end].encode("utf-8")).hexdigest()[:16]
 
 
-def fingerprints(settings: dict, name: str, engine=None) -> Path:
+def fingerprints(settings: dict, name: str, engine=None, view: str = "") -> Path:
     """The target's fingerprint file, computed once per build and fingerprint code."""
     from rusticre import hydra, workcopy
     from rusticre.locks import locked
     from rusticre.query import QueryRunner, run_script
-    selected = targets.resolve(settings, name)
+    selected = workcopy.with_view(targets.resolve(settings, name), view)
     state = workcopy.state_of(workcopy.load_store(settings, selected))
     directory = root_path(settings) / "fingerprints"
     directory.mkdir(parents=True, exist_ok=True)
@@ -218,17 +218,17 @@ def run(settings: dict, record: dict, output: Path) -> dict:
     source_name, destination_name = record["options"]["against"], record["target"]
     checks = record["options"].get("checks")
     prepared = source_image = destination_image = None
-    source_target = targets.resolve(settings, source_name)
-    destination_target = targets.resolve(settings, destination_name)
+    from rusticre import workcopy
+    source_target = workcopy.with_view(targets.resolve(settings, source_name), record["options"].get("against_view", ""))
+    destination_target = workcopy.with_view(targets.resolve(settings, destination_name), record.get("view", ""))
     if checks:
         source_image = _target_image(source_target)
         destination_image = _target_image(destination_target)
         prepared = _prepare_checks(checks, source_image)
-    from rusticre import workcopy
     source_state = workcopy.state_of(workcopy.load_store(settings, source_target))
     destination_state = workcopy.state_of(workcopy.load_store(settings, destination_target))
-    source = load(fingerprints(settings, source_name))
-    destination = load(fingerprints(settings, destination_name))
+    source = load(fingerprints(settings, source_name, view=source_target["view"]))
+    destination = load(fingerprints(settings, destination_name, view=destination_target["view"]))
     if (workcopy.state_of(workcopy.load_store(settings, source_target)) != source_state or
             workcopy.state_of(workcopy.load_store(settings, destination_target)) != destination_state):
         raise RuntimeError("overlays changed during diff; retry with stable overlays")
@@ -262,7 +262,10 @@ def run(settings: dict, record: dict, output: Path) -> dict:
     with (output / "names.jsonl").open("w", encoding="utf-8", newline="\n") as handle:
         for item in names:
             handle.write(json.dumps(item) + "\n")
-    summary = {"source": source_name, "destination": destination_name, "source_functions": len(source),
+    summary = {"source": source_name, "destination": destination_name,
+               "source_view": source_target["view"], "destination_view": destination_target["view"],
+               "source_overlay_state": source_state, "destination_overlay_state": destination_state,
+               "source_functions": len(source),
                "destination_functions": len(destination), "matched": len(pairs), **dict(counts),
                "names_to_transfer": len(names), "seconds": round(time.monotonic() - started, 1),
                "files": {"diff": str(output / "diff.jsonl"), "names_corpus": str(output / "names.jsonl")}}

@@ -52,7 +52,7 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
     allowed = {
         "decompile": {"max_characters"}, "data": {"table"}, "scan": {"end", "mnemonic", "operand", "regex"},
         "types": set(), "type": {"path"}, "variables": set(), "dossier": set(),
-        "blocks": set(), "pcode": {"nodes"}, "diff": {"against", "checks"}, "vtables": set(),
+        "blocks": set(), "pcode": {"nodes"}, "diff": {"against", "against_view", "checks"}, "vtables": set(),
         "vcalls": {"offset", "receiver_from", "receiver_type", "receiver_global", "vtable"},
         "writes": {"offset", "receiver_type"}, "orphans": {"referenced_only"},
         "trace": {"seed", "direction", "depth", "nodes", "functions", "argument", "brief", "callers", "debug"},
@@ -100,6 +100,9 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
             out["receiver_type"] = _text(out["receiver_type"], "receiver_type", 256, True)
     elif action == "diff":
         out["against"] = _text(out.get("against", ""), "against", 64, True)
+        if "against_view" in out:
+            from rusticre.workcopy import with_view
+            with_view({"key": "validate"}, out["against_view"])
         if "checks" in out:
             checks = Path(_text(out["checks"], "checks", 32768, True)).expanduser()
             if not checks.is_absolute() or not checks.is_file():

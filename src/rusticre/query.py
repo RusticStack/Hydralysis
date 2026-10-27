@@ -154,10 +154,8 @@ class QueryRunner:
                                "view": view})
         if action == "diff":
             from rusticre import overlayjobs
-            if view != "shared":
-                raise ValueError("diff currently uses the shared view; named-view cross-build transfer is not supported")
             self.target(options["against"])
-            return json.dumps(overlayjobs.start(self.settings, selected["name"], "diff", "", options), ensure_ascii=False)
+            return json.dumps(overlayjobs.start(self.settings, selected["name"], "diff", "", options, view=view), ensure_ascii=False)
         if action == "type_edit" and options.get("kind") in BULK_KINDS:
             from rusticre import overlayjobs
             return json.dumps(overlayjobs.start(self.settings, selected["name"], "edit", address, options, view=view), ensure_ascii=False)

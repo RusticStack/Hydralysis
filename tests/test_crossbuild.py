@@ -203,11 +203,35 @@ class Matching(unittest.TestCase):
                  patch("rusticre.query.QueryRunner", Runner), \
                  patch("rusticre.query.run_script", side_effect=run_script):
                 first = crossbuild.fingerprints({}, "fixture", engine=object())
+                other_view = crossbuild.fingerprints({}, "fixture", engine=object(), view="alice")
                 store["revision"] = 2
                 store["edits"] = [{"id": "2" * 32}]
                 second = crossbuild.fingerprints({}, "fixture", engine=object())
             self.assertNotEqual(first, second)
+            self.assertNotEqual(first, other_view)
             self.assertTrue(first.is_file() and second.is_file())
+
+    def test_diff_uses_and_reports_each_selected_view(self):
+        with workdir("cross") as folder:
+            folder = Path(folder)
+            source, destination = self.build()
+            for name, rows in (("source", source), ("destination", destination)):
+                (folder / (name + ".jsonl")).write_text("".join(json.dumps(row) + "\n" for row in rows.values()), encoding="utf-8")
+            targets = {"source": {"name": "source", "sha256": "a" * 64, "key": "source-key"},
+                       "destination": {"name": "destination", "sha256": "b" * 64, "key": "destination-key"}}
+            seen = []
+            def store(settings, target):
+                seen.append((target["name"], target["view"]))
+                return {"revision": 0, "edits": [], "reverted": []}
+            record = {"target": "destination", "view": "alice", "options": {"against": "source", "against_view": "bob"}}
+            with patch("rusticre.crossbuild.targets.resolve", side_effect=lambda settings, name: targets[name]), \
+                 patch("rusticre.crossbuild.fingerprints", side_effect=lambda settings, name, view="": folder / (name + ".jsonl")) as fingerprints, \
+                 patch("rusticre.workcopy.load_store", side_effect=store):
+                summary = crossbuild.run({}, record, folder / "output")
+            self.assertEqual((summary["source_view"], summary["destination_view"]), ("bob", "alice"))
+            self.assertIn(("source", "bob"), seen)
+            self.assertIn(("destination", "alice"), seen)
+            self.assertEqual([call.kwargs["view"] for call in fingerprints.call_args_list], ["bob", "alice"])
 
     def test_target_image_checks_registered_hash_and_requires_executable(self):
         with self.assertRaisesRegex(ValueError, "registered executable"):
