@@ -62,7 +62,11 @@ REJECTED = (
 # The advertised tool table is cached by running MCP sessions (listChanged is False), so it may
 # change only through a catalog epoch: bump CATALOG_EPOCH together with an entry in
 # tests/test_contracts.py CATALOG_HISTORY, and tell users a harness restart is needed once.
-# Epoch 2 restored the stronger pe_address wording ("ambiguous unprefixed addresses are refused").
+# Epoch 2 brought back the refusal clause of the pe_address description ("ambiguous unprefixed addresses are
+# refused", epoch 0), which epoch 1 had weakened to "(bare values may be refused)". It is NOT the epoch-0 text:
+# epoch 0 said "Use rva:0x... or va:0x...; ..." and the "0x..." examples stay dropped, because the eight tools that
+# carry the description would then cost 104 bytes more (8276 against 8172 advertised bytes, json.dumps with default
+# separators), over the 8192 budget of tests/test_contracts.py test_catalog_stays_small_in_bytes_as_well_as_count.
 # Where the catalog is reported: backend status, backend help and backend inspect (api.py), and the
 # MCP initialize result under _meta (mcp.py). ghidra_query status is built in query.py and does not carry it.
 # Everything added after epoch 1 rides the free-form `options` objects (see OPTION_BAGS).
