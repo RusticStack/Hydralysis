@@ -49,6 +49,12 @@ class Matching(unittest.TestCase):
         destination = {r["rva"]: r for r in (row("0x9", bytes_="x"),)}
         self.assertEqual(crossbuild.match(source, destination), {})
 
+    def test_three_collisions_remain_ambiguous_and_exclusions_can_leave_one(self):
+        source = {r["rva"]: r for r in (row("0x1", bytes_="x"), row("0x2", bytes_="x"), row("0x3", bytes_="x"))}
+        destination = {r["rva"]: r for r in (row("0x9", bytes_="x"),)}
+        self.assertEqual(crossbuild.match(source, destination), {})
+        self.assertEqual(crossbuild._unique(source, lambda item: item["bytes"], {"0x1", "0x2"}), {"x": "0x3"})
+
     def test_code_that_only_moved_is_identical(self):
         before = row("0x1", bytes_="call+0x10", shape="s", strings=("x",))
         self.assertTrue(crossbuild.identical_code(before, row("0x9", bytes_="call+0x40", shape="s", strings=("x",))))

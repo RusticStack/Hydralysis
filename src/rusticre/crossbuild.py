@@ -81,13 +81,20 @@ def load(path: Path) -> dict[str, dict]:
     return rows
 
 
-def _unique(rows: dict[str, dict], key) -> dict:
-    groups = defaultdict(list)
+def _unique(rows: dict[str, dict], key, excluded=()) -> dict:
+    # One RVA is enough until a second row makes a key ambiguous. Avoid a
+    # list per fingerprint and a full filtered copy of both programs per phase.
+    unique = {}
     for rva, row in rows.items():
+        if rva in excluded:
+            continue
         value = key(row)
         if value:
-            groups[value].append(rva)
-    return {value: items[0] for value, items in groups.items() if len(items) == 1}
+            if value in unique:
+                unique[value] = None
+            else:
+                unique[value] = rva
+    return {value: rva for value, rva in unique.items() if rva is not None}
 
 
 def identical_code(a: dict, b: dict) -> bool:
@@ -118,9 +125,8 @@ def match(source: dict[str, dict], destination: dict[str, dict]) -> dict[str, tu
     taken: set[str] = set()
 
     def phase(method, key, check=None, right_key=None):
-        left = {rva: row for rva, row in source.items() if rva not in pairs}
-        right = {rva: row for rva, row in destination.items() if rva not in taken}
-        a, b = _unique(left, key), _unique(right, right_key or key)
+        a = _unique(source, key, pairs)
+        b = _unique(destination, right_key or key, taken)
         for value, rva in a.items():
             other = b.get(value)
             if other and (check is None or check(source[rva], destination[other])):
