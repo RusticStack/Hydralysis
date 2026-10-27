@@ -61,6 +61,34 @@ class Matching(unittest.TestCase):
         self.assertFalse(crossbuild.identical_code(before, row("0x9", bytes_="call+0x40", shape="s", strings=("y",))))
         self.assertFalse(crossbuild.identical_code(before, row("0x9", bytes_="other", shape="t", strings=("x",))))
 
+    def test_truncated_fingerprint_prefix_never_counts_as_identical_code(self):
+        source = row("0x1", bytes_="same-prefix", shape="same-prefix", instructions=20001)
+        destination = row("0x9", bytes_="same-prefix", shape="same-prefix", instructions=20001)
+        self.assertFalse(crossbuild.identical_code(source, destination))
+        self.assertEqual(crossbuild.match({"0x1": source}, {"0x9": destination}), {})
+        exact_limit = row("0x1", bytes_="same-prefix", shape="same-prefix", instructions=20000)
+        self.assertTrue(crossbuild.identical_code(exact_limit, exact_limit))
+
+    def test_partial_anchor_match_is_reported_as_incomplete(self):
+        with workdir("cross-partial") as folder:
+            folder = Path(folder)
+            old = row("0x1", bytes_="a", shape="a", instructions=20001, strings=("anchor",))
+            new = row("0x9", bytes_="b", shape="b", instructions=20001, strings=("anchor",))
+            for name, item in (("source", old), ("destination", new)):
+                (folder / (name + ".jsonl")).write_text(json.dumps(item) + "\n", encoding="utf-8")
+            targets = {name: {"name": name, "sha256": digest * 64, "key": name}
+                       for name, digest in (("source", "a"), ("destination", "b"))}
+            store = {"revision": 0, "edits": [], "reverted": []}
+            record = {"target": "destination", "options": {"against": "source"}}
+            with patch("rusticre.crossbuild.targets.resolve", side_effect=lambda settings, name: targets[name]), \
+                 patch("rusticre.crossbuild.fingerprints", side_effect=lambda settings, name, view="": folder / (name + ".jsonl")), \
+                 patch("rusticre.workcopy.load_store", return_value=store):
+                result = crossbuild.run({}, record, folder / "output")
+            result_row = json.loads((folder / "output" / "diff.jsonl").read_text().splitlines()[0])
+            self.assertEqual((result_row["method"], result_row["status"]), ("anchors", "incomplete"))
+            self.assertFalse(result_row["fingerprint_complete"])
+            self.assertEqual(result["incomplete"], 1)
+
     def test_a_changed_function_keeps_its_string_head_and_a_removed_one_takes_no_place(self):
         main_a = row("0x100", bytes_="main", shape="main", callees=("0x1", "0x2"), size=200, instructions=60)
         main_b = row("0x900", bytes_="main", shape="main", callees=("0x9",), size=200, instructions=60)

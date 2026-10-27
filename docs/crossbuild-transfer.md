@@ -1,5 +1,10 @@
 # Cross-build transfer and hook candidates
 
+Fingerprinting inspects up to 20,000 instructions per function. A row with a
+longer body carries `fingerprint_complete: false`: its prefix cannot establish
+identical code or an exact/shape match. A pair found by other evidence reports
+`status: "incomplete"` rather than claiming the full bodies changed or match.
+
 `ghidra_query` action `diff` takes `options.against` as the source target and the
 requested target as the destination. Both projects must already be analysed. The
 JSONL diff records the match method and confidence. A match is a hypothesis: even

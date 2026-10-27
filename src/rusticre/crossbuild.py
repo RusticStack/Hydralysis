@@ -34,6 +34,13 @@ from rusticre.paths import root_path
 
 CONFIDENCE = {"exact": 1.0, "shape": 0.9, "anchors": 0.8, "callees": 0.8, "strings": 0.75, "callgraph": 0.7, "callers": 0.6}
 _DEFAULT_NAME = ("FUN_", "LAB_", "thunk_FUN_", "SUB_")
+# RusticQuery stops after seeing instruction 20,001; only the first 20,000
+# are hashed. A matching prefix does not establish full-body equivalence.
+FINGERPRINT_INSTRUCTION_LIMIT = 20000
+
+
+def fingerprint_complete(row: dict) -> bool:
+    return row["instructions"] <= FINGERPRINT_INSTRUCTION_LIMIT
 
 
 def fingerprint_code() -> str:
@@ -101,6 +108,8 @@ def identical_code(a: dict, b: dict) -> bool:
     """The same code, wherever it sits: equal bytes, or the same instruction shape (addresses
     masked) with the same size, strings, imports and constants. A call displacement or a
     RIP-relative offset that only moved with the layout is not a change."""
+    if not fingerprint_complete(a) or not fingerprint_complete(b):
+        return False
     if a["bytes"] == b["bytes"]:
         return True
     return (a["shape"] == b["shape"] and a["size"] == b["size"] and a["strings"] == b["strings"]
@@ -135,12 +144,12 @@ def match(source: dict[str, dict], destination: dict[str, dict]) -> dict[str, tu
 
     # Tiny functions (a ret, a jump, a refcount release) collide across a whole program: identical
     # bytes alone are trusted only for bodies large enough to be distinctive.
-    phase("exact", lambda row: row["bytes"] if row["size"] >= 24 else None)
-    phase("exact", lambda row: (row["bytes"], tuple(row["strings"]), tuple(row["imports"])) if row["size"] >= 8 and (row["strings"] or row["imports"]) else None)
-    phase("shape", lambda row: (row["shape"], row["size"]) if row["instructions"] >= 6 else None)
+    phase("exact", lambda row: row["bytes"] if row["size"] >= 24 and fingerprint_complete(row) else None)
+    phase("exact", lambda row: (row["bytes"], tuple(row["strings"]), tuple(row["imports"])) if row["size"] >= 8 and fingerprint_complete(row) and (row["strings"] or row["imports"]) else None)
+    phase("shape", lambda row: (row["shape"], row["size"]) if row["instructions"] >= 6 and fingerprint_complete(row) else None)
     phase("anchors", lambda row: (tuple(row["strings"]), tuple(row["imports"])) if row["strings"] or len(row["imports"]) >= 2 else None, _similar)
     phase("anchors", lambda row: (tuple(row["constants"]), row["instructions"] // 4) if len(row["constants"]) >= 2 else None, _similar)
-    phase("shape", lambda row: row["shape"] if row["instructions"] >= 12 else None, _similar)
+    phase("shape", lambda row: row["shape"] if row["instructions"] >= 12 and fingerprint_complete(row) else None, _similar)
     phase("strings", _string_prefixes, lambda a, b: _similar(a, b, 0.9))
     # Call graph: the k-th callee of a matched pair, when both are unmatched and alike.
     for _ in range(8):
@@ -240,25 +249,28 @@ def run(settings: dict, record: dict, output: Path) -> dict:
         for rva, row in source.items():
             if rva in pairs:
                 other, method = pairs[rva]
+                complete = fingerprint_complete(row) and fingerprint_complete(destination[other])
                 same = identical_code(row, destination[other])
-                status = ("same" if rva == other else "moved") if same else "changed"
+                status = ("same" if rva == other else "moved") if same else "changed" if complete else "incomplete"
                 counts[status] += 1
                 counts["by_" + method] += 1
                 report.write(json.dumps({"source": rva, "destination": other, "status": status, "method": method,
                                          "confidence": confidence(method, row), "name": row["name"],
-                                         "destination_name": destination[other]["name"]}) + "\n")
+                                         "destination_name": destination[other]["name"], "fingerprint_complete": complete}) + "\n")
                 if _named(row) and not _named(destination[other]):
                     names.append({"kind": "function", "address": "rva:" + other, "name": row["name"].replace("::", "_"),
                                   "comment": "REVIEW candidate from %s sha256:%s rva:%s (%s, confidence %.2f); verify correspondence"
                                              % (source_name, source_target["sha256"], rva, method, confidence(method, row))})
             else:
                 counts["gone"] += 1
-                report.write(json.dumps({"source": rva, "status": "gone", "name": row["name"]}) + "\n")
+                report.write(json.dumps({"source": rva, "status": "gone", "name": row["name"],
+                                         "fingerprint_complete": fingerprint_complete(row)}) + "\n")
         matched = {other for other, _ in pairs.values()}
         for rva, row in destination.items():
             if rva not in matched:
                 counts["new"] += 1
-                report.write(json.dumps({"destination": rva, "status": "new", "name": row["name"]}) + "\n")
+                report.write(json.dumps({"destination": rva, "status": "new", "name": row["name"],
+                                         "fingerprint_complete": fingerprint_complete(row)}) + "\n")
     with (output / "names.jsonl").open("w", encoding="utf-8", newline="\n") as handle:
         for item in names:
             handle.write(json.dumps(item) + "\n")
