@@ -170,10 +170,11 @@ class TransportTests(unittest.TestCase):
         return worker, output
 
     @staticmethod
-    def engine_call(release, entered):
+    def engine_call(release, entered=None):
         def fake(name, arguments):
             if name in ENGINE_TOOLS:
-                entered.append(name)
+                if entered is not None:
+                    entered.append(name)
                 if not release.wait(10):
                     raise RuntimeError("test did not release engine call")
             return "%s:%s" % (name, (arguments or {}).get("tag"))
@@ -202,12 +203,11 @@ class TransportTests(unittest.TestCase):
 
     def test_saturated_engine_lane_answers_busy_with_retry_hint_and_fast_lane_stays_open(self):
         release = threading.Event()
-        entered = []
         total = MAX_OUTSTANDING + 2
         messages = [request("q%d" % i, "tools/call",
                             {"name": "ghidra_query", "arguments": {"tag": "q%d" % i}}) for i in range(total)]
         messages.append(request("fp", "tools/call", {"name": "fingerprint", "arguments": {"tag": "fp"}}))
-        worker, output = self.serve_in_thread(messages, self.engine_call(release, entered))
+        worker, output = self.serve_in_thread(messages, self.engine_call(release))
         try:
             self.assertTrue(output.wait_for({"fp", "q%d" % MAX_OUTSTANDING, "q%d" % (MAX_OUTSTANDING + 1)}, 3))
             for ident in ("q%d" % MAX_OUTSTANDING, "q%d" % (MAX_OUTSTANDING + 1)):
@@ -217,6 +217,9 @@ class TransportTests(unittest.TestCase):
                 self.assertIn("Server busy", text)
                 self.assertIn("Retry", text)
                 self.assertIn("retryAfterMs=%d" % RETRY_AFTER_MS, text)
+                self.assertEqual(reply["result"]["structuredContent"],
+                                 {"error": "busy", "lane": "engine", "outstanding": MAX_OUTSTANDING,
+                                  "retryAfterMs": RETRY_AFTER_MS})
             self.assertEqual(output.text("fp"), "fingerprint:fp")
         finally:
             release.set()
@@ -227,7 +230,6 @@ class TransportTests(unittest.TestCase):
 
     def test_fast_lane_saturation_does_not_block_engine_calls(self):
         release = threading.Event()
-        entered = []
 
         def fake(name, arguments):
             if name not in ENGINE_TOOLS:
@@ -243,6 +245,7 @@ class TransportTests(unittest.TestCase):
             self.assertTrue(output.wait_for({"job", "f%d" % MAX_OUTSTANDING}, 3))
             self.assertEqual(output.text("job"), "job:job")
             self.assertIn("Server busy", output.text("f%d" % MAX_OUTSTANDING))
+            self.assertEqual(output.reply("f%d" % MAX_OUTSTANDING)["result"]["structuredContent"]["lane"], "fast")
         finally:
             release.set()
             worker.join(10)
@@ -279,11 +282,10 @@ class TransportTests(unittest.TestCase):
 
     def test_shutdown_at_eof_waits_for_accepted_calls_and_answers_them_all(self):
         release = threading.Event()
-        entered = []
         messages = [request("q%d" % i, "tools/call", {"name": "runtime", "arguments": {"tag": "q%d" % i}})
                     for i in range(TOOL_WORKERS)]
         messages.append(request("fp", "tools/call", {"name": "fingerprint", "arguments": {"tag": "fp"}}))
-        worker, output = self.serve_in_thread(messages, self.engine_call(release, entered))
+        worker, output = self.serve_in_thread(messages, self.engine_call(release))
         try:
             self.assertTrue(output.wait_for({"fp"}, 3))
             worker.join(0.3)

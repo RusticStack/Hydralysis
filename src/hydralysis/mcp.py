@@ -1,6 +1,13 @@
 """Stdio MCP server. Newline JSON by default; legacy framed input is echoed.
 
 The tool list is the dispatch table in api.py. Nothing else is registered.
+
+Concurrency: tools run on two lanes, `fast` (offline PE tools and the evidence store) and `engine` (every tool
+that can wait on the Hydra daemon), each with FAST_WORKERS / TOOL_WORKERS threads. MAX_OUTSTANDING is a limit PER LANE:
+at most 8 accepted and unanswered calls on each, so the total can reach 16. A call that finds its lane full is
+answered at once with a `Server busy` tool error that carries the retry hint twice: in the text (for an agent
+reading prose) and as `structuredContent.retryAfterMs` (for a client that parses). Clients that predate
+structuredContent (MCP 2025-06-18) ignore the extra field and still have the text.
 """
 
 from __future__ import annotations
@@ -142,7 +149,9 @@ class Server:
                             "Server busy: %d %s tool calls are outstanding. "
                             "Retry this call in about %d ms (retryAfterMs=%d), or after a result arrives."
                             % (MAX_OUTSTANDING, lane, RETRY_AFTER_MS, RETRY_AFTER_MS),
-                            error=True), framed)
+                            error=True,
+                            structured={"error": "busy", "lane": lane, "outstanding": MAX_OUTSTANDING,
+                                        "retryAfterMs": RETRY_AFTER_MS}), framed)
                 else:
                     dispatch(message, framed)
 
@@ -155,7 +164,7 @@ def _err(msg_id, code: int, message: str) -> dict:
     return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}}
 
 
-def _tool_result(msg_id, text: str, error: bool = False) -> dict:
+def _tool_result(msg_id, text: str, error: bool = False, structured: dict | None = None) -> dict:
     encoded = str(text).encode("utf-8")
     if len(encoded) > MAX_OUTPUT_BYTES:
         marker = ("\n[OUTPUT TRUNCATED: original %d UTF-8 bytes; only the head and tail "
@@ -166,7 +175,10 @@ def _tool_result(msg_id, text: str, error: bool = False) -> dict:
         tail = encoded[-(budget - budget // 2):].decode("utf-8", errors="ignore")
         text = head + marker.decode("utf-8") + tail
         error = True
-    return _ok(msg_id, {"content": [{"type": "text", "text": str(text)}], "isError": error})
+    result = {"content": [{"type": "text", "text": str(text)}], "isError": error}
+    if structured is not None:
+        result["structuredContent"] = structured
+    return _ok(msg_id, result)
 
 
 class _ParseError(ValueError):
