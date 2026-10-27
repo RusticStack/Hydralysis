@@ -11,7 +11,7 @@ merge, an engine release) with evidence instead of a hunch.
   timing       size-bucketed decompile timing table of a capture
   treehash     sha256 of every file of a tree (proves a source project was never written)
   project-copy copy a project and prove the copy is byte-identical
-  prepare      import + analyse executables through RusticRE's own preparation path
+  prepare      import + analyse executables through Hydralysis's own preparation path
 
 Everything a capture holds is derived from the analysed binary. It stays local: never commit a
 capture, never attach one to an issue. The normaliser and the diff themselves are pure and are
@@ -543,7 +543,7 @@ def _log(message: str) -> None:
 
 def _hydra_modules():
     sys.path.insert(0, str(REPO / "src"))
-    from rusticre import hydra, query  # noqa: PLC0415
+    from hydralysis import hydra, query  # noqa: PLC0415
     return hydra, query
 
 
@@ -627,7 +627,7 @@ def capture_hydra(args) -> Path:
                       "functions", "analyzed", "language", "compiler", "imageBase", "format", "md5", "mode", "cachedUpgrade")},
                   "project": gpr, "code": {"golden.py": sha256_file(Path(__file__)),
                                            "GoldenExport.java": sha256_file(HERE / "golden" / "GoldenExport.java"),
-                                           "RusticQuery.java": sha256_file(REPO / "src" / "rusticre" / "scripts" / "RusticQuery.java")},
+                                           "RusticQuery.java": sha256_file(REPO / "src" / "hydralysis" / "scripts" / "RusticQuery.java")},
                   "upgrade_cache": bool(args.upgrade_cache), "sample": None}
         entries_file = None
         selected = None
@@ -831,15 +831,15 @@ def capture_set(args) -> int:
 
 
 def prepare(args) -> int:
-    """Import and analyse executables through RusticRE's preparation worker; write a set file."""
+    """Import and analyse executables through Hydralysis's preparation worker; write a set file."""
     hydra, _query = _hydra_modules()
-    from rusticre import preparation  # noqa: PLC0415
+    from hydralysis import preparation  # noqa: PLC0415
     engine_dir = Path(args.engine).resolve()
     state_root = _state_root(args, "prepare")
     settings = _settings(args, engine_dir, state_root)
-    os.environ["RUSTICRE_ROOT"] = str(state_root)
+    os.environ["HYDRALYSIS_ROOT"] = str(state_root)
     os.environ["PYTHONPATH"] = str(REPO / "src") + os.pathsep + os.environ.get("PYTHONPATH", "")
-    from rusticre import query  # noqa: PLC0415
+    from hydralysis import query  # noqa: PLC0415
     query._keys.clear()
     jobs = {}
     for spec in args.exe:
@@ -946,7 +946,7 @@ def main(argv=None) -> int:
     copy.add_argument("dst")
     copy.add_argument("--out")
 
-    prep = commands.add_parser("prepare", help="import+analyse executables with RusticRE's preparation; write a set file")
+    prep = commands.add_parser("prepare", help="import+analyse executables with Hydralysis's preparation; write a set file")
     prep.add_argument("--engine", required=True)
     prep.add_argument("--exe", action="append", required=True, help="NAME=PATH, repeatable")
     prep.add_argument("--dest", required=True, help="directory that receives a stable copy of each prepared project")

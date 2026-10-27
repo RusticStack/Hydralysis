@@ -3,13 +3,17 @@
 `ghidra_query action=type_edit` with `options.kind=import_types` applies a whole type
 corpus to a target as one cited overlay: structures, unions, enums, typedefs and function
 types, plus `this` types and names for functions. It runs as a durable job (`job status
-<id>`), in the target's working copy; the canonical project is never written. Reverting the
-overlay (`kind=revert`) removes every type and binding it made.
+<id>`), in the target's working copy; the canonical project is never written.
+`expect_revision` is required, as on every edit: the `view_revision` that `ghidra_query status`
+reports for the view (shared or named). A type import touches everything, so any edit made since
+your revision is a conflict, never a rebase. Reverting the overlay (`kind=revert`, also with `expect_revision`) removes every
+type and binding it made.
 
 ```text
 hydralysis ghidra-query --target game --action type_edit --options-file import.json
 import.json: {"kind": "import_types", "corpus": "F:/work/types.jsonl",
-              "category": "/reflection", "source": "reflection dump of build 1.2.3 (sha256 ...)"}
+              "category": "/reflection", "source": "reflection dump of build 1.2.3 (sha256 ...)",
+              "expect_revision": 7}
 ```
 
 The corpus is copied once under its SHA-256 (`<root>/corpora/`), and the overlay records only

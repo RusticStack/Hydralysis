@@ -6,7 +6,7 @@ output: a Hydra Engine release, an upstream Ghidra merge (the decompiler's C++ a
 system change there), a RusticQuery change. The question it answers is not "does it build" but
 "did the C that agents read change, and did any function stop decompiling".
 
-Stock Ghidra is **not** a dependency of RusticRE or Hydra. The harness can also run a stock
+Stock Ghidra is **not** a dependency of Hydralysis or Hydra. The harness can also run a stock
 Ghidra install, only so that a baseline from the old engine can be compared with the new one.
 
 ## What it records
@@ -127,7 +127,7 @@ why.
 1. **Public fixtures, anywhere.** The MSVC fixtures (`tests/fixtures`, see
    [verification-fixtures.md](verification-fixtures.md)) are built reproducibly (`/Brepro`) from
    source in this repository, so their captures contain nothing proprietary. `golden.py prepare`
-   imports and analyses them through RusticRE's own preparation path and writes a set file;
+   imports and analyses them through Hydralysis's own preparation path and writes a set file;
    `capture-set` captures every program of a set; gate with `--profile fixtures`. Needs an
    engine and MSVC, so it is run by whoever has them (a self-hosted runner, a release
    checklist), not by the unit-test CI.

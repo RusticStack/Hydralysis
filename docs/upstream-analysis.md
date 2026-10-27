@@ -110,7 +110,10 @@ trimming also marks the affected components incomplete.
 
 ## Cited type overlays
 
-`type_edit` requires a nonempty `options.source`. Edits are user assertions,
+`type_edit` requires a nonempty `options.source` on every edit. Every edit and
+every revert, on every view (the shared one included), also requires
+`options.expect_revision`: the `view_revision` that `ghidra_query status`
+reports. Edits are user assertions,
 not silently promoted to binary ground truth. Accepted kinds are:
 
 - `struct`: explicit category `path`, byte `size` and at most 64 fields with
@@ -118,7 +121,8 @@ not silently promoted to binary ground truth. Accepted kinds are:
 - `signature`: C `prototype` for the selected function VA.
 - `variable`: recovered `variable` name and new `type`, with optional `name`.
 - `apply`: explicit data `type` at a VA, refusing conflicting code/data.
-- `rename` / `comment`: a cited name or comment for the selected address.
+- `rename` / `label` / `comment`: a cited function name, a name for a mapped
+  address (data included), or a comment, for the selected address.
 - `function_create`, `function_body`, `function_delete`: explicit definition
   corrections with matching exact entry bytes. Create/body edits require at
   most 64 inclusive `ranges` of numeric VAs and optionally a name. The entry
@@ -134,6 +138,13 @@ not silently promoted to binary ground truth. Accepted kinds are:
   SHA-256, byte size and original path, so replay never rereads a changed or
   missing file. Nested batches are refused. Java wraps all children in one
   outer transaction and returns an applied count, without dumping every edit.
+- `import_types`: a whole type corpus (JSONL) applied as one cited, revertible
+  overlay job; see [type-corpus.md](type-corpus.md).
+- `import_archive`: types from a `.gdt` type archive, whole or selected by exact
+  `paths`, as one cited overlay job; see [type-archives.md](type-archives.md).
+- `revert`: `ids` of overlays to remove in one step; the working copy is rebuilt
+  from the master. It adds no assertion, so it takes no new `source`, but it
+  still needs `expect_revision`.
 
 An edit executes within a transaction in the worker's memory. Its decompiler
 cache is disposed after the change. Only an `ok` backend response permits the

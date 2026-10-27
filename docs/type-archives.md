@@ -3,14 +3,15 @@
 `ghidra_query` action `type_edit` accepts an archive as a durable bulk job:
 
 ```json
-{"kind":"import_archive","archive":"F:/work/types.gdt","paths":["/Example/MyType"],"source":"link to the type archive and how it was produced"}
+{"kind":"import_archive","archive":"F:/work/types.gdt","paths":["/Example/MyType"],"source":"link to the type archive and how it was produced","expect_revision":7}
 ```
 
 Pass this object as the query `options`. Poll the returned overlay job, and use
 its `overlay_id` to revert the imported types as one edit. The selected target
 and optional named view determine which working copy receives the types; the
-canonical analysed project remains unchanged. Named views require the expected
-revision as for other edits.
+canonical analysed project remains unchanged. `expect_revision` is required, on
+the shared view as well as on named views (read it with `ghidra_query status`, field
+`view_revision`); leaving it out is an error that names the current revision.
 
 Hydralysis copies the archive into its own data root, records the full SHA-256 and
 size in the cited overlay, and checks the stored bytes on each replay. The
