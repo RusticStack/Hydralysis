@@ -635,9 +635,11 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
         _start_saver(settings, target)
         if extra:
             # What each record changed and what was there before, as the engine saw it (store v3 `effects`).
+            # Only the added records': a replay of up to MAX_OVERLAYS pending ones must not inflate the response.
+            added = {item["id"] for item in extra}
             return {**state, "effects": {item["id"]: [{"before": None, "after": None, **effect} for effect in item["effects"]]
                                          if item.get("effects") is not None else None
-                                         for item in (applied or {}).get("effects") or []}}
+                                         for item in (applied or {}).get("effects") or [] if item.get("id") in added}}
         return state
     finally:
         # Disconnecting keeps the committed changes in the daemon (shared mode);

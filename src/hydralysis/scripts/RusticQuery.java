@@ -2663,10 +2663,14 @@ public class RusticQuery extends GhidraScript {
         if (action.equals("type_edit")) {
             // Run contained, this is a dry run: the engine rolls the edit back afterwards.
             currentEffects = new JsonArray();
-            typeEdit(text(req, "address"), options(req), deadline);
+            JsonArray dryEffects;
+            try {
+                typeEdit(text(req, "address"), options(req), deadline);
+                dryEffects = currentEffects;
+            } finally { currentEffects = null; }
             JsonObject row = new JsonObject();
             row.addProperty("id", text(req, "id"));
-            row.add("effects", currentEffects);
+            row.add("effects", dryEffects);
             JsonArray reported = new JsonArray();
             reported.add(row);
             out.add("effects", reported);

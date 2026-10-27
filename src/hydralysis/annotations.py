@@ -74,6 +74,8 @@ def archived_records(settings: dict, selected: dict, store: dict) -> list[dict]:
     """
     found: list[dict] = []
     for entry in store.get("archived") or []:
+        if not isinstance(entry, dict) or not isinstance(entry.get("cid"), str):
+            raise ValueError("archive_unreadable: an archived entry has no commit id")
         path = _archive_path(settings, selected, entry["cid"])
         try:
             record = durable.read_sealed(path, default=None, max_bytes=workcopy.MAX_HISTORY_BYTES + 4096)
