@@ -141,7 +141,9 @@ class Client:
 
     def query(self, target: str, action: str, address: str = "", **options) -> dict:
         """ghidra_query; limit, cursor, contains and timeout_s are top level, the rest are options."""
-        top = {key: options.pop(key) for key in ("limit", "cursor", "contains", "timeout_s") if key in options}
+        # An export's limit and filters are its own options (the record count, not a page size).
+        lifted = ("timeout_s",) if action == "export" else ("limit", "cursor", "contains", "timeout_s")
+        top = {key: options.pop(key) for key in lifted if key in options}
         return self.call("ghidra_query", target=target, action=action, address=address,
                          options=options or None, **top)
 

@@ -119,7 +119,7 @@ The CLI retains `sections`, `exports`, `ghidra-scripts` and `ghidra-jobs` aliase
 
 ## Evidence and limits
 
-[Original usage research](docs/research.md), [upstream setup](docs/upstream-setup.md), [analysis research](docs/upstream-analysis.md), and the [KotOR/SWTOR PR review](docs/open-pr-insights.md) explain why these operations earned a place. [Verification](docs/verification-complete-workflow.md) records the 0.3.0 results; it predates the engine change.
+[Original usage research](docs/research.md), [upstream setup](docs/upstream-setup.md), [analysis research](docs/upstream-analysis.md), and the [KotOR/SWTOR PR review](docs/open-pr-insights.md) explain why these operations earned a place. [Verification on fixtures](docs/verification-fixtures.md) records the current results; [the 0.3.0 report](docs/verification-complete-workflow.md) predates the engine change.
 
 RusticRE covers native PE inspection and saved analysis. It is not a replacement for every upstream Android/browser/firmware feature. Runtime stepping/watchpoints, graphics debugging, automatic unpacking and universal type recovery remain outside the implemented contract. [KotOR](docs/capabilities-kotor.md) and [Night City Together](docs/capabilities-nct.md) still require their own engine/protocol/resource/framework implementations; those do not become game-specific server tools. No finite test corpus establishes that a remaster or multiplayer framework can be completed automatically.
 
@@ -131,4 +131,4 @@ set RUSTICRE_TEST_ROOT=F:/dev-cache/rusticre/test-work
 git diff --check
 ```
 
-Unit tests run without launching the engine or games; they work under `RUSTICRE_TEST_ROOT` (default `test-work/`). CI runs them on Windows. `tests/test_engine_integration.py` runs the real engine when `RUSTICRE_INTEGRATION_ENGINE` and `RUSTICRE_INTEGRATION_CLIENT` name a Hydra install and its `ghidra_session.py` (`RUSTICRE_INTEGRATION_JAVA` a JDK). It uses its own data root and daemon. There is no configured formatter or lint command. Only `pefile` and `capstone` are mandatory Python dependencies; engines are discovered or explicitly installed separately.
+Unit tests run without launching the engine or games; they work under `RUSTICRE_TEST_ROOT` (default `test-work/`). CI runs them on Windows. `tests/test_engine_integration.py` runs the real engine when `RUSTICRE_INTEGRATION_ENGINE` and `RUSTICRE_INTEGRATION_CLIENT` name a Hydra install and its `ghidra_session.py` (`RUSTICRE_INTEGRATION_JAVA` a JDK). It uses its own data root and daemon. [Verification on fixtures](docs/verification-fixtures.md) builds small x64 and x86 programs with known answers and checks each capability against them (`tests/fixtures/verify_fixtures.py`). There is no configured formatter or lint command. Only `pefile` and `capstone` are mandatory Python dependencies; engines are discovered or explicitly installed separately.
