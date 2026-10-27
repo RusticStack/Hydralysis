@@ -423,6 +423,12 @@ public class RusticQuery extends GhidraScript {
         int fieldKeys = 0;
         final Map<String, String> kinds = new HashMap<>();
         final Map<String, Integer> costs = new HashMap<>();
+        // For a call bound to a callee operation: which arguments the binding carries (from>to).
+        final Map<String, Set<Integer>> bindings = new HashMap<>();
+        // The consumer's input index of each def-use edge (from>to).
+        final Map<String, Integer> inputs = new HashMap<>();
+        // The callee operation's input indices a binding feeds (from>to).
+        final Map<String, Set<Integer>> consumers = new HashMap<>();
         void memoryEdge(String from, String to, String kind, long delta) {
             if (edges.size() >= 24000) { truncated = true; return; }
             backward.computeIfAbsent(to, key -> new LinkedHashSet<>()).add(from);
@@ -443,6 +449,9 @@ public class RusticQuery extends GhidraScript {
             JsonObject row = new JsonObject();
             row.addProperty("from", from); row.addProperty("to", to); row.addProperty("kind", kind);
             if (input >= 0) row.addProperty("input", input);
+            if (kind.equals("argument_binding") && input >= 0) bindings.computeIfAbsent(from + ">" + to, key -> new TreeSet<>()).add(input);
+            if (!kind.equals("def_use")) kinds.putIfAbsent(from + ">" + to, kind);
+            else if (input >= 0) inputs.putIfAbsent(from + ">" + to, input);
             edges.add(row);
         }
         void unknown(String id, String reason) {
@@ -537,7 +546,10 @@ public class RusticQuery extends GhidraScript {
                     if (callerInput >= operation.getNumInputs()) continue;
                     PcodeOp definition = operation.getInput(callerInput).getDef();
                     String from = definition == null ? entry.getKey() : opId(node.function, definition);
-                    if (model.operations.containsKey(from)) model.edge(from, calleeId, "argument_binding", callerInput - 1);
+                    if (model.operations.containsKey(from)) {
+                        model.edge(from, calleeId, "argument_binding", callerInput - 1);
+                        model.consumers.computeIfAbsent(from + ">" + calleeId, key -> new TreeSet<>()).add(i);
+                    }
                 }
             }
         }
@@ -581,6 +593,10 @@ public class RusticQuery extends GhidraScript {
     private final Map<Address, Integer> returnsParameter = new HashMap<>();
 
     private String identity(Function function, Varnode node, Map<String, String> aliases) {
+        return identity(function, node, aliases, 0);
+    }
+
+    private String identity(Function function, Varnode node, Map<String, String> aliases, int depth) {
         // A copy, a cast, or the result of a call that returns its own parameter is the same pointer.
         for (int guard = 0; guard < 8; guard++) {
             PcodeOp definition = node.getDef();
@@ -591,6 +607,13 @@ public class RusticQuery extends GhidraScript {
                 if (slot != null && slot + 1 < definition.getNumInputs()) { node = definition.getInput(slot + 1); continue; }
             }
             break;
+        }
+        // A pointer loaded from a field is named by that field, so two functions that load
+        // holder->config from the same holder see the same object (bounded nesting).
+        PcodeOp loaded = node.getDef();
+        if (loaded != null && loaded.getOpcode() == PcodeOp.LOAD && loaded.getNumInputs() >= 2 && depth < 3) {
+            String inner = fieldKey(function, loaded.getInput(1), aliases, depth + 1);
+            if (inner != null) return "*(" + inner + ")";
         }
         // Every address of one stack local is one identity, whichever PTRSUB formed it.
         Long local = stackOffset(node);
@@ -606,6 +629,10 @@ public class RusticQuery extends GhidraScript {
 
     // base+offset of an address expression, or null.
     private String fieldKey(Function function, Varnode address, Map<String, String> aliases) {
+        return fieldKey(function, address, aliases, 0);
+    }
+
+    private String fieldKey(Function function, Varnode address, Map<String, String> aliases, int depth) {
         long offset = 0;
         Varnode base = address;
         for (int guard = 0; guard < 8; guard++) {
@@ -622,7 +649,7 @@ public class RusticQuery extends GhidraScript {
             else break;
         }
         if (base.isConstant() || isStackBase(base)) return null;
-        return identity(function, base, aliases) + "+0x" + Long.toHexString(offset);
+        return identity(function, base, aliases, depth) + "+0x" + Long.toHexString(offset);
     }
 
     // Within one function, a write at a later instruction than its use is only reached
@@ -659,15 +686,29 @@ public class RusticQuery extends GhidraScript {
         }
         // A callee parameter is the caller's argument, for field identity across a call.
         Map<String, String> aliases = new HashMap<>();
-        for (FlowOperation node : model.operations.values()) {
-            PcodeOpAST operation = node.operation;
-            if (operation.getOpcode() != PcodeOp.CALL) continue;
-            Function callee = currentProgram.getFunctionManager().getFunctionAt(operation.getInput(0).getAddress());
-            if (callee == null || !functions.containsKey(callee.getEntryPoint()) || callee.equals(node.function)) continue;
-            for (int i = 1; i < operation.getNumInputs() && i < 16; i++) {
-                String parameter = "param:" + callee.getEntryPoint() + ":" + (i - 1);
-                if (!aliases.containsKey(parameter)) aliases.put(parameter, identity(node.function, operation.getInput(i), aliases));
+        // An argument may itself be named through another call's parameter, so resolve to a
+        // fixpoint: the order the calls are visited in must not decide the answer. The first
+        // call site seen binds a parameter; another caller's argument is not merged into it.
+        for (int pass = 0; pass < 4; pass++) {
+            boolean changed = false;
+            Set<String> bound = new HashSet<>();
+            for (FlowOperation node : model.operations.values()) {
+                PcodeOpAST operation = node.operation;
+                if (operation.getOpcode() != PcodeOp.CALL) continue;
+                Function callee = currentProgram.getFunctionManager().getFunctionAt(operation.getInput(0).getAddress());
+                if (callee == null || !functions.containsKey(callee.getEntryPoint()) || callee.equals(node.function)) continue;
+                for (int i = 1; i < operation.getNumInputs() && i < 16; i++) {
+                    String parameter = "param:" + callee.getEntryPoint() + ":" + (i - 1);
+                    if (!bound.add(parameter)) continue;
+                    Map<String, String> without = new HashMap<>(aliases);
+                    without.remove(parameter);
+                    String argument = identity(node.function, operation.getInput(i), without);
+                    if (argument.equals(parameter) || argument.equals(aliases.get(parameter))) continue;
+                    aliases.put(parameter, argument);
+                    changed = true;
+                }
             }
+            if (!changed) break;
         }
         record Slot(String id, Function function, long offset, int size) {}
         Map<Address, List<Slot>> writes = new HashMap<>();
@@ -734,9 +775,25 @@ public class RusticQuery extends GhidraScript {
                     model.memoryEdge(write.id(), load.id(), "stack_store" + order(model, write.id(), load.id()), write.offset() - load.offset());
             }
         }
+        java.util.regex.Pattern stackField = java.util.regex.Pattern.compile("stackaddr:([0-9a-fA-F]+):([0-9a-f]+)\\+0x([0-9a-f]+)");
         for (Map.Entry<String, List<String>> loads : fieldLoads.entrySet()) {
             for (String store : fieldStores.getOrDefault(loads.getKey(), List.of()))
                 for (String load : loads.getValue()) if (!store.equals(load)) model.memoryEdge(store, load, "field_store" + order(model, store, load), 0);
+            // A field whose base is a caller's stack local (passed down by address) is that exact
+            // slot: link the caller's writes to the slot, not every write near the pointer.
+            java.util.regex.Matcher slot = stackField.matcher(loads.getKey());
+            if (!slot.matches()) continue;
+            long at = Long.parseUnsignedLong(slot.group(2), 16) + Long.parseUnsignedLong(slot.group(3), 16);
+            for (Map.Entry<Address, List<Slot>> owner : writes.entrySet()) {
+                if (!owner.getKey().toString().equalsIgnoreCase(slot.group(1))) continue;
+                for (Slot write : owner.getValue())
+                    for (String load : loads.getValue()) {
+                        Varnode loadedValue = model.operations.get(load).operation.getOutput();
+                        int size = loadedValue == null ? 1 : loadedValue.getSize();
+                        if (write.offset() < at + size && at < write.offset() + write.size())
+                            model.memoryEdge(write.id(), load, "stack_field", write.offset() - at);
+                    }
+            }
         }
         // A callee that stores through a pointer parameter writes the caller's stack local whose
         // address was the argument: link the store to the caller's INDIRECT on that slot.
@@ -846,9 +903,23 @@ public class RusticQuery extends GhidraScript {
                 Set<String> next = links.getOrDefault(id, Set.of());
                 if (level >= depth) { if (!next.isEmpty()) { limited = true; stop(stops, model, id, "depth limit"); } continue; }
                 if (next.isEmpty() && backward) stop(stops, model, id, null);
+                // Backward across a call entered through an argument binding, only that argument's
+                // definition is the value's source; the call's other arguments are not.
+                Set<Integer> entered = null;
+                if (backward && model.operations.get(id).operation.getOpcode() == PcodeOp.CALL && parents.get(id) != null)
+                    entered = model.bindings.get(id + ">" + parents.get(id));
                 // A call that cannot write the slot passes its value through at no depth cost.
                 for (String item : next) {
                     if (selected.contains(item)) continue;
+                    if (entered != null) {
+                        // A def feeding the call's input k+1, or a binding into that input.
+                        Integer argument = model.inputs.get(item + ">" + id);
+                        Set<Integer> fed = model.consumers.getOrDefault(item + ">" + id, Set.of());
+                        boolean carries = argument != null && entered.contains(argument - 1);
+                        for (int input : fed) carries |= entered.contains(input - 1);
+                        boolean other = !model.kinds.containsKey(item + ">" + id) || fed.size() > 0;
+                        if (other && !carries) continue;
+                    }
                     boolean free = model.passThrough.contains(item) || model.passThrough.contains(id);
                     String key = backward ? item + ">" + id : id + ">" + item;
                     int step = free ? 0 : model.costs.getOrDefault(key, 1);
@@ -865,8 +936,14 @@ public class RusticQuery extends GhidraScript {
             for (String id : selected) {
                 PcodeOpAST operation = model.operations.get(id).operation;
                 int code = operation.getOpcode();
-                if (code == PcodeOp.PTRSUB || code == PcodeOp.INDIRECT || code == PcodeOp.CALL || code == PcodeOp.CALLIND) continue;
+                // A call is a value source only for the argument the trace came through: a
+                // constant argument binds from the call itself, so that input is the value.
+                Set<Integer> carried = Set.of();
+                if (code == PcodeOp.CALL && parents.get(id) != null)
+                    carried = model.bindings.getOrDefault(backward ? id + ">" + parents.get(id) : parents.get(id) + ">" + id, Set.of());
+                if (code == PcodeOp.PTRSUB || code == PcodeOp.INDIRECT || code == PcodeOp.CALLIND || (code == PcodeOp.CALL && carried.isEmpty())) continue;
                 for (int i = 0; i < operation.getNumInputs() && i < 16; i++) {
+                    if (code == PcodeOp.CALL && !carried.contains(i - 1)) continue;
                     Varnode input = operation.getInput(i);
                     // Structural operands are not values: a space id, a SUBPIECE byte offset, a
                     // PTRADD element size, or the offset of address arithmetic.
@@ -898,12 +975,22 @@ public class RusticQuery extends GhidraScript {
                     }
                     row.add("path_to_seed", path);
                     row.addProperty("after_use", path.toString().contains("(after_use)"));
+                    // value: the constant is what is read; address: it reaches the seed only as part
+                    // of an address (a base pointer's provenance or an offset), not as the value.
+                    boolean address = false;
+                    if (backward) for (String hop = id, next = parents.get(hop); next != null; hop = next, next = parents.get(hop)) {
+                        int consumer = model.operations.get(next).operation.getOpcode();
+                        Integer slot = model.inputs.get(hop + ">" + next);
+                        if ((consumer == PcodeOp.LOAD || consumer == PcodeOp.STORE) && slot != null && slot == 1) { address = true; break; }
+                    }
+                    row.addProperty("role", backward ? (address ? "address" : "value") : "unknown");
                     constants.add(row);
                 }
             }
             // Answers written before their use come first.
             List<JsonElement> ranked = new ArrayList<>(constants.asList());
-            ranked.sort(Comparator.comparing((JsonElement item) -> item.getAsJsonObject().get("after_use").getAsBoolean())
+            ranked.sort(Comparator.comparing((JsonElement item) -> "address".equals(text(item.getAsJsonObject(), "role")))
+                .thenComparing(item -> item.getAsJsonObject().get("after_use").getAsBoolean())
                 .thenComparing(item -> item.getAsJsonObject().getAsJsonArray("path_to_seed").size()));
             JsonArray sorted = new JsonArray();
             ranked.forEach(sorted::add);
@@ -950,11 +1037,16 @@ public class RusticQuery extends GhidraScript {
     }
 
     private boolean isAddressArithmetic(PcodeOpAST operation) {
-        Varnode output = operation.getOutput();
-        if (output == null) return false;
+        return isAddress(operation.getOutput(), 0);
+    }
+
+    // Used as a LOAD/STORE address, directly or through casts and copies.
+    private boolean isAddress(Varnode output, int depth) {
+        if (output == null || depth > 3) return false;
         for (var iterator = output.getDescendants(); iterator.hasNext(); ) {
             PcodeOp use = iterator.next();
             if ((use.getOpcode() == PcodeOp.LOAD || use.getOpcode() == PcodeOp.STORE) && use.getInput(1) == output) return true;
+            if ((use.getOpcode() == PcodeOp.CAST || use.getOpcode() == PcodeOp.COPY) && isAddress(use.getOutput(), depth + 1)) return true;
         }
         return false;
     }
