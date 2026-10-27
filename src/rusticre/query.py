@@ -132,7 +132,7 @@ class QueryRunner:
         if not 1 <= limit <= 200 or not 1 <= timeout_s <= 300:
             raise ValueError("limit must be 1..200; timeout_s must be 1..300")
         requires_address = action in ADDRESS_ACTIONS
-        requires_address |= action == "type_edit" and options.get("kind") not in ("struct", "batch", "revert", "import_types")
+        requires_address |= action == "type_edit" and options.get("kind") not in ("struct", "batch", "revert", "import_types", "import_archive")
         if requires_address and not address:
             raise ValueError("address is required (a VA such as 0x140001000, or rva:0x1000)")
         if action == "type" and not (address or options.get("path")):

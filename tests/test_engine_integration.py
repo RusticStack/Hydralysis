@@ -134,6 +134,36 @@ class EngineIntegration(unittest.TestCase):
         data = self.ask("data", address, options={"table": True})
         self.assertNotIn("integration_global", [item["name"] for item in data["labels"]])
 
+    def test_gdt_archive_import_and_revert(self):
+        from rusticre import overlayjobs
+        archive = Path(ENGINE) / "Ghidra/Features/Base/data/pcodetest/EmuTesting.gdt"
+        self.assertTrue(archive.is_file(), str(archive))
+        def submit(paths, revision):
+            job = self.ask("type_edit", options={"kind": "import_archive", "archive": str(archive),
+                                                "paths": paths, "source": "bundled EmuTesting.gdt",
+                                                "view": "archive-fixture", "expect_revision": revision})
+            deadline = time.monotonic() + 300
+            while job["state"] in overlayjobs.ACTIVE and time.monotonic() < deadline:
+                time.sleep(1)
+                job = overlayjobs.status(self.settings, job["id"])
+            return job
+        job = submit(["/u4"], 0)
+        self.assertEqual(job["state"], "done", job)
+        self.assertEqual(self.ask("type", options={"path": "/u4", "view": "archive-fixture"})["type"]["length"], 4)
+        self.assertEqual(job["result"]["import_report"]["records"], 1)
+        self.assertEqual(job["result"]["import_report"]["archive_types"], 1)
+        mismatch = submit(["/pointer"], 1)
+        self.assertEqual(mismatch["state"], "failed", mismatch)
+        self.assertIn("differs", mismatch.get("error", "").lower())
+        self.assertEqual(self.ask("status", options={"view": "archive-fixture"})["overlays"]["revision"], 1)
+        self.assertEqual(self.ask("type", options={"path": "/u4", "view": "archive-fixture"})["type"]["length"], 4)
+        with self.assertRaises(RuntimeError):
+            self.ask("type", options={"path": "/u4"})
+        self.ask("type_edit", options={"kind": "revert", "ids": [job["result"]["overlay_id"]],
+                                       "view": "archive-fixture", "expect_revision": 1})
+        with self.assertRaises(RuntimeError):
+            self.ask("type", options={"path": "/u4", "view": "archive-fixture"})
+
     def test_adopt_registers_the_prepared_project_in_place(self):
         from rusticre import hydra, targets
         gpr = self.prepared["project"]["gpr"]

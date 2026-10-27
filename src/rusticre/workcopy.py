@@ -148,6 +148,52 @@ def store_corpus(settings: dict, source: str) -> tuple[str, int]:
     return value, destination.stat().st_size
 
 
+def archive_path(settings: dict, digest: str) -> Path:
+    return root_path(settings) / "archives" / (digest + ".gdt")
+
+
+def verify_archive(path: Path, digest: str, size: int) -> None:
+    if path.stat().st_size != size:
+        raise ValueError("stored type archive has the wrong size: %s" % path)
+    actual = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 22), b""):
+            actual.update(block)
+    if actual.hexdigest() != digest:
+        raise ValueError("stored type archive does not match its SHA-256: %s" % path)
+
+
+def store_archive(settings: dict, source: str) -> tuple[str, int]:
+    """Snapshot exactly the hashed bytes, bounded and independent of the original file."""
+    source_path = Path(source)
+    before = source_path.stat()
+    directory = root_path(settings) / "archives"
+    directory.mkdir(parents=True, exist_ok=True)
+    temporary = directory / (uuid.uuid4().hex + ".tmp")
+    digest, size = hashlib.sha256(), 0
+    try:
+        with source_path.open("rb") as input_file, temporary.open("xb") as output_file:
+            for block in iter(lambda: input_file.read(1 << 22), b""):
+                size += len(block)
+                if size > MAX_CORPUS_BYTES:
+                    raise ValueError("archive exceeds 1 GiB")
+                digest.update(block)
+                output_file.write(block)
+        after = source_path.stat()
+        if size < 1 or (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+            raise ValueError("archive changed while copying or is empty")
+        value = digest.hexdigest()
+        destination = archive_path(settings, value)
+        with locked(destination.with_suffix(".lock"), what="type archive"):
+            if destination.exists():
+                verify_archive(destination, value, size)
+            else:
+                temporary.replace(destination)
+        return value, size
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def _replayable(settings: dict, target: dict, record: dict) -> dict:
     """What RusticQuery needs to replay one record: bulk records get their files."""
     options = dict(record["options"])
@@ -157,6 +203,11 @@ def _replayable(settings: dict, target: dict, record: dict) -> dict:
             raise ValueError("corpus %s of overlay %s is missing from %s; preserved overlays cannot be replayed"
                              % (options["corpus_sha256"][:12], record["id"], corpus.parent))
         options["corpus_file"] = str(corpus)
+        options["report_file"] = str(_directory(settings, target) / ("import-%s.json" % record["id"]))
+    if options.get("kind") == "import_archive":
+        archive = archive_path(settings, options["archive_sha256"])
+        verify_archive(archive, options["archive_sha256"], options["archive_bytes"])
+        options["archive_file"] = str(archive)
         options["report_file"] = str(_directory(settings, target) / ("import-%s.json" % record["id"]))
     return {"id": record["id"], "address": record["address"], "options": options}
 
@@ -397,6 +448,9 @@ def edit(settings: dict, engine: hydra.Engine, target: dict, address: str, optio
     if options.get("kind") == "import_types":
         digest, size = store_corpus(settings, options.pop("corpus"))
         options.update(corpus_sha256=digest, corpus_bytes=size)
+    if options.get("kind") == "import_archive":
+        digest, size = store_archive(settings, options.pop("archive"))
+        options.update(archive_sha256=digest, archive_bytes=size)
     record = {"id": uuid.uuid4().hex, "address": address, "options": options}
     clean = {**_edit(record), "by": _attribution(), "at": time.time()}
     with locked(_directory(settings, target) / ".sync.lock", SYNC_LOCK_S, "working copy"):
@@ -422,7 +476,7 @@ def edit(settings: dict, engine: hydra.Engine, target: dict, address: str, optio
 
 def _summary(report: dict) -> dict:
     """The import report's counts; the full report stays in its file."""
-    return {key: report.get(key) for key in ("records", "by_kind", "fields", "embedded_parents", "flattened_parents", "inherited_fields", "functions_typed_this", "functions_thiscall_kept",
+    return {key: report.get(key) for key in ("records", "archive_types", "already_present", "archive_sha256", "by_kind", "fields", "embedded_parents", "flattened_parents", "inherited_fields", "functions_typed_this", "functions_thiscall_kept",
                                              "functions_renamed", "unresolved_type_names", "conflicts_total",
                                              "failures_total", "category")} | {"unresolved_top": report.get("unresolved", [])[:10]}
 

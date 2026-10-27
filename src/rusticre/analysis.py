@@ -15,10 +15,11 @@ from pathlib import Path
 ADVANCED_ACTIONS = frozenset(("types", "type", "variables", "dossier", "blocks", "pcode", "trace", "type_edit", "data", "scan", "diff",
                               "vcalls", "vtables", "writes", "orphans"))
 _TYPE_KINDS = frozenset(("struct", "signature", "variable", "apply", "rename", "label", "comment",
-                         "function_create", "function_body", "function_delete", "batch", "import_types"))
+                         "function_create", "function_body", "function_delete", "batch", "import_types", "import_archive"))
 # Bulk kinds run as durable jobs: they can take minutes on a large program.
-BULK_KINDS = frozenset(("import_types",))
+BULK_KINDS = frozenset(("import_types", "import_archive"))
 _CORPUS_RECORD = {"corpus_sha256", "corpus_bytes", "corpus_input"}
+_ARCHIVE_RECORD = {"archive_sha256", "archive_bytes"}
 MAX_CORPUS_BYTES = 1024 * 1024 * 1024
 _SHA256 = re.compile(r"[0-9a-fA-F]{64}")
 _ADDRESS = re.compile(r"(?:0x)?[0-9a-fA-F]+")
@@ -56,7 +57,7 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
         "vcalls": {"offset", "receiver_from", "receiver_type", "receiver_global", "vtable"},
         "writes": {"offset", "receiver_type"}, "orphans": {"referenced_only"},
         "trace": {"seed", "direction", "depth", "nodes", "functions", "argument", "brief", "callers", "debug"},
-        "type_edit": {"kind", "source", "path", "size", "fields", "prototype", "variable", "type", "name", "comment", "expect", "ranges", "edits", "file", "expect_revision", "ids", "corpus", "category"} | (_BATCH_PROVENANCE | _CORPUS_RECORD if _record else set()),
+        "type_edit": {"kind", "source", "path", "size", "fields", "prototype", "variable", "type", "name", "comment", "expect", "ranges", "edits", "file", "expect_revision", "ids", "corpus", "category", "archive", "paths"} | (_BATCH_PROVENANCE | _CORPUS_RECORD | _ARCHIVE_RECORD if _record else set()),
     }
     if action not in allowed:
         if options:
@@ -149,6 +150,7 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
             "function_delete": {"expect"},
             "batch": {"edits", "file"} | (_BATCH_PROVENANCE if _record else set()),
             "import_types": {"corpus", "category"} | (_CORPUS_RECORD if _record else set()),
+            "import_archive": {"archive", "paths"} | (_ARCHIVE_RECORD if _record else set()),
         }[kind]
         if set(out) - {"kind", "source", "expect_revision"} - kind_fields:
             raise ValueError("options do not belong to type_edit kind %s" % kind)
@@ -157,6 +159,8 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
             return _batch(out, _record)
         if kind == "import_types":
             return _corpus(out, _record)
+        if kind == "import_archive":
+            return _archive(out, _record)
         required = {
             "struct": ("path",), "signature": ("prototype",), "variable": ("variable", "type"),
             "apply": ("type",), "rename": ("name",), "label": ("name",), "comment": ("comment",),
@@ -243,6 +247,35 @@ def _corpus(value: dict, recorded: bool) -> dict:
     return result
 
 
+def _archive(value: dict, recorded: bool) -> dict:
+    """Archives are snapshotted by content identity and never reread on replay."""
+    result = {"kind": "import_archive", "source": value["source"]}
+    if "paths" in value:
+        paths = value["paths"]
+        if not isinstance(paths, list) or not 1 <= len(paths) <= 200:
+            raise ValueError("archive paths must be an array of 1..200 exact type paths")
+        clean = [_text(path, "archive type path", 512, True) for path in paths]
+        if any(not path.startswith("/") or path.endswith("/") for path in clean) or len(set(clean)) != len(clean):
+            raise ValueError("archive paths must be unique absolute type paths")
+        result["paths"] = clean
+    if recorded:
+        if "archive" in value:
+            raise ValueError("a recorded archive import carries archive_sha256, not a path")
+        result["archive_sha256"] = _digest(value.get("archive_sha256", ""))
+        result["archive_bytes"] = _integer(value.get("archive_bytes"), "archive_bytes", 1, MAX_CORPUS_BYTES)
+        return result
+    if set(value) & _ARCHIVE_RECORD:
+        raise ValueError("archive provenance is computed, not supplied")
+    path = Path(_text(value.get("archive", ""), "archive", 32768, True)).expanduser()
+    if not path.is_absolute() or path.suffix.lower() != ".gdt":
+        raise ValueError("archive must be an absolute path to a .gdt file")
+    size = path.stat().st_size
+    if not 1 <= size <= MAX_CORPUS_BYTES or not path.is_file():
+        raise ValueError("archive must be a file containing 1 byte to 1 GiB")
+    result["archive"] = str(path.resolve())
+    return result
+
+
 def _overlay_path(root: str | Path, target_key: str) -> Path:
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", target_key):
         raise ValueError("invalid overlay target key")
@@ -308,7 +341,7 @@ def _edit(value: dict) -> dict:
     address = _text(value.get("address", ""), "overlay address", 128)
     if address and not _ADDRESS.fullmatch(address):
         raise ValueError("overlay address must be a numeric Ghidra VA")
-    if options["kind"] not in ("struct", "batch", "import_types") and not address:
+    if options["kind"] not in ("struct", "batch", "import_types", "import_archive") and not address:
         raise ValueError("this type edit requires a Ghidra VA")
     edit_id = value.get("id") or uuid.uuid4().hex
     if not isinstance(edit_id, str) or not re.fullmatch(r"[0-9a-f]{32}", edit_id):

@@ -52,7 +52,7 @@ def operation_help(component: str = "analysis") -> dict:
             "pcode": {"nodes": "1..200; stable op/varnode IDs seed a trace"},
             "trace": {"seed": "op/varnode id from pcode", "direction": "backward or forward", "depth": "1..32", "nodes": "1..200", "functions": "1..8"},
             "type_edit": {
-                "kind": "struct/signature/variable/apply/rename/label/comment/function_create/function_body/function_delete/batch/import_types/revert",
+                "kind": "struct/signature/variable/apply/rename/label/comment/function_create/function_body/function_delete/batch/import_types/import_archive/revert",
                 "shape": "all options are flat, next to kind: {\"kind\": \"struct\", \"path\": ..., \"size\": ..., \"fields\": [...]}, never {\"struct\": {...}}",
                 "source": "required supporting evidence", "expect_revision": "the revision you read; required for named views, optional for the shared view; a newer one is a conflict naming its editor",
                 "struct": "path, size, fields=[{offset, type, name, length?}]", "signature": "prototype",
@@ -61,6 +61,7 @@ def operation_help(component: str = "analysis") -> dict:
                 "function_delete": "expect=exact entry bytes; explicit entry VA",
                 "batch": "edits=[{address,options}] OR file=JSON array path, 1..200 nonbatch children, atomic; source inherited if absent",
                 "import_types": "corpus=absolute JSONL path (docs/type-corpus.md), category?; runs as a job; revertible in one step",
+                "import_archive": "archive=absolute .gdt path; source required; paths=[exact type paths] optional. Whole archive requires matching data organization; selected types use strict recursive layout checks. Runs as a job and reverts as one edit",
                 "revert": "ids=[overlay ids]: one step; the working copy is rebuilt from the master",
             },
             "vtables": "address = a function: the tables of code pointers that hold it, and its slot",

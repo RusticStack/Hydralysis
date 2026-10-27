@@ -2028,6 +2028,137 @@ public class RusticQuery extends GhidraScript {
         }
     }
 
+    // Refuse even nested conflicts: substitutions or renames would silently change layouts.
+    private static final class ArchiveConflictHandler extends DataTypeConflictHandler {
+        @Override public ConflictResult resolveConflict(DataType added, DataType existing) {
+            throw new IllegalArgumentException("conflicting data type: " + added.getPathName());
+        }
+        @Override public boolean shouldUpdate(DataType source, DataType local) {
+            if (!source.isEquivalent(local)) throw new IllegalArgumentException("changed associated data type: " + source.getPathName());
+            return false;
+        }
+        @Override public DataTypeConflictHandler getSubsequentHandler() { return this; }
+    }
+
+    // Ghidra's isEquivalent is type-specific: dynamic pointers can ignore width,
+    // bitfields can ignore bit offset, and component equivalence can ignore length.
+    // Check those explicitly and recurse through dependencies, refusing unknown
+    // data types rather than claiming an unexamined layout is unchanged.
+    private void checkArchiveLayout(DataType expected, DataType actual,
+            IdentityHashMap<DataType, Set<DataType>> seen, int depth, long deadline) throws Exception {
+        monitor.checkCancelled();
+        if (System.nanoTime() >= deadline || depth > 128 || seen.size() > 100000)
+            throw new IllegalArgumentException("archive layout verification budget exceeded; nothing applied");
+        if (expected == null || actual == null) {
+            if (expected != actual) throw new IllegalArgumentException("archive type dependency differs");
+            return;
+        }
+        Set<DataType> visited = seen.computeIfAbsent(expected, key -> Collections.newSetFromMap(new IdentityHashMap<>()));
+        if (!visited.add(actual)) return;
+        String path = expected.getPathName();
+        if (!actual.getPathName().equals(path) || !actual.isEquivalent(expected)
+                || expected.getLength() != actual.getLength() || expected.getAlignedLength() != actual.getAlignedLength()
+                || (!(expected instanceof BitFieldDataType) && expected.getAlignment() != actual.getAlignment()))
+            throw new IllegalArgumentException("resolved archive layout differs: " + path);
+        if (expected instanceof BitFieldDataType a) {
+            if (!(actual instanceof BitFieldDataType b) || a.getBitOffset() != b.getBitOffset()
+                    || a.getBitSize() != b.getBitSize() || a.getDeclaredBitSize() != b.getDeclaredBitSize()
+                    || a.getStorageSize() != b.getStorageSize()) throw new IllegalArgumentException("archive bitfield differs: " + path);
+            checkArchiveLayout(a.getBaseDataType(), b.getBaseDataType(), seen, depth + 1, deadline);
+        } else if (expected instanceof Pointer a) {
+            if (!(actual instanceof Pointer b)) throw new IllegalArgumentException("archive pointer differs: " + path);
+            checkArchiveLayout(a.getDataType(), b.getDataType(), seen, depth + 1, deadline);
+        } else if (expected instanceof ghidra.program.model.data.Array a) {
+            if (!(actual instanceof ghidra.program.model.data.Array b) || a.getNumElements() != b.getNumElements()
+                    || a.getElementLength() != b.getElementLength()) throw new IllegalArgumentException("archive array differs: " + path);
+            checkArchiveLayout(a.getDataType(), b.getDataType(), seen, depth + 1, deadline);
+        } else if (expected instanceof TypeDef a) {
+            if (!(actual instanceof TypeDef b) || !a.hasSameTypeDefSettings(b)) throw new IllegalArgumentException("archive typedef differs: " + path);
+            checkArchiveLayout(a.getDataType(), b.getDataType(), seen, depth + 1, deadline);
+        } else if (expected instanceof Composite a) {
+            if (!(actual instanceof Composite b) || (a instanceof Structure) != (b instanceof Structure)
+                    || a.getPackingType() != b.getPackingType() || a.getExplicitPackingValue() != b.getExplicitPackingValue()
+                    || a.getAlignmentType() != b.getAlignmentType() || a.getExplicitMinimumAlignment() != b.getExplicitMinimumAlignment())
+                throw new IllegalArgumentException("archive composite layout differs: " + path);
+            var left = a.getComponents(); var right = b.getComponents();
+            if (left.length != right.length) throw new IllegalArgumentException("archive component count differs: " + path);
+            for (int i = 0; i < left.length; i++) {
+                var x = left[i]; var y = right[i];
+                if (x.getOffset() != y.getOffset() || x.getLength() != y.getLength() || x.getOrdinal() != y.getOrdinal()
+                        || x.isBitFieldComponent() != y.isBitFieldComponent() || !Objects.equals(x.getFieldName(), y.getFieldName()))
+                    throw new IllegalArgumentException("archive component layout differs: " + path + " #" + i);
+                checkArchiveLayout(x.getDataType(), y.getDataType(), seen, depth + 1, deadline);
+            }
+        } else if (expected instanceof ghidra.program.model.data.Enum a) {
+            if (!(actual instanceof ghidra.program.model.data.Enum b) || a.isSigned() != b.isSigned()
+                    || !Arrays.equals(a.getNames(), b.getNames())) throw new IllegalArgumentException("archive enum differs: " + path);
+            for (String name : a.getNames()) if (a.getValue(name) != b.getValue(name)) throw new IllegalArgumentException("archive enum value differs: " + path);
+        } else if (expected instanceof FunctionDefinition a) {
+            if (!(actual instanceof FunctionDefinition b) || a.hasVarArgs() != b.hasVarArgs() || a.hasNoReturn() != b.hasNoReturn()
+                    || !Objects.equals(a.getCallingConventionName(), b.getCallingConventionName()))
+                throw new IllegalArgumentException("archive function definition differs: " + path);
+            checkArchiveLayout(a.getReturnType(), b.getReturnType(), seen, depth + 1, deadline);
+            var left = a.getArguments(); var right = b.getArguments();
+            if (left.length != right.length) throw new IllegalArgumentException("archive parameter count differs: " + path);
+            for (int i = 0; i < left.length; i++) {
+                if (left[i].getLength() != right[i].getLength() || !Objects.equals(left[i].getName(), right[i].getName()))
+                    throw new IllegalArgumentException("archive parameter differs: " + path + " #" + i);
+                checkArchiveLayout(left[i].getDataType(), right[i].getDataType(), seen, depth + 1, deadline);
+            }
+        } else if (!(expected instanceof BuiltInDataType) || expected instanceof Dynamic || expected instanceof FactoryDataType
+                || !expected.getClass().equals(actual.getClass())) {
+            throw new IllegalArgumentException("archive type kind cannot be verified: " + path);
+        }
+    }
+
+    private void importArchive(JsonObject opts, long deadline) throws Exception {
+        String path = text(opts, "archive_file");
+        if (path.isEmpty()) throw new IllegalArgumentException("import_archive needs its stored archive");
+        int imported = 0, existing = 0;
+        try (FileDataTypeManager archive = FileDataTypeManager.openFileArchive(new File(path), false)) {
+            DataTypeManager manager = currentProgram.getDataTypeManager();
+            if (archive.getDataStore().getWarning() != ghidra.program.model.dtarchive.ArchiveWarning.NONE)
+                throw new IllegalArgumentException("archive warning: " + archive.getDataStore().getWarningMessage(true));
+            JsonArray paths = opts.getAsJsonArray("paths");
+            if (paths == null && !archive.getDataOrganization().isEquivalent(manager.getDataOrganization()))
+                throw new IllegalArgumentException("archive and program data organizations differ; select explicit type paths for strict per-type verification");
+            var handler = new ArchiveConflictHandler();
+            List<DataType> selected = new ArrayList<>();
+            if (paths != null) for (JsonElement value : paths) {
+                DataType type = archive.getDataType(value.getAsString());
+                if (type == null) throw new IllegalArgumentException("archive type path not found: " + value.getAsString());
+                selected.add(type);
+            }
+            Iterator<DataType> types = paths == null ? archive.getAllDataTypes() : selected.iterator();
+            while (types.hasNext()) {
+                monitor.checkCancelled();
+                if (System.nanoTime() >= deadline) throw new IllegalStateException("archive import deadline reached; nothing applied");
+                DataType type = types.next();
+                DataType prior = manager.getDataType(type.getPathName());
+                if (prior != null && prior.isEquivalent(type)) {
+                    checkArchiveLayout(type, prior, new IdentityHashMap<>(), 0, deadline);
+                    existing++;
+                }
+                else {
+                    DataType resolved = manager.resolve(type, handler);
+                    checkArchiveLayout(type, resolved, new IdentityHashMap<>(), 0, deadline);
+                    imported++;
+                }
+                if ((imported + existing) % 500 == 0) monitor.setMessage("archive types " + (imported + existing));
+            }
+            JsonObject report = new JsonObject();
+            report.addProperty("records", imported + existing);
+            report.addProperty("archive_types", imported);
+            report.addProperty("already_present", existing);
+            report.addProperty("archive_sha256", text(opts, "archive_sha256"));
+            report.addProperty("source", text(opts, "source"));
+            report.addProperty("conflicts_total", 0);
+            report.addProperty("failures_total", 0);
+            if (!text(opts, "report_file").isEmpty()) write(Path.of(text(opts, "report_file")), report);
+            lastImport = report;
+        }
+    }
+
     private void typeEdit(String addressText, JsonObject opts, long deadline) throws Exception {
         if (System.nanoTime() >= deadline) throw new IllegalStateException("overlay edit deadline reached; edit not completed");
         monitor.checkCancelled();
@@ -2070,6 +2201,8 @@ public class RusticQuery extends GhidraScript {
                 manager.addDataType(structure, DataTypeConflictHandler.KEEP_HANDLER);
             } else if (kind.equals("import_types")) {
                 importTypes(opts, deadline);
+            } else if (kind.equals("import_archive")) {
+                importArchive(opts, deadline);
             } else if (kind.startsWith("function_")) {
                 Address entry = address(addressText);
                 var listing = currentProgram.getListing();
@@ -2159,6 +2292,7 @@ public class RusticQuery extends GhidraScript {
         if (file.isEmpty()) throw new IllegalArgumentException("apply_overlays needs edits_file");
         JsonObject batch = JsonParser.parseString(Files.readString(Path.of(file), StandardCharsets.UTF_8)).getAsJsonObject();
         JsonArray records = batch.getAsJsonArray("edits");
+        lastImport = null;
         monitor.initialize(records.size());
         // One outer transaction: a record that fails rolls back the whole call, so the
         // working copy is either at the new state or unchanged.
