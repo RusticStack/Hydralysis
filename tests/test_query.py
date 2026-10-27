@@ -253,6 +253,7 @@ class Overlays(EngineCase):
         path = workcopy._store_path(self.settings, self.runner.target("owned"))
         record = json.loads(path.read_text(encoding="utf-8"))
         record.pop("journal")
+        record.pop("seal", None)  # a pre-seal store; a stale seal would be store_corrupt (test_durable)
         path.write_text(json.dumps(record), encoding="utf-8")
         with self.assertRaises(RuntimeError) as raised:
             self.edit(kind="rename", name="Late", address="0x140009000", expect_revision=0)
