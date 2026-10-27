@@ -38,6 +38,20 @@ class ObservedOutput(io.BytesIO):
         return result
 
 
+class ObservedInput(io.BytesIO):
+    """Input that tells a test when the server has read past the last message (EOF)."""
+
+    def __init__(self, data):
+        super().__init__(data)
+        self.eof = threading.Event()
+
+    def readline(self, *args):
+        line = super().readline(*args)
+        if not line:
+            self.eof.set()
+        return line
+
+
 class IdOutput:
     """Binary sink that parses each newline-JSON reply and lets a test wait on ids."""
 
@@ -161,8 +175,20 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(replies[2]["id"], "ping")
 
     def serve_in_thread(self, messages, fake_call):
+        """Run Server().serve on a thread. Returns (worker, output); `worker.eof` is set when the input is consumed
+        and `worker.returned` when serve has returned."""
         output = IdOutput()
-        worker = threading.Thread(target=Server().serve, args=(io.BytesIO(lines(messages)), output))
+        stdin = ObservedInput(lines(messages))
+        returned = threading.Event()
+
+        def run():
+            try:
+                Server().serve(stdin, output)
+            finally:
+                returned.set()
+
+        worker = threading.Thread(target=run)
+        worker.eof, worker.returned = stdin.eof, returned
         patcher = patch("hydralysis.mcp.call", fake_call)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -285,11 +311,30 @@ class TransportTests(unittest.TestCase):
         messages = [request("q%d" % i, "tools/call", {"name": "runtime", "arguments": {"tag": "q%d" % i}})
                     for i in range(TOOL_WORKERS)]
         messages.append(request("fp", "tools/call", {"name": "fingerprint", "arguments": {"tag": "fp"}}))
-        worker, output = self.serve_in_thread(messages, self.engine_call(release))
+        entered = []
+        entered_all = threading.Event()
+        blocked = self.engine_call(release)
+        guard = threading.Lock()
+
+        def counted(name, arguments):
+            if name in ENGINE_TOOLS:
+                with guard:
+                    entered.append(name)
+                    if len(entered) == TOOL_WORKERS:
+                        entered_all.set()  # the last engine call is about to block on `release`
+            return blocked(name, arguments)
+
+        worker, output = self.serve_in_thread(messages, counted)
         try:
+            # Wait for the state under test instead of sleeping: the whole input is read (EOF reached), the fast
+            # call is answered and every engine call is in flight. Only then ask whether serve has returned.
+            self.assertTrue(worker.eof.wait(3), "the server did not reach EOF")
             self.assertTrue(output.wait_for({"fp"}, 3))
-            worker.join(0.3)
-            self.assertTrue(worker.is_alive(), "serve returned while engine calls were still running")
+            self.assertTrue(entered_all.wait(3), "the engine calls did not all start")
+            # serve must still be waiting for them. A returned serve sets the event at once, so a failure is fast;
+            # the pass waits out the grace window, which is a bound on a negative and not a synchronisation.
+            self.assertFalse(worker.returned.wait(0.3), "serve returned while engine calls were still running")
+            self.assertTrue(worker.is_alive())
         finally:
             release.set()
             worker.join(10)
