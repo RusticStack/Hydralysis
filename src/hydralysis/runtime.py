@@ -27,9 +27,10 @@ from hydralysis.runtime_ipc import request as ipc_request
 
 FRIDA_VERSION = "17.24.3"
 ACTION_NAMES = ("setup", "processes", "spawn", "attach", "status", "modules", "threads", "read", "patches",
-                "observe", "break", "continue", "unload", "resume", "detach", "writers", "capture", "snapshot", "compare")
+                "observe", "break", "continue", "unload", "resume", "detach", "writers", "capture", "snapshot", "compare",
+                "write", "watch")
 # Only the session's owner drives the target; any client may look.
-MUTATING = ("observe", "break", "continue", "unload", "resume", "detach", "writers")
+MUTATING = ("observe", "break", "continue", "unload", "resume", "detach", "writers", "write", "watch")
 # capture start/stop write the session's event log: the owner's. read, verify, list, counters and snapshot only look.
 CAPTURE_OWNER_OPS = ("start", "stop")
 # A store site's memory operand, as the analysis prints it: [BASE + 0xOFF].
@@ -269,6 +270,8 @@ class RuntimeRunner:
             return self._writers(session_id, args, token, owner)
         if action == "snapshot":
             args = self._snapshot_layouts(args)
+        if action in ("write", "watch"):
+            args = self._memory_gate(directory, args)
         timeout = int(args.pop("timeout_s", 15))
         if not 1 <= timeout <= 60:
             raise ValueError("runtime timeout_s must be 1..60")
@@ -380,6 +383,20 @@ class RuntimeRunner:
             proc.terminate_tree(process)
         raise TimeoutError("runtime startup timed out; target state unknown; inspect %s" % (directory / "worker.log"))
 
+
+    def _memory_gate(self, directory: Path, args: dict) -> dict:
+        """The fixture gate of `write` and `watch` (Z12). The caller cannot supply it: the client adds it from its own
+        settings (`runtime_fixture_sha256`, a list of build hashes) and the conformance stamps it holds."""
+        args.pop("_gate", None)
+        digest = str(_json(directory / "start.json").get("sha256") or "")
+        allowed = self.settings.get("runtime_fixture_sha256") or []
+        gate = {"fixture_sha256": digest if digest in allowed else "", "frida": FRIDA_VERSION, "stamps": {},
+                "conformance": bool(self.settings.get("runtime_watch_conformance_run"))}
+        for arch in ("x64", "x86"):
+            stamp = _json(_root(self.settings) / "watch-stamps" / (arch + ".json"))
+            if stamp:
+                gate["stamps"][arch] = stamp
+        return {**args, "_gate": gate}
 
     def _layout(self, args: dict) -> dict:
         """A type from a target's saved analysis (imported or overlay types included), as a read layout."""
