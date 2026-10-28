@@ -118,6 +118,11 @@ def provenance(settings: dict, target: str, view: str = "") -> tuple[dict, dict]
               "engine_release": hydra.RELEASE, "query_key": selected["key"]}
     if selected["view"] != "shared":
         result["view"] = selected["view"]
+    if selected.get("lineage"):
+        # The header names the generation the export reads (4.7): a commit moves it, and a resume is then refused because
+        # the recorded provenance no longer equals the observed one (generation, master revision and engine release included).
+        result["lineage"] = selected["lineage"]["id"]
+        result["generation"] = selected["lineage"]["generation"]
     if project.get("exe"):
         stat = Path(project["exe"]).stat()
         result["exe_stat"] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
