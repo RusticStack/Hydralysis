@@ -1,7 +1,7 @@
 [project]
-name = "rusticre"
-version = "0.2.0"
-description = "Reverse-engineering tools for a PE you own: disassembly, cross-references, signatures, hooks, and a read-only Ghidra run."
+name = "hydralysis"
+version = "0.5.0.dev0"
+description = "Small reverse-engineering server: PE evidence, analysis setup, reusable saved-project queries and verified runtime sessions."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -12,7 +12,9 @@ dependencies = [
 ]
 
 [project.scripts]
-rusticre = "rusticre.cli:main"
+hydralysis = "hydralysis.cli:main"
+# Compatibility alias for one release: existing MCP registrations and scripts call `rusticre`.
+rusticre = "hydralysis.cli:main"
 
 [project.optional-dependencies]
 dev = []
@@ -25,4 +27,4 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-rusticre = ["scripts/*.java"]
+hydralysis = ["scripts/*.java"]

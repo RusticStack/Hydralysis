@@ -1,5 +1,7 @@
 # Verification, 2026-10-24
 
+> Historical record: written when this project was called RusticRE (command `rusticre`, variables `RUSTICRE_*`, tool prefix `mcp__rusticre__*`). It is kept as written; the names are `hydralysis`, `HYDRALYSIS_*` and `mcp__hydralysis__*` now.
+
 Run on Windows with Python 3.14, Ghidra 12.1.4 PUBLIC and Adoptium JDK
 25.0.4, using the existing installations. Ghidra processes had a 6G heap cap
 and four CPU workers. No initial import or auto-analysis was performed.

@@ -1,9 +1,9 @@
 # Evidence behind the workflow changes
 
 Research date: 2026-10-24. This report distinguishes repository documentation,
-retained local call records, and new RusticRE checks. Historical timings below
+retained local call records, and new Hydralysis checks. Historical timings below
 are measurements reported by those projects, not a new benchmark or a claim of
-RusticRE speedup. Private transcripts and proprietary binary/decompiler output
+Hydralysis speedup. Private transcripts and proprietary binary/decompiler output
 are not included in this repository.
 
 ## Night City Together
@@ -46,7 +46,7 @@ unreliable.
 
 ### Failures change the design
 
-| Evidence | Consequence for RusticRE |
+| Evidence | Consequence for Hydralysis |
 | --- | --- |
 | The project's [REA integration notes](https://github.com/KelpHect/NightCityTogether/blob/1364117365c51720db26e5d88272e7cf0d7bbb33/tools/re/README.md#L105-L147) report a 1,278 s import/analysis query, patched to open an analysed project with `-process`, `-noanalysis`, and `-readOnly`. | A query must reuse saved analysis. Initial import is a separate operation, never an implicit fallback. |
 | The same source reports function queries taking 14–26 s per CLI launch versus 1.3 s in one MCP session; decompile 12–14 s versus 1.8 s; address references 0.2 s within the session. These are historical measurements on one game build and machine. | Keep a query worker warm; measure startup separately from repeated requests. |
@@ -78,7 +78,7 @@ that attribution. Its
 [lane policy](https://github.com/KelpHect/SWTOR-origins/blob/11ea4e93ff0069ed56590f01d935e98accac087b/docs/ghidra-setup.md#L35-L53)
 requires project copies, per-instance CPU limits, and reuse of saved analysis.
 The [startup explanation](https://github.com/KelpHect/SWTOR-origins/blob/11ea4e93ff0069ed56590f01d935e98accac087b/docs/ghidra-setup.md#L71-L77)
-distinguishes a slow healthy launch from a dead worker. RusticRE needs separate
+distinguishes a slow healthy launch from a dead worker. Hydralysis needs separate
 startup and per-query deadlines, rather than one short global deadline.
 
 The
@@ -86,7 +86,7 @@ The
 records GhidraMCP `BACKEND_UNAVAILABLE`, followed by three successful direct
 headless passes against a saved analysed lane with `-process`, `-noanalysis`, and
 `-readOnly`. This is concrete evidence of agents routing around an unavailable
-MCP. A short RusticRE CLI query must reach the same persistent analysis path as
+MCP. A short Hydralysis CLI query must reach the same persistent analysis path as
 MCP, and errors must identify whether setup, startup, or the query failed. A
 backend failure must never silently turn a query into another import.
 
@@ -129,7 +129,7 @@ client's complete negotiated tool catalog, deleted sessions, or tasks performed
 elsewhere. Read-only inspection of
 `C:\Users\KellHect\.qoder\settings.json` and its `.bak-20261023` backup
 corroborated simultaneous `rea`, `ghidra`, and `ghidra-headless` registrations;
-the current file also registers `rusticre`. No client settings were changed.
+the current file also registers `hydralysis`. No client settings were changed.
 Registration proves configuration, not successful negotiation or actual use.
 The user's reports of roughly 200 REA tools, the approximately 15 KB schema
 failure, and a registered smaller server being bypassed remain task-supplied
@@ -144,7 +144,7 @@ that agents route around has not replaced the old workflow.
 
 ### Protocol compatibility is part of adoption
 
-The initial RusticRE implementation accepted newline-delimited input but always
+The initial Hydralysis implementation accepted newline-delimited input but always
 wrote `Content-Length` frames. The
 [MCP stdio transport specification](https://modelcontextprotocol.io/specification/2025-06-18/basic/transports#stdio)
 requires newline-delimited JSON-RPC messages. A server that looks healthy in a
@@ -156,12 +156,12 @@ compatibility.
 ## Where REA or Ghidra still earns a call
 
 REA remains useful when a whole-function dossier needs basic blocks, p-code,
-value flow, or bounded def-use tracing that RusticRE does not implement. The
+value flow, or bounded def-use tracing that Hydralysis does not implement. The
 [historical workflow](https://github.com/KelpHect/NightCityTogether/blob/1364117365c51720db26e5d88272e7cf0d7bbb33/tools/re/README.md#L141-L147)
 explicitly distinguishes those questions from cheap PE disassembly and callers.
 
 Use Ghidra directly for initial import/analysis, interactive type recovery,
-renaming, comments, and other deliberate writes to the master project. RusticRE's
+renaming, comments, and other deliberate writes to the master project. Hydralysis's
 read-only query path should not pretend those edits were saved to the master.
 Live process state, engine reflection, and runtime hook installation remain
 separate tasks: an offline byte match proves a particular site's bytes, not the
@@ -211,7 +211,7 @@ The same corpus preserves a concrete filesystem admission failure. Session
 (Win32 50). F: is this machine's ReFS Dev Drive. The wrapper's recorded
 `time.ran` to `time.completed` interval is 3.12 seconds; it is not an isolated
 Ghidra startup or analysis measurement. The result is a backend filesystem
-incompatibility, not an empty search. RusticRE must preserve that distinction
+incompatibility, not an empty search. Hydralysis must preserve that distinction
 and work on its configured storage rather than hiding the failure behind a
 retry or another import.
 

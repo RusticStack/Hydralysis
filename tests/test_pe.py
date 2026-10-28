@@ -5,8 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from rusticre.pe import Image, _file_version
-from rusticre.prologue import compare, find_pattern, matches, parse_expect
+from hydralysis.pe import Image, _file_version
+from hydralysis.prologue import compare, find_pattern, matches, parse_expect
 
 
 def image(text=b"\x90" * 31 + b"\xc3", *, name=b".text", machine=0x14C, virtual_size=0x100):
@@ -95,9 +95,9 @@ class ProvenanceAndCandidates(unittest.TestCase):
         # The final five bytes are a call from 0x101b to 0x1000.
         pe = image(b"\x90" * 27 + b"\xe8" + struct.pack("<i", -32))
         callers = pe.callers(0x1000)
-        self.assertIn("0x101b E8 call candidate -> 0x1000", callers)
+        self.assertIn("rva:0x101b E8 call candidate -> rva:0x1000", callers)
         self.assertIn("instruction boundaries unverified", callers)
-        self.assertIn("0x101b call 0x1000", pe.callees(0x1000))
+        self.assertIn("rva:0x101b call rva:0x1000", pe.callees(0x1000))
 
 
 class SignatureVerification(unittest.TestCase):

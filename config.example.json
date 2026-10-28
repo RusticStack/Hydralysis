@@ -1,17 +1,15 @@
 {
-  "root": "F:/dev-cache/rusticre",
-  "ghidra_dir": "F:/dev-cache/ghidra/ghidra_12.1.4_PUBLIC",
+  "root": "D:/hydralysis-data",
   "java_home": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot",
-  "max_mem": "6G",
-  "max_cpu": 6,
-  "query_workers": 2,
-  "query_startup_s": 180,
-  "query_idle_s": 300,
-  "evidence": "F:/dev-cache/rusticre/evidence.db",
+  "hydra_max_heap": "12G",
+  "hydra_idle_s": 7200,
+  "hydra_keep_warm_s": 3600,
+  "overlay_save_debounce_s": 600,
+  "evidence": "D:/hydralysis-data/evidence.db",
+  "runtime_lock_check": [],
   "targets": {
     "sample": {
-      "dir": "",
-      "name": "",
+      "gpr": "F:/re/Sample/Sample.gpr",
       "program": "program.exe",
       "exe": "F:/binaries/program.exe",
       "scripts": ""

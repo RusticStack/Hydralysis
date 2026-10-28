@@ -10,7 +10,9 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from rusticre.mcp import MAX_OUTSTANDING, MAX_OUTPUT_BYTES, Server, _read_message
+from hydralysis.api import TOOL_NAMES
+from hydralysis.mcp import (ENGINE_TOOLS, MAX_OUTSTANDING, MAX_OUTPUT_BYTES, RETRY_AFTER_MS, TOOL_WORKERS,
+                            Server, _read_message, lane_of)
 
 
 def request(ident, method, params=None):
@@ -36,10 +38,60 @@ class ObservedOutput(io.BytesIO):
         return result
 
 
+class ObservedInput(io.BytesIO):
+    """Input that tells a test when the server has read past the last message (EOF)."""
+
+    def __init__(self, data):
+        super().__init__(data)
+        self.eof = threading.Event()
+
+    def readline(self, *args):
+        line = super().readline(*args)
+        if not line:
+            self.eof.set()
+        return line
+
+
+class IdOutput:
+    """Binary sink that parses each newline-JSON reply and lets a test wait on ids."""
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._replies = []
+
+    def write(self, value):
+        with self._cond:
+            for line in value.splitlines():
+                if line.strip():
+                    self._replies.append(json.loads(line))
+            self._cond.notify_all()
+        return len(value)
+
+    def flush(self):
+        pass
+
+    def replies(self):
+        with self._cond:
+            return list(self._replies)
+
+    def ids(self):
+        return {r["id"] for r in self.replies()}
+
+    def reply(self, ident):
+        return next(r for r in self.replies() if r["id"] == ident)
+
+    def text(self, ident):
+        return self.reply(ident)["result"]["content"][0]["text"]
+
+    def wait_for(self, wanted, timeout):
+        with self._cond:
+            return self._cond.wait_for(lambda: wanted <= {r["id"] for r in self._replies}, timeout)
+
+
 class TransportTests(unittest.TestCase):
     def run_server(self, payload):
         result = subprocess.run(
-            [sys.executable, "-m", "rusticre", "mcp"],
+            [sys.executable, "-m", "hydralysis", "mcp"],
             input=payload, capture_output=True, timeout=20,
         )
         self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", errors="replace"))
@@ -97,12 +149,12 @@ class TransportTests(unittest.TestCase):
                 raise RuntimeError("test did not release worker")
             return "finished"
 
-        messages = [request(index, "tools/call", {"name": "slow", "arguments": {"number": index}})
+        messages = [request(index, "tools/call", {"name": "inspect", "arguments": {"number": index}})
                     for index in range(MAX_OUTSTANDING + 1)]
         messages.append(request("list", "tools/list"))
         messages.append(request("ping", "ping"))
         worker = threading.Thread(target=Server().serve, args=(io.BytesIO(lines(messages)), output))
-        with patch("rusticre.mcp.call", slow):
+        with patch("hydralysis.mcp.call", slow):
             worker.start()
             try:
                 self.assertTrue(output.ping.wait(3), "ping blocked behind slow calls")
@@ -117,14 +169,194 @@ class TransportTests(unittest.TestCase):
         busy = next(reply for reply in replies if reply["id"] == MAX_OUTSTANDING)
         self.assertTrue(busy["result"]["isError"])
         self.assertIn("Server busy", busy["result"]["content"][0]["text"])
+        self.assertIn("retryAfterMs", busy["result"]["content"][0]["text"])
         self.assertEqual(len(calls), MAX_OUTSTANDING)
         self.assertEqual(replies[1]["id"], "list")
         self.assertEqual(replies[2]["id"], "ping")
 
+    def serve_in_thread(self, messages, fake_call):
+        """Run Server().serve on a thread. Returns (worker, output); `worker.eof` is set when the input is consumed
+        and `worker.returned` when serve has returned."""
+        output = IdOutput()
+        stdin = ObservedInput(lines(messages))
+        returned = threading.Event()
+
+        def run():
+            try:
+                Server().serve(stdin, output)
+            finally:
+                returned.set()
+
+        worker = threading.Thread(target=run)
+        worker.eof, worker.returned = stdin.eof, returned
+        patcher = patch("hydralysis.mcp.call", fake_call)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        worker.start()
+        return worker, output
+
+    @staticmethod
+    def engine_call(release, entered=None):
+        def fake(name, arguments):
+            if name in ENGINE_TOOLS:
+                if entered is not None:
+                    entered.append(name)
+                if not release.wait(10):
+                    raise RuntimeError("test did not release engine call")
+            return "%s:%s" % (name, (arguments or {}).get("tag"))
+        return fake
+
+    def test_four_blocked_engine_calls_do_not_delay_fingerprint_or_disasm(self):
+        release = threading.Event()
+        entered = []
+        messages = [request("q%d" % i, "tools/call",
+                            {"name": "ghidra_query", "arguments": {"tag": "q%d" % i}}) for i in range(TOOL_WORKERS)]
+        messages += [request("fp", "tools/call", {"name": "fingerprint", "arguments": {"tag": "fp"}}),
+                     request("dis", "tools/call", {"name": "disasm", "arguments": {"tag": "dis"}})]
+        worker, output = self.serve_in_thread(messages, self.engine_call(release, entered))
+        try:
+            self.assertTrue(output.wait_for({"fp", "dis"}, 3), "local tools were delayed by blocked engine calls")
+            self.assertEqual(output.ids() & {"q0", "q1", "q2", "q3"}, set())
+            self.assertEqual(output.text("fp"), "fingerprint:fp")
+            self.assertEqual(output.text("dis"), "disasm:dis")
+        finally:
+            release.set()
+            worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(entered), TOOL_WORKERS)
+        for i in range(TOOL_WORKERS):
+            self.assertEqual(output.text("q%d" % i), "ghidra_query:q%d" % i)
+
+    def test_saturated_engine_lane_answers_busy_with_retry_hint_and_fast_lane_stays_open(self):
+        release = threading.Event()
+        total = MAX_OUTSTANDING + 2
+        messages = [request("q%d" % i, "tools/call",
+                            {"name": "ghidra_query", "arguments": {"tag": "q%d" % i}}) for i in range(total)]
+        messages.append(request("fp", "tools/call", {"name": "fingerprint", "arguments": {"tag": "fp"}}))
+        worker, output = self.serve_in_thread(messages, self.engine_call(release))
+        try:
+            self.assertTrue(output.wait_for({"fp", "q%d" % MAX_OUTSTANDING, "q%d" % (MAX_OUTSTANDING + 1)}, 3))
+            for ident in ("q%d" % MAX_OUTSTANDING, "q%d" % (MAX_OUTSTANDING + 1)):
+                reply = output.reply(ident)
+                self.assertTrue(reply["result"]["isError"])
+                text = reply["result"]["content"][0]["text"]
+                self.assertIn("Server busy", text)
+                self.assertIn("Retry", text)
+                self.assertIn("retryAfterMs=%d" % RETRY_AFTER_MS, text)
+                self.assertEqual(reply["result"]["structuredContent"],
+                                 {"error": "busy", "lane": "engine", "outstanding": MAX_OUTSTANDING,
+                                  "retryAfterMs": RETRY_AFTER_MS})
+            self.assertEqual(output.text("fp"), "fingerprint:fp")
+        finally:
+            release.set()
+            worker.join(10)
+        self.assertFalse(worker.is_alive())
+        for i in range(MAX_OUTSTANDING):
+            self.assertEqual(output.text("q%d" % i), "ghidra_query:q%d" % i)
+
+    def test_fast_lane_saturation_does_not_block_engine_calls(self):
+        release = threading.Event()
+
+        def fake(name, arguments):
+            if name not in ENGINE_TOOLS:
+                if not release.wait(10):
+                    raise RuntimeError("test did not release fast call")
+            return "%s:%s" % (name, arguments["tag"])
+
+        messages = [request("f%d" % i, "tools/call", {"name": "disasm", "arguments": {"tag": "f%d" % i}})
+                    for i in range(MAX_OUTSTANDING + 1)]
+        messages.append(request("job", "tools/call", {"name": "job", "arguments": {"tag": "job"}}))
+        worker, output = self.serve_in_thread(messages, fake)
+        try:
+            self.assertTrue(output.wait_for({"job", "f%d" % MAX_OUTSTANDING}, 3))
+            self.assertEqual(output.text("job"), "job:job")
+            self.assertIn("Server busy", output.text("f%d" % MAX_OUTSTANDING))
+            self.assertEqual(output.reply("f%d" % MAX_OUTSTANDING)["result"]["structuredContent"]["lane"], "fast")
+        finally:
+            release.set()
+            worker.join(10)
+        self.assertFalse(worker.is_alive())
+
+    def test_every_reply_carries_its_own_id_under_concurrency(self):
+        names = ["fingerprint", "disasm", "ghidra_query", "backend", "inspect", "job", "strings", "prepare"]
+        rounds = 3
+        messages = []
+        for r in range(rounds):
+            for n, name in enumerate(names):
+                messages.append(request("%s-%d-%d" % (name, r, n), "tools/call",
+                                        {"name": name, "arguments": {"tag": "%s-%d-%d" % (name, r, n)}}))
+        delay = threading.Event()
+
+        def fake(name, arguments):
+            delay.wait(0.01 if name in ENGINE_TOOLS else 0.001)
+            return "%s|%s" % (name, arguments["tag"])
+
+        with patch("hydralysis.mcp.call", fake):
+            output = IdOutput()
+            Server().serve(io.BytesIO(lines(messages)), output)
+        replies = output.replies()
+        sent = [m["id"] for m in messages]
+        busy = {r["id"] for r in replies if "Server busy" in r["result"]["content"][0]["text"]}
+        # No reply is lost or duplicated; completion order is free, so match by id.
+        self.assertEqual(sorted(r["id"] for r in replies), sorted(sent))
+        for reply in replies:
+            if reply["id"] in busy:
+                continue
+            name, tag = reply["result"]["content"][0]["text"].split("|")
+            self.assertEqual(tag, reply["id"])
+            self.assertTrue(tag.startswith(name))
+
+    def test_shutdown_at_eof_waits_for_accepted_calls_and_answers_them_all(self):
+        release = threading.Event()
+        messages = [request("q%d" % i, "tools/call", {"name": "runtime", "arguments": {"tag": "q%d" % i}})
+                    for i in range(TOOL_WORKERS)]
+        messages.append(request("fp", "tools/call", {"name": "fingerprint", "arguments": {"tag": "fp"}}))
+        entered = []
+        entered_all = threading.Event()
+        blocked = self.engine_call(release)
+        guard = threading.Lock()
+
+        def counted(name, arguments):
+            if name in ENGINE_TOOLS:
+                with guard:
+                    entered.append(name)
+                    if len(entered) == TOOL_WORKERS:
+                        entered_all.set()  # the last engine call is about to block on `release`
+            return blocked(name, arguments)
+
+        worker, output = self.serve_in_thread(messages, counted)
+        try:
+            # Wait for the state under test instead of sleeping: the whole input is read (EOF reached), the fast
+            # call is answered and every engine call is in flight. Only then ask whether serve has returned.
+            self.assertTrue(worker.eof.wait(3), "the server did not reach EOF")
+            self.assertTrue(output.wait_for({"fp"}, 3))
+            self.assertTrue(entered_all.wait(3), "the engine calls did not all start")
+            # serve must still be waiting for them. A returned serve sets the event at once, so a failure is fast;
+            # the pass waits out the grace window, which is a bound on a negative and not a synchronisation.
+            self.assertFalse(worker.returned.wait(0.3), "serve returned while engine calls were still running")
+            self.assertTrue(worker.is_alive())
+        finally:
+            release.set()
+            worker.join(10)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(output.ids(), {"q0", "q1", "q2", "q3", "fp"})
+        leaked = [t for t in threading.enumerate() if t.name.startswith("hydralysis-")]
+        self.assertEqual(leaked, [])
+
+    def test_lane_classification_matches_the_tool_table(self):
+        self.assertEqual(ENGINE_TOOLS, {"ghidra_run", "ghidra_query", "backend", "prepare", "job", "runtime"})
+        self.assertTrue(ENGINE_TOOLS <= set(TOOL_NAMES))
+        for name in set(TOOL_NAMES) - ENGINE_TOOLS:
+            self.assertEqual(lane_of(name), "fast")
+        for name in ENGINE_TOOLS:
+            self.assertEqual(lane_of(name), "engine")
+        self.assertEqual(lane_of(None), "fast")
+        self.assertEqual(lane_of(["x"]), "fast")
+
     def test_large_unicode_tool_result_is_bounded_and_reports_loss(self):
         value = "HEAD" + "\U0001f680" * MAX_OUTPUT_BYTES + "TAIL"
-        with patch("rusticre.mcp.call", return_value=value):
-            response = Server().handle(request(1, "tools/call", {"name": "large"}))
+        with patch("hydralysis.mcp.call", return_value=value):
+            response = Server().handle(request(1, "tools/call", {"name": "fingerprint"}))
         result = response["result"]
         text = result["content"][0]["text"]
         self.assertTrue(result["isError"])
