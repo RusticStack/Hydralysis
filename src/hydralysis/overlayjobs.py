@@ -144,6 +144,13 @@ def run(path: Path) -> None:
             result = crossbuild.run(settings, record, path.parent)
         elif record["kind"] == "edit":
             result = workcopy.edit(settings, engine, selected, record["address"], dict(record["options"]), TIMEOUT_S)
+        elif record["kind"] == "commit":
+            from hydralysis import commits
+            try:
+                result = commits.run_commit(settings, selected, dict(record["options"]), engine, TIMEOUT_S)
+            except commits.CommitError as error:
+                _update(path, state="failed", error="%s: %s" % (error.code, error), error_payload=error.payload(), finished_at=time.time())
+                return
         else:
             result = workcopy.repair(settings, engine, selected, TIMEOUT_S)
         _update(path, state="done", result=result, finished_at=time.time())

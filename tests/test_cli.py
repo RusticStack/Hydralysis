@@ -2,7 +2,8 @@
 
 `backend` doctor and backups, and the `--options` JSON object, were reachable only through MCP. Until Y4b (doctor)
 and Y2 (backups) land their handlers the dispatcher answers `not_available`, and the command line passes that
-answer through unchanged: exit 0, the same JSON text.
+answer through unchanged: exit 0, the same JSON text. Y2 made the dispatcher read `api.HANDLER_MODULES`, so the two
+stub tests below patch that table with a module that never exists and stay true whichever handlers ship.
 """
 
 import io
@@ -100,6 +101,7 @@ class BackendActions(unittest.TestCase):
                     cli.main(argv)
                 self.assertEqual(stopped.exception.code, 2)
 
+    @patch.dict(api.HANDLER_MODULES, {"doctor": "hydralysis._no_such_handler", "backups": "hydralysis._no_such_handler"})
     def test_doctor_and_backups_pass_the_not_available_answer_through_without_side_effects(self):
         with patch("hydralysis.api._settings") as settings, patch("hydralysis.hydra.Engine") as engine:
             doctor_code, doctor_out, _ = run("backend", "--action", "doctor")
@@ -125,10 +127,11 @@ class BackendActions(unittest.TestCase):
             code, out, err = run("backend", "--action", "backups", "--options", '{"op": "delete"}')
         settings.assert_not_called()
         self.assertEqual((code, out), (1, ""))
-        self.assertIn("op must be list or verify", err)
+        self.assertIn("op must be list, verify or remove", err)
 
     def test_the_call_command_reaches_doctor_too(self):
-        code, out, _ = run("call", "backend", "--args", '{"action": "doctor"}')
+        with patch.dict(api.HANDLER_MODULES, {"doctor": "hydralysis._no_such_handler"}):
+            code, out, _ = run("call", "backend", "--args", '{"action": "doctor"}')
         self.assertEqual(code, 0)
         envelope = json.loads(out)
         self.assertTrue(envelope["ok"])

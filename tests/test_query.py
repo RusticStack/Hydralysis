@@ -540,7 +540,7 @@ class SharedBase(EngineCase):
                 if name == "fork_project" and Path(fields["path"]).name.startswith("base-")]
 
     def folder(self):
-        (folder,) = [path for path in workcopy.bases_root(self.settings).iterdir() if path.is_dir()]
+        (folder,) = [path for path in workcopy.bases_root(self.settings, self.runner.target("owned")).iterdir() if path.is_dir()]
         return folder
 
     def test_the_first_edits_of_many_views_build_one_base(self):
@@ -579,7 +579,7 @@ class SharedBase(EngineCase):
         folder = self.folder()
         for path in folder.glob("COMPLETE.json*"):
             path.unlink()
-        holder = LaneLock(str(workcopy.bases_root(self.settings) / (folder.name + ".lock")))
+        holder = LaneLock(str(workcopy.bases_root(self.settings, self.runner.target("owned")) / (folder.name + ".lock")))
         self.assertTrue(holder.acquire())
         self.addCleanup(holder.release)
         with patch("hydralysis.workcopy.BASE_WAIT_S", 0.3):
@@ -600,7 +600,7 @@ class SharedBase(EngineCase):
         saved = marker.read_bytes()
         for path in folder.glob("COMPLETE.json*"):
             path.unlink()
-        holder = LaneLock(str(workcopy.bases_root(self.settings) / (folder.name + ".lock")))
+        holder = LaneLock(str(workcopy.bases_root(self.settings, self.runner.target("owned")) / (folder.name + ".lock")))
         self.assertTrue(holder.acquire())
 
         def finish():
@@ -653,6 +653,51 @@ class LaunchConfiguration(unittest.TestCase):
             path = hydra.write_daemon_config({"root": folder, "expected_agents": 10})
             written = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual((written["maxLong"], written["maxQuick"]), (15, 20))
+
+class AdoptObservation(EngineCase):
+    """`copied` and `imported` come from what adopt observed, not from a literal (PROTOCOL-3.md 8.1)."""
+
+    def adopt(self, engine_class):
+        with patch("hydralysis.hydra.Engine", engine_class):
+            return targets.adopt(self.settings, engine_class(self.settings), str(self.gpr.parent), exe=str(self.exe), target="adopted")
+
+    def test_an_untouched_project_reports_nothing_observed(self):
+        result = self.adopt(fakehydra.FakeEngine)
+        self.assertEqual((result["copied"], result["imported"], result["written"]), (False, False, False))
+        self.assertIn("no copy, no write", result["note"])
+
+    def test_a_program_that_appears_while_the_project_is_opened_is_an_import(self):
+        class Growing(fakehydra.FakeEngine):
+            lists = 0
+
+            def _list(self, project, **kwargs):
+                type(self).lists += 1
+                if type(self).lists == 2:  # the second listing: something was imported meanwhile
+                    self.daemon.project_by_id(project)["programs"]["/extra.exe"] = {
+                        "sha256": "f" * 64, "analyzed": True, "functions": 1, "imageBase": "0x140000000",
+                        "saved": {"marker": "", "names": {}}, "live": None, "writers": set()}
+                return super()._list(project, **kwargs)
+        result = self.adopt(Growing)
+        self.assertTrue(result["imported"])
+        self.assertIn("imported", result["note"])
+
+    def test_a_file_that_changes_under_the_project_folder_is_a_write(self):
+        class Writing(fakehydra.FakeEngine):
+            def _open_project(self, path, **kwargs):
+                opened = super()._open_project(path, **kwargs)
+                Path(opened["gpr"]).with_name("Owned.rep").joinpath("written.bin").write_bytes(b"x")
+                return opened
+        result = self.adopt(Writing)
+        self.assertTrue(result["written"])
+        self.assertFalse(result["copied"])
+
+    def test_a_project_the_engine_registers_elsewhere_is_a_copy(self):
+        class Copying(fakehydra.FakeEngine):
+            def _open_project(self, path, **kwargs):
+                opened = super()._open_project(path, **kwargs)
+                return {**opened, "gpr": str(Path(self.settings["root"]) / "elsewhere" / "Owned.gpr")}
+        result = self.adopt(Copying)
+        self.assertTrue(result["copied"])
 
 
 if __name__ == "__main__":
