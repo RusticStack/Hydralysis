@@ -219,6 +219,28 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(len(self.rows(path)), 1)
         self.assertEqual(sum(action == "decompile" for action, _ in runner.calls), 1)
 
+    def test_the_header_names_the_lineage_and_generation_and_a_new_generation_refuses_the_resume(self):
+        selected = targets.resolve(self.settings, "fixture")
+        with patch("hydralysis.exporting.targets.resolve", return_value={**selected, "lineage": {"id": "L-0123abcd", "origin_key": selected["key"],
+                                                                                              "generation": 1, "cid": "c-00000001"}}):
+            _, header = exporting.provenance(self.settings, "fixture")
+        self.assertEqual((header["lineage"], header["generation"]), ("L-0123abcd", 1))
+        for key in ("master_revision", "engine_release"):
+            self.assertIn(key, header)
+        path = self.make()
+        record, _ = self.run_job(path)
+        self.assertNotIn("lineage", record["provenance"])  # a target with no commit has no lineage in its header
+        flipped = {**record["provenance"], "lineage": "L-0123abcd", "generation": 1, "master_revision": "rev-gen1"}
+        with patch("hydralysis.exporting.provenance", return_value=(self.project, flipped)), patch("hydralysis.exporting._launch") as launch, \
+                self.assertRaisesRegex(ValueError, "changed; resume refused"):
+            exporting.start(self.settings, "fixture", {"resume": record["id"]})
+        launch.assert_not_called()
+        for key, value in (("generation", 2), ("lineage", "L-ffffffff"), ("engine_release", "12.3-hydra.9")):
+            moved = {**record["provenance"], "lineage": "L-0123abcd", "generation": 1, key: value}
+            with self.subTest(changed=key), patch("hydralysis.exporting.provenance", return_value=(self.project, moved)), \
+                    patch("hydralysis.exporting._launch"), self.assertRaisesRegex(ValueError, "resume refused"):
+                exporting.start(self.settings, "fixture", {"resume": record["id"]})
+
     def test_resume_refuses_changed_source_and_preserves_output(self):
         path = self.make()
         record, _ = self.run_job(path)

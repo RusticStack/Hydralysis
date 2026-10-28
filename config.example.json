@@ -4,7 +4,9 @@
   "hydra_max_heap": "12G",
   "hydra_idle_s": 7200,
   "hydra_keep_warm_s": 3600,
-  "overlay_save_debounce_s": 600,
+  "expected_agents": 16,
+  "generationKeep": 3,
+  "viewIdleDeleteS": 86400,
   "evidence": "D:/hydralysis-data/evidence.db",
   "runtime_lock_check": [],
   "targets": {
