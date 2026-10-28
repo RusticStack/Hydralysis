@@ -4,14 +4,23 @@ The overlay store (overlays/<target key>.json) is the record: every edit carries
 its cited source, who made it (client and harness) and when, and the store has a
 revision that only moves forward. The canonical project is never written.
 
-To answer from the overlays, the engine forks the project into a working copy
-(a block clone on ReFS, a bounded copy elsewhere), applies every record in one
-owner transaction and saves it. The program then records the overlay state it
-holds; a reader compares that with the store and refreshes before it would
-answer from another version. A changed master, a reverted record or a missing
-copy means a new fork and a full replay; otherwise new records are applied
-incrementally. One writer at a time per target holds an OS lock; an editor that
-read an older revision gets a conflict instead of overwriting.
+To answer from the overlays, the engine forks the shared base of the master
+(the master in the engine's database format, built once per master revision,
+generation and engine release by whichever caller gets there first) into a
+working copy (a block clone on ReFS, a bounded copy elsewhere) and applies
+every pending record in one owner transaction. The program then records the
+overlay state it holds; a reader compares that with the store and refreshes
+before it would answer from another version. A changed master, a reverted
+record or a missing copy means a new fork and a full replay; otherwise new
+records are applied incrementally.
+
+A working copy is a cache and nothing else (D61): no second process saves it,
+the store is the record, and what the daemon loses with a restart is replayed
+from the store because the program's marker shows what it holds. One writer at a
+time per view holds an OS lock for at most SYNC_LOCK_S (then a structured
+`busy`); a sync uses a writer connection of its own, so two views never close
+each other's projects; an editor that read an older revision gets a conflict
+instead of overwriting.
 """
 
 from __future__ import annotations
@@ -22,15 +31,37 @@ import re
 import shutil
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
-from hydralysis import durable, hydra, revisions
+from hydralysis import durable, hydra, integrity, revisions
 from hydralysis.analysis import MAX_CORPUS_BYTES, MAX_HISTORY_BYTES, MAX_OVERLAYS, _edit, _overlay_path
 from hydralysis.backends import read_json, write_json
-from hydralysis.locks import locked
+from hydralysis.locks import LaneLock, LockBusy, locked
 from hydralysis.paths import root_path
 
-SYNC_LOCK_S = 900
+# The per-view lock bound (D44) and the bound on waiting for another caller's build of the shared base (4.10).
+# Both are unmeasured starting values; past them the caller gets the structured `busy`, never a silent wait.
+SYNC_LOCK_S = 30
+BASE_WAIT_S = 30
+
+
+@contextmanager
+def view_lock(settings: dict, target: dict):
+    """The per-view lock (replaces the per-target `.sync.lock`): bounded, OS-held, so a killed holder frees it.
+
+    A wait that runs out is a `LockBusy`; here it reaches the caller as the structured `busy` error
+    (a RuntimeError carrying the JSON payload, like the conflict payloads of `revisions`)."""
+    try:
+        with locked(_directory(settings, target) / ".view.lock", SYNC_LOCK_S, "working copy"):
+            yield
+    except LockBusy as busy:
+        raise RuntimeError(json.dumps(busy.payload())) from busy
+
+
+def _origin(target: dict) -> dict:
+    origin = target.get("origin_key") or target.get("key")
+    return {"origin_key": origin} if origin else {}
 
 
 def with_view(target: dict, view: str = "") -> dict:
@@ -38,9 +69,10 @@ def with_view(target: dict, view: str = "") -> dict:
     if not isinstance(view, str) or (view and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", view)):
         raise ValueError("view must be a name of 1..64 letters, digits, dots, dashes or underscores")
     if not view or view == "shared":
-        return {**target, "view": "shared"}
+        return {**target, "view": "shared", **_origin(target)}
     key = hashlib.sha256((target["key"] + "\nview:" + view).encode()).hexdigest()[:16]
-    return {**target, "key": key, "view": view}
+    # `origin_key` is the key of the master the view forks from: every view of it shares one base.
+    return {**target, "key": key, "view": view, **_origin(target)}
 
 
 def _store_path(settings: dict, target: dict) -> Path:
@@ -114,9 +146,50 @@ def _clean_commits(raw) -> list[dict]:
     return clean
 
 
+def lineage_binding(target: dict) -> dict | None:
+    """The base binding the head generation gives a view: {lineage, generation}, or None for a target with no lineage."""
+    link = target.get("lineage")
+    return {"lineage": link["id"], "generation": link["generation"]} if link else None
+
+
+def stale_reason(store: dict, target: dict) -> str | None:
+    """`master_generation_changed` when the view holds records on a generation that is no longer the head (4.7).
+
+    Reads keep answering from the view's working copy; a mutation is refused with `stale_view` until the view is rebased."""
+    binding = lineage_binding(target)
+    if binding and (store["edits"] or store["commits"]) and (store.get("base") or {}).get("generation", 0) != binding["generation"]:
+        return "master_generation_changed"
+    return None
+
+
+def refuse_stale(store: dict, target: dict, what: str, settings: dict | None = None) -> None:
+    """A mutation of a view behind the head is refused with `stale_view`, naming the generations (and views) that moved
+    the head and the `rebase` call that settles it (4.7, 4.10)."""
+    if stale_reason(store, target):
+        payload = {"error": "stale_view", "stale": "master_generation_changed", "what": what,
+                   "view": target.get("view", "shared"), "base": store.get("base"), "head": lineage_binding(target),
+                   "next": {"tool": "ghidra_query", "action": "type_edit",
+                            "options": {"kind": "rebase", "expect_revision": store["revision"]}},
+                   "suggest": "another view published a new generation; rebase this view before it edits"}
+        if settings is not None:
+            from hydralysis import views
+            payload["editors"] = views.editors_since(settings, target["lineage"]["id"], (store.get("base") or {}).get("generation", 0))
+        raise RuntimeError(json.dumps(payload))
+
+
+def heal(settings: dict, target: dict) -> None:
+    """Settle a commit or revert that died between its CURRENT.log line and its store write, and a publish whose view
+    was not finalized by the leader, before the view is used."""
+    if target.get("lineage"):
+        from hydralysis import commits, views
+        views.settle(settings, target)
+        commits.heal(settings, target)
+
+
 def _empty_store(sha256: str) -> dict:
     return {"version": STORE_VERSION, "sha256": sha256, "revision": 0, "base": dict(DEFAULT_BASE), "edits": [],
-            "reverted": [], "journal": [], "commits": [], "archived": [], "stale": None}
+            "reverted": [], "journal": [], "commits": [], "archived": [], "stale": None,
+            "published_through": {}, "changesets": []}
 
 
 def load_store(settings: dict, target: dict) -> dict:
@@ -129,7 +202,11 @@ def load_store(settings: dict, target: dict) -> dict:
     # version raises store_corrupt; only a store that was never written reads as "no edits".
     record = _store_record(path)
     if record is None:
-        return _empty_store(target["sha256"])
+        fresh = _empty_store(target["sha256"])
+        binding = lineage_binding(target)
+        if binding:
+            fresh["base"] = binding  # a view created after a commit starts on the head generation
+        return fresh
     if record.get("version") not in (1, 2, STORE_VERSION) or record.get("sha256") != target["sha256"]:
         raise ValueError("overlays at %s belong to another build or format; preserve them and use a new target" % path)
     edits = record.get("edits")
@@ -142,12 +219,35 @@ def load_store(settings: dict, target: dict) -> dict:
     if len({edit["id"] for edit in clean}) != len(clean):
         raise ValueError("overlay history has duplicate edit identities")
     base = record.get("base") if isinstance(record.get("base"), dict) else dict(DEFAULT_BASE)
+    binding = lineage_binding(target)
+    if binding and not clean and not record.get("commits") and base.get("generation") != binding["generation"]:
+        base = binding  # a view with no records follows the head (it has nothing to rebase)
     archived = record.get("archived")
     stale = record.get("stale")
     return {"version": record["version"], "sha256": target["sha256"], "revision": int(record.get("revision", len(clean))),
             "base": base, "edits": clean, "reverted": record.get("reverted", []),
             "journal": revisions.clean_journal(record.get("journal")), "commits": _clean_commits(record.get("commits")),
-            "archived": archived if isinstance(archived, list) else [], "stale": stale if isinstance(stale, str) else None}
+            "archived": archived if isinstance(archived, list) else [], "stale": stale if isinstance(stale, str) else None,
+            "published_through": _clean_through(record.get("published_through")), "changesets": _clean_changesets(record.get("changesets"))}
+
+
+MAX_CHANGESETS = 200
+
+
+def _clean_through(raw) -> dict:
+    """`published_through` (4.8): destination view -> the highest `seq` of this view's records already merged there."""
+    if not isinstance(raw, dict):
+        return {}
+    return {str(name): int(seq) for name, seq in raw.items() if isinstance(seq, int) and not isinstance(seq, bool) and seq >= 0}
+
+
+def _clean_changesets(raw) -> list[dict]:
+    """The publish queue's bookkeeping in this view (4.10): one entry per changeset settled here, so a settle is idempotent."""
+    kept = []
+    for item in raw if isinstance(raw, list) else []:
+        if isinstance(item, dict) and isinstance(item.get("csid"), str):
+            kept.append(item)
+    return kept[-MAX_CHANGESETS:]
 
 
 def _stored_version(path: Path) -> int | None:
@@ -186,7 +286,8 @@ def _v3(store: dict, target: dict) -> dict:
     return {"version": STORE_VERSION, "sha256": store.get("sha256", target["sha256"]), "revision": store["revision"],
             "base": base, "edits": edits, "reverted": store.get("reverted") or [], "journal": store.get("journal") or [],
             "commits": _clean_commits(store.get("commits")), "archived": store.get("archived") or [],
-            "stale": store.get("stale")}
+            "stale": store.get("stale"), "published_through": _clean_through(store.get("published_through")),
+            "changesets": _clean_changesets(store.get("changesets"))}
 
 
 def _save_store(settings: dict, target: dict, store: dict) -> None:
@@ -262,7 +363,6 @@ def summary(settings: dict, target: dict) -> dict:
             "latest_editor": {"by": latest["by"], "at": latest["at"]} if latest else None, "reverted": len(store["reverted"]),
             "working_copy": state.get("fork_gpr"), "working_state": state.get("state"),
             "in_sync": bool(state) and state.get("state") == state_text(state_of(store)),
-            "saved": bool(state.get("saved_at")) and state.get("saved_at", 0) >= state.get("updated_at", 0),
             "last_sync": state.get("last_sync"),
             "recent": [{"id": edit["id"], "address": edit["address"], "kind": edit["options"].get("kind"),
                         "by": edit.get("by"), "at": edit.get("at")} for edit in store["edits"][-10:]]}
@@ -461,8 +561,8 @@ class _Phases:
 
 
 def _fork(settings: dict, writer: hydra.Engine, target: dict, source: str, prefix: str,
-          phases: _Phases | None = None) -> dict:
-    directory = _directory(settings, target)
+          phases: _Phases | None = None, parent: Path | None = None) -> dict:
+    directory = parent if parent is not None else _directory(settings, target)
     directory.mkdir(parents=True, exist_ok=True)
     destination = directory / (prefix + uuid.uuid4().hex[:10])
     # On one ReFS volume this is a block clone; across volumes (a master on another drive) a full
@@ -492,30 +592,53 @@ def engine_release(engine: hydra.Engine) -> dict | None:
     return release or None
 
 
-def _base(settings: dict, writer: hydra.Engine, target: dict, master: dict, current: dict,
-          phases: _Phases | None = None) -> dict:
-    """The master in the engine's current database format, once per master revision.
+# ---- the shared base (PROTOCOL-3.md 4.10, D44) -----------------------------------------------------------------
 
-    A project saved by an older Ghidra is upgraded only in a copy (never in place), and
-    working copies are forked from this one, so a rebuild after a revert pays a block
-    clone and a replay, not another upgrade of the whole program.
+def base_key(target: dict, binding: dict | None, master: dict, release: dict | None) -> str:
+    """One key per (master origin, lineage generation, master revision, engine release): the identity of a base.
 
-    The base is keyed by the master revision and the engine release (hydraVersion and
-    ghidraVersion from hello): another release may write another database format, so a base
-    built by a different release (or by one that did not record it) is rebuilt once.
-    """
+    The analysis identity and the database format of the spec are not reported by a protocol-2 engine; the master
+    revision and the release pair stand in for them (see `engine_release`)."""
+    binding = binding or DEFAULT_BASE
+    material = json.dumps({"origin": target.get("origin_key", target["key"]), "lineage": binding.get("lineage", ""),
+                           "generation": binding.get("generation", 0), "master_revision": master.get("revision"),
+                           "release": release}, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(material.encode()).hexdigest()[:20]
+
+
+def bases_root(settings: dict, target: dict | None = None) -> Path:
+    """`bases/` (every master) or, with a target, `bases/<origin key>/` (the bases of that master's generations)."""
+    root = root_path(settings) / "bases"
+    return root / (target.get("origin_key") or target["key"]) if target else root
+
+
+def _base_ready(folder: Path) -> dict | None:
+    """The base built in FOLDER, or None while it has no completion marker (a folder without one is invisible)."""
+    record = read_json(folder / "COMPLETE.json")
+    if record.get("gpr") and Path(record["gpr"]).is_file() and integrity.newest_valid(record["gpr"]):
+        return record  # published to every view, so it is only ever read here, never repaired (K1)
+    return None
+
+
+def _build_base(settings: dict, writer: hydra.Engine, target: dict, master: dict, release: dict | None, key: str,
+                folder: Path, phases: _Phases | None, binding: dict | None = None) -> dict:
+    """Fork the master into FOLDER, bring it to the engine's current format, clear a stale marker, write the marker."""
     from hydralysis.query import open_program
-    release = engine_release(writer)
-    base = current.get("base") or {}
-    if (base.get("master_revision") == master.get("revision") and base.get("engine") == release
-            and Path(base.get("gpr", "")).is_file()):
-        return base
+    # A crashed builder left a partial fork here; nothing reads it (no marker), and this builder holds the lock.
+    for partial in folder.glob("base-*") if folder.is_dir() else ():
+        shutil.rmtree(partial, ignore_errors=True)
     started = time.monotonic()
-    forked = _fork(settings, writer, target, master["id"], "base-", phases)
+    forked = _fork(settings, writer, target, master["id"], "base-", phases, parent=folder)
     upgrading = time.monotonic()
     try:
         program = open_program(writer, forked["gpr"], target["program"], target["sha256"], writable=True, upgrade=True, refresh=True)
         upgraded = bool(writer.call("info", program=program["key"]).get("changed"))
+        # A generation is a published fork: it carries no overlay_state (commit step 5 cleared it). One that does is
+        # stale, a claim about records this base does not hold, so it is cleared before any view forks from it.
+        cleared = False
+        if _marker(writer, program):
+            _apply(settings, writer, program, [], None, 120)
+            cleared = upgraded = True
         if upgraded:
             writer.call("save", program=program["key"], comment="RusticRE base: current database format", wait=600000)
         writer.call("close_project", project=forked["project"])
@@ -528,9 +651,48 @@ def _base(settings: dict, writer: hydra.Engine, target: dict, master: dict, curr
             pass
         shutil.rmtree(Path(forked["gpr"]).parent, ignore_errors=True)
         raise
-    return {"gpr": forked["gpr"], "master_revision": master.get("revision"), "engine": release, "upgraded": upgraded,
-            "seconds": round(time.monotonic() - started, 3),
-            "fork": {key: forked.get(key) for key in ("method", "cloned", "bytes", "copyMs")}}
+    binding = binding or DEFAULT_BASE
+    record = {"gpr": forked["gpr"], "key": key, "lineage": binding.get("lineage", ""), "generation": binding.get("generation", 0),
+              "master_revision": master.get("revision"), "engine": release,
+              "upgraded": upgraded, "marker_cleared": cleared, "seconds": round(time.monotonic() - started, 3),
+              "fork": {name: forked.get(name) for name in ("method", "cloned", "bytes", "copyMs")}, "built_at": time.time()}
+    write_json(folder / "COMPLETE.json", record)  # the completion marker: written last, so a base is whole or invisible
+    return record
+
+
+def _base(settings: dict, writer: hydra.Engine, target: dict, master: dict, store: dict,
+          phases: _Phases | None = None) -> dict:
+    """The master in the engine's current database format, once per base key for every view and every process.
+
+    A project saved by an older Ghidra is upgraded only in a copy (never in place), and working copies are forked
+    from this one, so a rebuild after a revert pays a block clone and a replay, not another upgrade.
+
+    The first caller takes the OS lock `bases/<key>.lock` and builds; the others poll the completion marker for at
+    most BASE_WAIT_S and then get a structured `busy` (a LockBusy). Nobody who only reads waits here: a reader of a
+    view without records answers from the master.
+    """
+    release = engine_release(writer)
+    key = base_key(target, store.get("base"), master, release)
+    folder = bases_root(settings, target) / key
+    ready = _base_ready(folder)
+    if ready:
+        return ready
+    folder.parent.mkdir(parents=True, exist_ok=True)
+    lease = LaneLock(str(bases_root(settings, target) / (key + ".lock")))
+    started = time.monotonic()
+    while True:
+        if lease.acquire():
+            try:
+                ready = _base_ready(folder)  # another caller finished while this one waited for the lock
+                return ready or _build_base(settings, writer, target, master, release, key, folder, phases, store.get("base"))
+            finally:
+                lease.release()
+        time.sleep(0.05)
+        ready = _base_ready(folder)
+        if ready:
+            return ready
+        if time.monotonic() - started >= BASE_WAIT_S:
+            raise LockBusy("shared base", bases_root(settings, target) / (key + ".lock"), time.monotonic() - started, 2000)
 
 
 def _marker(engine: hydra.Engine, program: dict) -> dict | None:
@@ -569,16 +731,20 @@ def _prefix_matches(records: list[dict], marker: dict | None, wanted: dict | Non
     return count if _digest_of(ids) == marker.get("ids_sha256") else None
 
 
+def writer_for(settings: dict, target: dict) -> hydra.Engine:
+    """The writer connection of one view: private to it, so closing it never touches another view's programs."""
+    return hydra.Engine(settings, role="writer", lane=target["key"])
+
+
 def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list[dict] | None = None) -> dict:
     """Bring the working copy to the store (plus `extra`, the record being added). Lock held by caller.
 
     Changes are committed in the engine's shared-write mode and stay in the daemon after this
-    connection leaves; a background saver persists them (saving 1.5 GB takes about 35 s, so it
-    is never on the edit path). If the daemon stops first, the program's marker shows what it
-    lost and the next sync replays it from the store.
+    connection leaves. Nothing saves them (D61): a working copy is a cache, the store is the record, and if the
+    daemon stops first the program's marker shows what it lost and the next sync replays it from the store.
     """
     from hydralysis.query import forget, open_program
-    writer = hydra.Engine(settings, role="writer")
+    writer = writer_for(settings, target)
     records = pending_of(store) + (extra or [])
     wanted = state_of({**store, "revision": store["revision"] + len(extra or []),
                        "edits": store["edits"] + (extra or [])})
@@ -592,7 +758,19 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
         how = {"rebuilt": False}
         program = None
         applied = None
-        if Path(current.get("fork_gpr", "")).is_file() and current.get("master_revision") == master.get("revision"):
+        reusable = Path(current.get("fork_gpr", "")).is_file() and current.get("master_revision") == master.get("revision")
+        if reusable:
+            try:
+                # The fork is ours and disposable: a newest version with no valid header (a kill between the rename and
+                # the header write) is moved aside before the engine is asked to open it (integrity.py, D42).
+                checked = integrity.check_fork(current["fork_gpr"], disposable=True)
+                if checked["moved"]:
+                    how["integrity"] = checked
+            except integrity.CorruptNewest as damaged:
+                # Nothing usable is left in it: it is a cache, so it is rebuilt from the base and the store.
+                how["integrity"] = {"ok": False, "dropped": current["fork_gpr"], "report": damaged.report["newest_invalid"]}
+                reusable = False
+        if reusable:
             opening = time.monotonic()
             program = open_program(writer, current["fork_gpr"], target["program"], target["sha256"],
                                    writable=True, upgrade=True, refresh=True)
@@ -607,10 +785,10 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
                 gpr = current["fork_gpr"]
         base = current.get("base") or {}
         if program is None:
-            base = _base(settings, writer, target, master, current, phases)
+            base = _base(settings, writer, target, master, store, phases)
             forked = _fork(settings, writer, target, base["gpr"], "w-", phases)
             gpr = forked["gpr"]
-            how = {"rebuilt": True, "fork": {key: forked.get(key) for key in ("method", "cloned", "bytes", "copyMs")}}
+            how = {**how, "rebuilt": True, "fork": {key: forked.get(key) for key in ("method", "cloned", "bytes", "copyMs")}}
             opening = time.monotonic()
             program = open_program(writer, gpr, target["program"], target["sha256"], writable=True, upgrade=True, refresh=True)
             phases.add("open", opening)
@@ -620,19 +798,17 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
             applied = _apply(settings, writer, program, pending, wanted, timeout_s, target)
             phases.add("replay", opening)
         retired = list(current.get("retired", []))
-        for old in (current.get("fork_gpr"), (current.get("base") or {}).get("gpr")):
-            if old and old not in (gpr, base.get("gpr")) and old not in retired:
-                retired.append(old)
+        # Only this view's own forks are retired; the shared base belongs to every view.
+        if current.get("fork_gpr") and current["fork_gpr"] != gpr and current["fork_gpr"] not in retired:
+            retired.append(current["fork_gpr"])
         report = (applied or {}).get("import_report") if pending else None
         state = {"fork_gpr": gpr, "master_revision": master.get("revision"), "state": state_text(wanted),
                  "base": base, "edits": len(records), "updated_at": time.time(),
-                 "saved_at": current.get("saved_at") if not how["rebuilt"] else None,
                  "retired": _retire(writer, retired),
                  "last_sync": {**how, "applied_now": len(pending), "seconds": round(time.monotonic() - started, 3),
                                "phases_ms": phases.report(time.monotonic() - started),
                                **({"import_report": report} if report else {})}}
         write_json(_directory(settings, target) / "state.json", state)
-        _start_saver(settings, target)
         if extra:
             # What each record changed and what was there before, as the engine saw it (store v3 `effects`).
             # Only the added records': a replay of up to MAX_OVERLAYS pending ones must not inflate the response.
@@ -642,35 +818,10 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
                                          for item in (applied or {}).get("effects") or [] if item.get("id") in added}}
         return state
     finally:
-        # Disconnecting keeps the committed changes in the daemon (shared mode);
-        # readers keep (or refresh) their views.
+        # Disconnecting keeps the committed changes in the daemon (shared mode); readers keep (or refresh) their
+        # views. This connection is this view's own, so only this view's programs are released.
         writer.reset()
         forget(writer)
-
-
-def _start_saver(settings: dict, target: dict) -> None:
-    from hydralysis import proc
-    from hydralysis.locks import held
-    import os
-    import sys
-    directory = _directory(settings, target)
-    if held(str(directory / ".saver.lock")):
-        return
-    env = dict(os.environ)
-    env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
-    env["HYDRALYSIS_HARNESS"] = hydra.identity()["harness"]
-    keys = ("root", "hydra_dir", "hydra_client", "java_home", "hydra_idle_s", "hydra_keep_warm_s", "hydra_max_heap",
-            "hydra_allow_unpinned", "hydra", "fork_mode", "fork_max_copy_mb", "forbidden_drives", "overlay_save_debounce_s")
-    write_json(directory / "saver-settings.json", {**{key: settings[key] for key in keys if key in settings},
-                                                   "targets": {target["name"]: targets_entry(settings, target)}})
-    with (directory / "saver.log").open("ab") as log:
-        proc.popen([sys.executable, "-m", "hydralysis.workcopy_saver", str(directory), target["name"]],
-                   env=env, stdout=log, stderr=log, **({} if os.name == "nt" else {"start_new_session": True}))
-
-
-def targets_entry(settings: dict, target: dict) -> dict:
-    from hydralysis import targets
-    return targets.configured(settings)[target["name"]]
 
 
 def _retire(engine: hydra.Engine, gprs: list[str]) -> list[str]:
@@ -693,13 +844,19 @@ def _retire(engine: hydra.Engine, gprs: list[str]) -> list[str]:
 def reader(settings: dict, engine: hydra.Engine, target: dict) -> dict:
     """The working copy, synchronized with the store, opened read-only for queries."""
     from hydralysis.query import open_program
+    heal(settings, target)
     store = load_store(settings, target)
     wanted = state_text(state_of(store))
     state = _state(settings, target)
+    if stale_reason(store, target):
+        # A view behind the head keeps answering from the working copy it has, labelled with the generation it came from.
+        if Path(state.get("fork_gpr", "")).is_file():
+            return open_program(engine, state["fork_gpr"], target["program"], target["sha256"])
+        refuse_stale(store, target, "read", settings)
     if state.get("state") != wanted or not Path(state.get("fork_gpr", "")).is_file():
         if heavy(store):
             rebuilding(settings, target)
-        with locked(_directory(settings, target) / ".sync.lock", SYNC_LOCK_S, "working copy"):
+        with view_lock(settings, target):
             store = load_store(settings, target)
             state = _sync(settings, target, store, 300)
     return open_program(engine, state["fork_gpr"], target["program"], target["sha256"])
@@ -707,7 +864,8 @@ def reader(settings: dict, engine: hydra.Engine, target: dict) -> dict:
 
 def repair(settings: dict, engine: hydra.Engine, target: dict, timeout_s: int = 300) -> dict:
     """Re-sync the working copy from the store, whatever its program holds now."""
-    with locked(_directory(settings, target) / ".sync.lock", SYNC_LOCK_S, "working copy"):
+    heal(settings, target)
+    with view_lock(settings, target):
         return _sync(settings, target, load_store(settings, target), timeout_s)
 
 
@@ -759,6 +917,7 @@ def _rebase_report(expect: int, decision: dict) -> dict:
 def edit(settings: dict, engine: hydra.Engine, target: dict, address: str, options: dict, timeout_s: int) -> dict:
     """Validate, apply and record one cited edit (or batch) with an optimistic revision check."""
     expect = options.pop("expect_revision", None)
+    heal(settings, target)
     require_revision(settings, target, expect, "type_edit")
     if options.get("kind") == "import_types":
         digest, size = store_corpus(settings, options.pop("corpus"))
@@ -768,8 +927,9 @@ def edit(settings: dict, engine: hydra.Engine, target: dict, address: str, optio
         options.update(archive_sha256=digest, archive_bytes=size)
     record = {"id": uuid.uuid4().hex, "address": address, "options": options}
     clean = {**_edit(record), "by": _attribution(), "at": time.time()}
-    with locked(_directory(settings, target) / ".sync.lock", SYNC_LOCK_S, "working copy"):
+    with view_lock(settings, target):
         store = load_store(settings, target)
+        refuse_stale(store, target, "type_edit", settings)
         subjects = revisions.subjects_of(address, clean["options"])
         decision = reconcile(store, expect, subjects)
         if len(store["edits"]) >= MAX_OVERLAYS:
@@ -806,6 +966,7 @@ def add_proposals(settings: dict, engine: hydra.Engine, target: dict, records: l
     (what the engine reports here, not what the author saw). Each carries `imported_from` (the bundle and the
     record it came from). Used by bundle import; the same locking, rebase and cap rules as `edit`.
     """
+    heal(settings, target)
     require_revision(settings, target, expect, "import_bundle")
     clean = []
     for record in records:
@@ -814,8 +975,9 @@ def add_proposals(settings: dict, engine: hydra.Engine, target: dict, records: l
                       "imported_from": {**imported_from, "id": record.get("source_id", record["id"]),
                                         "by": record.get("source_by"), "at": record.get("source_at")}})
     subjects = sorted({subject for item in clean for subject in revisions.subjects_of(item["address"], item["options"])})
-    with locked(_directory(settings, target) / ".sync.lock", SYNC_LOCK_S, "working copy"):
+    with view_lock(settings, target):
         store = load_store(settings, target)
+        refuse_stale(store, target, "import_bundle", settings)
         decision = reconcile(store, expect, subjects)
         if len(store["edits"]) + len(clean) > MAX_OVERLAYS:
             raise ValueError("overlay history limit reached; export/review it before adding more edits")
@@ -855,9 +1017,11 @@ def revert(settings: dict, target: dict, ids: list[str], expect: int | None = No
     commit revert. A record whose removal would leave a later pending record on the same (subject, field) with a
     stale `before` is refused (`has_dependents`, the later ids named); `cascade` removes those as well.
     """
+    heal(settings, target)
     require_revision(settings, target, expect, "revert")
-    with locked(_directory(settings, target) / ".sync.lock", SYNC_LOCK_S, "working copy"):
+    with view_lock(settings, target):
         store = load_store(settings, target)
+        refuse_stale(store, target, "revert", settings)
         dropped = _selected(store, ids)
         if not dropped:
             raise ValueError("no overlay record or batch matches %s" % ", ".join(ids))

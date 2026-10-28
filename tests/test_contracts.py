@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -102,12 +103,29 @@ class CatalogEpoch(unittest.TestCase):
         self.assertEqual(set(api.OPTION_BAGS), {"ghidra_query", "backend", "ghidra_run", "job", "runtime"})
 
 
+def no_handler(*capabilities):
+    """Patch `api.HANDLER_MODULES` so that each capability's module never exists (PROTOCOL-3.md 8.2).
+
+    The dispatcher's own `not_available` path is asserted whichever handler modules the release ships, so neither the
+    package that lands `doctor.py` nor the one that lands `userscripts.py` edits this file."""
+    def decorate(test):
+        def wrapper(self, *args, **kwargs):
+            table = {name: "hydralysis._no_such_handler" for name in capabilities}
+            with patch.dict(api.HANDLER_MODULES, table):
+                return test(self, *args, **kwargs)
+        wrapper.__name__ = test.__name__
+        wrapper.__doc__ = test.__doc__
+        return wrapper
+    return decorate
+
+
 class NotAvailableCarriers(unittest.TestCase):
     def setUp(self):
         patcher = patch("hydralysis.api.load", return_value={})
         patcher.start()
         self.addCleanup(patcher.stop)
 
+    @no_handler("doctor", "backups")
     def test_doctor_and_backups_answer_not_available_without_side_effects(self):
         with patch("hydralysis.api._settings") as settings, patch("hydralysis.hydra.Engine") as engine:
             doctor = json.loads(call("backend", {"action": "doctor"}))
@@ -123,6 +141,7 @@ class NotAvailableCarriers(unittest.TestCase):
             self.assertEqual(reply["catalog"], catalog())
             self.assertEqual(reply["tool"], "backend")
 
+    @no_handler("doctor")
     def test_through_mcp_it_is_a_result_not_an_error(self):
         reply = Server().handle({"id": 1, "method": "tools/call", "params": {
             "name": "backend", "arguments": {"action": "doctor"}}})
@@ -137,6 +156,7 @@ class NotAvailableCarriers(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "backend action must be"):
             call("backend", {"action": "repair"})
 
+    @no_handler("scriptIsolation")
     def test_ghidra_run_options_are_never_silently_ignored(self):
         with patch("hydralysis.api._settings", return_value={}), patch("hydralysis.userscripts.run", return_value="ran") as run:
             self.assertEqual(call("ghidra_run", {"target": "t", "script": "s.py"}), "ran")
@@ -152,6 +172,7 @@ class NotAvailableCarriers(unittest.TestCase):
                     call("ghidra_run", {"target": "t", "script": "s.py", "options": bad})
             run.assert_not_called()
 
+    @no_handler("jobOptions")
     def test_job_options_are_reserved_and_plain_job_calls_are_unchanged(self):
         reply = json.loads(call("job", {"options": {"kind": "commit"}}))
         self.assertEqual((reply["not_available"], reply["options"]), ("jobOptions", ["kind"]))
@@ -161,6 +182,62 @@ class NotAvailableCarriers(unittest.TestCase):
         self.assertEqual(status.call_count, 2)
         with self.assertRaises(ValueError):
             call("job", {"options": "x"})
+
+
+class HandlerRegistry(unittest.TestCase):
+    """api.HANDLER_MODULES: a capability name to the module that implements it, read at call time (8.2)."""
+
+    def setUp(self):
+        patcher = patch("hydralysis.api.load", return_value={})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_the_registry_names_every_capability_a_later_package_registers(self):
+        self.assertEqual(set(api.HANDLER_MODULES), {"backups", "doctor", "jobOptions", "scriptIsolation", "views", "publish",
+                                                    "environment", "evidenceBundle"})
+        self.assertEqual(api.HANDLER_MODULES["backups"], "hydralysis.backups")
+        self.assertEqual(api.HANDLER_MODULES["jobOptions"], "hydralysis.commits")
+
+    def test_a_module_that_does_not_exist_yet_has_no_handler_and_a_broken_one_is_not_hidden(self):
+        with patch.dict(api.HANDLER_MODULES, {"doctor": "hydralysis._no_such_handler"}):
+            self.assertIsNone(api.handler("doctor"))
+        self.assertIsNone(api.handler("not-a-capability"))
+        # A module that exists but fails to import for another reason is a defect, not a missing feature.
+        folder = workdir("handler")
+        self.addCleanup(folder.cleanup)
+        (Path(folder.name) / "broken_handler_probe.py").write_text("import module_that_is_missing_for_sure\n", encoding="utf-8")
+        with patch("sys.path", [folder.name] + sys.path), patch.dict(api.HANDLER_MODULES, {"doctor": "broken_handler_probe"}):
+            with self.assertRaises(ModuleNotFoundError):
+                api.handler("doctor")
+
+    def test_a_registered_handler_answers_and_receives_the_request(self):
+        seen = {}
+
+        class Module:
+            @staticmethod
+            def handle(capability, request):
+                seen.update(capability=capability, request=request)
+                return json.dumps({"handled": capability})
+
+        with patch.dict(api.HANDLER_MODULES, {"doctor": "fake_doctor_handler"}), \
+                patch.dict("sys.modules", {"fake_doctor_handler": Module}):
+            reply = json.loads(call("backend", {"action": "doctor", "options": {"sections": ["engine"]}}))
+        self.assertEqual(reply, {"handled": "doctor"})
+        self.assertEqual((seen["request"]["tool"], seen["request"]["action"], seen["request"]["options"]),
+                         ("backend", "doctor", {"sections": ["engine"]}))
+
+    def test_a_module_without_handle_is_not_a_handler(self):
+        with patch.dict(api.HANDLER_MODULES, {"doctor": "json"}):
+            self.assertIsNone(api.handler("doctor"))
+
+    def test_backend_help_lists_the_agent_identity_and_the_retention_command(self):
+        with patch("hydralysis.api._settings", return_value={}):
+            help_text = json.loads(call("backend", {"action": "help"}))
+        bags = help_text["option_bags"]
+        self.assertIn("options.as", bags["ghidra_query"])
+        self.assertIn("options.as", bags["ghidra_run"])
+        self.assertIn("remove", bags["backend"])
+        self.assertEqual(help_text["catalog"], catalog())  # the bags ride outside the catalog hash
 
 
 class AgentContracts(unittest.TestCase):
