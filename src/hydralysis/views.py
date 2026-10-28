@@ -28,10 +28,12 @@ refused whole, its records stay pending in the view, and the conflict names the 
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import random
 import re
+import secrets
 import shutil
 import statistics
 import time
@@ -40,7 +42,7 @@ from contextlib import ExitStack
 from pathlib import Path
 
 from hydralysis import backups, commits, durable, hydra, integrity, lineage, revisions, targets, workcopy
-from hydralysis.locks import LaneLock, LockBusy, held
+from hydralysis.locks import LaneLock, LockBusy, held, locked
 
 FORMAT = 1
 PUBLISH_BATCH_MAX = 1            # `publishBatchMax`: changesets per generation; more only if SP7 shows it is needed
@@ -1252,3 +1254,232 @@ def outcome_of(result: dict) -> dict:
     return {"ok": True, "generation": result.get("generation"),
             **{key: result.get(key) for key in ("csid", "outcome", "gpr", "record_outcomes", "base_generation", "seq", "build_ms",
                                                 "manifestSha256", "converged", "in_master", "unverified") if result.get(key) is not None}}
+
+
+# ---- per-agent views: identity and the view records of 4.10 (Y5) -----------------------------------------------------
+#
+# The view of a call is (lineage, agent id). The agent id is `options.as`, else the process default
+# `<MCP clientInfo name>@<boot id>` (D59); `HYDRALYSIS_AGENT_ID`, read when the server starts, replaces the default with an id
+# that survives a restart. A process id is never part of an id. The view's store is keyed by the view NAME, a plain name
+# derived from the id (`view_name`), so every job, lock and file that already carries a view name works unchanged.
+#
+# `views/<view name>.json` in the lineage folder says who holds the view: the agent id, its kind, the agent's name, the boot
+# id, the pid with its start time, a lease refreshed by the holder's calls, the base generation and the state. A holder is
+# live while its lease holds and its process exists; a view with no live holder is `orphaned`, and the `adoptable` list of
+# a new process names the orphans of the same agent name that still have pending records.
+
+BOOT_ID = secrets.token_hex(8)       # 16 random hex digits, new at every start of this server process (D59, revision 8)
+RESERVED_VIEWS = ("shared", "master")  # `shared` is the collaboration view (named explicitly); `master` labels reads of the sealed master
+LEASE_S = 600                        # `viewLeaseS`: a holder that makes no call for this long no longer owns the view
+LEASE_REFRESH_S = 60                 # the lease is rewritten when this much of it is gone, not on every call
+RECORD_FORMAT = 1
+RECORD_LOCK_S = 10
+_AGENT_MAX = 128
+_STARTED_MS: list[int] = []
+
+
+def process_started_ms() -> int:
+    if not _STARTED_MS:
+        from hydralysis.preparation import process_start_ms
+        _STARTED_MS.append(process_start_ms(os.getpid()))
+    return _STARTED_MS[0]
+
+
+def agent_name() -> str:
+    """The MCP client's name (`clientInfo.name`, set at `initialize`), `cli` outside a server."""
+    return hydra.identity()["harness"]
+
+
+def clean_agent_id(value, what: str = "options.as") -> str:
+    if not isinstance(value, str) or not value.strip() or len(value) > _AGENT_MAX or any(ord(char) < 32 for char in value):
+        raise ValueError("%s must be a string of 1..%d printable characters" % (what, _AGENT_MAX))
+    return value.strip()
+
+
+def default_agent_id() -> tuple[str, str]:
+    """(id, kind) of a call that carries no `as`: `HYDRALYSIS_AGENT_ID` (stable across restarts), else `<client name>@<boot id>`."""
+    from hydralysis import compat
+    fixed = compat.env("AGENT_ID")
+    if fixed:
+        return clean_agent_id(fixed, "HYDRALYSIS_AGENT_ID"), "stable"
+    return "%s@%s" % (agent_name(), BOOT_ID), "default"
+
+
+def view_name(agent_id: str) -> str:
+    """The name of the view of AGENT_ID: the id itself when it is already a view name, else a slug with a short digest
+    (`claude-code@1f2e...` becomes `claude-code.at.1f2e....<digest>`), so two different ids never share a name."""
+    if _VIEW.fullmatch(agent_id) and agent_id not in RESERVED_VIEWS:
+        return agent_id
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", agent_id.replace("@", ".at.")).strip("-._")[:48] or "agent"
+    return "%s.%s" % (slug, hashlib.sha256(agent_id.encode("utf-8")).hexdigest()[:10])
+
+
+def identify(options: dict) -> dict:
+    """Who a call is. Pops `as` from OPTIONS. `{agent, kind, name, shared}`; `shared` is True for the collaboration view."""
+    given = options.pop("as", None)
+    if given is None:
+        agent, kind = default_agent_id()
+    else:
+        agent, kind = clean_agent_id(given), "explicit"
+    if agent == "shared":
+        return {"agent": agent, "kind": kind, "name": "shared", "shared": True}
+    if agent == "master":
+        raise ValueError("options.as 'master' is reserved: it labels reads of the sealed master")
+    return {"agent": agent, "kind": kind, "name": view_name(agent), "shared": False}
+
+
+def views_dir(settings: dict, lineage_id: str) -> Path:
+    return lineage.lineage_dir(settings, lineage_id) / "views"
+
+
+def record_path(settings: dict, lineage_id: str, name: str) -> Path:
+    if not _VIEW.fullmatch(name or ""):
+        raise ValueError("invalid view name")
+    return views_dir(settings, lineage_id) / (name + ".json")
+
+
+def _record_lock(settings: dict, lineage_id: str, name: str):
+    return locked(views_dir(settings, lineage_id) / (name + ".lock"), RECORD_LOCK_S, "view record")
+
+
+def read_record(settings: dict, lineage_id: str, name: str) -> dict | None:
+    """The view's record, or None when there is none or it cannot be read (a record is metadata: the store is the truth)."""
+    try:
+        return durable.read_sealed(record_path(settings, lineage_id, name), default=None, max_bytes=65536)
+    except (durable.StoreCorrupt, OSError, ValueError):
+        return None
+
+
+def list_records(settings: dict, lineage_id: str) -> list[dict]:
+    folder = views_dir(settings, lineage_id)
+    if not folder.is_dir():
+        return []
+    rows = []
+    for path in sorted(folder.glob("*.json")):
+        record = read_record(settings, lineage_id, path.stem)
+        if record and record.get("view") == path.stem:
+            rows.append(record)
+    return rows
+
+
+def _holder_live(holder: dict, now: float) -> bool:
+    from hydralysis import proc
+    if float(holder.get("lease_until", 0)) < now:
+        return False
+    try:
+        return proc.identity(int(holder.get("pid", 0)), int(holder.get("pid_started_ms", 0)))
+    except (OSError, ValueError):
+        return False
+
+
+def live_holders(record: dict, now: float | None = None) -> dict:
+    now = time.time() if now is None else now
+    return {boot: holder for boot, holder in (record.get("holders") or {}).items() if _holder_live(holder, now)}
+
+
+def holder_state(record: dict, now: float | None = None) -> str:
+    """`mine` (this process holds it), `live` (another process does) or `orphaned` (no holder is alive)."""
+    holders = live_holders(record, now)
+    if BOOT_ID in holders:
+        return "mine"
+    return "live" if holders else "orphaned"
+
+
+def claim(settings: dict, selected: dict, who: dict, lineage_id: str, lease_s: float = LEASE_S, create: bool = True) -> dict | None:
+    """Take (create, refresh or adopt) the record of the view WHO names, under the record's lock.
+
+    A process default id (`kind` default) belongs to the process that made it: another process that names it with `as`
+    while a holder is live is refused with `view_in_use` (it may adopt once the holder's lease ended or its process is
+    gone). Explicit and stable ids are shared by every caller that presents them (D59); the record keeps every live holder.
+    With CREATE False a missing record is not made."""
+    name = who["name"]
+    path = record_path(settings, lineage_id, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    with _record_lock(settings, lineage_id, name):
+        record = read_record(settings, lineage_id, name)
+        if record is None and not create:
+            return None
+        holders = {}
+        if record:
+            holders = {boot: item for boot, item in (record.get("holders") or {}).items() if _holder_live(item, now)}
+            others = [boot for boot in holders if boot != BOOT_ID]
+            if others and record.get("id_kind") == "default" and who["kind"] != "default":
+                owner = holders[others[0]]
+                raise ViewError("view_in_use", "view %s is held by a live process of the same agent (%s, pid %s); it can be "
+                                "adopted when its lease ends or its process exits" % (who["agent"], owner.get("agent_name"), owner.get("pid")),
+                                view=name, agent=who["agent"],
+                                owner={"boot_id": others[0], "pid": owner.get("pid"), "agent_name": owner.get("agent_name"),
+                                       "lease_until": owner.get("lease_until")})
+        mine = holders.get(BOOT_ID)
+        if mine and record and mine["lease_until"] - now > lease_s - LEASE_REFRESH_S:
+            return record
+        holders[BOOT_ID] = {"pid": os.getpid(), "pid_started_ms": process_started_ms(), "lease_until": now + lease_s,
+                            "agent_name": agent_name()}
+        adopted = None
+        if record and record.get("boot_id") != BOOT_ID and BOOT_ID not in (record.get("holders") or {}):
+            adopted = {"boot_id": record.get("boot_id"), "pid": record.get("pid"), "agent_name": record.get("agent_name"), "at": now}
+        previous = (record or {}).get("adopted_from")
+        body = {"format": RECORD_FORMAT, "view": name, "agent": who["agent"], "id_kind": (record or {}).get("id_kind") or who["kind"],
+                "agent_name": agent_name(), "boot_id": BOOT_ID, "pid": os.getpid(), "pid_started_ms": process_started_ms(),
+                "lease_until": now + lease_s, "holders": holders, "key": selected["key"], "target": selected["name"],
+                "base": (record or {}).get("base") or workcopy.lineage_binding(selected), "state": "open",
+                "created": (record or {}).get("created", now), "last_seen": now,
+                **({"adopted_from": adopted or previous} if (adopted or previous) else {})}
+        durable.write_sealed(path, body, max_bytes=65536)
+        return body
+
+
+def mark_state(settings: dict, lineage_id: str, name: str, state: str, **fields) -> None:
+    """Record that the view's fork is `evicted` (closed, folder kept), `deleted` or `open` again. Best effort."""
+    try:
+        with _record_lock(settings, lineage_id, name):
+            record = read_record(settings, lineage_id, name)
+            if record:
+                durable.write_sealed(record_path(settings, lineage_id, name), {**record, "state": state, **fields},
+                                     max_bytes=65536)
+    except (OSError, LockBusy, durable.StoreCorrupt, ValueError):
+        pass
+
+
+def describe(settings: dict, template: dict, record: dict, now: float | None = None) -> dict:
+    """One row of `status show=views`: the record, its holder state and what the store holds for it."""
+    now = time.time() if now is None else now
+    pending, base = None, record.get("base")
+    try:
+        store = workcopy.load_store(settings, {**template, "key": record["key"], "view": record["view"]})
+        pending, base = len(workcopy.pending_of(store)), store.get("base")
+    except (ValueError, OSError, durable.StoreCorrupt):
+        pass
+    return {"view": record["view"], "agent": record["agent"], "id_kind": record.get("id_kind"), "agent_name": record.get("agent_name"),
+            "state": holder_state(record, now), "fork": record.get("state"), "pending": pending, "base": base,
+            "boot_id": record.get("boot_id"), "pid": record.get("pid"), "lease_until": record.get("lease_until"),
+            "idle_s": round(now - record.get("last_seen", now), 1),
+            **({"adopted_from": record["adopted_from"]} if record.get("adopted_from") else {})}
+
+
+def adoptable(settings: dict, template: dict, lineage_id: str, name: str | None = None) -> list[dict]:
+    """The orphaned views of this lineage with the same agent name that still hold pending records (4.10 b)."""
+    name = agent_name() if name is None else name
+    found = []
+    for record in list_records(settings, lineage_id):
+        if record.get("agent_name") != name or holder_state(record) != "orphaned":
+            continue
+        row = describe(settings, template, record)
+        if row["pending"]:
+            found.append({"agent": row["agent"], "view": row["view"], "pending": row["pending"],
+                          "orphaned_since": record.get("lease_until"), "use": {"options": {"as": row["agent"]}}})
+    return found
+
+
+def views_status(settings: dict, template: dict, lineage_id: str | None, me: dict | None = None) -> dict:
+    """`status show=views`: every view of the lineage with its holder state, the adoptable orphans and this process's identity."""
+    default_id, kind = default_agent_id()
+    out = {"boot_id": BOOT_ID, "agent_name": agent_name(), "default_agent": default_id, "default_kind": kind, "pid": os.getpid(),
+           "lineage": lineage_id, "views": [], "adoptable": []}
+    if me:
+        out["you"] = {"agent": me["agent"], "view": me["name"]}
+    if lineage_id:
+        out["views"] = [describe(settings, template, record) for record in list_records(settings, lineage_id)]
+        out["adoptable"] = adoptable(settings, template, lineage_id)
+    return out
