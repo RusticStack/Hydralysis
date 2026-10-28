@@ -719,5 +719,149 @@ class AdoptObservation(EngineCase):
         self.assertTrue(result["copied"])
 
 
+class ViewsThroughQuery(unittest.TestCase):
+    """`type_edit kind=rebase|merge|publish` and `status show=queue` as the tools call them (PROTOCOL-3.md 4.7, 4.8, 4.10)."""
+
+    def setUp(self):
+        from test_commit import World
+
+        class Inner(World, unittest.TestCase):
+            def runTest(self):
+                pass
+        self.world = Inner()
+        self.world.setUp()
+        self.addCleanup(self.world.doCleanups)
+        self.runner = self.world.runner
+
+    def ask(self, action, address="", **options):
+        return json.loads(self.runner.query("owned", action, address, options=options))
+
+    def edit(self, name, address, view):
+        revision = workcopy.load_store(self.world.settings, self.world.target(view))["revision"]
+        return self.ask("type_edit", address, kind="rename", name=name, source="cited test evidence", expect_revision=revision, view=view)
+
+    def publish_through_the_job(self, view):
+        """The publish call starts a job; the job's worker is the function the overlay worker calls."""
+        from hydralysis import views
+        revision = workcopy.load_store(self.world.settings, self.world.target(view))["revision"]
+        with patch("hydralysis.views.start_job", return_value={"id": "overlay-0123456789ab", "state": "queued", "kind": "publish"}) as start:
+            answer = self.ask("type_edit", kind="publish", confirm_one_way_upgrade=True, expect_revision=revision, view=view)
+        options = start.call_args.args[2]
+        views.run_publish_job(self.world.settings, self.world.target(view), options, fakehydra.FakeEngine(self.world.settings), 60)
+        return answer, start
+
+    def test_publish_returns_a_job_with_its_position_and_the_worker_publishes(self):
+        self.edit("Mine", "0x140001000", "one")
+        answer, start = self.publish_through_the_job("one")
+        self.assertEqual((sorted(start.call_args.args[2]), answer["id"], answer["state"]), (["csid", "lineage"], "overlay-0123456789ab", "queued"))
+        self.assertEqual((answer["position"], answer["publish_pending"]["state"], answer["reused"]), (1, "publish_pending", False))
+        self.assertTrue(answer["csid"].startswith("c-"))
+        self.assertEqual(self.world.name_of("0x140001000"), "Mine")
+        queue = self.ask("status", show="queue", csid=answer["csid"])
+        self.assertEqual((queue["queue"]["length"], queue["changeset"]["state"], queue["changeset"]["outcome"]),
+                         (0, "done", "applied"))
+
+    def test_the_publish_job_runs_end_to_end_through_its_own_worker_record(self):
+        """A job record is made by `views.start_job` (the worker process is patched out), run by `views.run_job` (the worker body)
+        and read by `overlayjobs.status` like any overlay job; `overlayjobs.py` is not involved in running it."""
+        from hydralysis import overlayjobs, views
+        self.edit("Mine", "0x140001000", "one")
+        revision = workcopy.load_store(self.world.settings, self.world.target("one"))["revision"]
+        popen = type("Child", (), {"pid": 1111})()
+        with patch("hydralysis.proc.popen", return_value=popen) as spawn, patch("hydralysis.overlayjobs.proc_start", return_value=4444):
+            answer = self.ask("type_edit", kind="publish", confirm_one_way_upgrade=True, expect_revision=revision, view="one")
+        self.assertEqual(spawn.call_args.args[0][1:3], ["-m", "hydralysis.views"])
+        self.assertEqual((answer["kind"], answer["state"], answer["view"], answer["position"]), ("publish", "queued", "one", 1))
+        path = overlayjobs.job_path(self.world.settings, answer["id"])
+        with patch("hydralysis.overlayjobs.proc_start", return_value=4444):
+            views.run_job(path, engine=fakehydra.FakeEngine(self.world.settings), watch=False)
+        job = overlayjobs.status(self.world.settings, answer["id"])
+        self.assertEqual((job["state"], job["result"]["outcome"], job["result"]["generation"]), ("done", "applied", 1))
+        self.assertEqual(self.world.name_of("0x140001000"), "Mine")
+
+    def job_that_ends_in(self, error):
+        """Run a publish job whose publish raises ERROR; return the job as `overlayjobs.status` reads it."""
+        from hydralysis import overlayjobs, views
+        self.edit("Mine", "0x140001000", "one")
+        revision = workcopy.load_store(self.world.settings, self.world.target("one"))["revision"]
+        with patch("hydralysis.proc.popen", return_value=type("Child", (), {"pid": 1111})()),                 patch("hydralysis.overlayjobs.proc_start", return_value=4444):
+            answer = self.ask("type_edit", kind="publish", confirm_one_way_upgrade=True, expect_revision=revision, view="one")
+        path = overlayjobs.job_path(self.world.settings, answer["id"])
+        with patch("hydralysis.overlayjobs.proc_start", return_value=4444), patch.object(views, "run_publish_job", side_effect=error):
+            views.run_job(path, engine=fakehydra.FakeEngine(self.world.settings), watch=False)
+        return overlayjobs.status(self.world.settings, answer["id"])
+
+    def test_a_publish_job_that_ends_in_a_commit_error_keeps_its_payload(self):
+        from hydralysis import commits
+        job = self.job_that_ends_in(commits.CommitError("verify_failed", "planted commit refusal"))
+        self.assertEqual((job["state"], job["error_payload"]["error"]), ("failed", "verify_failed"))
+        self.assertIn("planted commit refusal", job["error"])
+
+    def test_a_publish_job_that_ends_in_a_lineage_error_keeps_its_payload(self):
+        from hydralysis import lineage
+        job = self.job_that_ends_in(lineage.LineageError("tampered", "planted lineage refusal"))
+        self.assertEqual((job["state"], job["error_payload"]["error"]), ("failed", "tampered"))
+        self.assertIn("planted lineage refusal", job["error"])
+
+    def test_a_publish_job_whose_changeset_conflicts_fails_with_the_rebase_call_that_works(self):
+        from hydralysis import overlayjobs, views
+        self.edit("Mine", "0x140001000", "one")  # one never sees "Theirs": its record rests on the old value
+        self.edit("Theirs", "0x140001000", "two")
+        self.publish_through_the_job("two")
+        revision = workcopy.load_store(self.world.settings, self.world.target("one"))["revision"]
+        with patch("hydralysis.proc.popen", return_value=type("Child", (), {"pid": 1111})()),                 patch("hydralysis.overlayjobs.proc_start", return_value=4444):
+            answer = self.ask("type_edit", kind="publish", confirm_one_way_upgrade=True, expect_revision=revision, view="one")
+        path = overlayjobs.job_path(self.world.settings, answer["id"])
+        with patch("hydralysis.overlayjobs.proc_start", return_value=4444):
+            views.run_job(path, engine=fakehydra.FakeEngine(self.world.settings), watch=False)
+        job = overlayjobs.status(self.world.settings, answer["id"])
+        self.assertEqual((job["state"], job["error_payload"]["error"]), ("failed", "publish_conflict"))
+        call = job["error_payload"]["next"]["options"]
+        self.assertEqual(call["kind"], "rebase")
+        self.assertIn("expect_revision", call)
+        resolved = self.ask("type_edit", view="one", **{**call, "resolve": {item: "take_mine" for item in call["resolve"]}})
+        self.assertEqual((resolved["rebased"], resolved["outcome"]), (True, "resolved"))
+
+    def test_the_stale_view_refusal_names_the_rebase_call_and_the_rebase_settles_it(self):
+        self.edit("FromOne", "0x140001000", "one")
+        self.edit("FromTwo", "0x140002000", "two")
+        self.publish_through_the_job("one")
+        with self.assertRaises(RuntimeError) as raised:
+            self.edit("More", "0x140003000", "two")
+        body = json.loads(str(raised.exception))
+        self.assertEqual(body["error"], "stale_view")
+        self.assertEqual(body["next"], {"tool": "ghidra_query", "action": "type_edit",
+                                        "options": {"kind": "rebase", "expect_revision": 1}})
+        done = self.ask("type_edit", view="two", **body["next"]["options"])
+        self.assertEqual((done["rebased"], done["outcome"], done["view"]), (True, "clean", "two"))
+        self.assertEqual(self.edit("More", "0x140003000", "two")["revision"], 3)
+
+    def test_merge_and_publish_to_a_view_answer_at_once_and_a_conflict_is_a_result(self):
+        self.edit("Source", "0x140001000", "src")
+        self.edit("Dest", "0x140001000", "dst")
+        revision = workcopy.load_store(self.world.settings, self.world.target("dst"))["revision"]
+        conflict = self.ask("type_edit", kind="merge", **{"from": "src"}, view="dst", expect_revision=revision)
+        self.assertEqual((conflict["ok"], conflict["outcome"], conflict["conflicts"][0]["theirs"], conflict["conflicts"][0]["mine"]),
+                         (False, "conflict", "Dest", "Source"))
+        taken = self.ask("type_edit", kind="merge", **{"from": "src"}, view="dst", expect_revision=revision,
+                         resolve={conflict["conflicts"][0]["subject"]: "take_mine"})
+        self.assertEqual((taken["outcome"], taken["merged"]), ("merged", 1))
+        self.edit("Later", "0x140002000", "src")
+        pushed = self.ask("type_edit", kind="publish", to="dst", view="src", expect_revision=workcopy.load_store(
+            self.world.settings, self.world.target("dst"))["revision"])
+        self.assertEqual(pushed["merged"], 1)
+
+    def test_bad_options_are_refused_before_anything_is_created(self):
+        self.edit("Mine", "0x140001000", "one")
+        for options in ({"kind": "publish"}, {"kind": "merge", "expect_revision": 1}, {"kind": "rebase", "expect_revision": "1"},
+                        {"kind": "publish", "expect_revision": 1, "colour": "red"}, {"kind": "rebase", "expect_revision": 1, "resolve": {"x": "maybe"}}):
+            with self.assertRaises(ValueError, msg=options):
+                self.runner.query("owned", "type_edit", "", options={**options, "view": "one"})
+        self.assertFalse((workcopy.root_path(self.world.settings) / "lineages").exists())
+
+    def test_the_queue_of_a_target_that_never_published_is_empty(self):
+        self.assertEqual(self.ask("status", show="queue")["queue"]["length"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

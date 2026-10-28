@@ -67,6 +67,7 @@ class ExportTests(unittest.TestCase):
     def make(self, **options):
         with patch("hydralysis.exporting._launch", side_effect=lambda path, record, settings: record):
             result = exporting.start(self.settings, "fixture", options)
+        self.token = result.get("owner_token", "")
         path = exporting.job_path(self.settings, result["id"])
         exporting.update(path, generation="test", state="interrupted")
         return path
@@ -401,6 +402,205 @@ class ExportTests(unittest.TestCase):
         image.read_rva.assert_called_with(0x1000, 5)
         response["function"]["body_truncated"] = True
         self.assertIsNone(export_worker.body_hash(response, image)["body_sha256"])
+
+    # ---- Z6: the snapshot at export start, parity, kill and resume, cancel ----
+
+    def corpus(self, count):
+        return [{"address": hex(0x401000 + 16 * index), "name": "f%d" % index,
+                 "body": ["[%08x, %08x]" % (0x401000 + 16 * index, 0x401004 + 16 * index)], "body_truncated": False}
+                for index in range(count)]
+
+    def resume_in_process(self, record, **kwargs):
+        """Resume through exporting.start, running the worker in this process in place of a launched one."""
+        def launch(path, current, settings):
+            exporting.update(path, state="queued", generation="test", cancel_requested=False)
+            return current
+        with patch("hydralysis.exporting._launch", side_effect=launch):
+            exporting.start(self.settings, "fixture", {"resume": record["id"]})
+        return self.run_job(exporting.job_path(self.settings, record["id"]), **kwargs)
+
+    def test_the_snapshot_fixes_the_expected_count_and_parity_is_kept_apart_from_all_succeeded(self):
+        path = self.make()
+        record, _ = self.run_job(path, rows=self.corpus(7))
+        self.assertEqual(record["parity"]["expected"], 7)
+        self.assertEqual((record["parity"]["written"], record["parity"]["failed"]), (7, 0))
+        self.assertTrue(record["parity"]["ok"] and record["all_succeeded"] and record["complete"])
+        snapshot = read_json(path.parent / "snapshot.json")
+        self.assertEqual((snapshot["count"], len(snapshot["keys"])), (7, 7))
+        self.assertEqual(record["snapshot_sha256"], snapshot["keys_sha256"])
+        failing = self.make(contains="f")
+        failed, _ = self.run_job(failing, rows=self.corpus(7), failing=self.corpus(7)[3]["address"])
+        # One known failure: every expected row is accounted for (written + failed == expected) but not all succeeded.
+        self.assertEqual((failed["parity"]["written"], failed["parity"]["failed"], failed["parity"]["expected"]), (6, 1, 7))
+        self.assertTrue(failed["parity"]["ok"])
+        self.assertFalse(failed["all_succeeded"])
+        self.assertFalse(failed["complete"])
+
+    def test_parity_names_missing_and_unexpected_rows(self):
+        snapshot = {"keys": ["a", "b", "c"], "count": 3}
+        progress = {"keys": {"a", "z"}, "succeeded": 2, "failed": 0}
+        result = export_worker.parity(snapshot, {"limit": 100}, progress)
+        self.assertFalse(result["ok"])
+        self.assertEqual((result["expected"], result["missing"], result["unexpected"]), (3, 2, 1))
+        full = export_worker.parity(snapshot, {"limit": 2}, {"keys": {"a", "b"}, "succeeded": 1, "failed": 1})
+        self.assertTrue(full["ok"])  # a limit of 2 expects the first two keys of the snapshot
+
+    def test_a_limit_below_the_corpus_expects_the_limit(self):
+        path = self.make(limit=3)
+        record, _ = self.run_job(path, rows=self.corpus(8))
+        self.assertEqual((record["parity"]["expected"], record["parity"]["snapshot_count"], record["completed"]), (3, 8, 3))
+        self.assertTrue(record["parity"]["ok"])
+        self.assertTrue(record["limited"])
+
+    def test_a_corpus_that_changes_after_the_snapshot_pauses_the_export(self):
+        class Drifting(FakeRunner):
+            def query(self, target, action, **options):
+                if action == "functions" and sum(call[0] == "functions" for call in self.calls) == 1:
+                    # the second enumeration (the export's own, after the snapshot) sees one more function
+                    self.rows.append({"address": "0x409000", "name": "late", "body": [], "body_truncated": False})
+                return super().query(target, action, **options)
+        path = self.make()
+        with patch("hydralysis.export_worker.Image", return_value=None), redirect_stdout(io.StringIO()):
+            export_worker.run(path, "test", runner_factory=lambda settings: Drifting(settings, rows=self.corpus(3)))
+        record = read_json(path)
+        self.assertEqual(record["state"], "paused")
+        self.assertIn("snapshot does not list", record["error"])
+        self.assertFalse(record["all_succeeded"])
+
+    def test_a_kill_at_half_and_a_resume_equal_an_uninterrupted_run(self):
+        corpus = self.corpus(20)
+        whole = self.make()
+        done, _ = self.run_job(whole, rows=corpus)
+        self.assertEqual(done["state"], "done")
+
+        class Killed(BaseException):
+            pass
+
+        class Dies(FakeRunner):
+            def query(self, target, action, **options):
+                if action == "decompile" and sum(call[0] == "decompile" for call in self.calls) >= 10:
+                    raise Killed()
+                return super().query(target, action, **options)
+        path = self.make(timeout_s=31)  # a distinct job (different options), same corpus
+        with patch("hydralysis.export_worker.Image", return_value=None), redirect_stdout(io.StringIO()):
+            with self.assertRaises(Killed):
+                export_worker.run(path, "test", runner_factory=lambda settings: Dies(settings, rows=corpus))
+        killed = read_json(path)
+        self.assertEqual(killed["state"], "running")  # nothing marked the end: a kill
+        self.assertEqual(len(self.rows(path)), 10)
+        snapshot_bytes = (path.parent / "snapshot.json").read_bytes()
+        exporting.update(path, state="interrupted")
+        resumed, _ = self.resume_in_process(killed, rows=corpus)
+        self.assertEqual(resumed["state"], "done")
+        self.assertEqual((path.parent / "snapshot.json").read_bytes(), snapshot_bytes)  # the snapshot is not retaken
+        self.assertEqual(resumed["parity"]["expected"], 20)
+        self.assertTrue(resumed["parity"]["ok"] and resumed["complete"])
+
+        def normal(job_path):
+            record = read_json(job_path)
+            text = Path(record["output_path"]).read_text(encoding="utf-8")
+            return text.replace(record["id"], "JOB").replace('"timeout_s": 31', '"timeout_s": 30')
+        # Row for row, the resumed export is the uninterrupted one apart from the job id and the timeout that told them apart.
+        first = [json.loads(line) for line in normal(path).splitlines()]
+        second = [json.loads(line) for line in normal(whole).splitlines()]
+        for rows in (first, second):
+            for row in rows:
+                row.pop("provenance")
+        self.assertEqual(first, second)
+        self.assertEqual(resumed["succeeded"], done["succeeded"])
+
+    def test_a_kill_during_the_snapshot_resumes_by_taking_it_again(self):
+        class Killed(BaseException):
+            pass
+
+        class Dies(FakeRunner):
+            def query(self, target, action, **options):
+                if action == "functions":
+                    raise Killed()
+                return super().query(target, action, **options)
+        path = self.make()
+        with patch("hydralysis.export_worker.Image", return_value=None), redirect_stdout(io.StringIO()):
+            with self.assertRaises(Killed):
+                export_worker.run(path, "test", runner_factory=lambda settings: Dies(settings, rows=self.corpus(4)))
+        self.assertFalse((path.parent / "snapshot.json").exists())
+        exporting.update(path, state="interrupted")
+        resumed, _ = self.resume_in_process(read_json(path), rows=self.corpus(4))
+        self.assertEqual((resumed["state"], resumed["parity"]["expected"]), ("done", 4))
+
+    def test_resume_refuses_a_missing_or_edited_snapshot(self):
+        path = self.make()
+        record, _ = self.run_job(path, rows=self.corpus(5))
+        snapshot = path.parent / "snapshot.json"
+        original = snapshot.read_bytes()
+        edited = json.loads(original)
+        edited["keys"] = edited["keys"][:-1]
+        edited["count"] = len(edited["keys"])
+        for label, change in (("edited", lambda: snapshot.write_text(json.dumps(edited))),
+                              ("missing", lambda: snapshot.unlink())):
+            with self.subTest(case=label):
+                change()
+                with patch("hydralysis.exporting._launch") as launch, self.assertRaisesRegex(ValueError, "snapshot"):
+                    exporting.start(self.settings, "fixture", {"resume": record["id"]})
+                launch.assert_not_called()
+                snapshot.write_bytes(original)
+        with patch("hydralysis.exporting._launch") as launch:
+            self.assertTrue(exporting.start(self.settings, "fixture", {"resume": record["id"]})["reused"])
+        launch.assert_not_called()
+
+    def test_job_json_is_not_rewritten_for_every_row(self):
+        path = self.make()
+        writes = []
+        actual = export_worker.update
+
+        def counting(path, **changes):
+            writes.append(str(changes.get("stage", "")))
+            return actual(path, **changes)
+        with patch("hydralysis.export_worker.update", side_effect=counting):
+            record, _ = self.run_job(path, rows=self.corpus(40))
+        self.assertEqual(record["succeeded"], 40)
+        self.assertLessEqual(sum(stage.startswith("exporting ") for stage in writes), 3)
+
+    def test_cancel_latency_is_one_bounded_query(self):
+        import threading
+
+        class Slow(FakeRunner):
+            def query(self, target, action, **options):
+                if action == "decompile":
+                    time.sleep(0.25)
+                return super().query(target, action, **options)
+        path = self.make()
+
+        def work():
+            with patch("hydralysis.export_worker.Image", return_value=None), redirect_stdout(io.StringIO()):
+                export_worker.run(path, "test", runner_factory=lambda settings: Slow(settings, rows=self.corpus(40)))
+        thread = threading.Thread(target=work)
+        thread.start()
+        deadline = time.monotonic() + 30
+        output = Path(read_json(path)["output_path"])
+        while time.monotonic() < deadline and not (output.exists() and len(output.read_text().splitlines()) >= 2):
+            time.sleep(0.02)
+        started = time.monotonic()
+        exporting.update(path, cancel_requested=True, state="cancelling")
+        thread.join(30)
+        latency = time.monotonic() - started
+        self.assertEqual(read_json(path)["state"], "cancelled")
+        self.assertLess(latency, 3.0)  # one 0.25 s query plus the bookkeeping, nowhere near the 40 rows
+        self.assertLess(len(self.rows(path)), 10)
+
+    def test_cancel_while_paused_closes_the_job_and_the_job_can_still_resume(self):
+        path = self.make()
+        record, _ = self.run_job(path, rows=self.corpus(5), busy=True)
+        self.assertEqual(record["state"], "paused")
+        result = exporting.cancel(self.settings, record["id"], self.token)
+        self.assertEqual(result["state"], "cancelled")
+        self.assertFalse(result["cancel_requested"])
+        resumed, _ = self.resume_in_process(result, rows=self.corpus(5))
+        self.assertEqual((resumed["state"], resumed["parity"]["expected"]), ("done", 5))
+
+    def test_cancel_of_a_finished_job_changes_nothing(self):
+        path = self.make()
+        record, _ = self.run_job(path, rows=self.corpus(2))
+        self.assertEqual(exporting.cancel(self.settings, record["id"], self.token)["state"], "done")
 
 
 if __name__ == "__main__":
