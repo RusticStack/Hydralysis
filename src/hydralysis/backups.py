@@ -360,16 +360,20 @@ def listing(settings: dict, lineage_id: str, verify_all: bool = False) -> dict:
 # ---- retention (OD8): remove is a dry run unless confirm:true --------------------------------------------------
 
 def protected_generations(settings: dict, lineage_id: str, selected_stores: list[dict] | None = None) -> dict[int, str]:
-    """Generations that `remove` refuses: generation 0, the head, a revert target and the base of a live view."""
+    """Generations that `remove` refuses: generation 0, the head, every generation the revert chain can reach and the base
+    of a live view.
+
+    `commit_revert` undoes the latest live commit and the commit before it becomes the latest (its archived records come
+    back), so after reverting c3 the next target is the generation before it, and so on down to generation 0. Every
+    published generation at or below the head is therefore a revert target. What stays removable is a generation above the
+    head (a rolled-back or unpublished candidate) and a folder that CURRENT.log never published."""
     rows = lineage.history(settings, lineage_id)
     top = rows[-1]["gen"] if rows else 0
     keep = {0: "generation 0 is the adopted project and is never removed", top: "the head generation"}
-    live = [row for row in rows if row.get("reason") in ("commit", "recover")]
-    if len(live) >= 1 and rows:
-        for row in reversed(rows[:-1]):
-            if row["gen"] != top:
-                keep.setdefault(row["gen"], "the revert target (the generation before the head)")
-                break
+    published = sorted({row["gen"] for row in rows if row.get("gen", 0) < top and row.get("reason") in ("commit", "recover", "rollback")})
+    for number in published:
+        keep.setdefault(number, "the revert target (the generation before the head)" if number == published[-1]
+                        else "a generation the revert chain can reach (commit_revert walks back to generation 0)")
     bases = Path(root_path(settings)) / "bases"
     for marker in bases.glob("*/*/COMPLETE.json") if bases.is_dir() else ():
         try:
