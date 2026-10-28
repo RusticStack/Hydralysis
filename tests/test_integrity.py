@@ -200,7 +200,7 @@ class BeforeTheEngineOpensIt(unittest.TestCase):
 
     def test_a_damaged_shared_base_is_not_repaired_and_is_rebuilt(self):
         self.edit("One", 0)
-        record = workcopy._base_ready(next(path for path in workcopy.bases_root(self.settings).iterdir() if path.is_dir()))
+        record = workcopy._base_ready(next(path for path in workcopy.bases_root(self.settings, self.runner.target("owned")).iterdir() if path.is_dir()))
         folder = Path(record["gpr"]).parent
         make_project(folder, name=Path(record["gpr"]).stem, versions=(1, 2), bad=(2,))
         before = tree(folder)

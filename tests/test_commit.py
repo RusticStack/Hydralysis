@@ -997,6 +997,45 @@ class FaultMatrix(World, unittest.TestCase):
                 self.assertEqual(self.pending_ids(), [one])  # the skipped record is still pending, never taken for committed
                 self.assertEqual(self.name_of(A), "One")
 
+    def test_resume_verified_publishes_the_verified_candidate_without_rebuilding_it(self):
+        for point in ("after_verify", "after_seal", "before_publish"):
+            with self.subTest(point=point):
+                self.setUp()
+                self.edit("One", A)
+                self.edit("Two", B)
+                self.faulted(point)
+                candidate = lineage.generation_dir(self.settings, self.lineage_id(), 1)
+                before = lineage.tree_hash(candidate)
+                forks = len([c for c in self.daemon.calls if c[1] == "fork_project"])
+                saves = len([c for c in self.daemon.calls if c[1] == "save"])
+                answer = self.settle({}, resume_verified=True)
+                self.assertTrue(answer["resumed"])
+                self.assertEqual(answer["generation"], 1)                 # the sealed candidate itself, not a new number
+                self.assertEqual(lineage.tree_hash(candidate), before)    # not rebuilt, not touched
+                self.assertTrue((candidate / "SEALED.json").is_file())    # sealed if it was not yet
+                self.assertEqual(len([c for c in self.daemon.calls if c[1] == "fork_project"]), forks)
+                self.assertEqual(len([c for c in self.daemon.calls if c[1] == "save"]), saves)
+                self.assertEqual(self.pending_ids(), [])
+                self.assertEqual(self.name_of(B), "Two")
+
+    def test_resume_verified_refuses_a_candidate_built_for_another_selection_or_that_no_longer_verifies(self):
+        self.edit("One", A)
+        self.edit("Two", B)
+        self.faulted("before_publish", only={"ids": [self.ids()[0]]})
+        candidate = lineage.generation_dir(self.settings, self.lineage_id(), 1)
+        answer = self.commit(cid=self.CID, resume_verified=True)  # a different selection (everything): rebuilt as generation 2
+        self.assertEqual((answer.get("resumed"), answer["generation"]), (None, 2))
+        self.assertTrue(lineage.verify_manifest(candidate)["ok"])
+        self.setUp()
+        self.edit("One", A)
+        self.faulted("before_publish")
+        candidate = lineage.generation_dir(self.settings, self.lineage_id(), 1)
+        victim = next(candidate.rglob("programs.json"))
+        os.chmod(victim, 0o666)
+        victim.write_text("tampered", encoding="utf-8")
+        answer = self.commit(cid=self.CID, resume_verified=True)
+        self.assertEqual((answer.get("resumed"), answer["generation"]), (None, 2))  # it does not verify any more: a new attempt
+
     def test_a_resume_of_a_verified_unpublished_candidate_is_not_attempted_by_default(self):
         self.edit("One", A)
         self.faulted("before_publish")

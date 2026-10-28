@@ -476,6 +476,24 @@ def _commit(settings: dict, selected: dict, options: dict, engine, lineage_id: s
                      expect_revision=options["expect_revision"], from_generation=facts["head"]["gen"])
         _point("after_prepare")
 
+        reuse = _resumable(settings, lineage_id, cid, attempt, chosen) if options.get("resume_verified") else None
+        if reuse is not None:
+            # Opt-in: re-hash the verified candidate of the earlier attempt (done above), seal it if it is not sealed yet, publish it
+            # without rebuilding. Nothing is applied, saved or forked again.
+            note("SEALED")
+            if not (reuse["folder"] / lineage.SEAL_MARKER).is_file():
+                backups.seal(reuse["folder"], reuse["manifest_sha"])
+            intent.write("CANDIDATE_RESERVED", gen=reuse["generation"], resumed=True)
+            intent.write("SEALED", manifest_sha256=reuse["manifest_sha"], resumed=True)
+            note("PUBLISHED")
+            finalized = _publish(settings, selected, lineage_id, cid, reuse["generation"], reuse["gpr"], reuse["manifest_sha"],
+                                 reuse["manifest"].get("engine") or {}, intent)
+            facts = reuse["manifest"]["store"]
+            return {"ok": True, "cid": cid, "attempt": attempt, "generation": reuse["generation"], "gpr": reuse["gpr"],
+                    "ids": facts["ids"], "skipped": [{"id": ident, "reason": "left_pending"} for ident in facts.get("skipped", [])],
+                    "closure_added": added, "resumed": True, "manifestSha256": reuse["manifest_sha"], "revision": finalized["revision"],
+                    "seconds": round(time.monotonic() - started, 3)}
+
         # 2. BACKUP_DONE: a fresh, re-hashed backup of the current generation, per policy.
         note("BACKUP_DONE")
         master = engine.call("open_project", path=source_gpr)
@@ -578,17 +596,8 @@ def _commit(settings: dict, selected: dict, options: dict, engine, lineage_id: s
         intent.write("SEALED", manifest_sha256=manifest_sha)
         _point("after_seal")
 
-        # 8. PUBLISHED: the commit point of the publish (the candidate has been immutable since 7b).
         note("PUBLISHED")
-        _point("before_publish")
-        intent.write("PUBLISHED", gen=generation, manifest_sha256=manifest_sha)
-        line = {"gen": generation, "cid": cid, "reason": "commit", "gpr": candidate_gpr, "manifestSha256": manifest_sha,
-                "engine": body["engine"]}
-        _append_published(settings, lineage_id, line)
-        _point("after_publish")
-
-        # 9. FINALIZED: idempotent, keyed by the cid, one atomic store write.
-        finalized = finalize(settings, selected, lineage_id, cid, generation, intent, point=True)
+        finalized = _publish(settings, selected, lineage_id, cid, generation, candidate_gpr, manifest_sha, body["engine"], intent)
         return {"ok": True, "cid": cid, "attempt": attempt, "generation": generation, "gpr": candidate_gpr, "ids": final_ids,
                 "skipped": skipped, "closure_added": added, "backup": made["backup"]["id"], "manifestSha256": manifest_sha,
                 "excluded_functions": sorted(set(reference) & excluded_all), "revision": finalized["revision"],
@@ -615,6 +624,43 @@ def _commit(settings: dict, selected: dict, options: dict, engine, lineage_id: s
             pass
         if clone_folder is not None:
             shutil.rmtree(clone_folder, ignore_errors=True)
+
+
+def _publish(settings: dict, selected: dict, lineage_id: str, cid: str, generation: int, candidate_gpr: str, manifest_sha: str,
+             engine_summary: dict, intent: Intent) -> dict:
+    """Steps 8 and 9: the CURRENT.log line (the commit point of the publish), then FINALIZED."""
+    _point("before_publish")
+    intent.write("PUBLISHED", gen=generation, manifest_sha256=manifest_sha)
+    _append_published(settings, lineage_id, {"gen": generation, "cid": cid, "reason": "commit", "gpr": candidate_gpr,
+                                             "manifestSha256": manifest_sha, "engine": engine_summary})
+    _point("after_publish")
+    return finalize(settings, selected, lineage_id, cid, generation, intent, point=True)
+
+
+def _resumable(settings: dict, lineage_id: str, cid: str, attempt: int, chosen: list[dict]) -> dict | None:
+    """`resume_verified`: an earlier attempt of this cid ended with a verified (or sealed), unpublished candidate that still
+    verifies against its manifest and was built for exactly this selection. Returns its generation and manifest facts."""
+    rows = lineage.intent_log(settings, lineage_id, cid).scan().records
+    for earlier in sorted({row.get("attempt", 0) for row in rows if row.get("attempt", 0) < attempt}, reverse=True):
+        mine = [row for row in rows if row.get("attempt") == earlier]
+        steps = {row["step"] for row in mine}
+        reserved = next((row["gen"] for row in mine if row["step"] == "CANDIDATE_RESERVED"), None)
+        if not ({"VERIFIED"} & steps) or reserved is None:
+            continue
+        folder = lineage.generation_dir(settings, lineage_id, reserved)
+        check = lineage.verify_manifest(folder)
+        manifest = check["manifest"]
+        if not check["ok"] or manifest.get("cid") != cid or any(row.get("reason") == "commit" and row.get("gen") == reserved
+                                                                  for row in lineage.history(settings, lineage_id)):
+            continue
+        store = manifest.get("store") or {}
+        if sorted(store.get("ids", []) + store.get("skipped", [])) != sorted(record["id"] for record in chosen):
+            continue
+        gpr = next((str(path) for path in sorted(folder.glob("*.gpr"))), None)
+        if gpr:
+            return {"generation": reserved, "folder": folder, "gpr": gpr, "manifest": manifest,
+                    "manifest_sha": lineage.manifest_file_sha256(folder)}
+    return None
 
 
 def _abort(intent: Intent, error: CommitError, candidate_folder: Path | None) -> None:

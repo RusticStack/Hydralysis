@@ -431,5 +431,113 @@ class EngineIntegration(unittest.TestCase):
         self.assertFalse(result["copied"])
 
 
+@unittest.skipUnless(ENGINE and CLIENT and BINARY and Path(BINARY).is_file(), "set HYDRALYSIS_INTEGRATION_ENGINE/CLIENT")
+class EngineCommit(unittest.TestCase):
+    """PROTOCOL-3.md 4.6 on the real engine: a commit makes a verified, sealed generation, the adopted project stays
+    byte-identical, the name is read from the generation, a second commit archives the first, and a revert chain returns
+    both records to pending with the pointer at generation 0."""
+
+    @classmethod
+    def setUpClass(cls):
+        _prepare(cls, BINARY, "commit", "fixture")
+
+    @classmethod
+    def tearDownClass(cls):
+        _release(cls)
+
+    def ask(self, action, address="", **kwargs):
+        return json.loads(self.runner.query("fixture", action, address, **kwargs))
+
+    def test_commit_round_trip_archival_and_revert_chain(self):
+        from hydralysis import commits, hydra, lineage, workcopy
+        listed = self.ask("functions", limit=5)["functions"]
+        first, second = listed[0]["address"], listed[1]["address"]
+        master = Path(self.prepared["project"]["gpr"]).parent
+        master_tree = lineage.tree_hash(master)
+
+        def edit(address, name):
+            revision = workcopy.load_store(self.settings, workcopy.with_view(self.runner.target("fixture"), "")).get("revision")
+            return json.loads(self.runner.query("fixture", "type_edit", address, timeout_s=300, options={
+                "kind": "rename", "name": name, "source": "commit integration test", "expect_revision": revision}))
+
+        def commit(**options):
+            selected = workcopy.with_view(self.runner.target("fixture"), "")
+            body = {"kind": "commit", "confirm_one_way_upgrade": True,
+                    "expect_revision": workcopy.load_store(self.settings, selected)["revision"], **options}
+            return commits.run_commit(self.settings, selected, body, hydra.Engine(self.settings), timeout_s=600)
+
+        original = self.ask("decompile", first)["function"]["name"]
+        edit(first, "committed_one")
+        plan = commit(dry_run=True)
+        self.assertTrue(plan["dry_run"] and plan["ok"], plan)
+        self.assertEqual(lineage.tree_hash(master), master_tree)
+        c1 = commit()
+        self.assertEqual((c1["ok"], c1["generation"]), (True, 1), c1)
+        selected = self.runner.target("fixture")
+        self.assertEqual(selected["lineage"]["generation"], 1)
+        self.assertTrue(lineage.verify_head(self.settings, selected["lineage"]["id"])["ok"])
+        self.assertEqual(lineage.tree_hash(master), master_tree, "the adopted project must stay byte-identical (O1)")
+        folder = lineage.generation_dir(self.settings, selected["lineage"]["id"], 1)
+        self.assertTrue((folder / "SEALED.json").is_file())
+        self.assertEqual(self.ask("decompile", first)["function"]["name"], "committed_one")  # read from the generation
+        self.assertNotEqual(original, "committed_one")
+        status = json.loads(self.runner.query("fixture", "status", "", options={"show": "lineage"}))
+        self.assertEqual((status["generation"], status["reason"]), (1, "commit"))
+        # a sealed generation is never opened writable: the engine of this release has no seal, so it is client discipline
+        edit(second, "committed_two")
+        c2 = commit()
+        self.assertEqual(c2["generation"], 2)
+        store = workcopy.load_store(self.settings, workcopy.with_view(self.runner.target("fixture"), ""))
+        self.assertEqual([entry["cid"] for entry in store["archived"]], [c1["cid"]])
+        self.assertEqual(self.ask("decompile", second)["function"]["name"], "committed_two")
+        selected = workcopy.with_view(self.runner.target("fixture"), "")
+        commits.revert(self.settings, selected, {"kind": "commit_revert", "expect_revision": store["revision"]})
+        selected = workcopy.with_view(self.runner.target("fixture"), "")
+        commits.revert(self.settings, selected, {"kind": "commit_revert",
+                                                 "expect_revision": workcopy.load_store(self.settings, selected)["revision"]})
+        selected = self.runner.target("fixture")
+        self.assertEqual(selected["lineage"]["generation"], 0)
+        store = workcopy.load_store(self.settings, workcopy.with_view(selected, ""))
+        self.assertEqual([record["id"] for record in workcopy.pending_of(store)], c1["ids"] + c2["ids"])
+        self.assertEqual(self.ask("decompile", first)["function"]["name"], "committed_one")   # replayed onto generation 0 again
+        self.assertEqual(self.ask("decompile", second)["function"]["name"], "committed_two")
+        self.assertEqual(lineage.tree_hash(master), master_tree)
+
+    def test_subset_missing_type_on_the_real_engine(self):
+        """4.2: a subset commit of a signature without the struct it uses must fail closed (ABORTED, nothing published). If the
+        engine instead accepted it and substituted an undefined type, this test fails and the closure must be extended."""
+        from hydralysis import commits, hydra, lineage, workcopy
+        listed = self.ask("functions", limit=5)["functions"]
+        address = listed[2]["address"] if len(listed) > 2 else listed[-1]["address"]
+        view = "subset-missing-type"
+
+        def edit(options, at=address):
+            selected = workcopy.with_view(self.runner.target("fixture"), view)
+            return json.loads(self.runner.query("fixture", "type_edit", at, timeout_s=300, options={
+                **options, "source": "commit integration test", "view": view,
+                "expect_revision": workcopy.load_store(self.settings, selected)["revision"]}))
+
+        edit({"kind": "struct", "path": "/HydralysisSubsetProbe", "size": 8,
+              "fields": [{"offset": 0, "type": "int", "name": "first"}]}, "")
+        signature = edit({"kind": "signature", "prototype": "void probe_subset(HydralysisSubsetProbe *item)"})
+        selected = workcopy.with_view(self.runner.target("fixture"), view)
+        store = workcopy.load_store(self.settings, selected)
+        self.assertEqual(len(store["edits"]), 2)
+        outcome = None
+        try:
+            outcome = commits.run_commit(self.settings, selected, {
+                "kind": "commit", "confirm_one_way_upgrade": True, "expect_revision": store["revision"],
+                "only": {"ids": [signature["overlay_id"]]}}, hydra.Engine(self.settings), timeout_s=600)
+        except commits.CommitError as error:
+            self.assertEqual(error.code, "apply_refused", error.payload())  # fail closed, the effect is named
+            self.assertIn(("HydralysisSubsetProbe"), str(error) + json.dumps(error.payload()))
+        self.assertIsNone(outcome, "the engine applied a signature whose struct was not in the commit: extend the closure with type references")
+        link = self.runner.target("fixture").get("lineage")
+        if link:  # a lineage may exist from an earlier test of this class; nothing of this commit was published
+            self.assertEqual([row for row in lineage.history(self.settings, link["id"]) if row.get("cid") and
+                              commits.last_steps(self.settings, link["id"], row["cid"])["data"].get("view") == view], [])
+        self.assertEqual(len(workcopy.pending_of(workcopy.load_store(self.settings, selected))), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
