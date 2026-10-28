@@ -531,6 +531,25 @@ class ViewLifecycle(EngineCase):
         self.assertIn(second.conn, second._program(key_two)["writers"])
         self.assertNotIn(first.conn, first._program(key_one)["writers"])
 
+    def test_sync_opens_its_writer_through_writer_for_with_the_views_own_lane(self):
+        # Mutation guard (review round 1): replacing writer_for by a bare hydra.Engine(role="writer") in _sync must fail here.
+        made = []
+        factory = workcopy.hydra.Engine
+
+        def spy(*args, **kwargs):
+            engine = factory(*args, **kwargs)
+            made.append(engine)
+            return engine
+        with patch("hydralysis.hydra.Engine", spy):
+            self.edit(kind="rename", name="One", view="a")
+            self.edit(kind="rename", name="Two", view="b")
+        writers = [engine for engine in made if engine.role == "writer"]
+        lanes = {engine.lane for engine in writers}
+        self.assertTrue(writers)
+        self.assertNotIn("", lanes)
+        for view in ("a", "b"):
+            self.assertIn(workcopy.with_view(self.runner.target("owned"), view)["key"], lanes)
+
 
 class SharedBase(EngineCase):
     """PROTOCOL-3.md 4.10: one base per (origin, generation, master revision, engine release), shared by every view."""
