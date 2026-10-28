@@ -344,7 +344,7 @@ class AgentContracts(unittest.TestCase):
         with workdir() as folder:
             root = Path(folder)
             (root / "config.example.json").write_text('{"targets":{"sample":{"exe":"missing.exe"}}}')
-            with patch.dict(os.environ, {}, clear=True), patch("hydralysis.config.Path.cwd", return_value=root):
+            with patch.dict(os.environ, {}, clear=True), patch("hydralysis.config.Path.cwd", return_value=root),                     patch("hydralysis.config.user_config_dir", return_value=root):
                 self.assertIsNone(config_path())
 
     def test_default_evidence_follows_selected_data_root(self):
