@@ -742,6 +742,276 @@ class Merge(ViewWorld, unittest.TestCase):
         self.assertEqual(self.merge("src", "dst", allow_unverified_before=True)["merged"], 1)
 
 
+def lying_probe(real, caller: str, lie: str = "Lie"):
+    """`workcopy.probe` as the daemon would answer if the program it was asked about did not hold what the code just wrote:
+    the answer for a call made from CALLER is wrong, every other call (the classification of the records) is true."""
+    def probe(engine, program, probes, *args, **kwargs):
+        found = real(engine, program, probes, *args, **kwargs)
+        if sys._getframe(1).f_code.co_name == caller:
+            found = {pair: (lie if value is not None else None) for pair, value in found.items()}
+        return found
+    return probe
+
+
+class VerificationCanFail(ViewWorld, unittest.TestCase):
+    """Each check of the verification fails when the daemon returns a wrong value, and the message names the check that
+    failed: a test that cannot fail proves nothing (review of Y3, round 1)."""
+
+    def drain_one(self, view="one"):
+        sealed = self.seal(view)
+        return sealed, views.drain(self.settings, self.lineage_id(), self.engine(), stop_after=sealed["csid"])
+
+    def test_an_applied_effect_that_the_candidate_does_not_hold_fails_verification(self):
+        self.edit("Mine", A, view="one")
+        with patch.object(workcopy, "probe", lying_probe(workcopy.probe, "_verify_candidate")):
+            sealed, led = self.drain_one()
+        self.assertEqual((led["failure"]["error"], led["failure"]["counted"]), ("candidate_failed", True))
+        self.assertIn("applied effect(s) are not what the candidate holds", led["failure"]["message"])
+        self.assertEqual(led["failure"]["mismatches"][0]["found"], "Lie")
+        self.assertEqual(self.head()["gen"], 0)
+        # the same publish with a truthful daemon succeeds: the failure above came from the planted value
+        self.assertEqual(self.run_job(sealed, "one")["outcome"], "applied")
+
+    def test_an_untouched_function_that_decompiles_differently_in_the_candidate_fails_verification(self):
+        self.edit("Mine", B, view="one")  # A is the function the fake lists, and the changeset does not touch it
+        real, seen = commits._decompile, {}
+
+        def decompile(engine, program, address, sha256):
+            text = real(engine, program, address, sha256)
+            seen[address] = seen.get(address, 0) + 1
+            return text + " tampered" if address == A and seen[address] == 2 else text  # the 2nd call is the candidate's
+        with patch.object(commits, "_decompile", decompile):
+            sealed, led = self.drain_one()
+        self.assertEqual((led["failure"]["error"], led["failure"]["counted"]), ("candidate_failed", True))
+        self.assertIn("untouched function %s decompiles differently" % A, led["failure"]["message"])
+        self.assertEqual(self.head()["gen"], 0)
+        self.assertEqual(self.run_job(sealed, "one")["outcome"], "applied")
+
+    def test_a_rebased_copy_that_does_not_hold_the_kept_values_changes_nothing(self):
+        record = self.edit("FromTwo", B, view="two")["overlay_id"]
+        self.edit("FromOne", A, view="one")
+        self.publish("one")
+        before = self.store("two")
+        with patch.object(workcopy, "probe", lying_probe(workcopy.probe, "_build_rebased_copy")):
+            with self.assertRaises(views.ViewError) as raised:
+                self.rebase("two")
+        self.assertEqual(raised.exception.code, "rebase_verify_failed")
+        self.assertEqual(raised.exception.detail["mismatches"][0]["found"], "Lie")
+        after = self.store("two")
+        self.assertEqual((after["base"], after["revision"], after["edits"]), (before["base"], before["revision"], before["edits"]))
+        self.assertEqual(self.pending_ids("two"), [record])
+        self.assertEqual(self.rebase("two")["outcome"], "clean")  # and the same rebase with a truthful daemon works
+
+
+class MergedFrom(ViewWorld, unittest.TestCase):
+    """`in_master` matches a record by the id it was merged from, not only by its own id (and not only through the manifest's
+    `merged_from_ids`): view one published X; view two holds Y, merged from X, and Y must not be applied a second time."""
+
+    def setup_merged(self):
+        x = self.edit("Shared", A, view="one")["overlay_id"]
+        self.assertEqual(self.merge("one", "two")["merged"], 1)
+        (y,) = self.pending_ids("two")
+        self.assertNotEqual(x, y)
+        self.assertEqual(self.store("two")["edits"][0]["merged_from"]["id"], x)
+        self.publish("one")
+        self.assertIn(x, self.manifest(1)["store"]["ids"])
+        self.assertNotIn(x, self.manifest(1)["store"]["merged_from_ids"])
+        return x, y
+
+    def test_a_record_merged_from_a_published_one_is_skipped_by_the_leader(self):
+        x, y = self.setup_merged()
+        result = self.publish("two")
+        self.assertEqual((result["outcome"], result["generation"], result["record_outcomes"]), ("skipped", None, {y: "skipped"}))
+        self.assertEqual([row["gen"] for row in self.rows()], [0, 1])
+
+    def test_a_record_merged_from_a_published_one_is_dropped_by_the_rebase(self):
+        x, y = self.setup_merged()
+        result = self.rebase("two")
+        self.assertEqual((result["dropped_in_master"], result["converged"], result["kept"]), ([y], [], []))
+        self.assertEqual(self.pending_ids("two"), [])
+
+
+class Guards(ViewWorld, unittest.TestCase):
+    """The idempotence guards and the fallbacks, tested directly (a concurrency test cannot hit them deterministically)."""
+
+    def test_the_first_result_written_for_a_changeset_is_the_outcome(self):
+        self.edit("Mine", A, view="one")
+        sealed = self.seal("one")
+        first = views.write_done(self.settings, sealed["lineage"], sealed["csid"], {"outcome": "applied", "generation": 7})
+        again = views.write_done(self.settings, sealed["lineage"], sealed["csid"], {"outcome": "conflict", "generation": None})
+        other = views.write_done(self.settings, sealed["lineage"], sealed["csid"], {"outcome": "skipped", "generation": 9})
+        self.assertEqual((first["outcome"], again["outcome"], other["outcome"]), ("applied", "applied", "applied"))
+        self.assertEqual(views.read_done(self.settings, sealed["lineage"], sealed["csid"])["generation"], 7)
+        self.assertFalse(views.declined_path(self.settings, sealed["lineage"], sealed["csid"]).exists())
+
+    def test_a_changeset_is_finalized_in_its_view_once(self):
+        record = self.edit("Mine", A, view="one")["overlay_id"]
+        sealed = self.seal("one")
+        self.run_job(sealed, "one")
+        first = self.store("one")
+        target = self.target("one")
+        self.assertFalse(views.finalize_changeset(self.settings, target, sealed["lineage"], sealed["csid"], 1, [record], first["revision"]))
+        second = self.store("one")
+        self.assertEqual((second["revision"], second["commits"], second["changesets"], second["journal"]),
+                         (first["revision"], first["commits"], first["changesets"], first["journal"]))
+        self.assertEqual(len(second["commits"]), 1)
+
+    def test_acquiring_the_lock_repairs_a_torn_log_tail_before_anything_is_appended(self):
+        self.edit("Mine", A, view="one")
+        sealed = self.seal("one")
+        with patch.dict(os.environ, {"HYDRALYSIS_TEST_MODE": "1", "HYDRALYSIS_TEST_FAULT": "publish.append_torn:torn:30"}):
+            with patch.object(durable, "_die", side_effect=durable.FaultInjected("died")):
+                with self.assertRaises(durable.FaultInjected):
+                    views.drain(self.settings, self.lineage_id(), self.engine(), stop_after=sealed["csid"])
+        self.assertIsNotNone(self.head()["torn_tail"])
+        # the changeset is decided elsewhere, so this leader has nothing to append: the repair is the acquisition's own
+        views.write_done(self.settings, sealed["lineage"], sealed["csid"], {"outcome": "conflict", "generation": None, "conflicts": []})
+        self.assertEqual(views.outstanding(self.settings, self.lineage_id()), [])
+        led = views.drain(self.settings, self.lineage_id(), self.engine())
+        self.assertEqual((led["led"], led["built"]), (True, []))
+        self.assertIsNone(self.head()["torn_tail"])
+        self.assertTrue(lineage.current_log(self.settings, self.lineage_id()).repairs())
+
+    def test_a_candidate_folder_that_cannot_be_moved_aside_costs_a_gap_not_a_failure(self):
+        self.edit("Mine", A, view="one")
+        sealed = self.seal("one")
+        folder = lineage.generation_dir(self.settings, self.lineage_id(), 1)
+        folder.mkdir(parents=True)
+        (folder / "left-by-a-dead-leader.txt").write_text("never head", encoding="utf-8")
+        real = durable.replace_file
+
+        def held(source, target, *args, **kwargs):
+            if Path(source) == folder:
+                raise OSError("an open handle")  # only the move of the abandoned candidate is refused
+            return real(source, target, *args, **kwargs)
+        with patch.object(durable, "replace_file", held):
+            number = views.reserve_generation(self.settings, self.lineage_id())
+        self.assertEqual(number, 2)  # the number is skipped: a gap, and nothing else
+        self.assertTrue((folder / "left-by-a-dead-leader.txt").is_file())  # nothing was deleted
+        with patch.object(durable, "replace_file", held):
+            result = self.run_job(sealed, "one")
+        self.assertEqual(result["generation"], 2)
+        self.assertEqual([row["gen"] for row in self.rows()], [0, 2], "the log has a gap, as the module text says it can")
+        self.assertTrue(lineage.verify_head(self.settings, self.lineage_id())["ok"])
+
+
+class LateRecords(ViewWorld, unittest.TestCase):
+    """A record added to a view while its changeset waits, then another view's publish decided first: the remainder is
+    classified against the generations the base would jump over (review of Y3, round 1, blocking 2)."""
+
+    def late_scenario(self):
+        """View two seals C0 on A. View one seals C1 on B, then renames A (the view is not stale yet, so the edit is accepted).
+        The leader publishes C0 as generation 1 and C1 as generation 2 (rebased)."""
+        self.edit("TwoName", A, view="two")
+        self.edit("OneB", B, view="one")
+        sealed_two, sealed_one = self.seal("two"), self.seal("one")
+        late = self.edit("OneLate", A, view="one")["overlay_id"]
+        led = views.drain(self.settings, self.lineage_id(), self.engine(), stop_after=sealed_one["csid"])
+        self.assertEqual((led["built"], self.done(sealed_one["csid"])["outcome"]), ([1, 2], "rebased"))
+        self.assertEqual(self.name_of(A), "TwoName")  # the master
+        return sealed_one, late
+
+    def test_the_base_does_not_jump_over_a_generation_the_remaining_records_were_never_checked_against(self):
+        sealed, late = self.late_scenario()
+        store = self.store("one")
+        self.assertEqual(self.pending_ids("one"), [late])
+        self.assertEqual(store["base"]["generation"], 0)  # not 2
+        self.assertIsNotNone(workcopy.stale_reason(store, self.target("one")))
+        body = self.error(lambda: self.edit("More", C, view="one"))
+        self.assertEqual(body["error"], "stale_view")
+        self.assertEqual([item["generation"] for item in body["editors"]], [1, 2])
+        self.assertEqual([entry["generation"] for entry in store["commits"]], [2])  # what the view published is recorded
+
+    def test_rebase_lists_the_late_record_as_a_conflict_and_take_mine_works(self):
+        self.late_scenario()
+        listed = self.rebase("one")
+        self.assertEqual((listed["ok"], listed["outcome"]), (False, "conflict"))
+        conflict = listed["conflicts"][0]
+        self.assertEqual((conflict["subject"], conflict["theirs"], conflict["mine"]), ("address:" + A, "TwoName", "OneLate"))
+        self.assertEqual([item["generation"] for item in conflict["editors"]], [1])  # generation 2 did not touch A
+        kept = self.rebase("one", resolve={"address:" + A: "take_mine"})
+        self.assertEqual((kept["outcome"], kept["to_generation"]), ("resolved", 2))
+        self.assertEqual(self.names([A, B], "one"), {A: "OneLate", B: "OneB"})
+        self.assertEqual(self.publish("one")["outcome"], "applied")
+        self.assertEqual(self.names([A, B]), {A: "OneLate", B: "OneB"})
+
+    def test_rebase_keep_drops_the_late_record(self):
+        self.late_scenario()
+        done = self.rebase("one", resolve={"address:" + A: "keep"})
+        self.assertEqual((done["outcome"], len(done["dropped_keep"])), ("resolved", 1))
+        self.assertEqual(self.pending_ids("one"), [])
+        self.assertEqual(self.names([A, B], "one"), {A: "TwoName", B: "OneB"})
+
+    def test_the_conflict_of_a_publish_names_a_rebase_call_that_works(self):
+        self.late_scenario()
+        again = self.seal("one")
+        with self.assertRaises(views.ViewError) as raised:
+            self.run_job(again, "one")
+        body = raised.exception.payload()
+        self.assertEqual(body["error"], "publish_conflict")
+        call = body["next"]["options"]
+        self.assertEqual((call["kind"], call["expect_revision"]), ("rebase", self.store("one")["revision"]))
+        self.assertEqual(sorted(call["resolve"]), ["address:" + A])
+        done = self.rebase("one", resolve={subject: "take_mine" for subject in call["resolve"]})
+        self.assertTrue(done["rebased"])
+        self.assertEqual(self.publish("one")["outcome"], "applied")
+
+    def test_a_view_with_nothing_left_still_moves_to_the_generation_it_published(self):
+        self.edit("TwoName", A, view="two")
+        self.edit("OneB", B, view="one")
+        self.seal("two")
+        sealed_one = self.seal("one")
+        views.drain(self.settings, self.lineage_id(), self.engine(), stop_after=sealed_one["csid"])
+        self.assertEqual(self.store("one")["base"]["generation"], 2)
+        self.assertIsNone(workcopy.stale_reason(self.store("one"), self.target("one")))
+
+
+class DeadEnds(ViewWorld, unittest.TestCase):
+    """`take_mine` settles every kind of conflict, so the publish that follows does not conflict again, and `rebase` does not
+    answer `up_to_date` while a record still conflicts (review of Y3, round 1, nit 3)."""
+
+    def with_second_effect(self, record_id, view, **effect):
+        store = self.store(view)
+        for item in store["edits"]:
+            if item["id"] == record_id:
+                item["effects"] = item["effects"] + [effect]
+        workcopy._save_store(self.settings, self.target(view), store)
+
+    def test_a_partially_converged_record_is_settled_by_take_mine(self):
+        record = self.edit("X", A, view="two")["overlay_id"]
+        self.with_second_effect(record, "two", subject="address:" + B, field="name", before="FUN_" + B.removeprefix("0x"), after="Y")
+        self.edit("Y", B, view="one")
+        self.publish("one")  # the master now holds B = Y, which is the second effect's `after`
+        listed = self.rebase("two")
+        self.assertEqual((listed["outcome"], listed["conflicts"][0]["reason"]), ("conflict", "partially_converged"))
+        done = self.rebase("two", resolve={"address:" + B: "take_mine"})
+        self.assertEqual((done["outcome"], done["reanchored"]), ("resolved", [record]))
+        self.assertEqual(self.publish("two")["outcome"], "applied")
+        self.assertEqual(self.names([A, B]), {A: "X", B: "Y"})
+
+    def test_a_chain_conflict_on_an_up_to_date_view_is_listed_and_settled_by_take_mine(self):
+        record = self.edit("X", A, view="one")["overlay_id"]
+        self.with_second_effect(record, "one", subject="address:" + A, field="name", before="Z", after="X")
+        sealed = self.seal("one")
+        with self.assertRaises(views.ViewError) as raised:
+            self.run_job(sealed, "one")
+        self.assertEqual(raised.exception.payload()["conflicts"][0]["reason"], "chain")
+        # the view is on the head generation: the old answer here was `up_to_date`, a dead end
+        listed = self.rebase("one")
+        self.assertEqual((listed["outcome"], listed["conflicts"][0]["reason"]), ("conflict", "chain"))
+        done = self.rebase("one", resolve={"address:" + A: "take_mine"})
+        self.assertEqual((done["rebased"], done["outcome"], done["reanchored"]), (True, "resolved", [record]))
+        self.assertEqual(self.publish("one")["outcome"], "applied")
+        self.assertEqual(self.rebase("one")["outcome"], "up_to_date")
+
+    def test_an_up_to_date_view_with_records_that_do_not_conflict_is_still_up_to_date(self):
+        self.edit("X", A, view="one")
+        self.assertEqual(self.rebase("one")["outcome"], "up_to_date")
+        self.publish("one")
+        self.edit("More", B, view="one")
+        self.assertEqual(self.rebase("one")["outcome"], "up_to_date")
+
+
 class Classify(unittest.TestCase):
     """The one rule of rebase, merge and publish."""
 
@@ -1044,7 +1314,7 @@ class Processes(ViewWorld, unittest.TestCase):
         lock = str(views.publish_lock_path(self.settings, self.lineage_id()))
         leaders_killed = 0
         leader_file = lineage.lineage_dir(self.settings, self.lineage_id()) / "publish.leader.json"
-        while len(killed) < kills and time.monotonic() < deadline:
+        while (len(killed) < kills or leaders_killed < kills - 2) and time.monotonic() < deadline:
             time.sleep(rng.uniform(0.05, 0.4))
             if not locks.held(lock):
                 continue
@@ -1056,8 +1326,11 @@ class Processes(ViewWorld, unittest.TestCase):
             except (OSError, ValueError, KeyError):
                 leader_pid = None
             leaders = [view for view in alive if processes[view].pid == leader_pid]
-            # four kills of the process that holds the lock, the rest of any process: a follower's kill must cost nothing
-            victim = leaders[0] if leaders and leaders_killed < kills - 2 else rng.choice(alive)
+            # four kills of the process that holds the lock (the loop waits until it has made them), the rest of any process: a
+            # follower's kill must cost nothing
+            if leaders_killed < kills - 2 and not leaders:
+                continue
+            victim = leaders[0] if leaders_killed < kills - 2 else rng.choice(alive)
             leaders_killed += victim in leaders
             processes[victim].kill()  # TerminateProcess on Windows
             killed.append(victim)
@@ -1095,7 +1368,8 @@ class Processes(ViewWorld, unittest.TestCase):
         self.assertEqual([row["gen"] for row in self.rows()], list(range(len(self.rows()))), "a killed leader left a gap in the log")
         for row in self.rows()[1:]:
             self.assertTrue(lineage.verify_manifest(lineage.project_folder_of(row["gpr"]))["ok"])
-        self.assertTrue(killed and leaders_killed, "no leader was killed: the test did not exercise a kill of the lock holder")
+        self.assertGreaterEqual(leaders_killed, kills - 2, "fewer than %d kills of the lock holder: the test did not exercise it" % (kills - 2))
+        self.assertGreaterEqual(len(killed), kills)
 
 
 for _point in Processes.POINTS:

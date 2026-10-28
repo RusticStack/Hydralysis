@@ -20,7 +20,12 @@ A view is a store of cited records on top of a base generation. Three things mov
   before `done/<csid>.json` is resolved by reading the manifest: a changeset is applied exactly once. A follower never
   waits on the leader inside a call; it polls its job (`publish_pending{position, etaMs}`) and tries the lock on each poll.
 
-The generations of `CURRENT.log` stay consecutive: a candidate that never became head is moved aside and its number is used again.
+The generations of `CURRENT.log` stay consecutive: a candidate that never became head is moved aside and its number is used again,
+unless the OS or the engine will not let go of the folder (an open handle on Windows): then the number is skipped and the log has a gap.
+
+The queue's order is the order of the changeset ids (allocated when a changeset is sealed); two sealers on different views can
+write their files in the reverse order of their ids, so a leader may decide a later id first. That costs order only: every
+changeset is still decided once, against the head it finds.
 
 Nothing here writes the master or a published generation. A conflict is never resolved silently: the changeset is
 refused whole, its records stay pending in the view, and the conflict names the other editors.
@@ -34,6 +39,7 @@ import random
 import re
 import shutil
 import statistics
+import subprocess
 import time
 import uuid
 from contextlib import ExitStack
@@ -220,7 +226,7 @@ def classify(records: list[dict], live: dict, chain: dict | None = None) -> tupl
             continue
         states, found_conflict = [], None
         updates: dict[tuple[str, str], str] = {}
-        for effect in effects:
+        for index, effect in enumerate(effects):
             pair = (effect["subject"], effect["field"])
             before, after = _text(effect["before"]), _text(effect["after"])
             if effect["subject"] == revisions.WILDCARD:
@@ -228,13 +234,13 @@ def classify(records: list[dict], live: dict, chain: dict | None = None) -> tupl
                 continue
             if pair in blocked:
                 found_conflict = {"subject": pair[0], "field": pair[1], "reason": "depends_on_conflict", "before": effect["before"],
-                                  "after": effect["after"]}
+                                  "after": effect["after"], "effect": index}
                 break
             if pair in chain or pair in updates:
                 expected = updates.get(pair, chain.get(pair))
                 if before != expected:
                     found_conflict = {"subject": pair[0], "field": pair[1], "reason": "chain", "before": effect["before"],
-                                      "now": expected, "after": effect["after"]}
+                                      "now": expected, "after": effect["after"], "effect": index}
                     break
                 states.append("apply")
             else:
@@ -247,13 +253,14 @@ def classify(records: list[dict], live: dict, chain: dict | None = None) -> tupl
                     states.append("converged")
                 else:
                     found_conflict = {"subject": pair[0], "field": pair[1], "reason": "drift", "before": effect["before"],
-                                      "now": now, "after": effect["after"]}
+                                      "now": now, "after": effect["after"], "effect": index}
                     break
             updates[pair] = after
         if found_conflict is None and "converged" in states and any(state != "converged" for state in states):
-            first = next(effect for effect, state in zip(effects, states) if state == "converged")
+            at = next(index for index, state in enumerate(states) if state == "converged")
+            first = effects[at]
             found_conflict = {"subject": first["subject"], "field": first["field"], "reason": "partially_converged",
-                              "before": first["before"], "now": first["after"], "after": first["after"]}
+                              "before": first["before"], "now": first["after"], "after": first["after"], "effect": at}
         if found_conflict is not None:
             blocked.update((effect["subject"], effect["field"]) for effect in effects if effect["subject"] != revisions.WILDCARD)
             verdicts.append({"id": record["id"], "outcome": "conflict", **found_conflict})
@@ -294,12 +301,11 @@ def rebase(settings: dict, engine, selected: dict, options: dict, timeout_s: int
         store = workcopy.load_store(settings, selected)
         decision = workcopy.reconcile(store, options["expect_revision"], [revisions.WILDCARD])
         base_generation = (store.get("base") or {}).get("generation", 0)
-        if binding is None or base_generation == binding["generation"]:
-            return {"ok": True, "rebased": False, "outcome": "up_to_date", "view": selected.get("view", "shared"),
-                    "revision": store["revision"], "view_revision": store["revision"], "base": store.get("base"),
-                    "note": "this view is already on the head generation"}
-        lineage_id = binding["lineage"]
         pending = workcopy.pending_of(store)
+        current = binding is not None and base_generation == binding["generation"]
+        if binding is None or (current and not pending):
+            return _up_to_date(selected, store)
+        lineage_id = binding["lineage"]
         known = master_ids(settings, lineage_id, base_generation)
         in_the_master = [record for record in pending if in_master(record, known)]
         rest = [record for record in pending if not in_master(record, known)]
@@ -310,6 +316,8 @@ def rebase(settings: dict, engine, selected: dict, options: dict, timeout_s: int
             verdicts, _ = classify(rest, probe_live(engine, program, rest))
         by_id = {record["id"]: record for record in rest}
         conflicts = [verdict for verdict in verdicts if verdict["outcome"] == "conflict"]
+        if current and not conflicts and not in_the_master and not any(item["outcome"] == "converged" for item in verdicts):
+            return _up_to_date(selected, store)
         editors = editors_since(settings, lineage_id, base_generation, {item["subject"] for item in conflicts}) if conflicts else []
         unresolved = [item for item in conflicts if _resolution(options.get("resolve"), item) is None]
         if unresolved:
@@ -333,15 +341,18 @@ def rebase(settings: dict, engine, selected: dict, options: dict, timeout_s: int
             dropped_keep |= set(revisions.dependents(store["edits"], dropped_keep, workcopy.committed_ids(store)))
             batches = {by_id[ident].get("batch") for ident in dropped_keep if ident in by_id and by_id[ident].get("batch")}
             dropped_keep |= {record["id"] for record in pending if record.get("batch") in batches}
-        # take_mine: the record stays; its `before` becomes what the master holds now.
+        # take_mine: the record stays; the `before` that disagrees (with the master for a drift, with the value already there
+        # for a partial convergence, with the record before it for a chain) becomes the value the record will replace, so
+        # the next publish finds nothing to dispute. A record that only rests on a conflicting one is kept unchanged.
         reanchored: dict[str, list[dict]] = {}
         for item in conflicts:
-            if _resolution(options.get("resolve"), item) == "take_mine" and item["reason"] == "drift" and item["id"] not in dropped_keep:
+            if (_resolution(options.get("resolve"), item) == "take_mine" and item["reason"] in ("drift", "partially_converged", "chain")
+                    and item["id"] not in dropped_keep):
                 record = by_id[item["id"]]
                 effects = [dict(effect) for effect in record["effects"]]
-                for effect in effects:
-                    if (effect["subject"], effect["field"]) == (item["subject"], item["field"]):
-                        effect["before"] = None if item["now"] == revisions.ABSENT else item["now"]
+                at = item.get("effect")
+                if isinstance(at, int) and 0 <= at < len(effects):
+                    effects[at]["before"] = None if item["now"] == revisions.ABSENT else item["now"]
                 reanchored[item["id"]] = effects
         removed = ({record["id"] for record in in_the_master} | set(converged) | dropped_keep)
         kept_ids = [record["id"] for record in rest if record["id"] not in removed]
@@ -372,6 +383,12 @@ def rebase(settings: dict, engine, selected: dict, options: dict, timeout_s: int
             "unverified": [item["id"] for item in verdicts if item["outcome"] == "unchecked"],
             "revision": new_store["revision"], "view_revision": new_store["revision"], "verified": verified["verified"],
             "outcomes_checked": verified.get("checked", 0)}
+
+
+def _up_to_date(selected: dict, store: dict) -> dict:
+    return {"ok": True, "rebased": False, "outcome": "up_to_date", "view": selected.get("view", "shared"),
+            "revision": store["revision"], "view_revision": store["revision"], "base": store.get("base"),
+            "note": "this view is already on the head generation and none of its records conflicts with it"}
 
 
 def _shadow(target: dict) -> dict:
@@ -590,7 +607,9 @@ def write_done(settings: dict, lineage_id: str, csid: str, record: dict) -> dict
 
 
 def outstanding(settings: dict, lineage_id: str) -> list[str]:
-    """The changesets sealed and not yet decided, in the order they were sealed (the FIFO of D45)."""
+    """The changesets sealed and not yet decided, in the order of their ids (the FIFO of D45). The id is allocated before the file
+    is written under the view's lock, so two sealers on different views can write in the reverse order of their ids: FIFO is
+    nominal at that grain, and costs only the order in which two near-simultaneous changesets are decided."""
     finished = set(_ids_in(_dir(settings, lineage_id, "done"))) | set(_ids_in(_dir(settings, lineage_id, "declined")))
     return [csid for csid in _ids_in(_dir(settings, lineage_id, "pending")) if csid not in finished]
 
@@ -996,7 +1015,8 @@ def _build_locked(settings: dict, lineage_id: str, engine, batch_ids: list[str],
 
 def reserve_generation(settings: dict, lineage_id: str) -> int:
     """The number of the next candidate: one more than the highest generation the log ever named, so the generations of
-    `CURRENT.log` are consecutive (K12) however many candidates were abandoned. Only the leader (it holds `publish.lock` and
+    `CURRENT.log` are consecutive (K12) however many candidates were abandoned, unless the OS or the engine will not let go of an
+    abandoned folder (see below), which makes a gap. Only the leader (it holds `publish.lock` and
     `.commit.lock`) gets here, so a folder at that number that the log never named is an abandoned candidate: it was never head,
     and it is moved aside, not deleted, for manual removal (D28). If the OS or the engine will not let go of it the number is
     skipped instead, which costs a gap and nothing else."""
@@ -1150,7 +1170,13 @@ def finalize_changeset(settings: dict, selected: dict, lineage_id: str, csid: st
                        snapshot: int | None) -> bool:
     """In one atomic store write of the sealing view: the decided records become a commit entry of the new generation (the
     previous live entry is archived, as in 4.2) and the base moves to it; with no generation (the values were already there)
-    they are dropped. Idempotent by `csid`. Returns whether anything was written."""
+    they are dropped. Idempotent by `csid`. Returns whether anything was written.
+
+    The base moves to GENERATION only when that is safe for what stays in the view. Records the view still holds (added while the
+    changeset waited) were written over the head the view had, and the generations between its old base and GENERATION (other
+    views' publishes the leader decided first) were never classified against them. When such records remain and the jump crosses
+    another generation, the base stays: the view is then stale, `rebase` classifies the remainder against the head (a conflict is
+    listed and resolvable), and until then it answers from the working copy it has."""
     with workcopy.view_lock(settings, selected):
         store = workcopy.load_store(settings, selected)
         if any(item.get("csid") == csid for item in store["changesets"]):
@@ -1158,6 +1184,7 @@ def finalize_changeset(settings: dict, selected: dict, lineage_id: str, csid: st
         present = [record["id"] for record in store["edits"] if record["id"] in set(ids)]
         committed = workcopy.committed_ids(store)
         present = [ident for ident in present if ident not in committed]
+        remaining = [record["id"] for record in workcopy.pending_of(store) if record["id"] not in set(present)]
         who, now = workcopy._attribution(), time.time()
         if generation is not None:
             live = [entry for entry in store["commits"] if not entry.get("reverted")]
@@ -1168,9 +1195,11 @@ def finalize_changeset(settings: dict, selected: dict, lineage_id: str, csid: st
                 store["commits"] = store["commits"] + [{"cid": csid, "generation": generation, "snapshot": snapshot, "ids": sorted(present),
                                                         "skipped": [], "ids_sha256": workcopy._digest_of(sorted(present)),
                                                         "bundle_sha256": None, "at": now, "reverted": False}]
-            if generation >= (store.get("base") or {}).get("generation", 0):
+            old_base = (store.get("base") or {}).get("generation", 0)
+            crosses_others = generation > old_base + 1
+            if generation >= old_base and not (remaining and crosses_others):
                 store["base"] = {"lineage": lineage_id, "generation": generation}
-            store["stale"] = None
+                store["stale"] = None
             op = "commit"
         else:
             store["edits"] = [record for record in store["edits"] if record["id"] not in set(present)]
@@ -1224,9 +1253,12 @@ def run_publish_job(settings: dict, selected: dict, options: dict, engine=None, 
             result = read_done(settings, lineage_id, csid)
             if result is None and led["failure"] and not led["failure"].get("counted") and led["failure"]["error"] != "commit_busy":
                 failure = led["failure"]
-                raise ViewError(failure["error"], failure["message"], csid=csid, retained="the changeset stays queued; its records stay pending")
+                raise ViewError(failure["error"], failure["message"], csid=csid,
+                                retained="the changeset stays queued and its records stay pending; this job ends, and no job drives the "
+                                         "changeset now: it is published when any later publish on this lineage (from any view) leads "
+                                         "the queue, so publish again once the cause is gone")
         if result is not None:
-            return outcome_of(result)
+            return outcome_of(result, _revision_of(settings, selected))
         info = pending_info(settings, lineage_id, csid)
         if info["state"] == "done":
             continue
@@ -1240,15 +1272,123 @@ def run_publish_job(settings: dict, selected: dict, options: dict, engine=None, 
         time.sleep(POLL_S)
 
 
-def outcome_of(result: dict) -> dict:
+def _revision_of(settings: dict, selected: dict) -> int | None:
+    try:
+        return workcopy.load_store(settings, selected)["revision"]
+    except (OSError, ValueError, durable.StoreCorrupt, RuntimeError):
+        return None
+
+
+def outcome_of(result: dict, revision: int | None = None) -> dict:
+    """The result of a decided changeset as the job reports it. With REVISION (the sealing view's store revision) the conflict
+    carries the exact `rebase` call that settles it."""
     outcome = result.get("outcome")
     if outcome == "conflict":
+        options = {"kind": "rebase"}
+        if revision is not None:
+            options["expect_revision"] = revision
+        options["resolve"] = {item["subject"]: "take_mine | keep" for item in result.get("conflicts", []) if item.get("subject")}
         raise ViewError("publish_conflict", "the master holds other values where this changeset rests on older ones; nothing was "
                         "published and the records stay pending in the view", csid=result["csid"], conflicts=result.get("conflicts", []),
-                        next={"tool": "ghidra_query", "action": "type_edit", "options": {"kind": "rebase"}})
+                        next={"tool": "ghidra_query", "action": "type_edit", "options": options},
+                        suggest="rebase this view: it lists each conflict, and resolve decides it (take_mine re-anchors your record to "
+                                "the master's value, keep drops it); then publish again")
     if outcome in ("candidate_failed", "corrupt_changeset"):
         raise ViewError(outcome, "the changeset was not published; its records stay pending in the view", csid=result["csid"],
                         failure=result.get("failure"), candidates=result.get("candidates"))
     return {"ok": True, "generation": result.get("generation"),
             **{key: result.get(key) for key in ("csid", "outcome", "gpr", "record_outcomes", "base_generation", "seq", "build_ms",
                                                 "manifestSha256", "converged", "in_master", "unverified") if result.get(key) is not None}}
+
+
+# ---- the publish job's own worker ---------------------------------------------------------------------------------
+# A publish job is an overlay job record (`overlay-jobs/<id>/job.json`, read by `overlayjobs.status` and the `job` tool like
+# any other) whose worker process is `python -m hydralysis.views <job.json>`. `overlayjobs.py` belongs to Y0a and Y2 (8.1) and
+# is left as it was: this module starts and runs its own worker rather than adding a job kind there.
+
+def start_job(settings: dict, target: str, options: dict, view: str = "") -> dict:
+    """Start the worker of a publish job for the sealed changeset in OPTIONS ({csid, lineage}). Returns the job as
+    `overlayjobs.status` shows it, plus `owner_token`."""
+    import sys
+    from hydralysis import jobowner, overlayjobs, proc
+    from hydralysis.backends import read_json, write_json
+    from hydralysis.locks import locked
+    from hydralysis.paths import root_path
+    root = root_path(settings)
+    with locked(root / "overlay-jobs" / ".start.lock", what="overlay jobs"):
+        view = "" if view == "shared" else view
+        job_id = "overlay-" + uuid.uuid4().hex[:12]
+        path = overlayjobs.job_path(settings, job_id)
+        path.parent.mkdir(parents=True)
+        record = {"id": job_id, "kind": "publish", "target": target, "view": view, "address": "", "options": dict(options),
+                  "state": "queued", "created_at": time.time(), "by": hydra.identity()}
+        token = jobowner.issue(record)
+        write_json(path, record)
+        keys = ("root", "hydra_dir", "hydra_client", "java_home", "hydra_idle_s", "hydra_keep_warm_s", "hydra_max_heap",
+                "hydra_allow_unpinned", "hydra", "fork_mode", "fork_max_copy_mb", "forbidden_drives", "targets", "expected_agents",
+                "publish_wait_s", "publish_batch_max", "tmp_dir", "backup_roots")
+        write_json(path.parent / "settings.json", {key: settings[key] for key in keys if key in settings})
+        env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent), HYDRALYSIS_HARNESS=hydra.identity()["harness"])
+        # No log file: a raw file write outside `durable` is a site `test_durable` counts. What the worker has to say goes into the
+        # job record (`error`), which `overlayjobs.status` shows; `main` below puts any uncaught exception there too.
+        child = proc.popen([sys.executable, "-m", "hydralysis.views", str(path)], env=env, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, **({} if os.name == "nt" else {"start_new_session": True}))
+        with locked(path.with_suffix(".lock"), what="overlay job"):
+            current = read_json(path)
+            if current.get("state") == "queued" and not current.get("worker_pid"):
+                current.update(worker_pid=child.pid, worker_started_ms=overlayjobs.proc_start(child.pid), updated_at=time.time())
+                write_json(path, current)
+        return {**overlayjobs.status(settings, job_id), "owner_token": token}
+
+
+def run_job(path: Path, engine=None, watch: bool = True) -> None:
+    """The worker body of a publish job: lead or follow until the changeset is decided, and record the result in the job."""
+    import threading
+    from hydralysis import overlayjobs
+    from hydralysis.backends import read_json
+    record = read_json(path)
+    settings = read_json(path.parent / "settings.json")
+    cancel_file = path.parent / "cancel.request"
+
+    def watcher():
+        while True:
+            if cancel_file.exists():
+                overlayjobs._update(path, state="cancelled", finished_at=time.time(),
+                                    error="cancelled; the changeset stays queued and is published when a leader reaches it")
+                os._exit(3)
+            time.sleep(0.5)
+
+    if watch:
+        threading.Thread(target=watcher, daemon=True).start()
+    overlayjobs._update(path, state="running", worker_pid=os.getpid(), worker_started_ms=overlayjobs.proc_start(os.getpid()),
+                        started_at=time.time())
+    try:
+        selected = workcopy.with_view(targets.resolve(settings, record["target"]), record.get("view", ""))
+        result = run_publish_job(settings, selected, dict(record["options"]), engine, overlayjobs.TIMEOUT_S,
+                                 progress=lambda info: overlayjobs._update(path, publish_pending=info))
+    except ViewError as error:
+        overlayjobs._update(path, state="failed", error="%s: %s" % (error.code, error), error_payload=error.payload(),
+                            finished_at=time.time())
+        return
+    except Exception as exc:
+        overlayjobs._update(path, state="failed", error="%s: %s" % (type(exc).__name__, exc), finished_at=time.time())
+        return
+    overlayjobs._update(path, state="done", result=result, finished_at=time.time())
+
+
+def main(argv: list[str]) -> None:
+    from hydralysis import overlayjobs
+    path = Path(argv[0]).resolve()
+    try:
+        run_job(path)
+    except BaseException as exc:  # run_job records its own failures; this is what happens before or around it
+        try:
+            overlayjobs._update(path, state="failed", error="%s: %s" % (type(exc).__name__, exc), finished_at=time.time())
+        except Exception:
+            pass
+        raise
+
+
+if __name__ == "__main__":
+    import sys
+    main(sys.argv[1:])

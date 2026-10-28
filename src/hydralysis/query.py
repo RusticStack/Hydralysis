@@ -232,7 +232,7 @@ class QueryRunner:
     def _views(self, target: str, options: dict, view: str, timeout_s: int) -> str:
         """`type_edit kind=rebase|merge|publish` (4.7, 4.8, 4.10). Rebase and the merge of a view into another answer at once;
         a publish to the master seals a changeset and answers with a job and its position in the queue."""
-        from hydralysis import commits, overlayjobs, views
+        from hydralysis import commits, views
         selected = workcopy.with_view(self.target(target), view)
         view = selected["view"]
         try:
@@ -246,8 +246,7 @@ class QueryRunner:
             sealed = views.seal_changeset(self.settings, selected, clean)
             if sealed.get("state") == "done":  # the same records were decided while this call was being made
                 return json.dumps({**sealed, "view": view}, ensure_ascii=False)
-            job = overlayjobs.start(self.settings, selected["name"], "publish", "", {"csid": sealed["csid"], "lineage": sealed["lineage"]},
-                                    view=view)
+            job = views.start_job(self.settings, selected["name"], {"csid": sealed["csid"], "lineage": sealed["lineage"]}, view=view)
         except (views.ViewError, commits.CommitError) as error:
             raise RuntimeError(json.dumps(error.payload())) from error
         except lineage.LineageError as error:
