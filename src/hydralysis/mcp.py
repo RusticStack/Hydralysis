@@ -20,7 +20,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 from hydralysis import __version__
-from hydralysis import compat
+from hydralysis import compat, environment
 from hydralysis.api import TOOL_NAMES, call, catalog, instructions, tool_table
 
 PROTOCOL_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
@@ -35,6 +35,17 @@ RETRY_AFTER_MS = 2000
 # Tools that talk to the engine (directly or through a workflow). Everything else is
 # local/offline (PE-only tools and the evidence store) and runs on the fast lane.
 ENGINE_TOOLS = frozenset({"ghidra_run", "ghidra_query", "backend", "prepare", "job", "runtime"})
+
+
+_ENVIRONMENT: dict | None = None
+
+
+def _environment() -> dict:
+    """The environment report of this launch, computed once. Reads files only; never starts the engine."""
+    global _ENVIRONMENT
+    if _ENVIRONMENT is None:
+        _ENVIRONMENT = environment.describe()
+    return _ENVIRONMENT
 
 
 def lane_of(name) -> str:
@@ -65,7 +76,7 @@ class Server:
                 "instructions": instructions(),
                 # The tool table is cached for the life of this session (listChanged is false): the epoch
                 # and hash say which table the session was started with.
-                "_meta": {"hydralysis/catalog": catalog()},
+                "_meta": {"hydralysis/catalog": catalog(), "hydralysis/environment": _environment()},
             })
         if method in ("notifications/initialized", "notifications/cancelled"):
             return None
@@ -92,6 +103,8 @@ class Server:
         return _err(msg_id, -32601, "method not found: %s" % method)
 
     def serve(self, stdin=None, stdout=None) -> None:
+        # The launch banner: root, configuration, engine release and file system, once, on stderr (stdout is the transport).
+        environment.announce(_environment())
         stdin = stdin if stdin is not None else sys.stdin.buffer
         stdout = stdout if stdout is not None else sys.stdout.buffer
         output_lock = threading.Lock()
