@@ -187,6 +187,8 @@ The CLI retains `sections`, `exports`, `ghidra-scripts` and `ghidra-jobs` aliase
 
 Hydralysis covers native PE inspection and saved analysis. It is not a replacement for every upstream Android/browser/firmware feature. Runtime stepping/watchpoints, graphics debugging, automatic unpacking and universal type recovery remain outside the implemented contract. [KotOR](docs/capabilities-kotor.md) and [Night City Together](docs/capabilities-nct.md) still require their own engine/protocol/resource/framework implementations; those do not become game-specific server tools. No finite test corpus establishes that a remaster or multiplayer framework can be completed automatically.
 
+Tool counts: Hydralysis registers 20 tools (counted from `tool_table()`). The two figures it is compared with, 30 GhidraMCP tools and 207 for the `reverse-engineer-anything` skill, are third-party figures that were not reproduced; see [the tool mapping](docs/tool-mapping.md) and [the dated table](docs/verification.md#owner-reported-third-party-figures-2026-10-28). One MCP process runs 4 engine workers and accepts 8 outstanding calls per lane (the engine lane and the offline lane count separately). The 9th concurrent call on a lane from one client gets `Server busy` with `retryAfterMs=2000`, by design: retry it, or wait for a result.
+
 ## Development
 
 ```text

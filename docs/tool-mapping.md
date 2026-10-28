@@ -1,8 +1,10 @@
 # Tool mapping (skeleton)
 
-How the Hydralysis surface relates to the two tools it replaced in agent sessions. This is a skeleton: rows I could derive from this repository's docs, skills and source are filled in; everything else says **to verify**. No row has been checked by running the other tool.
+How the Hydralysis surface relates to the two tools it replaced in agent sessions. This is a skeleton (`status` is `skeleton` in [data/tool-surfaces.json](data/tool-surfaces.json)): rows I could derive from this repository's docs, skills and source are filled in; everything else says **to verify**. No row has been checked by running the other tool.
 
 ## Counts, and where each comes from
+
+The counts below are written by `tools/count_surfaces.py` into `docs/data/tool-surfaces.json`, and `tests/test_tool_mapping.py` checks this page against it and against `api.TOOL_NAMES`. Only the Hydralysis count is reproduced from this repository; the other two are third-party figures, listed with the date and the label "not reproduced" in [verification.md](verification.md#owner-reported-third-party-figures-2026-10-28).
 
 | Surface | Count | Source | Status |
 | --- | --- | --- | --- |
