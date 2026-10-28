@@ -300,7 +300,8 @@ def load_bundle(folder: Path) -> dict:
             raise BundleError("bundle_record_invalid", "evidence.jsonl line %d has content fields that are not those of "
                               "the evidence model" % number)
         try:
-            evidence.verify_content(record["content"], record["evidence_id"])
+            evidence.check_content(record["content"], record["evidence_id"])
+            evidence.check_meta(record["meta"])
         except EvidenceIntegrityError as exc:
             raise BundleError(exc.code, "evidence.jsonl line %d: %s" % (number, exc), evidence_id=exc.evidence_id) from exc
         if record["evidence_id"] in seen:

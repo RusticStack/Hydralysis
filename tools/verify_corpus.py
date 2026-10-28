@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 
 from hydralysis.api import call
@@ -67,7 +68,86 @@ def verify(path: Path, settings: dict) -> dict:
     return result
 
 
+def golden_c_hashes(path: Path) -> dict:
+    """entry -> c_sha256 from a golden capture's rows.jsonl (hashes only; the capture's C text is not read)."""
+    result = {}
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            row = json.loads(line)
+            if row.get("type") == "function" and row.get("status") == "ok":
+                result[hex(int(row["entry"], 16))] = row.get("c_sha256")
+    return result
+
+
+def export_corpus(settings: dict, target: str, args) -> dict:
+    """Run (or resume) a full decompile export of TARGET, then report parity, timing and, optionally, golden agreement.
+
+    The report holds counts, digests and timings only: no function bodies and no game text."""
+    from hydralysis import exporting
+    from hydralysis.backends import read_json
+
+    started = time.monotonic()
+    options = {"resume": args.resume} if args.resume else {"mode": args.mode, "timeout_s": args.timeout_s}
+    job = exporting.start(settings, target, options)
+    while job["state"] in exporting.ACTIVE:
+        time.sleep(args.poll_s)
+        job = exporting.status(settings, job["id"])
+        print(job["state"], job.get("completed"), flush=True)
+    record = read_json(exporting.job_path(settings, job["id"]))
+    output = Path(record["output_path"])
+    report = {"job": record["id"], "target": target, "state": record["state"], "build_sha256": record["provenance"]["sha256"],
+              "pin_sha256": args.pin, "pin_matches": args.pin is None or record["provenance"]["sha256"] == args.pin,
+              "parity": record.get("parity"), "all_succeeded": record.get("all_succeeded"), "complete": record.get("complete"),
+              "completed": record.get("completed"), "succeeded": record.get("succeeded"), "failed": record.get("failed"),
+              "truncated": record.get("truncated"), "elapsed_run_s": record.get("elapsed_run_s"),
+              "wall_s": round(time.monotonic() - started, 1), "output_bytes": output.stat().st_size if output.is_file() else 0,
+              "output_sha256": record.get("output_sha256"), "error": record.get("error", "")}
+    if record.get("elapsed_run_s") and record.get("completed"):
+        report["rows_per_s"] = round(record["completed"] / record["elapsed_run_s"], 2)
+    if args.golden:
+        golden = golden_c_hashes(Path(args.golden))
+        seen, same, different = set(), 0, []
+        with output.open(encoding="utf-8") as handle:
+            for line in handle:
+                row = json.loads(line)
+                key = hex(int(row["key"], 16))
+                seen.add(key)
+                if row.get("state") == "done" and golden.get(key) == row.get("c_sha256"):
+                    same += 1
+                else:
+                    different.append(key)
+        report["golden"] = {"rows": len(golden), "same_c_sha256": same, "different": len(different),
+                            "missing_from_export": len(set(golden) - seen), "not_in_golden": len(seen - set(golden)),
+                            "different_sample": different[:20]}
+    report["ok"] = bool(record["state"] == "done" and report["pin_matches"] and (record.get("parity") or {}).get("ok")
+                        and (not args.require_all_succeeded or record.get("all_succeeded")))
+    return report
+
+
+def export_main(argv) -> int:
+    parser = argparse.ArgumentParser(prog="verify_corpus.py export", description=export_corpus.__doc__)
+    parser.add_argument("--target", required=True, help="a target already analysed and registered (use a COPY of a game project)")
+    parser.add_argument("--output", required=True, type=Path, help="report JSON (counts and digests only)")
+    parser.add_argument("--mode", default="decompile", choices=("decompile", "functions", "types"))
+    parser.add_argument("--timeout-s", type=int, default=120)
+    parser.add_argument("--poll-s", type=float, default=5.0)
+    parser.add_argument("--resume", default="", help="resume this export job id instead of starting one")
+    parser.add_argument("--pin", help="expected build SHA-256 of the target; the run fails if the export's build differs")
+    parser.add_argument("--golden", help="a golden capture's rows.jsonl: compare each row's c_sha256 with it")
+    parser.add_argument("--require-all-succeeded", action="store_true",
+                        help="also fail when a row failed or was truncated (parity alone does not)")
+    args = parser.parse_args(argv)
+    report = export_corpus(load(), args.target, args)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text(json.dumps(report, indent=2))
+    print(json.dumps({key: value for key, value in report.items() if key != "golden"}), flush=True)
+    return 0 if report["ok"] else 1
+
+
 def main():
+    import sys
+    if sys.argv[1:2] == ["export"]:
+        return export_main(sys.argv[2:])
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path)
     parser.add_argument("--output", required=True, type=Path)

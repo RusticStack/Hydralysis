@@ -1,0 +1,167 @@
+{
+  "factor": 3,
+  "report_only": true,
+  "recorded": "2026-10-28",
+  "machine": "DOOMBRINGER",
+  "program": "whoami.exe fixture (sha256 23240ef9f8b0a9a324110b1c2331de31dc1b0e08f5359cb707e51a939af56cd3)",
+  "engine": "12.3-hydra.3 (published), unpinned",
+  "note": "Medians of one recorded run on a loaded shared machine (see the reports under _logs/Z2/final for the foreign load). A budget is three times the median and is only reported, never enforced. The KotOR figures are not recorded here: they need a copy of the project and the owner's run.",
+  "entries": {
+    "bench_cold_start.total_s.median": {
+      "median": 4.249,
+      "budget": 12.747
+    },
+    "bench_install.seconds.median": {
+      "median": 14.683,
+      "budget": 44.049
+    },
+    "mcp_latency.function.median_ms": {
+      "median": 2.103,
+      "budget": 6.309
+    },
+    "mcp_latency.ghidra_query.decompile.median_ms": {
+      "median": 355.113,
+      "budget": 1065.339
+    },
+    "mcp_latency.ghidra_query.status.median_ms": {
+      "median": 32.228,
+      "budget": 96.684
+    },
+    "named_view_cost.NTFS.rebuilt/1.base_upgrade.median_ms": {
+      "median": 162.0,
+      "budget": 486.0
+    },
+    "named_view_cost.NTFS.rebuilt/1.fork.median_ms": {
+      "median": 258.0,
+      "budget": 774.0
+    },
+    "named_view_cost.NTFS.rebuilt/1.total.median_ms": {
+      "median": 570.0,
+      "budget": 1710.0
+    },
+    "named_view_cost.NTFS.rebuilt/12.fork.median_ms": {
+      "median": 271.0,
+      "budget": 813.0
+    },
+    "named_view_cost.NTFS.rebuilt/12.total.median_ms": {
+      "median": 1718.5,
+      "budget": 5155.5
+    },
+    "named_view_cost.NTFS.rebuilt/4.fork.median_ms": {
+      "median": 223.0,
+      "budget": 669.0
+    },
+    "named_view_cost.NTFS.rebuilt/4.total.median_ms": {
+      "median": 906.0,
+      "budget": 2718.0
+    },
+    "named_view_cost.NTFS.replay.1.first_call_s": {
+      "median": 0.8,
+      "budget": 2.4
+    },
+    "named_view_cost.NTFS.replay.100.first_call_s": {
+      "median": 0.469,
+      "budget": 1.407
+    },
+    "named_view_cost.NTFS.replay.1000.first_call_s": {
+      "median": 1.391,
+      "budget": 4.173
+    },
+    "named_view_cost.NTFS.replay.4096.first_call_s": {
+      "median": 2.556,
+      "budget": 7.668
+    },
+    "named_view_cost.NTFS.shared/1.fork.median_ms": {
+      "median": 136.0,
+      "budget": 408.0
+    },
+    "named_view_cost.NTFS.shared/1.total.median_ms": {
+      "median": 241.0,
+      "budget": 723.0
+    },
+    "named_view_cost.NTFS.shared/12.fork.median_ms": {
+      "median": 352.5,
+      "budget": 1057.5
+    },
+    "named_view_cost.NTFS.shared/12.total.median_ms": {
+      "median": 1265.0,
+      "budget": 3795.0
+    },
+    "named_view_cost.NTFS.shared/4.fork.median_ms": {
+      "median": 179.0,
+      "budget": 537.0
+    },
+    "named_view_cost.NTFS.shared/4.total.median_ms": {
+      "median": 437.5,
+      "budget": 1312.5
+    },
+    "named_view_cost.ReFS.rebuilt/1.base_upgrade.median_ms": {
+      "median": 185.0,
+      "budget": 555.0
+    },
+    "named_view_cost.ReFS.rebuilt/1.fork.median_ms": {
+      "median": 245.0,
+      "budget": 735.0
+    },
+    "named_view_cost.ReFS.rebuilt/1.total.median_ms": {
+      "median": 709.0,
+      "budget": 2127.0
+    },
+    "named_view_cost.ReFS.rebuilt/12.fork.median_ms": {
+      "median": 408.0,
+      "budget": 1224.0
+    },
+    "named_view_cost.ReFS.rebuilt/12.total.median_ms": {
+      "median": 2186.5,
+      "budget": 6559.5
+    },
+    "named_view_cost.ReFS.rebuilt/4.fork.median_ms": {
+      "median": 181.0,
+      "budget": 543.0
+    },
+    "named_view_cost.ReFS.rebuilt/4.total.median_ms": {
+      "median": 719.0,
+      "budget": 2157.0
+    },
+    "named_view_cost.ReFS.replay.1.first_call_s": {
+      "median": 0.865,
+      "budget": 2.595
+    },
+    "named_view_cost.ReFS.replay.100.first_call_s": {
+      "median": 0.782,
+      "budget": 2.346
+    },
+    "named_view_cost.ReFS.replay.1000.first_call_s": {
+      "median": 1.33,
+      "budget": 3.99
+    },
+    "named_view_cost.ReFS.replay.4096.first_call_s": {
+      "median": 3.983,
+      "budget": 11.949
+    },
+    "named_view_cost.ReFS.shared/1.fork.median_ms": {
+      "median": 217.0,
+      "budget": 651.0
+    },
+    "named_view_cost.ReFS.shared/1.total.median_ms": {
+      "median": 524.0,
+      "budget": 1572.0
+    },
+    "named_view_cost.ReFS.shared/12.fork.median_ms": {
+      "median": 277.5,
+      "budget": 832.5
+    },
+    "named_view_cost.ReFS.shared/12.total.median_ms": {
+      "median": 977.5,
+      "budget": 2932.5
+    },
+    "named_view_cost.ReFS.shared/4.fork.median_ms": {
+      "median": 167.5,
+      "budget": 502.5
+    },
+    "named_view_cost.ReFS.shared/4.total.median_ms": {
+      "median": 401.5,
+      "budget": 1204.5
+    }
+  }
+}
