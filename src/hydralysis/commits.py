@@ -619,8 +619,9 @@ def _commit(settings: dict, selected: dict, options: dict, engine, lineage_id: s
         raise
     except hydra.EngineError as error:
         refusal = CommitError("engine_refused", "the engine refused %s: %s" % (error.command or "a call", error), engine_error=error.code)
-        if not _published(settings, lineage_id, cid):
-            _abort(intent, refusal, candidate_folder)
+        if _published(settings, lineage_id, cid):
+            raise _finalize_pending(refusal, cid, lineage_id) from error
+        _abort(intent, refusal, candidate_folder)
         raise refusal from error
     except Exception as error:
         if _published(settings, lineage_id, cid):
@@ -678,7 +679,7 @@ def _published(settings: dict, lineage_id: str, cid: str) -> bool:
     try:
         return any(row.get("cid") == cid and row.get("reason") == "commit" for row in lineage.history(settings, lineage_id))
     except Exception:
-        return False  # an unreadable log is settled by recovery, which reads it again under the lock
+        return True  # unreadable: unknown counts as published, so ABORTED is never written; recovery reads the log again under the lock
 
 
 def _finalize_pending(error: Exception, cid: str, lineage_id: str) -> "CommitError":
@@ -813,6 +814,17 @@ def finalize(settings: dict, selected: dict, lineage_id: str, cid: str, generati
         raise CommitError("finalize_failed", "generation %d has no manifest for %s" % (generation, cid))
     with workcopy.view_lock(settings, selected):
         store = workcopy.load_store(settings, selected)
+        settled = None
+        if any(entry.get("cid") == cid for entry in store["commits"] + store["archived"]):
+            settled = {"revision": store["revision"], "already": True}
+    if settled is not None:
+        # The store write happened (a crash or a failure between it and the intent line): close the intent log now, or the
+        # commit stays "in flight" forever and revert refuses its records.
+        if intent is not None:
+            intent.write("FINALIZED", gen=generation, revision=settled["revision"])
+        return settled
+    with workcopy.view_lock(settings, selected):
+        store = workcopy.load_store(settings, selected)
         if any(entry.get("cid") == cid for entry in store["commits"] + store["archived"]):
             return {"revision": store["revision"], "already": True}
         facts = manifest["store"]
@@ -909,6 +921,8 @@ def in_flight_ids(settings: dict, selected: dict) -> dict[str, str]:
     if lineage_id is None:
         return {}
     found: dict[str, str] = {}
+    store = workcopy.load_store(settings, selected)
+    settled = {entry.get("cid") for entry in store["commits"] + store["archived"]}
     for cid in intent_cids(settings, lineage_id):
         steps = last_steps(settings, lineage_id, cid)
         if steps["step"] in ("ABORTED", "FINALIZED", None):
@@ -916,6 +930,8 @@ def in_flight_ids(settings: dict, selected: dict) -> dict[str, str]:
         ids = steps["data"].get("ids") or []
         if not ids:
             continue
+        if cid in settled:
+            continue  # the store already holds the commit: nothing is in flight, whatever the intent log still says
         if not _published(settings, lineage_id, cid):
             probe = LaneLock(str(lineage.commit_lock_path(settings, lineage_id)))
             if probe.acquire():
@@ -1039,7 +1055,7 @@ def heal(settings: dict, selected: dict) -> bool:
     known = {entry["cid"]: entry for entry in store["commits"] + store["archived"]}
     if link["reason"] == "commit":
         if cid in known:
-            return False
+            return _close_intent(settings, selected, link["id"], cid)
     else:
         entry = known.get(cid)
         if entry is None or (cid in {item["cid"] for item in store["commits"]} and entry.get("reverted")) or                 store.get("base", {}).get("generation") == link["generation"]:
@@ -1061,6 +1077,20 @@ def heal(settings: dict, selected: dict) -> bool:
                 archived = entry is None
                 _finish_revert(settings, selected, store, link["id"], entry or {"cid": cid}, archived, link["generation"])
         return True
+    finally:
+        lock.release()
+
+
+def _close_intent(settings: dict, selected: dict, lineage_id: str, cid: str) -> bool:
+    """The store holds the commit but its intent log never got FINALIZED (a crash between the two): close it under the commit
+    lock. A busy lock means a live commit or revert is working; it closes the log itself, so this returns without waiting."""
+    if last_steps(settings, lineage_id, cid)["step"] in ("FINALIZED", "ABORTED", None):
+        return False
+    lock = LaneLock(str(lineage.commit_lock_path(settings, lineage_id)))
+    if not lock.acquire():
+        return False
+    try:
+        return bool(recover(settings, selected, lineage_id))
     finally:
         lock.release()
 

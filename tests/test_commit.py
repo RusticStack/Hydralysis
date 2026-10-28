@@ -815,6 +815,51 @@ class AfterPublish(World, unittest.TestCase):
             self.commit(cid="c-fa5e0005")
         self.assertEqual(commits.in_flight_ids(self.settings, self.target()), {ident: "c-fa5e0005" for ident in selected_ids})
 
+    def test_a_store_write_without_its_finalized_line_is_closed_and_the_skipped_record_can_be_reverted(self):
+        self.edit("One", A)       # drifts, so it is skipped and stays pending
+        self.edit("Two", B)
+        one, two = self.ids()
+        self.daemon.projects[self.daemon._norm(self.gpr)]["programs"]["/owned.exe"]["saved"]["names"][A] = "OutOfBand"
+        cid = "c-fa5e0007"
+        original = commits.Intent.write
+
+        def write(intent, step, **data):
+            if step == "FINALIZED":
+                raise OSError("disk full")  # the state a crash right after the store write leaves
+            return original(intent, step, **data)
+        with patch.object(commits.Intent, "write", write), self.assertRaises(commits.CommitError) as raised:
+            self.commit(cid=cid, on_drift="skip")
+        self.assertEqual(raised.exception.code, "finalize_pending")
+        lid = self.lineage_id()
+        self.assertEqual([entry["cid"] for entry in self.store()["commits"]], [cid])  # the store write happened
+        self.assertEqual(commits.last_steps(self.settings, lid, cid)["step"], "PUBLISHED")
+        # the store already holds the commit, so nothing is in flight even though the intent log still says PUBLISHED
+        self.assertEqual(commits.in_flight_ids(self.settings, self.target()), {})
+        # a resubmission closes the intent log
+        again = self.commit(cid=cid)
+        self.assertEqual(again["generation"], 1)
+        self.assertEqual(commits.last_steps(self.settings, lid, cid)["step"], "FINALIZED")
+        self.assertEqual(len(self.published(cid)), 1)
+        self.oracle({})
+        revert = workcopy.revert(self.settings, self.target(), [one], expect=self.store()["revision"])
+        self.assertEqual(revert["reverted"], 1)
+
+    def test_recovery_closes_a_commit_whose_store_write_has_no_finalized_line(self):
+        self.edit("One", A)
+        cid = "c-fa5e0008"
+        original = commits.Intent.write
+
+        def write(intent, step, **data):
+            if step == "FINALIZED":
+                raise OSError("disk full")
+            return original(intent, step, **data)
+        with patch.object(commits.Intent, "write", write), self.assertRaises(commits.CommitError):
+            self.commit(cid=cid)
+        lid = self.lineage_id()
+        self.assertEqual(commits.last_steps(self.settings, lid, cid)["step"], "PUBLISHED")
+        self.assertEqual(self.name_of(A), "One")  # a read heals it
+        self.assertEqual(commits.last_steps(self.settings, lid, cid)["step"], "FINALIZED")
+
     def test_an_abort_requested_just_before_the_publish_is_honoured_and_the_request_is_consumed(self):
         self.edit("One", A)
         cid = "c-fa5e0006"
