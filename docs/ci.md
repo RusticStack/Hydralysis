@@ -9,7 +9,7 @@ PEs and the engine ships as a Windows build. There are two jobs.
 | Job | Runs | Needs | Does not need |
 | --- | --- | --- | --- |
 | `unit` (Python 3.11, 3.13, 3.14) | `python -m unittest discover -s tests`: the whole unit suite, the synthetic golden-harness tests (`tests/test_golden.py`) and the no-stock-Ghidra source scan (`tests/test_no_stock_ghidra.py`) | Python and `pip install -e .` | an engine, a JDK, game data |
-| `engine` (Python 3.13) | `tests/test_engine_integration.py` against the real pinned Hydra release: prepare, query, overlays, revert, adopt, archive import, bulk export, and the mandatory `expect_revision` rules | JDK 25 (Temurin, `actions/setup-java`), the pinned engine and client archives | game data, a stock Ghidra |
+| `engine` (Python 3.13) | `tests/test_engine_integration.py` against the real pinned Hydra release: prepare, query, overlays, revert, adopt, archive import, bulk export, and the mandatory `expect_revision` rules; then `tests/test_concurrency.py` (the Z1 concurrency guard, whose engine-backed cases are skipped without an engine); then `tests/test_engine_nostock.py` and `tools/audit_harness.py --self` (below) | JDK 25 (Temurin, `actions/setup-java`), the pinned engine and client archives | game data, a stock Ghidra |
 
 The integration tests analyse a small PE that every Windows host has (`whoami.exe`, or the file named by
 `HYDRALYSIS_INTEGRATION_BINARY`). Each run uses its own private data root and daemon and stops it at the end.
@@ -44,7 +44,25 @@ Hydralysis never uses a stock Ghidra. CI proves it in three places:
 - `tests/test_no_stock_ghidra.py` (in `unit`) scans the shipped source, skills, documentation and tools for the
   stock hooks.
 
-The script itself lives under `.github/`, outside the scanned roots, because it has to name the hook it forbids.
+- `tests/test_engine_nostock.py` (in `engine`) proves it end to end. One sequential class scrubs `os.environ` and
+  `PATH` itself, plants a decoy stock install (a directory named by the stock hook variable and first on `PATH`, whose
+  launchers would write a marker if anything ran them) and then drives the public tool dispatch: `backend inspect`
+  (not ready, the decoy reported as ignored), `backend install` (a job that unpacks the pinned release from archives
+  it re-hashes), `backend inspect` (ready), `prepare` (a job), `prepare` with `adopt`, `ghidra_query` on both
+  targets and a small `ghidra_run` script. A process audit then requires every process of the run to be Hydra Engine
+  under the private root, none to name a stock launcher or the decoy, the decoy tree to be byte-identical and its
+  marker never written. The archives come from `HYDRALYSIS_NOSTOCK_ARCHIVES`, else from the `downloads` folder beside
+  the engine in `HYDRALYSIS_INTEGRATION_ENGINE` (where `ci_engine.py install` leaves them); nothing is downloaded, and
+  without them the class is skipped.
+- `tools/audit_harness.py` audits the agent harnesses: it reads each harness configuration it finds (or is given),
+  launches each configured Hydralysis server for `initialize` and `tools/list` only, and searches the skill
+  directories about Hydralysis for the stock-install names (a line that says the setting is ignored is allowed). A
+  stock server or name is a failure (exit 1); an old server name or a server started from a mutable checkout is a
+  warning. `AuditHarnessTool` in the same test file shows it fails on planted input. On a hosted runner there is no
+  harness configuration, so CI runs it with `--self` (this checkout's own server) and the repository's skills; the
+  audit of a developer machine is a local step (`python tools/audit_harness.py`).
+
+The CI helper script lives under `.github/`, outside the scanned roots, because it has to name the hook it forbids.
 
 ## Limits
 
