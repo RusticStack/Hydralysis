@@ -66,11 +66,17 @@ class Fixture:
         self.process = subprocess.Popen([build["path"], str(self.stop)], cwd=str(Path(build["path"]).parent),
                                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.detached = False
-        started = runner.call("attach", {"exe": build["path"], "sha256": build["sha256"], "pid": self.process.pid})
-        self.session, self.owner = started["session"], started["owner"]
-        modules = self.call("modules", limit=50)["modules"]
-        main = next(m for m in modules if m["name"].lower() == Path(build["path"]).name.lower())
-        self.delta = int(main["base"], 16) - int(build["image_base"], 16)
+        try:
+            started = runner.call("attach", {"exe": build["path"], "sha256": build["sha256"], "pid": self.process.pid})
+            self.session, self.owner = started["session"], started["owner"]
+            modules = self.call("modules", limit=50)["modules"]
+            main = next(m for m in modules if m["name"].lower() == Path(build["path"]).name.lower())
+            self.delta = int(main["base"], 16) - int(build["image_base"], 16)
+        except BaseException:
+            self.process.kill()          # never leave the fixture we started behind
+            self.process.wait()
+            self.stop.unlink(missing_ok=True)
+            raise
 
     def live(self, name: str) -> str:
         return hex(int(self.build["globals"][name], 16) + self.delta)
@@ -157,7 +163,10 @@ def proof(runner, build: dict) -> list[str]:
 
 def race_iteration(runner, build: dict, index: int) -> str:
     """One teardown race; '' when it passed, else why not."""
-    fixture = Fixture(runner, build)
+    try:
+        fixture = Fixture(runner, build)
+    except Exception as error:
+        return "fixture attach failed: %s" % str(error)[:300]
     why = ""
     try:
         fixture.call("watch", op="arm", address=fixture.live("g_watched"), size=4, access="write",

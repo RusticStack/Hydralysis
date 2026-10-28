@@ -396,9 +396,17 @@ class MemoryMixin:
                  "coverage": "the threads that existed at arm time; rearm adds later ones"}
         self.watches[watch["id"]] = watch
         self._persist_memory()
-        script = self._memory()
         problem = ""
         try:
+            try:
+                script = self._memory()
+            except Exception:
+                # no script, so nothing was ever armed: the slot goes back without a disarm
+                self._move(watch, "disarming")
+                watch["verified"] = {"evidence": "never armed: the memory script could not be created",
+                                     "at_ms": int(time.time() * 1000)}
+                self._move(watch, "clear")
+                raise
             result = script.exports_sync.arm(watch["id"], watch["slot"], hex(address), size, KINDS[kind])
             script.exports_sync.limit(watch["id"], limit)
             watch["threads"], watch["failed"] = result["armed"], result["failed"]
@@ -411,6 +419,8 @@ class MemoryMixin:
                     problem = "debug-register readback does not show the watch on every armed thread"
         except Exception as exc:
             problem = "arming failed: %s" % exc
+        if problem and watch["state"] == "clear":
+            raise RuntimeError("%s; rolled back: clear" % problem)
         if problem:
             outcome = self._disarm_id(watch["id"], rolling_back=True)
             raise RuntimeError("%s; rolled back: %s" % (problem, outcome["state"]))
@@ -467,6 +477,14 @@ class MemoryMixin:
         """Disarm every live watch and prove it clear before the worker lets go of the target."""
         for watch_id, watch in list(self.watches.items()):
             if watch["state"] in ("armed", "arming", "disarming", "tainted"):
+                if self.detached:
+                    # The process or its session is gone: a debug register cannot kill a process that no longer exists.
+                    watch["state"] = "clear"
+                    watch["verified"] = {"evidence": "target gone", "at_ms": int(time.time() * 1000)}
+                    watch.pop("error", None)
+                    self._persist_memory()
+                    self._refresh_taint()
+                    continue
                 try:
                     self._disarm_id(watch_id, rolling_back=True)
                 except Exception as exc:

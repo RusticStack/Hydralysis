@@ -222,6 +222,44 @@ class Tainted(Case):
         self.assertIn("0x80000004", result["target_state"])
         self.assertTrue(result["tainted"])
 
+    def test_a_dead_target_is_not_an_armed_hazard(self):
+        watch = self.arm()
+        self.target.readback_unavailable = True      # a gone session: nothing can be created or called on it
+        self.target.fail_unset = {1, 2, 3}
+        self.agent.detached = True
+        calls = len(self.script.calls)
+        result = self.detach()
+        self.assertEqual(result["state"], "detached")
+        self.assertEqual(self.agent.tainted, "")
+        self.assertEqual(self.agent.watches[watch["id"]]["state"], "clear")
+        self.assertEqual(self.agent.watches[watch["id"]]["verified"]["evidence"], "target gone")
+        self.assertEqual(len(self.script.calls), calls)     # no disarm was attempted
+
+    def test_a_dead_target_clears_an_already_tainted_watch_too(self):
+        self.taint()
+        self.agent.detached = True
+        self.assertEqual(self.detach()["state"], "detached")
+        self.assertEqual(self.agent.tainted, "")
+
+    def test_a_failed_script_creation_rolls_the_arm_back_and_frees_the_slot(self):
+        def broken():
+            raise RuntimeError("session is gone")
+        self.agent._memory = broken
+        for _ in range(memory.SLOTS + 1):
+            with self.assertRaises(RuntimeError) as raised:
+                self.watch()
+            self.assertIn("arming failed", str(raised.exception))
+        self.assertFalse([w for w in self.agent.watches.values() if w["state"] == "arming"])
+
+    def test_an_address_beyond_the_pointer_width_is_refused(self):
+        arch_limit = 1 << (32 if self.arch == "x86" else 64)
+        for address in (hex(arch_limit), hex(arch_limit - 2)):
+            with self.assertRaises(ValueError, msg=address) as raised:
+                self.watch(address=address)
+            self.assertIn("pointer width", str(raised.exception))
+        with self.assertRaises(ValueError):
+            self.watch(address="0x0")
+
     def test_the_worker_does_not_idle_out_while_tainted(self):
         import inspect
 
