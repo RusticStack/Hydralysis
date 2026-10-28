@@ -8,6 +8,8 @@ HYDRALYSIS_CONFIG selects the data root the fixtures were prepared in (prepare_f
 from __future__ import annotations
 
 import json
+import re as _re
+import struct
 import sys
 from pathlib import Path
 
@@ -25,6 +27,7 @@ MANIFEST: dict = {}
 
 def load(out_dir: str) -> dict:
     MANIFEST.update(json.loads((Path(out_dir) / "manifest.json").read_text()))
+    MANIFEST_DIR[:] = [out_dir]
     return MANIFEST
 
 
@@ -435,8 +438,369 @@ def check_ledger(manifest: dict) -> list[str]:
     return failures
 
 
+# --- Surface parity (Z8): metadata, listing, read-memory, call graph and name to address, each against the
+# --- linker map of the MSVC fixtures (x86 and x64). Ground truth is the map, the C sources and the PE headers
+# --- parsed here with struct, never an answer of the tool under test. Rows of docs/tool-mapping.md.
+
+EXES = ("flow_fixture.exe", "vcall_fixture.exe", "diff1.exe", "diff2.exe")
+# Functions the saved analysis does not list: fx_detour is only ever reached through a stored pointer
+# (install_detour), so no call or entry-point seed leads to it. A documented gap of list_functions.
+UNLISTED = {"flow_fixture.exe": {"fx_detour"}}
+# Direct calls made by the fixtures' own functions, from the C sources (caller -> callees).
+EDGES = {
+    "flow_fixture.exe": {"fx_flow": {"fx_relay", "fx_read"}, "fx_relay": {"fx_store"}},
+    "vcall_fixture.exe": {"fx_sides_global": {"Square::sides"}, "fx_sides_made": {"fx_make_shape"}},
+    "diff1.exe": {},
+    "diff2.exe": {"df_added": {"df_banner", "df_mix", "df_walk"}, "df_banner": {"df_limit"}},
+}
+# String literals of diff_fixture.c per build.
+LITERALS = {"diff1.exe": ("alpha", "beta", "gamma", "delta", "value=%d units", "diff fixture build one"),
+            "diff2.exe": ("alpha", "beta", "gamma", "delta", "value=%d units", "diff fixture build two")}
+# What flow_fixture.c calls in kernel32 (a subset of the map's import table).
+SOME_IMPORTS = {"flow_fixture.exe": {"Sleep", "GetFileAttributesA", "VirtualProtect", "FlushInstructionCache", "GetCurrentProcess"}}
+MANIFEST_DIR: list[str] = []
+
+
+def _build(manifest: dict, arch: str, exe: str) -> dict:
+    return manifest[arch + "/" + exe]
+
+
+def _pages(name: str, size: int = 100) -> list[dict]:
+    """Every function of the saved analysis, by cursor pages."""
+    found, cursor = [], ""
+    while True:
+        page = re.query(name, "functions", limit=size, **({"cursor": cursor} if cursor else {}))
+        found += page["functions"]
+        if not page["truncated"]:
+            return found
+        cursor = page["next_cursor"]
+
+
+def _body(function: dict) -> tuple[int, int]:
+    first, last = function["body"][0].strip("[]").split(",")
+    return int(first, 16), int(last, 16)
+
+
+def _unique(functions: dict) -> dict[int, list[str]]:
+    """Map function VAs; identical-code folding gives one address several names."""
+    by_address: dict[int, list[str]] = {}
+    for function, address in functions.items():
+        by_address.setdefault(int(address, 16), []).append(function)
+    return by_address
+
+
+def _sections(path: str) -> list[dict]:
+    """PE section table parsed straight from the file (no Hydralysis code)."""
+    data = Path(path).read_bytes()
+    pe = struct.unpack_from("<I", data, 0x3C)[0]
+    count, optional = struct.unpack_from("<H", data, pe + 6)[0], struct.unpack_from("<H", data, pe + 20)[0]
+    first, rows = pe + 24 + optional, []
+    for index in range(count):
+        raw = data[first + 40 * index: first + 40 * index + 40]
+        name = raw[:8].rstrip(b"\0").decode("ascii")
+        vsize, rva, rawsize, rawptr = struct.unpack_from("<IIII", raw, 8)
+        rows.append({"name": name, "rva": rva, "vsize": vsize, "raw_size": rawsize, "raw_ptr": rawptr})
+    return rows
+
+
+def _file_bytes(path: str, rva: int, size: int) -> bytes:
+    """Bytes of the file at an RVA: the section's file bytes, zero filled past its raw data (what the loader maps)."""
+    data = Path(path).read_bytes()
+    for section in _sections(path):
+        if section["rva"] <= rva < section["rva"] + max(section["vsize"], section["raw_size"]):
+            start = rva - section["rva"]
+            raw = data[section["raw_ptr"]: section["raw_ptr"] + section["raw_size"]][start: start + size]
+            return raw + b"\0" * (size - len(raw))
+    raise ValueError("rva %#x is outside every section" % rva)
+
+
+def _map_imports(build: dict) -> set[tuple[str, str, int]]:
+    """(module, name, IAT rva) of every import, from the linker map's __imp_ rows."""
+    base, found = int(build["image_base"], 16), set()
+    for line in Path(build["path"]).with_suffix(".map").read_text(errors="replace").splitlines():
+        match = _re.fullmatch(r"\s*\d{4}:[0-9a-f]{8}\s+__imp_(\S+)\s+([0-9a-f]{8,16})\s+(\S+):(\S+)", line, flags=_re.I)
+        if match:
+            name = match.group(1)
+            name = _re.sub(r"@\d+$", "", name[1:] if name.startswith("_") and base < 0x100000000 else name)
+            found.add((match.group(4).lower(), name, int(match.group(2), 16) - base))
+    return found
+
+
+def _tool_rows(text: str) -> list[list[str]]:
+    return [line.split() for line in text.splitlines() if line.startswith("rva:")]
+
+
+def _check(label: str, ok: bool, detail: str, failures: list[str]) -> None:
+    print("%s %s: %s" % ("PASS" if ok else "FAIL", label, detail))
+    if not ok:
+        failures.append(label)
+
+
+def check_listing(manifest: dict) -> list[str]:
+    """Rows get_program_info, list_functions, list_methods, search_functions_by_name, list_segments, list_imports,
+    list_exports, list_data_items and list_strings (docs/tool-mapping.md)."""
+    failures: list[str] = []
+    for arch in ARCHES:
+        for exe in EXES:
+            build, name = _build(manifest, arch, exe), target(arch, exe)
+            label, base = "%s %s" % (arch, exe), int(build["image_base"], 16)
+            # get_program_info: the identity from the PE header and from the saved analysis agree with the build.
+            header = re.call("fingerprint", exe=build["path"])
+            answer = re.query(name, "functions", limit=1)
+            bits = 64 if arch == "x64" else 32
+            ok = (build["sha256"] in header and ("image_base %s" % build["image_base"]) in header and "bits %d" % bits in header
+                  and answer["sha256"] == build["sha256"] and int(answer["image_base"], 16) == base)
+            _check("metadata " + label, ok, "sha256 %s base %s bits %d" % (build["sha256"][:12], build["image_base"], bits), failures)
+            # list_functions: paged listing equals one big page, has no duplicates, and lists the map's functions.
+            listed = _pages(name)
+            single = _pages(name, 200)
+            addresses = [int(f["address"], 16) for f in listed]
+            unique = _unique(build["functions"])
+            missing = {n for a, names in unique.items() if a not in set(addresses) for n in names}
+            ok = (len(addresses) == len(set(addresses))
+                  and addresses == [int(f["address"], 16) for f in single]
+                  and missing == UNLISTED.get(exe, set()))
+            _check("functions " + label, ok, "%d listed over %d pages of 100 (the same over pages of 200); map functions not listed %s (expected %s)"
+                   % (len(addresses), -(-len(addresses) // 100), sorted(missing), sorted(UNLISTED.get(exe, set()))), failures)
+            # list_methods / bounds: every listed map function starts at the map address and ends before the next map entry.
+            by = {int(f["address"], 16): f for f in listed}
+            entries, bad = sorted(unique), []
+            for position, address in enumerate(entries):
+                if address in by:
+                    start, end = _body(by[address])
+                    following = entries[position + 1] if position + 1 < len(entries) else None
+                    if start != address or (following is not None and end >= following):
+                        bad.append((hex(address), hex(end)))
+            _check("bounds " + label, not bad, "%d map functions with exact entry and no body over the next entry; bad %s" % (len(entries), bad), failures)
+            # search_functions_by_name: contains matches the analysis name; without symbols that is FUN_<address>.
+            sample = next(a for a in entries if a in by)
+            wanted = by[sample]["name"]
+            hits = re.query(name, "functions", contains=wanted, limit=100)["functions"]
+            mapped = next(iter(unique[sample]))
+            nothing = re.query(name, "functions", contains=mapped, limit=100)
+            ok = (wanted == "FUN_%08x" % sample and [int(h["address"], 16) for h in hits] == [sample]
+                  and not nothing["functions"] and nothing["scanned"] >= len(listed))
+            _check("search " + label, ok, "contains %s -> %s; contains %s (a map name) -> %d (no symbols in a stripped build)"
+                   % (wanted, [h["address"] for h in hits], mapped, len(nothing["functions"])), failures)
+            # list_segments: the section table agrees with the PE headers (not Ghidra memory blocks).
+            table = re.call("fingerprint", exe=build["path"], detail="sections")
+            tool = {row[0]: row for row in (line.split() for line in table.splitlines() if line.startswith("."))}
+            expected = _sections(build["path"])
+            ok = len(tool) == len(expected) and all(
+                s["name"] in tool and ("rva=%#x" % s["rva"]) in tool[s["name"]] and ("vsize=%#x" % s["vsize"]) in tool[s["name"]]
+                and ("raw=%#x" % s["raw_size"]) in tool[s["name"]] for s in expected)
+            _check("segments " + label, ok, "%d sections %s" % (len(expected), [s["name"] for s in expected]), failures)
+            # list_imports: the import table equals the linker map's __imp_ rows (module, name, IAT rva).
+            truth = _map_imports(build)
+            rows = _tool_rows(re.call("imports", exe=build["path"], limit=200))
+            got = {(row[1].lower(), row[2], int(row[0][4:], 16)) for row in rows}
+            ok = got == truth and SOME_IMPORTS.get(exe, set()) <= {item[1] for item in got}
+            _check("imports " + label, ok, "%d imports, map %d, only-tool %s, only-map %s"
+                   % (len(got), len(truth), sorted(got - truth)[:3], sorted(truth - got)[:3]), failures)
+            # list_exports: an executable without an export table answers an empty list.
+            exports = re.call("fingerprint", exe=build["path"], detail="exports")
+            _check("exports " + label, "(no exports)" in exports and not _tool_rows(exports), "empty export table", failures)
+            # list_strings: the source literals are found, and the bytes at the address are the literal.
+            if exe in LITERALS:
+                missing_strings = []
+                for literal in LITERALS[exe]:
+                    found = _tool_rows(re.call("strings", exe=build["path"], pattern="^%s$" % _re.escape(literal), limit=10))
+                    where = [int(row[0][4:], 16) for row in found if " ".join(row[2:]) == literal]
+                    if not where or _file_bytes(build["path"], where[0], len(literal)) != literal.encode():
+                        missing_strings.append(literal)
+                other = LITERALS["diff2.exe" if exe == "diff1.exe" else "diff1.exe"][-1]
+                absent = not _tool_rows(re.call("strings", exe=build["path"], pattern=_re.escape(other), limit=10))
+                _check("strings " + label, not missing_strings and absent,
+                       "%d literals found at their bytes, other build's literal absent: %s; missing %s"
+                       % (len(LITERALS[exe]), absent, missing_strings), failures)
+        # list_data_items: no enumeration; per address, and RTTI names the vftables like the map does.
+        build, name = _build(manifest, arch, "vcall_fixture.exe"), target(arch, "vcall_fixture.exe")
+        wrong = []
+        for symbol in ("Square::vftable", "Triangle::vftable", "Gadget::vftable", "Shape::vftable"):
+            data = re.query(name, "data", build["globals"][symbol])
+            label_names = [item["name"] for item in data["labels"]]
+            if symbol not in label_names:
+                wrong.append((symbol, label_names))
+        slots = []
+        for klass in ("Square", "Triangle"):
+            data = re.query(name, "data", build["globals"][klass + "::vftable"])
+            values = [int(c["value"], 16) for c in data["data"]["components"]]
+            slots.append(values[:2] == [int(build["functions"][klass + "::area"], 16), int(build["functions"][klass + "::sides"], 16)])
+        _check("data %s vcall_fixture.exe" % arch, not wrong and all(slots),
+               "vftable labels equal the map names (bad %s); area and sides slots of Square and Triangle match the map" % wrong, failures)
+    return failures
+
+
+def _owner(entries: dict[int, list[str]], listed: list[dict], site: int) -> tuple:
+    for function in listed:
+        start, end = _body(function)
+        if start <= site <= end:
+            return tuple(entries.get(start, ()))
+    return ()
+
+
+def check_callgraph(manifest: dict) -> list[str]:
+    """Rows get_function_by_address, get_function_calls, get_xrefs_to, get_xrefs_from and get_function_xrefs."""
+    failures: list[str] = []
+    for arch in ARCHES:
+        for exe in EXES:
+            build, name = _build(manifest, arch, exe), target(arch, exe)
+            label, base = "%s %s" % (arch, exe), int(build["image_base"], 16)
+            unique, listed = _unique(build["functions"]), _pages(name)
+            listed_at = {int(f["address"], 16): f for f in listed}
+            known = sorted(a for a in unique if a in listed_at)
+            expected = {int(build["functions"][caller], 16): {int(build["functions"][c], 16) for c in callees}
+                        for caller, callees in EDGES[exe].items()}
+            bad_calls, bad_refs, bad_pe, extra, computed, tail = [], [], [], 0, 0, 0
+            for address in known:
+                dossier = re.query(name, "dossier", hex(address))
+                found = {int(edge["to"], 16) for edge in dossier["callees"] if int(edge["to"], 16) in unique}
+                if found != expected.get(address, set()):
+                    bad_calls.append((hex(address), sorted(hex(x) for x in found), sorted(hex(x) for x in expected.get(address, set()))))
+                start, end = _body(listed_at[address])
+                if any(not start <= int(edge["from"], 16) <= end for edge in dossier["callees"]):
+                    bad_calls.append((hex(address), "a callee site outside the body"))
+                # get_xrefs_to: the references action and the dossier's callers are the same call sites, and every
+                # expected caller appears as a site inside that caller's body.
+                references = re.query(name, "xrefs", hex(address))["references"]
+                sites = {int(r["from"], 16) for r in references}
+                calls = {int(r["from"], 16) for r in dossier["callers"]}
+                # xrefs also lists data references (vtable slots, unwind tables); every other reference is not a call.
+                others = {int(r["from"], 16): r["type"] for r in references if int(r["from"], 16) not in calls}
+                owners = {_owner(unique, listed, s) for s in calls}
+                wanted = {tuple(unique[c]) for c, callees in expected.items() if address in callees}
+                if not calls <= sites or any("CALL" in kind for kind in others.values()) or not wanted <= owners:
+                    bad_refs.append((hex(address), sorted(hex(s) for s in calls - sites)[:3], sorted(wanted - owners)))
+                # The PE-only callers tool lists the direct call sites (E8/E9 bytes reaching the entry); a computed
+                # call that the analysis resolved (a virtual call through a known vtable) is not decodable there.
+                direct = {s for s in calls if _file_bytes(build["path"], s - base, 1) in (b"\xe8", b"\xe9")}
+                pe_sites = {base + int(row[0][4:], 16) for row in _tool_rows(re.call("callers", exe=build["path"], address="va:" + hex(address)))}
+                computed += len(calls - direct)
+                if not direct <= pe_sites:
+                    bad_pe.append((hex(address), sorted(hex(s) for s in direct - pe_sites)[:3]))
+                # The PE-only callees tool: the calls inside the body include the analysis' direct calls; sites past
+                # the body (leaf functions have no pdata record, so decoding runs on) are counted, not failed.
+                pe_calls = [(base + int(row[0][4:], 16), base + int(row[2][4:], 16)) for row in
+                            _tool_rows(re.call("callees", exe=build["path"], address="va:" + hex(address)))]
+                inside = {(s, t) for s, t in pe_calls if start <= s <= end}
+                extra += len(pe_calls) - len(inside)
+                truth_calls = {(int(e["from"], 16), int(e["to"], 16)) for e in dossier["callees"]
+                               if _file_bytes(build["path"], int(e["from"], 16) - base, 1) == b"\xe8"}
+                tail += sum(1 for e in dossier["callees"] if _file_bytes(build["path"], int(e["from"], 16) - base, 1) != b"\xe8")
+                if not truth_calls <= inside:
+                    bad_pe.append((hex(address), "callees", sorted(hex(s) for s, _ in truth_calls - inside)[:3]))
+            _check("callees " + label, not bad_calls, "%d functions, edges from the sources %s; mismatches %s"
+                   % (len(known), {sorted(unique[c])[0]: len(v) for c, v in expected.items()}, bad_calls[:3]), failures)
+            _check("xrefs_to " + label, not bad_refs, "callers equal the xref sites and cover the expected callers; mismatches %s" % bad_refs[:3], failures)
+            _check("pe_callgraph " + label, not bad_pe,
+                   "PE callers/callees contain every direct E8/E9 edge of the analysis; %d computed call(s) and %d tail jump(s) are only in the analysis, "
+                   "the callees tool decoded %d site(s) past leaf functions; mismatches %s"
+                   % (computed, tail, extra, bad_pe[:3]), failures)
+            # get_function_by_address: any address inside a body answers the same function.
+            odd = []
+            for address in known:
+                start, end = _body(listed_at[address])
+                inner = re.query(name, "function", hex(end))["function"]
+                if int(inner["address"], 16) != start:
+                    odd.append((hex(end), inner["address"]))
+            _check("function_by_address " + label, not odd, "%d map functions answered from their last byte; mismatches %s" % (len(known), odd[:3]), failures)
+    return failures
+
+
+def _write_map(manifest: dict, arch: str, exe: str, out_dir: Path, extra: list | None = None, digest: str = "") -> Path:
+    build = _build(manifest, arch, exe)
+    base = int(build["image_base"], 16)
+    entries = [{"name": n, "rva": "0x%x" % (int(a, 16) - base)} for n, a in build["functions"].items()]
+    path = out_dir / ("namemap-%s-%s%s.json" % (arch, exe, "-" + digest[:6] if digest else ""))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"sha256": digest or build["sha256"],
+                                "source": "linker map %s, function rows (Z8 parity)" % Path(build["path"]).with_suffix(".map").name,
+                                "entries": entries + (extra or [])}))
+    return path
+
+
+def check_namemap(manifest: dict) -> list[str]:
+    """Rows decompile_function (by name), decompile_function_by_address and read_memory, with the cited address map as the name source."""
+    failures: list[str] = []
+    out_dir = Path(MANIFEST_DIR[0]) / "namemap"
+    for arch in ARCHES:
+        for exe in EXES:
+            build, name = _build(manifest, arch, exe), target(arch, exe)
+            label, base = "%s %s" % (arch, exe), int(build["image_base"], 16)
+            listed = {int(f["address"], 16) for f in _pages(name)}
+            re.query(name, "address_map", path=str(_write_map(manifest, arch, exe, out_dir)))
+            wrong, undone = [], []
+            for symbol, address in build["functions"].items():
+                where = int(address, 16)
+                if where in listed:
+                    answer = re.query(name, "function", "name:" + symbol)
+                    resolved = answer.get("address_resolution", {})
+                    if int(answer["function"]["address"], 16) != where or int(resolved.get("rva", "0"), 16) != where - base:
+                        wrong.append((symbol, answer["function"]["address"], resolved.get("rva")))
+                else:
+                    undone.append(symbol)
+                # read_memory: the bytes behind a name are the file's bytes at the mapped address.
+                text = re.call("bytes", exe=build["path"], address="name:" + symbol, size=16)
+                read = bytes.fromhex(next(line for line in text.splitlines() if not line.startswith("#")).replace(" ", ""))
+                if read != _file_bytes(build["path"], where - base, 16):
+                    wrong.append((symbol, "bytes", read.hex()))
+                # The saved analysis' own instruction bytes (Ghidra memory) equal those file bytes too.
+                if where in listed:
+                    scanned = re.query(name, "scan", hex(where), limit=2)["instructions"]
+                    memory = b"".join(bytes.fromhex(i["bytes"].replace(" ", "")) for i in scanned)
+                    if memory != _file_bytes(build["path"], where - base, len(memory)):
+                        wrong.append((symbol, "ghidra memory", memory.hex()))
+            _check("namemap " + label, not wrong,
+                   "%d names resolved to the map address, %d unlisted name(s) %s read through the map; mismatches %s"
+                   % (len(build["functions"]) - len(undone), len(undone), undone, wrong[:3]), failures)
+        build, name = _build(manifest, arch, "flow_fixture.exe"), target(arch, "flow_fixture.exe")
+        # decompile_function by name: the same function the address form decompiles.
+        by_name = re.query(name, "decompile", "name:fx_read")
+        by_address = re.query(name, "decompile", build["functions"]["fx_read"])
+        ok = by_name["function"] == by_address["function"] and by_name["c"] == by_address["c"] and "return" in by_name["c"]
+        _check("decompile_by_name %s" % arch, ok, "name:fx_read decompiles to %s as the address form" % by_name["function"]["address"], failures)
+        # Negative rows: an unknown name, a map for another build and two maps that disagree are refused.
+        refusals = []
+        for what, call in (
+            ("unknown name", lambda: re.query(name, "function", "name:not_in_any_map")),
+            ("other build", lambda: re.query(name, "address_map", path=str(_write_map(
+                manifest, arch, "flow_fixture.exe", out_dir, digest=_build(manifest, arch, "diff1.exe")["sha256"])))),
+        ):
+            try:
+                call()
+                refusals.append(what + " accepted")
+            except Exception as error:  # the client raises the engine's refusal
+                if not any(word in str(error).lower() for word in ("not found", "no address", "mismatch", "unknown", "not in", "no map")):
+                    refusals.append("%s: unexpected %s" % (what, str(error)[:160]))
+        for variant, rva in (("a", 0x1000), ("b", 0x1010)):
+            path = out_dir / ("conflict-%s-%s.json" % (arch, variant))
+            path.write_text(json.dumps({"sha256": build["sha256"], "source": "Z8 conflict probe " + variant,
+                                        "entries": [{"name": "z8_conflict", "rva": "0x%x" % rva}]}))
+            re.query(name, "address_map", path=str(path))
+        try:
+            re.query(name, "function", "name:z8_conflict")
+            refusals.append("conflicting rows resolved")
+        except Exception as error:
+            if "ambiguous" not in str(error).lower():
+                refusals.append("conflict: unexpected %s" % str(error)[:160])
+        _check("namemap_refusals %s" % arch, not refusals,
+               "unknown name, another build's map and conflicting rows are refused; problems %s" % refusals, failures)
+        # read_memory / list_segments / list_classes gap: ghidra_query has no such action.
+        gaps = []
+        for action in ("memory", "read_memory", "segments", "classes", "namespaces"):
+            try:
+                re.query(name, action, build["functions"]["fx_read"])
+                gaps.append(action + " exists")
+            except Exception:
+                pass
+        _check("documented_gaps %s" % arch, not gaps,
+               "no ghidra_query action for memory, segments, classes or namespaces (the tool-mapping gaps); found %s" % gaps, failures)
+    return failures
+
+
 CHECKS = {"value_flow": check_value_flow, "writers": check_writers, "hooked": check_hooked, "diff": check_diff,
-          "vcalls": check_vcalls, "sample": check_sample, "mcp_typed_read": check_mcp_typed_read, "ledger": check_ledger}
+          "vcalls": check_vcalls, "sample": check_sample, "mcp_typed_read": check_mcp_typed_read, "ledger": check_ledger,
+          "listing": check_listing, "callgraph": check_callgraph, "namemap": check_namemap}
 
 
 def main(argv: list[str]) -> int:
