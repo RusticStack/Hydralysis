@@ -26,6 +26,9 @@ default game spec (`--spec kotor`) lists no addresses it could not prove, so it 
 
     python tools/scenarios/kotor_vfs_lookup.py --profile <dir> [--install <dir>] [--spec kotor|<file.json>] [--twice]
 
+The recorded pass sequence (`expected_pass_sequence`) is derived from the spec's `allowed_skips`: it is every step
+above except those the spec lists there, in order, unless the spec states `expected_pass_sequence` itself.
+
 Exit status 0 only when every step ran as the spec's recorded pass sequence says, no hook dropped events without a
 stated limitation, the install tree hash is unchanged, and (with --twice) the second bundle compares equal.
 """
@@ -388,7 +391,8 @@ class Scenario:
         # the sites of the probes, unless the spec names the ones to compare with the file (a probe may sit where the
         # file has no section bytes to compare, which the fake binding's header probe does)
         rows = [{"module": h["module"], "rva": h["rva"], "size": 8, "name": h["label"], "sha256": self._module_sha(h)}
-                for h in self.hooks] if not self.spec.get("patch_sites") else                [{"size": 8, "sha256": self.digest, **row} for row in self.spec["patch_sites"]]
+                for h in self.hooks] if not self.spec.get("patch_sites") else \
+                [{"size": 8, "sha256": self.digest, **row} for row in self.spec["patch_sites"]]
         patches = self.rt("patches", rows=rows) if rows else {"patched": 0, "checked": 0}
         if patches["patched"]:
             raise RuntimeError("%d probe site(s) still differ from the file after unload" % patches["patched"])

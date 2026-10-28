@@ -203,7 +203,7 @@ class Mirror(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(status["typed_read"], "fail")
         self.assertEqual([status[s] for s in ("snapshot", "writers", "evidence_add", "bundle_export")], ["not_run"] * 4)
-        self.assertEqual(status["detach"], "not_run" if not run["session"] else status["detach"])
+        self.assertEqual(status["detach"], "pass" if run["session"] else "not_run")
         state = json.loads((self.root / "state" / "runtime-sessions" / run["session"] / "state.json").read_text())
         self.assertTrue(state.get("detached"))
 
