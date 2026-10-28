@@ -64,11 +64,11 @@ def check_value_flow(manifest: dict) -> list[str]:
 class Running:
     """A fixture process under a Hydralysis runtime session; stopped through its stop file."""
 
-    def __init__(self, arch: str, exe: str):
+    def __init__(self, arch: str, exe: str, extra_argv=()):
         build = MANIFEST[arch + "/" + exe]
-        self.build, self.stop_file = build, Path(build["path"]).with_suffix(".stop")
+        self.build, self.stop_file, self.detached = build, Path(build["path"]).with_suffix(".stop"), False
         self.stop_file.unlink(missing_ok=True)
-        started = re.runtime("spawn", exe=build["path"], sha256=build["sha256"], argv=[str(self.stop_file)],
+        started = re.runtime("spawn", exe=build["path"], sha256=build["sha256"], argv=[str(self.stop_file), *extra_argv],
                              cwd=str(Path(build["path"]).parent))
         self.session, self.owner = started["session"], started["owner"]
         re.runtime("resume", session=self.session, owner=self.owner)
@@ -86,11 +86,18 @@ class Running:
     def __enter__(self):
         return self
 
+    def detach(self):
+        """Detach now (the program keeps running); __exit__ then only stops it."""
+        result = re.runtime("detach", session=self.session, owner=self.owner)
+        self.detached = True
+        return result
+
     def __exit__(self, *exc):
-        try:
-            re.runtime("detach", session=self.session, owner=self.owner)
-        except Exception as error:  # still report the check
-            print("  detach:", error)
+        if not self.detached:
+            try:
+                re.runtime("detach", session=self.session, owner=self.owner)
+            except Exception as error:  # still report the check
+                print("  detach:", error)
         self.stop_file.write_text("stop")
 
 
@@ -300,6 +307,200 @@ def check_sample(manifest: dict) -> list[str]:
     return failures
 
 
+def _payloads(running: "Running", kind: str | None = None, after: int = 0) -> list[dict]:
+    """The probe payloads in the session's event ring (at most 200 per call), optionally of one event kind."""
+    events = running.call("status", limit=200, after=after)["events"]
+    payloads = [(e.get("message") or {}).get("payload") or {} for e in events]
+    return [p for p in payloads if isinstance(p, dict) and (kind is None or p.get("event") == kind)]
+
+
+def _wait(condition, seconds: float):
+    import time
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        found = condition()
+        if found:
+            return found
+        time.sleep(0.1)
+    return condition()
+
+
+def _file_head(build: dict, rva: int, size: int = 8) -> str:
+    return re.read(build["path"], "rva:%#x" % rva, size).hex(" ").upper()
+
+
+def check_break_continue(manifest: dict) -> list[str]:
+    """The runtime smoke's steps, committed (C1-24, C2-18). runtime_fixture's rustic_transform(Sample *, int delta)
+    runs every 50 ms and logs a line per step. A breakpoint on it stops the program (the log stops), the Sample
+    behind argument 0 is read through its absolute address (armor 7, health = the step number), `continue` lets it
+    run, the probe is inert after its one hit, `unload` leaves the file's bytes in place (patches: none) and a
+    detach leaves the program running."""
+    import time
+    failures = []
+    for arch in ARCHES:
+        build = manifest[arch + "/runtime_fixture.exe"]
+        name, base = Path(build["path"]).name, int(build["image_base"], 16)
+        rva = int(build["functions"]["rustic_transform"], 16) - base
+        log = Path(build["path"]).with_suffix(".log")
+        log.unlink(missing_ok=True)
+
+        def steps() -> int:
+            return len(log.read_text().splitlines()) if log.exists() else 0
+
+        with Running(arch, "runtime_fixture.exe", extra_argv=[str(log)]) as running:
+            _wait(lambda: steps() >= 3, 10)
+            probe = running.call("break", module=name, rva=hex(rva), sha256=build["sha256"], expect=_file_head(build, rva),
+                                 limit=1, capture=[{"arg": 0, "as": "hex", "size": 8, "label": "sample"},
+                                                   {"arg": 1, "as": "i32", "label": "delta"}])
+            hit = _wait(lambda: next(iter(_payloads(running, "break")), None), 10) or {}
+            decoded = hit.get("decoded") or [{}, {}]
+            time.sleep(0.5)
+            stopped_at = steps()
+            time.sleep(1.0)
+            stalled = steps() == stopped_at
+            paused = probe["hook_id"] in running.call("status", limit=1)["paused_hooks"]
+            raw = bytes.fromhex(str(decoded[0].get("value") or "00" * 8))
+            health, armor = struct.unpack("<ii", raw)
+            absolute = bytes.fromhex(running.call("read", address=decoded[0].get("pointer") or "0x1", size=8)["bytes"].replace(" ", ""))
+            running.call("continue", hook_id=probe["hook_id"])
+            resumed = _wait(lambda: steps() >= stopped_at + 10, 5)
+            released = not running.call("status", limit=1)["paused_hooks"]
+            breaks = len(_payloads(running, "break"))
+            running.call("unload", hook_id=probe["hook_id"])
+            row = running.call("patches", sha256=build["sha256"], rows=[{"module": name, "rva": hex(rva), "size": 8, "name": "rustic_transform"}])["rows"][0]
+            running.detach()
+            after = steps()
+            alive = _wait(lambda: steps() >= after + 10, 5)
+        ok = (hit.get("event") == "break" and decoded[1].get("value") == 3 and stalled and paused and armor == 7
+              and health == stopped_at % 90 and absolute == raw and resumed and released and breaks == 1
+              and not row["patched"] and alive)
+        print("%s break_continue %s: broke at step %d (health %d armor %d delta %s), stalled %s, paused %s, absolute read same %s, "
+              "continued %s, released %s, break events %d, patched after unload %s, running after detach %s"
+              % ("PASS" if ok else "FAIL", arch, stopped_at, health, armor, decoded[1].get("value"), stalled, paused,
+                 absolute == raw, bool(resumed), released, breaks, row["patched"], bool(alive)))
+        if not ok:
+            failures.append("break_continue " + arch)
+    return failures
+
+
+def check_export_hook(manifest: dict) -> list[str]:
+    """Z10: flow_fixture exports fx_exported(int), called once per frame with the frame number. A probe named by
+    export (no RVA, no expect) resolves the name in the module FILE's export table, lands on the linker map's
+    address for it, and sees consecutive frame numbers. A name the table lacks (fx_hooked is not exported) and an
+    RVA that is not the export's are refused."""
+    failures = []
+    for arch in ARCHES:
+        build = manifest[arch + "/flow_fixture.exe"]
+        name, base = Path(build["path"]).name, int(build["image_base"], 16)
+        rva = int(build["functions"]["fx_exported"], 16) - base
+        with Running(arch, "flow_fixture.exe") as running:
+            refusals = {}
+            for label, options in (("not exported", {"export": "fx_hooked"}), ("wrong rva", {"export": "fx_exported", "rva": hex(rva + 16)})):
+                try:
+                    running.call("observe", module=name, sha256=build["sha256"], **options)
+                    refusals[label] = "ACCEPTED"
+                except Exception as error:
+                    refusals[label] = str(error)
+            probe = running.call("observe", module=name, export="fx_exported", sha256=build["sha256"], limit=6,
+                                 capture=[{"arg": 0, "as": "i32", "label": "frame"}])
+            enters = _wait(lambda: (lambda rows: rows if len(rows) >= 3 else None)(_payloads(running, "enter")), 10) or []
+            running.call("unload", hook_id=probe["hook_id"])
+        frames = [e["decoded"][0]["value"] for e in enters if e.get("decoded")]
+        addresses = {e.get("address") for e in enters}
+        ok = (probe["rva"] == hex(rva) and probe["export"]["name"] == "fx_exported" and probe["expect_source"] == "file"
+              and addresses == {hex(int(build["functions"]["fx_exported"], 16) + running.delta)}
+              and len(frames) >= 3 and all(b > a for a, b in zip(frames, frames[1:]))
+              and "no export fx_hooked" in refusals["not exported"] and "is at rva" in refusals["wrong rva"])
+        print("%s export_hook %s: fx_exported rva %s (map %s), expect from %s, frames %s, refused: %s"
+              % ("PASS" if ok else "FAIL", arch, probe["rva"], hex(rva), probe["expect_source"], frames[:6],
+                 {k: v[:70] for k, v in refusals.items()}))
+        if not ok:
+            failures.append("export_hook " + arch)
+    return failures
+
+
+def check_capture(manifest: dict) -> list[str]:
+    """Z10: capture windows on a live program. fx_exported fires about 20 times a second. A window with a probe
+    limited to 8 records exactly 8 events while the probe's own counter says many more fired: partial,
+    hit_limit_reached. A short window with room to spare records every call its probe counted: complete. The
+    durable log of each verifies and returns its events."""
+    import time
+    failures = []
+    for arch in ARCHES:
+        build = manifest[arch + "/flow_fixture.exe"]
+        name = Path(build["path"]).name
+        frame = [{"arg": 0, "as": "i32", "label": "frame"}]
+        with Running(arch, "flow_fixture.exe") as running:
+            windows = []
+            for label, limit, seconds in (("limited", 8, 3.0), ("roomy", 200, 1.5)):
+                started = running.call("capture", op="start", name=label)
+                probe = running.call("observe", module=name, export="fx_exported", sha256=build["sha256"], limit=limit, capture=frame)
+                time.sleep(seconds)
+                closed = running.call("capture", op="stop")
+                running.call("unload", hook_id=probe["hook_id"])
+                windows.append((started, closed))
+            (_, limited), (_, roomy) = windows
+            verified = [running.call("capture", op="verify", capture=c["capture"]) for _, c in windows]
+            page = running.call("capture", op="read", capture=limited["capture"], limit=200)
+        a, b = limited["hooks"][0], roomy["hooks"][0]
+        enters = [e for e in page["events"] if ((e["message"].get("payload") or {}).get("event")) == "enter"]
+        ok = (limited["coverage"] == {"status": "partial", "limitations": ["hit_limit_reached"]}
+              and a["recorded"] == 8 and a["seen"] > 20 and a["lost"] == a["seen"] - 8 and len(enters) == 8
+              and roomy["coverage"]["status"] == "complete" and 10 <= b["seen"] < 200 and b["recorded"] == b["seen"]
+              and all(v["ok"] for v in verified) and roomy["evidence"]["from_capture"] == roomy["capture"]
+              and roomy["evidence"]["subject_sha256"] == build["sha256"])
+        print("%s capture %s: limited window saw %s recorded %s lost %s (%s); roomy window saw %s recorded %s (%s); log verifies %s"
+              % ("PASS" if ok else "FAIL", arch, a["seen"], a["recorded"], a["lost"], limited["coverage"]["status"],
+                 b["seen"], b["recorded"], roomy["coverage"]["status"], [v["ok"] for v in verified]))
+        if not ok:
+            failures.append("capture " + arch)
+    return failures
+
+
+def check_snapshot(manifest: dict) -> list[str]:
+    """Z10: snapshots of a live program and their comparison. g_config (mode 2, limit 0..100, a growing speed)
+    read through an inline layout in two snapshots 1.5 s apart: mode unchanged, speed increased, limit in range,
+    the main module's file hash the build's. A snapshot of a second run of the program (another process, another
+    session) compares equal to the first outside the region, with the default volatile masks only."""
+    import time
+    failures = []
+    layout = [{"name": "mode", "offset": 0, "type": "i32"}, {"name": "limit", "offset": 4, "type": "i32"},
+              {"name": "speed", "offset": 8, "type": "f32"}]
+    for arch in ARCHES:
+        build = manifest[arch + "/flow_fixture.exe"]
+        name = Path(build["path"]).name
+
+        def take(running):
+            return running.call("snapshot", name="g_config", regions=[{"name": "config", "address": hex(running.live("g_config")),
+                                                                      "size": 12, "layout": layout}])
+
+        with Running(arch, "flow_fixture.exe") as first:
+            time.sleep(0.5)
+            one = take(first)
+            time.sleep(1.5)
+            two = take(first)
+            within = first.call("compare", a=one["snapshot"], b=two["snapshot"], predicates=[
+                {"path": "regions/config/fields/mode/value", "op": "unchanged"},
+                {"path": "regions/config/fields/speed/value", "op": "increased"},
+                {"path": "regions/config/fields/limit/value", "op": "between", "value": [0, 100]},
+                {"path": "modules/%s/file_sha256" % name.lower(), "op": "eq", "value": build["sha256"]}])
+        with Running(arch, "flow_fixture.exe") as second:
+            time.sleep(0.5)
+            three = take(second)
+            across = second.call("compare", other_session=first.session, a=three["snapshot"], b=one["snapshot"], mask=["regions/*"])
+        main = next(m for m in one["modules"] if m["name"].lower() == name.lower())
+        ok = (within["ok"] and not within["equal"] and across["equal"] and main["file_sha256"] == build["sha256"]
+              and one["regions_complete"] and one["modules_complete"] and one["target"]["exe_sha256"] == build["sha256"]
+              and one["target"]["pid"] != three["target"]["pid"])
+        print("%s snapshot %s: predicates %s; across two runs equal %s (%d differences, %d masked, first %s)"
+              % ("PASS" if ok else "FAIL", arch, [(p["path"].rsplit("/", 2)[-2], p["ok"]) for p in within["predicates"]],
+                 across["equal"], across["difference_count"], across["masked_differences"],
+                 [d["path"] for d in across["differences"][:3]]))
+        if not ok:
+            failures.append("snapshot " + arch)
+    return failures
+
+
 class McpClient:
     """The real stdio MCP server (hydralysis mcp), driven as an agent's client would."""
 
@@ -370,19 +571,25 @@ def check_mcp_typed_read(manifest: dict) -> list[str]:
             modules = mcp.tool("runtime", action="modules", options={"session": session, "limit": 50})["modules"]
             main = next(m for m in modules if m["name"].lower() == Path(build["path"]).name.lower())
             address = int(build["globals"]["g_config"], 16) - int(build["image_base"], 16) + int(main["base"], 16)
-            reads = []
+            reads, sources = [], []
             for _ in range(2):
                 time.sleep(1)
-                reads.append({f["name"]: f.get("value") for f in mcp.tool(
-                    "runtime", action="read", options={"session": session, "address": hex(address), "type": "Config",
-                                                       "target": name})["fields"]})
+                answer = mcp.tool("runtime", action="read", options={"session": session, "address": hex(address), "type": "Config",
+                                                                     "target": name})
+                reads.append({f["name"]: f.get("value") for f in answer["fields"]})
+                sources.append(answer.get("layout_source") or {})
+            status = mcp.tool("ghidra_query", target=name, action="status")
             mcp.tool("runtime", action="detach", options={"session": session, "owner": owner})
             stop.write_text("stop")
         finally:
             mcp.close()
+        # The read names the view and the revision its layout came from: the revision the engine reports for that view.
+        sourced = all(isinstance(s.get("revision"), int) and s["revision"] == status.get("view_revision")
+                      and s.get("view") == "shared" and s.get("target") == name for s in sources)
         ok = (job.get("state") == "done" and all(r["mode"] == 2 and 0 <= r["limit"] <= 100 for r in reads)
-              and reads[1]["speed"] > reads[0]["speed"] > 0)
-        print("%s mcp_typed_read %s: import %s; reads %s" % ("PASS" if ok else "FAIL", arch, job.get("state"), reads))
+              and reads[1]["speed"] > reads[0]["speed"] > 0 and sourced)
+        print("%s mcp_typed_read %s: import %s; reads %s; layout from %s (status view_revision %s)"
+              % ("PASS" if ok else "FAIL", arch, job.get("state"), reads, sources[-1], status.get("view_revision")))
         if not ok:
             failures.append("mcp_typed_read " + arch)
     return failures
@@ -807,7 +1014,9 @@ def check_namemap(manifest: dict) -> list[str]:
 
 CHECKS = {"value_flow": check_value_flow, "writers": check_writers, "hooked": check_hooked, "diff": check_diff,
           "vcalls": check_vcalls, "sample": check_sample, "mcp_typed_read": check_mcp_typed_read, "ledger": check_ledger,
-          "listing": check_listing, "callgraph": check_callgraph, "namemap": check_namemap}
+          "listing": check_listing, "callgraph": check_callgraph, "namemap": check_namemap,
+          "break_continue": check_break_continue, "export_hook": check_export_hook, "capture": check_capture,
+          "snapshot": check_snapshot}
 
 
 def main(argv: list[str]) -> int:

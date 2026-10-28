@@ -5,7 +5,7 @@ usage: python tests/fixtures/build_fixtures.py <out dir>
 No PDB is written, so analysis sees what it sees in a shipped program, and builds are
 reproducible (/Brepro), so a rebuild keeps the prepared targets valid. Each build's
 linker map (/MAP) is the ground truth for function addresses. Writes <out>/<arch>/*.exe,
-*.map and manifest.json (sha256 and map addresses of every fx_/df_ function).
+*.map and manifest.json (sha256 and map addresses of every fx_/df_/rustic_ function).
 """
 
 from __future__ import annotations
@@ -19,7 +19,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 BUILDS = [("flow_fixture.exe", "flow_fixture.c", []), ("vcall_fixture.exe", "vcall_fixture.cpp", ["/EHsc", "/GR"]),
-          ("diff1.exe", "diff_fixture.c", []), ("diff2.exe", "diff_fixture.c", ["/DV2"])]
+          ("diff1.exe", "diff_fixture.c", []), ("diff2.exe", "diff_fixture.c", ["/DV2"]),
+          # the runtime smoke's program: exported rustic_transform/rustic_entry over a Sample, a stop file and a log file
+          ("runtime_fixture.exe", "runtime_fixture.c", [])]
 SYMBOL = re.compile(r"^\s*\d{4}:[0-9a-f]{8}\s+(\S+)\s+([0-9a-f]{8,16})\s+(f\s)?", re.I)
 
 
@@ -34,13 +36,13 @@ def vcvars() -> Path:
 
 
 def symbols(map_path: Path) -> tuple[dict, dict]:
-    """fx_/df_ function and g_ data VAs from a linker map (C names carry a leading underscore on x86)."""
+    """fx_/df_/rustic_ function and g_ data VAs from a linker map (C names carry a leading underscore on x86)."""
     functions, data = {}, {}
     for line in map_path.read_text(errors="replace").splitlines():
         match = SYMBOL.match(line)
         if match:
             name = match.group(1).lstrip("_")
-            if match.group(3) and name.startswith(("fx_", "df_")):
+            if match.group(3) and name.startswith(("fx_", "df_", "rustic_")):
                 functions[name] = "0x%x" % int(match.group(2), 16)
             elif not match.group(3) and name.startswith("g_"):
                 data[name] = "0x%x" % int(match.group(2), 16)
