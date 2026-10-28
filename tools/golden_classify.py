@@ -61,10 +61,10 @@ POLICY = {
     "bad-data-limit": ("accepted", "12.3 counts bad-data exceptions (GP-6945, option maxBadData, default 4); 12.1.4 has no limit"),
     "unimplemented-instruction": ("open", "not attributed to an upstream change"),
     "switch-jump-table": ("open", "not attributed to an upstream change"),
-    "warning-comment": ("accepted", "comment text only; the code lines are identical after normalisation"),
+    "warning-comment": ("accepted", "comment text only; the code is identical once the comment lines are removed"),
     "calling-convention": ("open", "not attributed to an upstream change"),
     "block-reorder": ("accepted", "presentation: identical statements, different order; not checked for equivalence one by one"),
-    "condition-inversion": ("accepted", "presentation: same operands, flipped condition; not checked for equivalence one by one"),
+    "condition-inversion": ("accepted", "presentation: only conditions with the same operands and a negated or mirrored operator changed; not checked for equivalence one by one"),
     "control-flow": ("open", "not attributed to an upstream change"),
     "stack-layout": ("open", "not attributed to an upstream change"),
     "local-types": ("open", "not attributed to an upstream change"),
@@ -85,13 +85,43 @@ _NAME = re.compile(r"\b(?:[A-Za-z]{0,8}Var\d+|param_\d+|local_(?:res)?[0-9a-fA-F
 _STACK = re.compile(r"\bstack0x[0-9a-fA-F]+|\b[A-Za-z]{1,6}Stack_|\bin_stack_|\blocal_res")
 _DECL = re.compile(r"^\s*(?:unsigned\s+)?[A-Za-z_][A-Za-z_0-9]*(?:\s*\*+)?\s+\**[A-Za-z]+[A-Za-z_]*<?\d*>?\s*(?:\[\d+\])?;\s*$")
 _BRACE = re.compile(r"^\s*(?:\}|\{|\}?\s*else\s*\{?|\})\s*$")
-_OPS = re.compile(r"==|!=|<=|>=|<|>|!")
+_OPS = re.compile(r"==|!=|<=|>=|(?<![-<>])[<>](?![<>=])|!(?!=)")
 _COND = re.compile(r"\b(?:if|while)\b")
-_WARN_LINE = re.compile(r"^\s*/\*\s*WARNING|^\s*\*|^\s*//")
+_NUMBERED = re.compile(r"<(\d+)>")
+# Relational operators: the negation (a < b is false exactly when a >= b) and the mirror (a < b is b > a).
+_NEG = {"<": ">=", ">=": "<", ">": "<=", "<=": ">"}
+_MIRROR = {"<": ">", ">": "<", "<=": ">=", ">=": "<="}
+_SYMMETRIC = ("==", "!=")
+
+
+def strip_comments(text: str) -> str:
+    """Drop the lines that are only comment: `//` lines, `/*` lines and every line up to the closing `*/`.
+
+    A continuation line such as ` * text` counts as comment only inside an open `/*`. A line that starts
+    with `*` outside a comment is code (a pointer store such as `*p = 1;`) and is kept.
+    """
+    kept: list[str] = []
+    inside = False
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if inside:
+            inside = "*/" not in stripped
+            continue
+        if stripped.startswith("//"):
+            continue
+        if stripped.startswith("/*"):
+            inside = "*/" not in stripped
+            continue
+        kept.append(line)
+    return "\n".join(kept)
 
 
 def _changed_lines(a: str, b: str) -> tuple[list[str], list[str]]:
-    la, lb = golden.normalise(a).split("\n"), golden.normalise(b).split("\n")
+    return _diff(golden.normalise(a), golden.normalise(b))
+
+
+def _diff(norm_a: str, norm_b: str) -> tuple[list[str], list[str]]:
+    la, lb = norm_a.split("\n"), norm_b.split("\n")
     minus: list[str] = []
     plus: list[str] = []
     for line in difflib.unified_diff(la, lb, lineterm="", n=0):
@@ -105,36 +135,84 @@ def _keywords(lines: list[str]) -> Counter:
     return Counter(word for line in lines for word in _FLOW.findall(line))
 
 
-def _operands(lines: list[str]) -> Counter:
-    return Counter(token for line in lines for token in re.findall(r"\w+", _OPS.sub(" ", line)))
-
-
 def _count(pattern: re.Pattern, lines: list[str]) -> int:
     return sum(len(pattern.findall(line)) for line in lines)
 
 
+def _sides(line: str):
+    """The two operands of a line holding one condition with one comparison, or None."""
+    inner = re.sub(r"^\s*(?:\}\s*)?(?:else\s+)?(?:if|while)\s*\(|\)\s*\{?\s*$", "", line)
+    parts = _OPS.split(inner)
+    return (parts[0].strip(), parts[1].strip()) if len(parts) == 2 else None
+
+
+def _flipped(line_a: str, line_b: str) -> bool:
+    """The same operands with the condition negated or mirrored. The operators are compared, not ignored:
+    `x == 0` against `x < 0` is a different test, `x < 0` against `x >= 0` or `0 > x` is not."""
+    line_a, line_b = _NUMBERED.sub(r"\1", line_a), _NUMBERED.sub(r"\1", line_b)  # iVar<1> is one name, not operators
+    words_a, words_b = re.findall(r"\w+", _OPS.sub(" ", line_a)), re.findall(r"\w+", _OPS.sub(" ", line_b))
+    if Counter(words_a) != Counter(words_b):
+        return False
+    ops_a, ops_b = _OPS.findall(line_a), _OPS.findall(line_b)
+    if len(ops_a) != len(ops_b) or "!" in ops_a or "!" in ops_b:
+        return False
+    same_order = words_a == words_b
+    sides_a, sides_b = _sides(line_a), _sides(line_b)
+    reversed_order = len(ops_a) == 1 and sides_a is not None and sides_b is not None and sides_a == sides_b[::-1]
+    for first, second in zip(ops_a, ops_b):
+        if first in _SYMMETRIC:
+            if second not in _SYMMETRIC:
+                return False
+        elif same_order:
+            if second != _NEG.get(first):
+                return False
+        elif reversed_order:
+            if second not in (_MIRROR.get(first), _NEG.get(_MIRROR.get(first, ""))):
+                return False
+        else:
+            return False
+    return True
+
+
+def _pure_condition_change(minus: list[str], plus: list[str]) -> bool:
+    """Every changed line is a condition that is flipped or mirrored, or a statement that only moved
+    (the same multiset of statements on both sides). Anything else changed is not a condition inversion."""
+    cond_a = [x for x in minus if _COND.search(x)]
+    cond_b = [x for x in plus if _COND.search(x)]
+    if not cond_a or len(cond_a) != len(cond_b) or cond_a == cond_b:
+        return False
+    if not all(_flipped(x, y) for x, y in zip(cond_a, cond_b)):
+        return False
+    rest_a = Counter(x.strip() for x in minus if not _COND.search(x) and not _BRACE.match(x))
+    rest_b = Counter(x.strip() for x in plus if not _COND.search(x) and not _BRACE.match(x))
+    return rest_a == rest_b
+
+
 def signals(a: str, b: str) -> list[str]:
     """Every cause whose pattern shows up in the changed lines, in CAUSES order. Never empty."""
-    minus, plus = _changed_lines(a, b)
+    # comments come off the raw text first, so that the renumbering of the machine-made names sees code only
+    code_a, code_b = golden.normalise(strip_comments(a)), golden.normalise(strip_comments(b))
+    raw_minus, raw_plus = _changed_lines(a, b)
+    if code_a == code_b and golden.normalise(a) != golden.normalise(b):
+        return ["warning-comment"]
+    # the bad-data and unimplemented-instruction notes are comments, so they are looked for in the raw
+    # lines; every other rule reads the lines with the comments removed
+    minus, plus = _diff(code_a, code_b)
     both = minus + plus
     found: set[str] = set()
-    if any(_BAD.search(line) for line in both):
+    if any(_BAD.search(line) for line in raw_minus + raw_plus):
         found.add("bad-data-limit")
-    if any(_UNIMPL.search(line) for line in both):
+    if any(_UNIMPL.search(line) for line in raw_minus + raw_plus):
         found.add("unimplemented-instruction")
     if _count(_SWITCH, minus) != _count(_SWITCH, plus) or any("jumptable" in line.lower() for line in both):
         found.add("switch-jump-table")
-    if both and all(_WARN_LINE.match(line) for line in both):
-        found.add("warning-comment")
     if _count(_CONV, minus) != _count(_CONV, plus):
         found.add("calling-convention")
     body_a = Counter(x.strip() for x in minus if not _BRACE.match(x))
     body_b = Counter(x.strip() for x in plus if not _BRACE.match(x))
-    if body_a and body_a == body_b and minus != plus:
+    if body_a and body_a == body_b:
         found.add("block-reorder")
-    cond_a = [x for x in minus if _COND.search(x)]
-    cond_b = [x for x in plus if _COND.search(x)]
-    if cond_a and cond_b and cond_a != cond_b and _operands(cond_a) == _operands(cond_b):
+    if _pure_condition_change(minus, plus):
         found.add("condition-inversion")
     if _keywords(minus) != _keywords(plus):
         found.add("control-flow")
@@ -144,7 +222,7 @@ def signals(a: str, b: str) -> list[str]:
         found.add("local-types")
     if _count(_TYPE, minus) != _count(_TYPE, plus):
         found.add("types-casts")
-    if [_CONST.findall(line) for line in minus] != [_CONST.findall(line) for line in plus] and len(minus) == len(plus):
+    if Counter(c for line in minus for c in _CONST.findall(line)) != Counter(c for line in plus for c in _CONST.findall(line)):
         found.add("constants-data")
     # names only: after masking the machine-made names the changed lines are the same
     if len(minus) == len(plus) and [_NAME.sub("N", x) for x in minus] == [_NAME.sub("N", x) for x in plus]:
@@ -156,6 +234,14 @@ def signals(a: str, b: str) -> list[str]:
 def primary(signal_list: list[str]) -> str:
     # warning-comment is only primary when nothing about the code matched; the order of CAUSES decides the rest
     return signal_list[0]
+
+
+def is_accepted(signal_list: list[str]) -> bool:
+    """Accepted only when the primary cause is an accepted class AND no open-class cause matches the same
+    function. A function whose condition is flipped and whose constants also changed stays open."""
+    if POLICY[primary(signal_list)][0] != "accepted":
+        return False
+    return all(POLICY[name][0] == "accepted" for name in signal_list)
 
 
 def option_differences(header_a: dict, header_b: dict) -> dict:
@@ -190,6 +276,8 @@ def compare(dir_a, dir_b, dir_unpinned=None) -> dict:
     primary_counts: Counter = Counter()
     signal_counts: Counter = Counter()
     changed_entries: set[str] = set()
+    pure_counts: Counter = Counter()
+    pure_accepted = 0
     for entry in sorted(set(rows_a) | set(rows_b)):
         kind = golden.classify(rows_a.get(entry), rows_b.get(entry))
         counts[kind] += 1
@@ -197,7 +285,11 @@ def compare(dir_a, dir_b, dir_unpinned=None) -> dict:
             continue
         changed_entries.add(entry)
         found = signals(text_a[entry], text_b[entry])
-        primary_counts[primary(found)] += 1
+        first = primary(found)
+        primary_counts[first] += 1
+        if is_accepted(found):
+            pure_counts[first] += 1
+            pure_accepted += 1
         for name in found:
             signal_counts[name] += 1
     compared = sum(counts.values())
@@ -222,9 +314,11 @@ def compare(dir_a, dir_b, dir_unpinned=None) -> dict:
                    for name, _ in CAUSES},
         "reported_not_gated": True,
     }
-    accepted = sum(primary_counts[name] for name, _ in CAUSES if POLICY[name][0] == "accepted")
-    report["accepted_functions"] = accepted
-    report["open_functions"] = counts["changed"] - accepted
+    candidate = sum(primary_counts[name] for name, _ in CAUSES if POLICY[name][0] == "accepted")
+    report["candidate_accepted_functions"] = candidate
+    report["accepted_functions"] = pure_accepted
+    report["accepted_by_cause"] = {name: pure_counts.get(name, 0) for name, _ in CAUSES if POLICY[name][0] == "accepted"}
+    report["open_functions"] = counts["changed"] - pure_accepted
     if dir_unpinned:
         report["maxBadData_effect"] = _effect(dir_a, dir_unpinned, rows_a, rows_b, changed_entries)
     return report
@@ -291,7 +385,8 @@ def render_markdown(report: dict) -> str:
     for name, description in CAUSES:
         item = report["policy"][name]
         out.append("| %s (%s) | %d | %s | %s |" % (name, description, item["functions"], item["status"], item["reason"]))
-    out += ["", "Accepted: %d. Open: %d. Reported, never gated." % (report["accepted_functions"], report["open_functions"])]
+    out += ["", "Candidate accepted (primary cause is an accepted class): %d. Accepted with no open-class signal alongside: %d. Open: %d. Reported, never gated."
+            % (report["candidate_accepted_functions"], report["accepted_functions"], report["open_functions"])]
     effect = report.get("maxBadData_effect")
     if effect:
         out += ["", "Effect of the %s option (the newer engine's default %s against the pinned value):" % (

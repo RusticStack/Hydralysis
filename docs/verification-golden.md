@@ -64,23 +64,41 @@ changed; none failed or is missing on either side. Each changed function gets on
 the first rule that matches its changed lines (rule order is the table order). The rules are
 heuristic text rules over the normalised line diff, not a proof of equivalence.
 
-| primary cause | functions | policy |
-| --- | ---: | --- |
-| bad instruction handling (`maxBadData`) | 0 | accepted |
-| unimplemented instruction | 0 | open |
-| switch or jump table | 8 | open |
-| WARNING comment text only | 2 | accepted |
-| calling convention or register notation | 47 | open |
-| same statements, different order | 54 | accepted |
-| same conditions, flipped polarity or swapped operands | 744 | accepted |
-| different branch, loop or goto count | 236 | open |
-| stack variables split, merged or resized | 401 | open |
-| declared types of locals | 129 | open |
-| types or pointer casts | 59 | open |
-| constants or data references | 167 | open |
-| variable naming only | 21 | accepted |
-| no rule matched | 103 | open |
-| **accepted / open** | **821 / 1,150** | |
+A function is **accepted** only when its primary cause is an accepted class **and** no open-class
+rule matches the same function. The class rules themselves are strict: a condition inversion needs
+every changed condition to have the same operands with a negated or mirrored operator (`x < 0`
+against `x >= 0` or `0 > x`; `x == 0` against `x < 0` does not count) and nothing else changed
+except statements that only moved; comment text is the comment lines only (`//`, `/*`, and the
+lines up to `*/`), so a line that starts with `*` outside a comment is code.
+
+| primary cause | functions | policy | of which accepted (no open-class signal alongside) |
+| --- | ---: | --- | ---: |
+| bad instruction handling (`maxBadData`) | 0 | accepted | 0 |
+| unimplemented instruction | 0 | open | |
+| switch or jump table | 8 | open | |
+| WARNING comment text only | 8 | accepted | 8 |
+| calling convention or register notation | 47 | open | |
+| same statements, different order | 75 | accepted | 61 |
+| same conditions, flipped polarity or mirrored operands | 580 | accepted | 564 |
+| different branch, loop or goto count | 254 | open | |
+| stack variables split, merged or resized | 416 | open | |
+| declared types of locals | 132 | open | |
+| types or pointer casts | 60 | open | |
+| constants or data references | 223 | open | |
+| variable naming only | 0 | accepted | 0 |
+| no rule matched | 168 | open | |
+| **candidate accepted / accepted / open** | **663 / 633 / 1,338** | | |
+
+"Candidate accepted" is the count by primary cause alone (663). "Accepted" (633) drops the 30
+candidates where an open-class rule also matched. Open is everything not accepted (1,971 - 633).
+
+Correction to the first version of this page, which reported 821 accepted and 1,150 open: its
+comment rule counted any line starting with `*` as comment (both of its 2 "comment only" functions
+were pointer stores with a changed constant; the real comment-only count is 8), and its condition
+rule ignored the operator and every other changed line (744 candidates there, 580 now; 629 of those
+744 also matched an open-class rule). Part of that earlier overlap was noise (a swapped `0 == x`
+counted as a changed constant), which is also fixed: constants are now compared as a multiset.
+The earlier "variable naming only" 21 are now 0 as a primary cause; where they went was not traced one by one. Nothing has been checked per function.
 
 `by_signal` (every rule that matches, not only the first) is in the tool's JSON output; a function
 can have several causes, so those counts add up to more than 1,971.
@@ -89,7 +107,8 @@ can have several causes, so those counts add up to more than 1,971.
 
 * **accepted** means: the mechanism is named, the difference is reported, and no action is required.
   The accepted classes are presentation differences (statement order, condition polarity, comment
-  text, naming). They are accepted **by class**; no individual function was checked for semantic
+  text, naming), and a function counts as accepted only when no open-class rule also matches it.
+  They are accepted **by class**; no individual function was checked for semantic
   equivalence, so "accepted" is a statement about the class rule, not a proof for each function.
 * **open** means: not attributed to a documented upstream change. Open is not a failure and nothing
   is gated on it; it is the list a person would look at first if a decompiler difference mattered.
@@ -150,7 +169,7 @@ Captures: `_golden/baselines/ghidra-12.1.4/kotor/explicit` (the existing stock b
 `_golden/baselines/hydra-3-released/kotor/explicit-pinned` and `explicit-default`,
 `_golden/baselines/ghidra-12.1.4/fixtures/<name>/explicit`,
 `_golden/baselines/hydra-3-released-upgraded/fixtures/<name>/explicit` and
-`hydra-3-released-fresh/fixtures/<name>/explicit`. Reports: `_golden/after/z7/`. The project copies
+`hydra-3-released-fresh/fixtures/<name>/explicit`. Reports: `_golden/after/z7/` (first version) and `_golden/after/z7r2/` (after the review fixes). The project copies
 used by the engine captures are in `_golden/copies-z7` (each proven identical to its source by
 `project-copy`); the KotOR original was never opened by an engine.
 
