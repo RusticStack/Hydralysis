@@ -18,7 +18,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-from hydralysis import durable, hydra, proc
+from hydralysis import durable, hydra, proc, runtime_capture as capture
 from hydralysis.locks import LaneLock
 from hydralysis.paths import root_path
 from hydralysis.proc import identity as _identity, stop as _stop
@@ -27,9 +27,11 @@ from hydralysis.runtime_ipc import request as ipc_request
 
 FRIDA_VERSION = "17.24.3"
 ACTION_NAMES = ("setup", "processes", "spawn", "attach", "status", "modules", "threads", "read", "patches",
-                "observe", "break", "continue", "unload", "resume", "detach", "writers")
+                "observe", "break", "continue", "unload", "resume", "detach", "writers", "capture", "snapshot", "compare")
 # Only the session's owner drives the target; any client may look.
 MUTATING = ("observe", "break", "continue", "unload", "resume", "detach", "writers")
+# capture start/stop write the session's event log: the owner's. read, verify, list, counters and snapshot only look.
+CAPTURE_OWNER_OPS = ("start", "stop")
 # A store site's memory operand, as the analysis prints it: [BASE + 0xOFF].
 _STORE_OPERAND = re.compile(r"\[([A-Za-z][A-Za-z0-9]*)\s*\+\s*0x([0-9a-fA-F]+)\]")
 # How many bytes past a site a probe may overwrite; no jump may land inside them.
@@ -234,6 +236,13 @@ class RuntimeRunner:
         if not re.fullmatch(r"[0-9a-f]{32}", session_id):
             raise ValueError("session must be the runtime session id returned by spawn/attach")
         directory = self.root / session_id
+        # Reading a finished capture or comparing snapshots needs the session's files, not its worker.
+        if action == "compare":
+            return capture.compare_snapshots(self.root, session_id, args)
+        if action == "capture" and str(args.get("op") or "") in ("read", "verify", "list"):
+            return capture.capture_host_op(directory, session_id, args)
+        if action == "snapshot" and args.get("op") == "list":
+            return capture.list_snapshots(directory)
         ready = _json(directory / "ready.json")
         alive = _identity(int(ready.get("pid", 0)), int(ready.get("started_ms", 0)))
         if not alive:
@@ -248,7 +257,8 @@ class RuntimeRunner:
             raise RuntimeError("runtime worker is no longer alive; target state is unknown; log=%s" % (directory / "worker.log"))
         token = str(args.pop("owner", "") or _TOKENS.get(session_id, ""))
         owner = _json(directory / "owner.json")
-        if action in MUTATING and owner and not hmac.compare_digest(
+        owner_only = action in MUTATING or (action == "capture" and str(args.get("op") or "") in CAPTURE_OWNER_OPS)
+        if owner_only and owner and not hmac.compare_digest(
                 hashlib.sha256(token.encode()).hexdigest(), str(owner.get("token_sha256", ""))):
             raise PermissionError("runtime session %s is owned by %s (%s) since %s; other clients may use status, modules, "
                                   "threads, read and patches; driving it needs options.owner, the token its spawn/attach returned"
@@ -257,6 +267,8 @@ class RuntimeRunner:
             args.update(self._layout(args))
         if action == "writers":
             return self._writers(session_id, args, token, owner)
+        if action == "snapshot":
+            args = self._snapshot_layouts(args)
         timeout = int(args.pop("timeout_s", 15))
         if not 1 <= timeout <= 60:
             raise ValueError("runtime timeout_s must be 1..60")
@@ -378,7 +390,8 @@ class RuntimeRunner:
         if not target:
             raise ValueError("read with type needs options.target: the analysis target that defines the type")
         selection = {"view": view} if view else {}
-        answer = json.loads(QueryRunner(resolved(self.settings)).query(target, "type", options={"path": name, **selection}, limit=200))
+        runner = QueryRunner(resolved(self.settings))
+        answer = json.loads(runner.query(target, "type", options={"path": name, **selection}, limit=200))
         described = answer["type"]
         layout, enums = [], {}
         for field in described.get("fields", []):
@@ -387,7 +400,7 @@ class RuntimeRunner:
             # An enum reads as its unsigned value plus the member name (a few per type; each is one query).
             if field.get("kind") == "EnumDB" and field.get("length") in (1, 2, 4, 8) and len(enums) < 32:
                 if field["path"] not in enums:
-                    members = json.loads(QueryRunner(resolved(self.settings)).query(
+                    members = json.loads(runner.query(
                         target, "type", options={"path": field["path"], **selection}, limit=200)).get("type", {}).get("values", [])
                     enums[field["path"]] = {str(int(str(item["value"]), 0)): item["name"] for item in members}
                 row.update({"enum": row["type"], "type": "u%d" % (8 * field["length"]), "names": enums[field["path"]]})
@@ -395,7 +408,36 @@ class RuntimeRunner:
         if not layout:
             raise ValueError("type %s has no fields to read" % name)
         size = int(args.get("size") or described.get("length") or 0)
-        return {"layout": layout, "size": max(1, min(4096, size)), "type_name": described.get("path")}
+        return {"layout": layout, "size": max(1, min(4096, size)), "type_name": described.get("path"),
+                "layout_source": self._layout_source(runner, target, view)}
+
+    def _layout_source(self, runner, target: str, view: str) -> dict:
+        """Which view of which analysis the layout came from, and that view's revision when it was read."""
+        source = {"target": target, "view": view or "shared"}
+        try:
+            from hydralysis import workcopy
+            selected = workcopy.with_view(runner.target(target), view)
+            source.update(view=selected["view"], revision=workcopy.load_store(self.settings, selected)["revision"])
+        except Exception as exc:  # said, not hidden: a read without a revision is not a read of a known revision
+            source.update(revision=None, revision_error="%s: %s" % (type(exc).__name__, str(exc)[:160]))
+        return source
+
+    def _snapshot_layouts(self, args: dict) -> dict:
+        """Regions of a snapshot may name a type (`type` + `target`): resolve each like a typed read."""
+        regions = args.get("regions")
+        if not isinstance(regions, list):
+            return args
+        rows = []
+        for row in regions:
+            if isinstance(row, dict) and "type" in row:
+                row = {**row}
+                resolved_layout = self._layout(row)
+                row.update(layout=resolved_layout["layout"], type_name=resolved_layout["type_name"],
+                           layout_source=resolved_layout["layout_source"])
+                row.setdefault("size", resolved_layout["size"])
+                row.pop("view", None)
+            rows.append(row)
+        return {**args, "regions": rows}
 
     def _writers(self, session_id: str, args: dict, token: str, owner: dict) -> dict:
         probes = {}

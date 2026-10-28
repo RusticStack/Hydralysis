@@ -6,7 +6,9 @@
    - field writers: exactly three functions write Config.limit (fx_store, fx_reset,
      fx_clamp); Pair.second sits at the same offset on x86 and is written by fx_pair;
    - a live patch: at start main writes a jmp from fx_hooked to fx_detour;
-   - a float per frame: fx_tick(Config*, float dt) once per loop. */
+   - a float per frame: fx_tick(Config*, float dt) once per loop;
+   - an exported function, fx_exported(int), called once per loop with the frame number: the export-name hook
+     check hooks it by name, from the file's export table. */
 #include <windows.h>
 #include <stdio.h>
 
@@ -39,6 +41,8 @@ FX int fx_detour(int value) { return value * 3 + 2; }
 
 FX float fx_tick(Config *config, float dt) { config->speed += dt; return config->speed; }
 
+__declspec(dllexport) FX int fx_exported(int value) { return value * 5 + 3; }
+
 static void install_detour(void) {
     unsigned char *site = (unsigned char *)fx_hooked;
     if (site[0] == 0xE9) site += 5 + *(int *)(site + 1);  /* an incremental-link thunk */
@@ -64,6 +68,7 @@ int main(int argc, char **argv) {
         fx_pair(&g_pair, frame);
         g_sink += fx_hooked(frame);
         fx_tick(&g_config, 0.25f + (frame % 4) * 0.125f);
+        g_sink += fx_exported(frame);
         Sleep(50);
     }
     return 0;
