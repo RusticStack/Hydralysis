@@ -179,6 +179,8 @@ def file_bytes(path: str, rva: int, size: int, load_base: int | None = None) -> 
 
 # Bytes a probe overwrites at its site (a 5-byte jump, rounded up to whole instructions).
 PROBE_SPAN = 8
+# state.json is rewritten after a message at most this often (see RuntimeAgent._publish_soon).
+PUBLISH_EVERY_S = 0.25
 
 
 def _relocated(module: dict, rva: int, expected: list, actual: list) -> bool:
@@ -239,6 +241,9 @@ class RuntimeAgent(CaptureMixin, ActionsMixin):
         self.pauses = {}
         self.log = EventLog(directory, directory.name)
         self.open_capture = None
+        self._publish_gate = threading.Lock()
+        self._published = 0.0
+        self._timer = None
         self.lock = threading.RLock()
         self.write_lock = threading.Lock()
         self.state = "starting"
@@ -275,6 +280,33 @@ class RuntimeAgent(CaptureMixin, ActionsMixin):
         with self.write_lock:
             _write(self.directory / "state.json", state)
 
+    def _publish_soon(self):
+        """state.json after a message, at most every PUBLISH_EVERY_S: a sealed, fsynced write per message cannot keep up
+        with a probe that fires 20 times a second (the backlog delays every later request). The durable event log, not
+        state.json, holds each event; the last publish before the worker ends is always made."""
+        with self._publish_gate:
+            if time.monotonic() - self._published >= PUBLISH_EVERY_S:
+                self._published = time.monotonic()
+                due = True
+            else:
+                due = False
+                if self._timer is None:
+                    self._timer = threading.Timer(PUBLISH_EVERY_S, self._publish_late)
+                    self._timer.daemon = True
+                    self._timer.start()
+        if due:
+            self.publish()
+
+    def _publish_late(self):
+        with self._publish_gate:
+            self._timer = None
+            self._published = time.monotonic()
+        if self.directory.is_dir():
+            try:
+                self.publish()
+            except Exception as exc:  # the next message or the final publish tries again
+                print("deferred state publish failed:", repr(exc), flush=True)
+
     def message(self, script_id: str, message: dict, data=None):
         original = message
         encoded = json.dumps(message, ensure_ascii=False, default=str).encode("utf-8")
@@ -299,7 +331,7 @@ class RuntimeAgent(CaptureMixin, ActionsMixin):
             if message.get("type") == "send" and isinstance(payload, dict) and payload.get("event") == "break":
                 hook_id = payload["hook_id"]
                 self.pauses[hook_id] = time.monotonic()
-        self.publish()
+        self._publish_soon()
 
     def startup(self, initial: dict):
         exe = initial["exe"]
@@ -394,6 +426,8 @@ class RuntimeAgent(CaptureMixin, ActionsMixin):
         if errors:
             raise RuntimeError("runtime cleanup incomplete: " + "; ".join(errors))
         self.closed = True
+        if self._timer is not None:
+            self._timer.cancel()
         self.log.close()
         return {"state": "detached", "target_state": "unknown", "pid": self.pid,
                 "spawn_resumed": not self.paused_spawn, "scripts_released": not self.scripts}

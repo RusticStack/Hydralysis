@@ -404,6 +404,17 @@ class CaptureWindow(AgentCase):
         self.assertEqual([row["name"] for row in rows], ["one", "two"])
         self.assertEqual(capture._find(self.directory, "two")["capture"], second["capture"])
 
+    def test_state_is_published_at_a_bounded_rate_not_per_message(self):
+        import time
+        with patch.object(self.agent, "publish", wraps=self.agent.publish) as publish:
+            for index in range(300):
+                self.agent.message("hook", {"type": "send", "payload": {"event": "enter", "hook_id": "hook", "hit": index}})
+            time.sleep(0.6)
+        self.assertLess(publish.call_count, 6)
+        state = json.loads((self.directory / "state.json").read_text())
+        self.assertEqual(state["last_sequence"], self.agent.sequence)
+        self.assertEqual(state["messages_seen"], self.agent.log.counters["messages"])
+
     def test_counters_op_reports_the_probes_own_counts(self):
         self.environment(HYDRALYSIS_FAKE_HITS="5")
         probe = self.hook(limit=3)
