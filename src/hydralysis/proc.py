@@ -36,17 +36,30 @@ _reaper: threading.Thread | None = None
 
 
 def _reap_children() -> None:
-    """Keep background handles until exit, then reap them without blocking callers."""
+    """Keep background handles until exit, then reap them without blocking callers.
+
+    The thread lives only while a child is registered: when the last one is reaped it clears `_reaper` and
+    returns, so no idle thread outlives the children it served. `popen` starts a new one on demand. Both the
+    exit decision and the restart decision are made under `_children_changed`, so a child registered at the
+    moment the thread ends is never left without a reaper.
+    """
+    global _reaper
+    me = threading.current_thread()
     while True:
         with _children_changed:
-            while not _children:
-                _children_changed.wait()
+            if not _children:
+                if _reaper is me:
+                    _reaper = None
+                return
             children = tuple(_children)
         exited = [child for child in children if child.poll() is not None]
         with _children_changed:
             _children.difference_update(exited)
-            if _children:
-                _children_changed.wait(timeout=0.25)
+            if not _children:
+                if _reaper is me:
+                    _reaper = None
+                return
+            _children_changed.wait(timeout=0.25)
 
 
 def popen(command, **kwargs) -> subprocess.Popen:
