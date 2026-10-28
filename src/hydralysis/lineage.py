@@ -141,16 +141,21 @@ def ensure(settings: dict, target: dict) -> dict:
     across every later flip. Idempotent: a second call returns the same lineage (also after a crash between the
     folder and the registry write)."""
     origin = target.get("origin_key") or target["key"]
-    lineage_id = find(settings, origin)
-    if lineage_id is None:
-        lineage_id = "L-" + uuid.uuid4().hex[:8]
-        folder = lineage_dir(settings, lineage_id)
-        folder.mkdir(parents=True, exist_ok=False)
-        write_json(folder / "lineage.json", {"format": FORMAT, "id": lineage_id, "origin_key": origin, "origin_gpr": target["gpr"],
-                                             "program": target["program"], "sha256": target["sha256"], "createdAt": now_iso()})
-    if current_log(settings, lineage_id).last() is None:
-        append_current(settings, lineage_id, {"gen": 0, "cid": None, "reason": "register", "gpr": load(settings, lineage_id)["origin_gpr"],
-                                              "manifestSha256": None, "engine": None})
+    # Find and create are one step per origin key: the commit lock lives inside the lineage folder, so it cannot order two
+    # first commits. This lock sits beside the lineages and is keyed by the origin, across threads and processes.
+    root = lineages_root(settings)
+    root.mkdir(parents=True, exist_ok=True)
+    with durable.file_lock(root / (".create.%s.lock" % sha256_hex(origin.encode("utf-8"))[:24]), what="lineage creation"):
+        lineage_id = find(settings, origin)
+        if lineage_id is None:
+            lineage_id = "L-" + uuid.uuid4().hex[:8]
+            folder = lineage_dir(settings, lineage_id)
+            folder.mkdir(parents=True, exist_ok=False)
+            write_json(folder / "lineage.json", {"format": FORMAT, "id": lineage_id, "origin_key": origin, "origin_gpr": target["gpr"],
+                                                 "program": target["program"], "sha256": target["sha256"], "createdAt": now_iso()})
+        if current_log(settings, lineage_id).last() is None:
+            append_current(settings, lineage_id, {"gen": 0, "cid": None, "reason": "register", "gpr": load(settings, lineage_id)["origin_gpr"],
+                                                  "manifestSha256": None, "engine": None})
     register(settings, target, lineage_id, origin)
     return load(settings, lineage_id)
 

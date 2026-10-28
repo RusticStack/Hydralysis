@@ -1012,6 +1012,15 @@ def revert(settings: dict, target: dict, ids: list[str], expect: int | None = No
             dropped = dropped + [edit for edit in _selected(store, [edit["batch"] for edit in dropped if edit.get("batch")])
                                  if edit not in dropped]
         dropped_ids = {edit["id"] for edit in dropped}
+        # A commit that has written its PREPARE line still needs its selected records in the store when it finalizes.
+        from hydralysis import commits
+        flying = commits.in_flight_ids(settings, target)
+        busy = sorted(ident for ident in dropped_ids if ident in flying)
+        if busy:
+            raise RuntimeError(json.dumps({"error": "commit_in_flight", "ids": busy, "cid": flying[busy[0]],
+                                           "current_revision": store["revision"], "retryAfterMs": 2000,
+                                           "suggest": "a commit is working on these records; retry when it finishes, or "
+                                                      "commit_abort it first"}))
         kept = [edit for edit in store["edits"] if edit["id"] not in dropped_ids]
         removed = [edit["id"] for edit in store["edits"] if edit["id"] in dropped_ids]
         subjects = sorted({subject for edit in dropped for subject in revisions.subjects_of(edit["address"], edit["options"])})
