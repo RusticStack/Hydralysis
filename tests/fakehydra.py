@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import json
+import shutil
 import threading
 from pathlib import Path
 
@@ -38,6 +39,17 @@ class Daemon:
         self.replies: dict[str, dict] = {}
         self.hello_extra: dict = {}
         self.sessions = 0
+        # Y2 (commit, backups): `effects` makes the fake report what an edit changed, answer annotation_probe and enforce
+        # verify_before, like the new RusticQuery; `sealed_predicate` is the engine's notion of "sealed" (D38/D66):
+        # "union" = SEALED.json or a generation/backup sidecar with state "complete"; "rev6" = disposable:false alone
+        # (the predicate the review rejected: it seals a candidate before it is verified); "none" = hydra.2/3 itself.
+        self.effects = False
+        self.sealed_predicate = "union"
+        self.pre_apply_names: dict = {}
+        self.fail_script: dict[str, int] = {}   # script action -> remaining calls that fail (a deliberate engine refusal)
+        # Type names that a signature may only use once a struct record defined them (fail closed otherwise): models the
+        # engine refusing a prototype with an undefined type, so a subset commit that leaves the struct behind aborts.
+        self.typed_names: set[str] = set()
 
     def add_project(self, gpr: Path, programs: dict[str, dict]) -> dict:
         gpr.parent.mkdir(parents=True, exist_ok=True)
@@ -181,10 +193,13 @@ class FakeClientModule:
 class FakeEngine:
     """The interface Hydralysis uses from hydra.Engine."""
 
-    def __init__(self, settings: dict, role: str = "reader"):
+    def __init__(self, settings: dict, role: str = "reader", start: bool = True, lane: str = ""):
         self.settings = settings
         self.role = role
-        self.key = "fake|" + role
+        self.lane = lane
+        # One daemon connection per (role, lane): a writer of one view leaving does not release another view's programs.
+        self.conn = role + ("|" + lane if lane else "")
+        self.key = "fake|" + self.conn
         self.daemon = DAEMON
         self.writable: set[str] = set()  # program keys this connection may write
 
@@ -193,7 +208,7 @@ class FakeEngine:
         # Like the real daemon: committed changes in shared mode stay, the writer leaves.
         for key in self.writable:
             program = self._program(key)
-            program["writers"].discard(self.role)
+            program["writers"].discard(self.conn)
         self.writable.clear()
 
     def hello(self):
@@ -251,7 +266,8 @@ class FakeEngine:
             raise EngineError("not_found", "no program " + path)
         key = "%s:%s" % (project, "/" + path.lstrip("/"))
         if writable:
-            program["writers"].add(self.role)
+            self._refuse_if_sealed(self.daemon.project_by_id(project), "a writable open")
+            program["writers"].add(self.conn)
             self.writable.add(key)
             if program["live"] is None:
                 program["live"] = copy.deepcopy(program["saved"])
@@ -265,30 +281,87 @@ class FakeEngine:
 
     def _save(self, program, **_):
         entry = self._program(program)
+        project = self.daemon.project_by_id(program.split(":", 1)[0])
+        self._refuse_if_sealed(project, "save")
         if entry["live"] is not None:
             entry["saved"] = copy.deepcopy(entry["live"])
+            self._persist(project)
         return {"revision": "saved"}
+
+    @staticmethod
+    def _persist(project):
+        """Write the saved state of every program into the project's .rep folder (the fake's database files)."""
+        gpr = Path(project["gpr"])
+        rep = gpr.parent / (gpr.stem + ".rep")
+        rep.mkdir(parents=True, exist_ok=True)
+        state = {path: program["saved"] for path, program in project["programs"].items()}
+        (rep / "programs.json").write_text(json.dumps(state, sort_keys=True), encoding="utf-8")
+
+    def _sidecar(self, project):
+        gpr = Path(project["gpr"])
+        try:
+            return json.loads((gpr.parent / (gpr.stem + ".fork.json")).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+
+    def _is_sealed(self, project) -> bool:
+        predicate = self.daemon.sealed_predicate
+        if predicate == "none":
+            return False
+        gpr = Path(project["gpr"])
+        sidecar = self._sidecar(project)
+        if predicate == "rev6":
+            return bool(sidecar) and sidecar.get("disposable") is False
+        if (gpr.parent / "SEALED.json").is_file():
+            return True
+        return bool(sidecar) and sidecar.get("purpose") in ("generation", "backup") and sidecar.get("state") == "complete"
+
+    def _refuse_if_sealed(self, project, what):
+        if self._is_sealed(project):
+            raise EngineError("sealed", "%s refused: %s is sealed" % (what, project["gpr"]),
+                              {"reason": "sealed", "project": project["gpr"]})
 
     def _close_project(self, project, discard=False, **_):
         for key in [key for key in self.writable if key.startswith(project + ":")]:
-            self._program(key)["writers"].discard(self.role)
+            self._program(key)["writers"].discard(self.conn)
             self.writable.discard(key)
+        if discard:
+            # Closing with discard drops the unsaved changes of the project's programs and keeps its folder.
+            for program in self.daemon.project_by_id(project)["programs"].values():
+                program["live"] = None
         return {"closed": True}
 
     def _close_program(self, program, **_):
         self.writable.discard(program)
         return {"closed": True}
 
-    def _fork_project(self, project, path, writable=True, mode="auto", **_):
+    def _fork_project(self, project, path, writable=True, mode="auto", purpose=None, **_):
         source = (self.daemon.project_by_id(project) if not Path(project).suffix and not Path(project).exists()
                   else self.daemon.projects[self.daemon._norm(project)])
         destination = Path(path)
+        if destination.exists() and any(destination.iterdir()):
+            raise EngineError("exists", "the destination already exists: %s" % destination)
         name = Path(source["gpr"]).stem
         gpr = destination / (name + ".gpr")
-        programs = {item: {"sha256": entry["sha256"]} for item, entry in source["programs"].items()}
+        programs = {item: {"sha256": entry["sha256"], "analyzed": entry["analyzed"], "functions": entry["functions"]}
+                    for item, entry in source["programs"].items()}
+        origin = Path(source["gpr"]).parent
+        destination.mkdir(parents=True, exist_ok=True)
+        for item in origin.iterdir():  # the files of the source, as a clone has them (never its locks or its seal)
+            if item.name in ("SEALED.json", "backup.json", "MANIFEST.json") or item.name.endswith((".lock", ".lock~", ".fork.json")):
+                continue
+            if item.is_dir():
+                shutil.copytree(item, destination / item.name)
+            else:
+                shutil.copy2(item, destination / item.name)
         fork = self.daemon.add_project(gpr, programs)
         for item, entry in source["programs"].items():
             fork["programs"][item]["saved"] = copy.deepcopy(entry["saved"])
+        sidecar = {"format": 1, "purpose": purpose or "fork", "disposable": purpose not in ("generation", "backup"),
+                   "source": source["gpr"]}
+        if purpose == "generation":
+            sidecar["state"] = "candidate"
+        (destination / (name + ".fork.json")).write_text(json.dumps(sidecar), encoding="utf-8")
         opened = self._open_project(str(gpr), writable=True)
         return {"project": opened["id"], "gpr": str(gpr), "method": "clone", "cloned": True, "bytes": 1,
                 "copyMs": self.daemon.fork_copy_ms}
@@ -316,26 +389,91 @@ class FakeEngine:
         out = {"id": request["id"], "ok": True, "sha256": entry["sha256"], "image_base": entry["imageBase"],
                "address_kind": "VA", "overlay_state": view["marker"]}
         action = request["action"]
-        if request.get("expected_sha256") and request["expected_sha256"] != entry["sha256"]:
+        pending_failure = self.daemon.fail_script.get(action, 0)
+        if pending_failure:
+            self.daemon.fail_script[action] = pending_failure - 1
+            out.update(ok=False, error="deliberate refusal of %s" % action, recoverable=True)
+        elif request.get("expected_sha256") and request["expected_sha256"] != entry["sha256"]:
             out.update(ok=False, error="program SHA-256 differs", recoverable=False)
+        elif action == "annotation_probe" and self.daemon.effects:
+            values = []
+            for item in request["options"]["probes"]:
+                row = {"subject": item["subject"], "field": item["field"]}
+                if item["subject"] != "*":
+                    if item["field"] == "name":
+                        address = item["subject"].removeprefix("address:")
+                        row["value"] = view["names"].get(address, "FUN_" + address.removeprefix("0x"))
+                    elif item["field"] == "signature":
+                        row["value"] = view.get("sigs", {}).get(item["subject"], "absent")
+                    elif item["field"] == "definition":
+                        path = item["subject"].removeprefix("type:")
+                        row["value"] = "sha256:" + path.strip("/") if path in view.get("types", []) else "absent"
+                    else:
+                        row["value"] = "absent"
+                values.append(row)
+            out["values"] = values
         elif action == "apply_overlays":
             if not owner:
                 out.update(ok=False, error="not a writer")
+            elif self._is_sealed(self.daemon.project_by_id(program.split(":", 1)[0])):
+                out.update(ok=False, error="sealed", recoverable=False)
             else:
                 batch = json.loads(Path(request["edits_file"]).read_text(encoding="utf-8"))
                 staged = copy.deepcopy(view)
+                rows = []
+                seen = set()
                 for edit in batch["edits"]:
                     options = edit["options"]
                     if options.get("name") == "FAIL":
                         out.update(ok=False, error="java.lang.IllegalArgumentException: overlay record refused",
                                    recoverable=True)
                         break
+                    if options.get("kind") == "struct" and self.daemon.effects:
+                        path = options["path"]
+                        staged.setdefault("types", [])
+                        rows.append({"id": edit["id"], "effects": [{"subject": "type:" + path, "field": "definition",
+                                                                    "before": "absent" if path not in staged["types"] else "sha256:old",
+                                                                    "after": "sha256:" + path.strip("/")}]})
+                        if path not in staged["types"]:
+                            staged["types"].append(path)
+                        continue
+                    if options.get("kind") == "signature" and self.daemon.effects:
+                        address = edit["address"]
+                        subject = "address:" + hex(int(address, 16))
+                        used = [name for name in self.daemon.typed_names if name in options["prototype"]]
+                        undefined = [name for name in used if "/" + name not in staged.get("types", [])]
+                        if undefined:
+                            out.update(ok=False, error="overlay record refused, nothing applied: unknown data type %s" % undefined[0],
+                                       recoverable=True)
+                            break
+                        staged.setdefault("sigs", {})
+                        rows.append({"id": edit["id"], "effects": [{"subject": subject, "field": "signature",
+                                                                    "before": staged["sigs"].get(subject, "absent"),
+                                                                    "after": options["prototype"]}]})
+                        staged["sigs"][subject] = options["prototype"]
+                        continue
                     if options.get("kind") == "rename":
-                        staged["names"][edit["address"]] = options["name"]
+                        address = edit["address"]
+                        before = staged["names"].get(address, "FUN_" + address.removeprefix("0x"))
+                        subject = "address:" + hex(int(address, 16))
+                        if batch.get("verify_before") and self.daemon.effects and edit.get("effects") and (subject, "name") not in seen:
+                            expected = edit["effects"][0]["before"]
+                            if expected != before:
+                                out.update(ok=False, error="verify_before mismatch: %s name expected '%s' found '%s'"
+                                           % (subject, expected, before),
+                                           verify_mismatch={"id": edit["id"], "subject": subject, "field": "name",
+                                                            "expected": expected, "found": before})
+                                break
+                        seen.add((subject, "name"))
+                        rows.append({"id": edit["id"], "effects": [{"subject": subject, "field": "name", "before": before,
+                                                                    "after": options["name"]}]})
+                        staged["names"][address] = options["name"]
                 else:
-                    staged["marker"] = json.dumps(batch["state"], separators=(",", ":"))
+                    staged["marker"] = "" if batch["state"] is None else json.dumps(batch["state"], separators=(",", ":"))
                     entry["live"] = staged
                     out["overlay_state"] = staged["marker"]
+                    if self.daemon.effects:
+                        out["effects"] = rows
         elif action == "decompile":
             address = request["address"]
             name = view["names"].get(address, "FUN_" + address.removeprefix("0x"))

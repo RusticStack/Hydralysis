@@ -1024,7 +1024,6 @@ NOT_A_RECORD = {  # (file, function, kind) -> why
     ("workcopy.py", "store_archive", "open(xb)"): "content-addressed archive copy",
     ("workcopy.py", "store_archive", "Path.replace"): "content-addressed archive copy",
     ("workcopy.py", "_apply", "write_text"): "request file handed to the engine, deleted after use",
-    ("workcopy.py", "_start_saver", "open(ab)"): "saver process log",
     ("overlayjobs.py", "start", "open(ab)"): "worker process log",
     ("overlayjobs.py", "cancel", "write_text"): "cancel marker file",
 }
