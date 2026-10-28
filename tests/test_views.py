@@ -298,6 +298,42 @@ class Queue(ViewWorld, unittest.TestCase):
         self.assertEqual(self.pending_ids("one") != [], True)  # its records are pending still
 
 
+class Batch(ViewWorld, unittest.TestCase):
+    """`publish_batch_max` above 1 (off by default, D45): several changesets in one generation, each decided on its own."""
+
+    def test_a_batch_makes_one_generation_for_several_changesets_and_rejects_the_conflicting_one_alone(self):
+        self.settings["publish_batch_max"] = 3
+        self.edit("First", A, view="one")
+        self.edit("Second", B, view="two")
+        self.edit("Clash", A, view="three")  # the same subject as `one`, sealed after it: it loses, the others do not
+        sealed = [self.seal(view) for view in ("one", "three", "two")]
+        led = views.drain(self.settings, self.lineage_id(), self.engine())
+        self.assertEqual((led["built"], led["failure"]), ([1], None))
+        row = self.rows()[-1]
+        self.assertEqual([item["csid"] for item in row["changesets"]], [sealed[0]["csid"], sealed[2]["csid"]])
+        self.assertEqual(self.done(sealed[1]["csid"])["outcome"], "conflict")
+        self.assertEqual([self.done(item["csid"])["generation"] for item in sealed], [1, None, 1])
+        self.assertEqual(sorted(self.manifest(1)["store"]["by_changeset"]), sorted([sealed[0]["csid"], sealed[2]["csid"]]))
+        self.assertEqual(self.names([A, B]), {A: "First", B: "Second"})
+        self.settle("one")
+        self.settle("two")
+        self.assertEqual((self.pending_ids("one"), self.pending_ids("two")), ([], []))
+        self.assertEqual(self.pending_ids("three") != [], True)  # the loser's record is pending still
+        self.assertEqual([row["gen"] for row in self.rows()], [0, 1])
+
+    def test_a_later_changeset_in_a_batch_is_checked_against_the_one_before_it(self):
+        self.settings["publish_batch_max"] = 2
+        self.edit("Early", A, view="one")
+        self.edit("Late", A, view="two")
+        sealed = [self.seal("one"), self.seal("two")]
+        views.drain(self.settings, self.lineage_id(), self.engine())
+        # `two` rests on the original value, which `one` changes inside the same batch: a conflict, not a lost update
+        self.assertEqual((self.done(sealed[0]["csid"])["outcome"], self.done(sealed[1]["csid"])["outcome"]), ("applied", "conflict"))
+        self.assertEqual(self.name_of(A), "Early")
+        conflict = self.done(sealed[1]["csid"])["conflicts"][0]
+        self.assertEqual((conflict["reason"], conflict["theirs"]), ("chain", "Early"))
+
+
 class VerifyBeforeHead(ViewWorld, unittest.TestCase):
     def test_a_candidate_is_sealed_and_verified_before_the_log_line_is_appended(self):
         self.edit("One", A, view="one")
