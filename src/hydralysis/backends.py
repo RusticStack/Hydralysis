@@ -251,9 +251,17 @@ def ensure(settings: dict, install: bool = False, cancelled=lambda: False) -> di
     root = Path(report["root"])
     root.mkdir(parents=True, exist_ok=True)
     lock = LaneLock(str(root / ".backend.lock"))
-    if not lock.acquire():
-        raise ValueError("backend setup is already running")
+    # Workers that start together (several agents preparing at once) must not fail each other: wait a bounded time for
+    # the holder, then read the state again, because the holder may have finished the install.
+    deadline = time.monotonic() + 30
+    while not lock.acquire():
+        if cancelled():
+            raise InterruptedError("backend setup cancelled")
+        if time.monotonic() > deadline:
+            raise ValueError("backend setup is already running")
+        time.sleep(0.05)
     try:
+        report = inspect(settings)
         if not report["ready"]:
             if not install:
                 raise ValueError("Hydra Engine %s, its client and a full JDK 25+ are required; run backend install"

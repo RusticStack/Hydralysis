@@ -71,3 +71,66 @@ def root_path(settings: dict) -> Path:
         raise ValueError("Hydralysis data root %s is on %s, which this configuration forbids (forbidden_drives=%s); "
                          "set root or HYDRALYSIS_ROOT to an allowed location" % (root, root.drive, ",".join(banned)))
     return validate_project_path(root)
+
+
+def root_source(settings: dict | None = None, environ=os.environ, exists=os.path.exists) -> str:
+    """Where the data root comes from: `env`, `config`, `default` or `legacy` (an existing RusticRE-named root)."""
+    settings = settings or {}
+    if compat.env("ROOT", environ=environ):
+        return "env"
+    if settings.get("root"):
+        return "config"
+    home = str(Path.home())
+    current = _root_for("Hydralysis", "hydralysis", sys.platform, environ, home)
+    legacy = _root_for("RusticRE", "rusticre", sys.platform, environ, home)
+    return "legacy" if not exists(current) and exists(legacy) else "default"
+
+
+def system_drive(platform: str = sys.platform, environ=os.environ) -> str | None:
+    """The drive Windows lives on (`C:`), or None where there is no drive letter."""
+    if platform != "win32":
+        return None
+    return (environ.get("SystemDrive") or "C:").upper().rstrip("\\/")
+
+
+def volume_info(path: str | Path, probe=None) -> dict:
+    """The file system under PATH: `{fs, cow, drive}`; `fs` is None and `cow` None when it cannot be read.
+
+    `cow` is True for ReFS (and APFS, btrfs, xfs, bcachefs), where a fork can be a block clone, and False for
+    others, so a non-COW root can be warned about. PROBE(path) -> fs name replaces the system call (tests).
+    """
+    target = Path(path)
+    while not target.exists() and target.parent != target:
+        target = target.parent
+    drive = target.drive.upper() if target.drive else None
+    try:
+        name = probe(target) if probe is not None else _fs_name(target)
+    except Exception:
+        name = None
+    if not name:
+        return {"fs": None, "cow": None, "drive": drive}
+    return {"fs": name, "cow": name.lower() in ("refs", "apfs", "btrfs", "xfs", "bcachefs", "zfs"), "drive": drive}
+
+
+def _fs_name(path: Path) -> str | None:
+    if sys.platform == "win32":
+        import ctypes
+        root = ctypes.create_unicode_buffer(260)
+        if not ctypes.windll.kernel32.GetVolumePathNameW(str(path), root, 260):
+            return None
+        fs = ctypes.create_unicode_buffer(64)
+        if not ctypes.windll.kernel32.GetVolumeInformationW(root.value, None, 0, None, None, None, fs, 64):
+            return None
+        return fs.value or None
+    best, found = "", None
+    try:
+        with open("/proc/mounts", encoding="utf-8") as handle:
+            for line in handle:
+                parts = line.split()
+                if len(parts) >= 3:
+                    mount = parts[1].replace("\\040", " ")
+                    if str(path).startswith(mount) and len(mount) > len(best):
+                        best, found = mount, parts[2]
+    except OSError:
+        return None
+    return found

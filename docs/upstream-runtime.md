@@ -61,7 +61,13 @@ No caller supplies a remote address. Structured agent errors leave the session
 available; a native request that fails its deadline is cleaned up and retired.
 Durable readiness, state and logs remain on disk; filesystem access errors
 propagate with errno, native error when available, and the exact path.
-Evidence records the generated probe's SHA-256.
+The answer to `observe` and `break` reports the generated probe's SHA-256 as `script_sha256`. The evidence ledger does
+not take it by itself: a caller that stores a claim from that answer passes it in the claim's `parameters`
+(`{"script_sha256": "..."}`), where it becomes part of the claim's content-addressed `evidence_id`.
+This is possible only through `add_claim` in Python today: the `evidence_add` API and MCP surface forwards none of
+`parameters`, `coverage`, `limitations`, `confidence`, `authority`, `subject_sha256`, `from_capture` or `provenance`,
+so a claim added there has coverage `unknown`. A later package widens `evidence_add`. The `provenance` field (view,
+sequence, generation) is stored and exported, but nothing populates it yet.
 Messages retain at most 1,000 events / 256 KiB, and an individual oversized
 payload is explicitly clipped. Event pagination cannot recover already evicted
 events; `dropped_events` discloses that loss.
@@ -110,7 +116,7 @@ merely to establish generic runtime behavior.
 
 The coordinator's `runtime_fixture.exe` was exercised through `RuntimeRunner`
 with the optional backend installed under
-`F:\dev-cacheusticre\complete-20261024`. The successful bounded harness
+`F:\dev-cache\rusticre\complete-20261024`. The successful bounded harness
 log is `runtime-integration-smoke-v5-ipc.log`; full observations and fixture SHA-256
 are in `runtime-integration-results.json`. It verified paused spawn, explicit
 PID attach, module bytes, mismatch refusal, observed arguments/registers/return
