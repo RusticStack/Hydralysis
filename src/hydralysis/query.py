@@ -17,7 +17,7 @@ import time
 import uuid
 from pathlib import Path
 
-from hydralysis import hydra, targets, workcopy
+from hydralysis import hydra, lineage, targets, workcopy
 from hydralysis.analysis import ADVANCED_ACTIONS, BULK_KINDS, validate_options
 
 ACTIONS = {"decompile", "function", "functions", "xrefs", "status", "stop"} | ADVANCED_ACTIONS
@@ -44,8 +44,11 @@ def _public(value):
 
 
 def open_program(engine: hydra.Engine, gpr: str, program: str, sha256: str, *, writable: bool = False,
-                 upgrade: bool = False, refresh: bool = False) -> dict:
-    """Join (or open) one program and check the build before anything is answered from it."""
+                 upgrade: bool = False, refresh: bool = False, share: bool = True, backup: str | None = None) -> dict:
+    """Join (or open) one program and check the build before anything is answered from it.
+
+    `share=False` opens a writable program for its caller alone (a commit's candidate); `backup` is the verified
+    backup an upgrading writable open names on an engine with the upgrade gate."""
     cache_key = (engine.key, str(Path(gpr)).lower(), program, writable)
     with _keys_guard:
         known = _keys.get(cache_key)
@@ -54,7 +57,9 @@ def open_program(engine: hydra.Engine, gpr: str, program: str, sha256: str, *, w
     opened = engine.call("open_project", path=gpr, writable=writable, wait=BUSY_WAIT_MS)
     fields = {"path": program, "project": opened["id"]}
     if writable:
-        fields.update(writable=True, share=True, upgrade=upgrade)
+        fields.update(writable=True, share=share, upgrade=upgrade)
+        if backup:
+            fields["backup"] = backup
     info = engine.call("open_program", wait=BUSY_WAIT_MS, **fields)
     if str(info.get("sha256", "")).lower() != sha256:
         raise ValueError("%s in %s reports SHA-256 %s, not the target build %s; nothing was answered"
@@ -123,6 +128,12 @@ class QueryRunner:
             raise ValueError("options must be an object")
         options = dict(options or {})
         view = options.pop("view", "")
+        if action == "type_edit" and options.get("kind") in ("commit", "commit_revert", "commit_abort"):
+            return self._commit(target, options, view, timeout_s)
+        if action == "status" and options.get("show") == "lineage":
+            selected = workcopy.with_view(self.target(target), view)
+            return json.dumps(_public({"target": {key: selected[key] for key in ("name", "program", "sha256", "view")},
+                                       **lineage.status(self.settings, selected)}), ensure_ascii=False)
         supplied_options = options
         options = validate_options(action, supplied_options)
         # Batch/corpus normalization constructs a new dict; retain the already
@@ -143,6 +154,8 @@ class QueryRunner:
             raise ValueError("use a numeric VA or hexadecimal row cursor, not a symbol name")
         selected = workcopy.with_view(self.target(target), view)
         view = selected["view"]
+        if action != "stop":
+            workcopy.heal(self.settings, selected)  # settle a commit that died between its CURRENT.log line and its store write
         if action == "type_edit":
             # Every mutation, on the shared view and on named views, names the revision it read.
             workcopy.require_revision(self.settings, selected, options.get("expect_revision"), "type_edit")
@@ -181,6 +194,35 @@ class QueryRunner:
         if not response.get("ok"):
             raise RuntimeError(json.dumps(_public(response), ensure_ascii=False))
         return json.dumps(_public(response), ensure_ascii=False)
+
+    def _commit(self, target: str, options: dict, view: str, timeout_s: int) -> str:
+        """`type_edit kind=commit|commit_revert|commit_abort`: a commit is a job; a dry run and a revert answer at once."""
+        from hydralysis import commits, locks, overlayjobs
+        selected = workcopy.with_view(self.target(target), view)
+        view = selected["view"]
+        try:
+            clean = commits.validate(options)
+            if clean["kind"] == "commit_revert":
+                return json.dumps({**commits.revert(self.settings, selected, clean, self.engine), "view": view})
+            if clean["kind"] == "commit_abort":
+                return json.dumps({**commits.request_abort(self.settings, selected, clean["cid"]), "view": view})
+            if clean.get("dry_run"):
+                return json.dumps({**commits.run_commit(self.settings, selected, clean, self.engine, timeout_s), "view": view})
+            # Everything that can be refused before a worker is started is refused here: it creates nothing.
+            commits.preconditions(self.settings, selected, clean, self.engine)
+            commits._plan_confirmation(clean)
+            link = selected.get("lineage")
+            if link and locks.held(str(lineage.commit_lock_path(self.settings, link["id"]))):
+                raise commits.CommitError("commit_busy", "another commit holds this lineage's commit lock; retry when it finishes",
+                                          retryAfterMs=5000)
+            clean["cid"] = clean.get("cid") or commits.new_cid()
+            job = overlayjobs.start(self.settings, selected["name"], "commit", "", clean, view=view)
+        except commits.CommitError as error:
+            raise RuntimeError(json.dumps(error.payload())) from error
+        except lineage.LineageError as error:
+            raise RuntimeError(json.dumps(error.payload())) from error
+        return json.dumps({**job, "cid": clean["cid"], "view": view, "view_revision": workcopy.load_store(self.settings, selected)["revision"]},
+                          ensure_ascii=False)
 
     def _ask(self, selected: dict, request: dict, timeout_s: int) -> dict:
         expected_state = workcopy.expected_state(self.settings, selected)
@@ -229,13 +271,18 @@ class QueryRunner:
         failed = []
         master = str(Path(selected["gpr"])).lower()
         working = workcopy._directory(self.settings, selected).resolve()
+        # Every generation of the lineage is released too (the head, the older ones the target resolved to, the shared bases).
+        roots = [working, workcopy.bases_root(self.settings, selected).resolve()]
+        if selected.get("lineage"):
+            roots.append(lineage.lineage_dir(self.settings, selected["lineage"]["id"]).resolve())
+        adopted = str(Path(selected.get("adopted_gpr") or selected["gpr"])).lower()
 
         def belongs(key):
             if key[0] != self.engine.key or key[2].lstrip("/") != selected["program"].lstrip("/"):
                 return False
-            if key[1] == master and selected.get("view", "shared") == "shared":
+            if key[1] in (master, adopted) and selected.get("view", "shared") == "shared":
                 return True
-            return Path(key[1]).resolve().is_relative_to(working)
+            return any(Path(key[1]).resolve().is_relative_to(root) for root in roots)
 
         with _keys_guard:
             entries = [(key, value) for key, value in _keys.items() if belongs(key)]
