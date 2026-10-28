@@ -75,6 +75,55 @@ def with_view(target: dict, view: str = "") -> dict:
     return {**target, "key": key, "view": view, **_origin(target)}
 
 
+def master_target(target: dict) -> dict:
+    """The sealed master as a read target: no overlays, no working copy, no store (D43: an agent without a view reads it).
+
+    `key` stays the target's key, so a reply names the same build; `master_read` tells `program_for` and `_ask` to skip
+    the store of that key (which belongs to the `shared` view)."""
+    return {**target, "view": "master", "master_read": True, **_origin(target)}
+
+
+def view_exists(settings: dict, target: dict) -> bool:
+    """Does the view of TARGET have a store? A view is created lazily, by its first edit; before that it has nothing."""
+    return durable.exists(_store_path(settings, target))
+
+
+def release(engine: hydra.Engine, settings: dict, target: dict) -> list[str]:
+    """Close this process's open programs of the view's working copy, discarding what the daemon holds unsaved, and keep
+    the folder (eviction, 3.11, D61): every record is in the store, so the next use replays what the program lost.
+
+    Only the view's own forks are closed (the ones a reader of this process opened and the one its writer connection left
+    open in the daemon): never the master, a generation or the shared base. Returns the project ids closed."""
+    from hydralysis import query
+    folder = _directory(settings, target).resolve()
+    with query._keys_guard:
+        mine = [(key, value) for key, value in query._keys.items()
+                if key[0] == engine.key and Path(key[1]).resolve().is_relative_to(folder)]
+    projects = {value["project"] for _, value in mine}
+    state = _state(settings, target)
+    forks = {str(Path(item).resolve()).lower() for item in [state.get("fork_gpr"), *(state.get("retired") or [])] if item}
+    if forks:
+        try:
+            for item in engine.call("status").get("projects", []):
+                if item.get("id") and str(Path(item.get("gpr", "")).resolve()).lower() in forks:
+                    projects.add(item["id"])
+        except (hydra.EngineError, OSError):
+            pass
+    closed = []
+    for project in sorted(projects):
+        try:
+            engine.call("close_project", project=project, discard=True)
+            closed.append(project)
+        except hydra.EngineError as error:
+            if error.code not in ("not_found", "no_project", "closed", "no_program"):
+                raise
+    with query._keys_guard:
+        for key, value in mine:
+            if query._keys.get(key) is value:
+                query._keys.pop(key, None)
+    return closed
+
+
 def _store_path(settings: dict, target: dict) -> Path:
     return _overlay_path(root_path(settings), target["key"])
 

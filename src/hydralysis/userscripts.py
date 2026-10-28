@@ -44,9 +44,16 @@ def _stage(settings: dict, source: Path) -> str:
     return source.name
 
 
-def run(settings: dict, target: str, script: str, args: list[str], timeout_s: int = 600, view: str = "") -> str:
+def run(settings: dict, target: str, script: str, args: list[str], timeout_s: int = 600, view: str = "", who: dict | None = None) -> str:
     from hydralysis.query import QueryRunner
-    selected = workcopy.with_view(targets.resolve(settings, target), view)
+    resolved = targets.resolve(settings, target)
+    # No view named: the caller's own view when it has one (`who`, from `options.as` or the process default), else the sealed
+    # master (D43). A script is contained and rolled back either way; it never reads a view the caller does not hold.
+    master = False
+    if not view and who is not None:
+        view = "shared" if who["shared"] else who["name"]
+        master = not who["shared"] and not workcopy.view_exists(settings, workcopy.with_view(resolved, view))
+    selected = workcopy.master_target(resolved) if master else workcopy.with_view(resolved, view)
     name = script if script.endswith((".java", ".py")) else script + ".java"
     if not _SCRIPT.fullmatch(name):
         raise ValueError("script must be a simple .java or .py file name")

@@ -6,7 +6,12 @@
    - field writers: exactly three functions write Config.limit (fx_store, fx_reset,
      fx_clamp); Pair.second sits at the same offset on x86 and is written by fx_pair;
    - a live patch: at start main writes a jmp from fx_hooked to fx_detour;
-   - a float per frame: fx_tick(Config*, float dt) once per loop. */
+   - a float per frame: fx_tick(Config*, float dt) once per loop;
+   - an exported function, fx_exported(int), called once per loop with the frame number: the export-name hook
+     check hooks it by name, from the file's export table;
+   - a watch case (Z12): g_watched is stored by fx_watched_store every frame, and again from a second thread about every
+     millisecond, so a watch is hit while it is being disarmed; g_fixture_marker is what the runtime's write and watch
+     gate looks for in the file: only this fixture holds it. */
 #include <windows.h>
 #include <stdio.h>
 
@@ -19,6 +24,8 @@ typedef struct Pair { void *first; int second; } Pair;
 volatile int g_sink;
 Config g_config = { 2, 0, 0.0f };
 Pair g_pair;
+volatile int g_watched;
+const char g_fixture_marker[] = "HYDRALYSIS_FIXTURE_ONLY";
 
 FX void fx_store(Config *config, int value) { config->limit = value; }
 FX void fx_relay(Holder *holder, int value) { fx_store(holder->config, value); }
@@ -39,6 +46,19 @@ FX int fx_detour(int value) { return value * 3 + 2; }
 
 FX float fx_tick(Config *config, float dt) { config->speed += dt; return config->speed; }
 
+FX void fx_watched_store(int value) { g_watched = value; }
+
+static DWORD WINAPI fx_watch_thread(LPVOID unused) {
+    (void)unused;
+    for (int i = 0; i < 2000000; ++i) {
+        fx_watched_store(i);
+        Sleep(1);
+    }
+    return 0;
+}
+
+__declspec(dllexport) FX int fx_exported(int value) { return value * 5 + 3; }
+
 static void install_detour(void) {
     unsigned char *site = (unsigned char *)fx_hooked;
     if (site[0] == 0xE9) site += 5 + *(int *)(site + 1);  /* an incremental-link thunk */
@@ -54,6 +74,8 @@ static void install_detour(void) {
 
 int main(int argc, char **argv) {
     install_detour();
+    g_sink += g_fixture_marker[0];
+    CreateThread(NULL, 0, fx_watch_thread, NULL, 0, NULL);
     /* argv[1]: a stop file; the loop ends when it exists (or after 10 minutes). */
     for (int frame = 0; frame < 12000; ++frame) {
         if (argc > 1 && GetFileAttributesA(argv[1]) != INVALID_FILE_ATTRIBUTES) break;
@@ -64,6 +86,8 @@ int main(int argc, char **argv) {
         fx_pair(&g_pair, frame);
         g_sink += fx_hooked(frame);
         fx_tick(&g_config, 0.25f + (frame % 4) * 0.125f);
+        g_sink += fx_exported(frame);
+        fx_watched_store(frame);
         Sleep(50);
     }
     return 0;

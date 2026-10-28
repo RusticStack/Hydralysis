@@ -167,3 +167,15 @@ Local records: `kotor2-native-mcp.json` retains the original native calls and
 the wrong-address discovery; `kotor2-fresh-results.json` / `kotor2-fresh.log`
 record the corrected subprocess checks; `kotor2-tests.log` records the 63-test
 pass. Existing MCP processes need a reload to load this source update.
+
+## Owner-reported third-party figures, 2026-10-28
+
+Figures that came from the owner or from a third party's own metadata. None was reproduced by running the other tool; each row says where it comes from and what this repository counted instead. A figure here is context, not evidence.
+
+| Figure | Reported by | Counted here | Status |
+| --- | --- | --- | --- |
+| 28 GhidraMCP tools | the owner | 30 `@mcp.tool` functions at bridge revision `1e98025` (recorded in `docs/data/tool-surfaces.json`) | not reproduced |
+| 207 tools in `reverse-engineer-anything` | the skill's `tool_count` metadata | no live `tools/list` was enumerated | not reproduced |
+| 7.0-7.8 s for the same question through the upstream command-line launcher (Ghidra 12.1.4) | the owner | no upstream launcher is used or run by this repository | not reproduced |
+
+The Hydralysis figure next to them is reproduced: 20 tools, counted from `tool_table()` by `tools/count_surfaces.py`.

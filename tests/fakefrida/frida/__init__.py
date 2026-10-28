@@ -42,6 +42,7 @@ class Script:
         self.exports_sync = _Exports(self)
         match = re.search(r"const p=(\{.*?\});", source)
         self.parameters = json.loads(match.group(1)) if match else None
+        self.seen = 0
 
     def on(self, event, callback):
         if event == "message":
@@ -56,18 +57,30 @@ class Script:
             got = self.session.read(BASE + self.parameters["rva"], len(self.parameters["expect"]))
             if got != self.parameters["expect"]:
                 raise RuntimeError("PROLOGUE MISMATCH; probe refused")
+            export = self.parameters.get("export")
+            if export is not None:
+                # What the probe script checks against the live module's own export table.
+                from hydralysis.runtime_exports import module_export
+                if module_export(self.session.exe, export)["rva"] != self.parameters["rva"]:
+                    raise RuntimeError("EXPORT MISMATCH; probe refused")
             self._send({"event": "probe_installed", "hook_id": self.parameters["id"], "verified_bytes": got})
             # One simulated hit, so status, continue and unload have something to act on.
+            # HYDRALYSIS_FAKE_HITS=N: the probe fires N times; it sends at most `limit` events, as the real one does,
+            # and its counters() say N.
+            hits = int(os.environ.get("HYDRALYSIS_FAKE_HITS", "1"))
             if self.parameters.get("sample"):
+                self.seen = 120
                 self._send({"event": "sample", "hook_id": self.parameters["id"], "window_s": self.parameters["sample"]["window_s"],
                             "count": 120, "rate": 12.0, "min": 0.5, "max": 4.0, "last": 3.5})
             else:
                 # A hit whose first capture points at "ABC": what the probe copies, decoded by the worker.
                 captures = [{"pointer": hex(BASE), "hex": ("414243" + "00" * c["size"])[:c["size"] * 2]}
                             for c in self.parameters.get("captures", [])]
-                self._send({"event": "break" if self.parameters["pause"] else "enter", "hook_id": self.parameters["id"],
-                            "hit": 1, "thread": 1, "address": hex(BASE + self.parameters["rva"]),
-                            "arguments": ["0x0"] * 8, "backtrace": [], "captures": captures})
+                self.seen = hits
+                for hit in range(1, min(hits, self.parameters["limit"]) + 1):
+                    self._send({"event": "break" if self.parameters["pause"] else "enter", "hook_id": self.parameters["id"],
+                                "hit": hit, "thread": 1, "address": hex(BASE + self.parameters["rva"]),
+                                "arguments": ["0x0"] * 8, "backtrace": [], "captures": captures})
         self.loaded = True
 
     def unload(self):
@@ -103,6 +116,12 @@ class Script:
     # probe script
     def rpc_status(self):
         return {"installed": self.loaded}
+
+    def rpc_counters(self):
+        if os.environ.get("HYDRALYSIS_FAKE_NO_COUNTERS"):
+            raise RuntimeError("script has no exported counters")
+        limit = (self.parameters or {}).get("limit", 0)
+        return {"seen": self.seen, "hits": min(self.seen, limit), "limit": limit}
 
     def rpc_release(self):
         self.loaded = False
@@ -161,8 +180,12 @@ class Device:
         pass
 
     def attach(self, pid):
-        from hydralysis.runtime_worker import _process_path
-        return Session(pid, _process_path(pid))
+        # In the worker process the module is `__main__`; importing it under its own name would load a second copy
+        # and hide a handler that looks its helpers up by that name (the real binding imports nothing of ours).
+        process_path = getattr(sys.modules.get("__main__"), "_process_path", None)
+        if process_path is None:
+            from hydralysis.runtime_worker import _process_path as process_path
+        return Session(pid, process_path(pid))
 
 
 def get_local_device():
