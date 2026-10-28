@@ -38,7 +38,8 @@ class LegacyEnvironment(unittest.TestCase):
 
 class ConfigFile(unittest.TestCase):
     def _find(self, folder: Path):
-        with patch.dict(os.environ, {}, clear=True), patch("hydralysis.config.Path.cwd", return_value=folder):
+        # The configuration lives in the per-user folder, never the working directory (Z3).
+        with patch.dict(os.environ, {}, clear=True), patch("hydralysis.config.user_config_dir", return_value=folder):
             return config.config_path()
 
     def test_old_config_name_is_found_and_recorded_but_the_new_one_wins(self):

@@ -413,25 +413,19 @@ def _workflow(name: str, args: dict) -> str:
         if action == "install":
             from hydralysis.preparation import start_install
             return json.dumps(start_install(settings, component), indent=2)
-        if action in ("status", "stop"):
+        if action == "status":
+            if component != "analysis":
+                raise ValueError("status/stop apply to the shared analysis engine")
+            # Joins a running daemon and never starts one; the environment handler (environment.py, Z3) answers.
+            return dispatch("environment", "backend action=status is not available in this release",
+                            {"tool": "backend", "action": action, "options": options, "args": args, "settings": None},
+                            tool="backend", action=action)
+        if action == "stop":
             if component != "analysis":
                 raise ValueError("status/stop apply to the shared analysis engine")
             from hydralysis import hydra
             engine = hydra.Engine(_settings())
-            if action == "stop":
-                return json.dumps(engine.stop(force=bool(args.get("force"))), indent=2)
-            status = engine.call("status")
-            keep = ("protocol", "hydraVersion", "ghidraVersion", "installId", "pid", "startedAt", "memory", "youAre")
-            summary = {key: status.get(key) for key in keep if key in status}
-            summary["catalog"] = catalog()
-            summary["projects"] = [{key: item.get(key) for key in ("id", "name", "gpr", "writable", "revision", "stale", "users")}
-                                   for item in status.get("projects", [])][:20]
-            summary["programs"] = [{key: item.get(key) for key in ("key", "mode", "owner", "users", "busy")}
-                                   for item in status.get("programs", [])][:40]
-            summary["clients"] = [{key: item.get(key) for key in ("id", "name", "harness")}
-                                  for item in status.get("clients", [])][:40]
-            summary["imports"] = status.get("imports")
-            return json.dumps(summary, indent=2, default=str)
+            return json.dumps(engine.stop(force=bool(args.get("force"))), indent=2)
         if action != "inspect":
             raise ValueError("backend action must be inspect, install, status, stop, help, doctor or backups")
         if component == "runtime":

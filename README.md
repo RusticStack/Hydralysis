@@ -49,7 +49,7 @@ uv venv .venv
 .venv/Scripts/hydralysis.exe tools
 ```
 
-Select a data directory with no dot-prefixed path components using `HYDRALYSIS_ROOT`, or set `root` in `hydralysis.local.json` (or the file `HYDRALYSIS_CONFIG` names). The default is per user: `%LOCALAPPDATA%\Hydralysis` on Windows, `~/Library/Application Support/Hydralysis` on macOS, `$XDG_DATA_HOME/hydralysis` (when dot-free) or `~/hydralysis` on Linux. Any drive is accepted; a machine that keeps data off some drives says so with `forbidden_drives` in the config or `HYDRALYSIS_FORBIDDEN_DRIVES=C:,D:`.
+Select a data directory with no dot-prefixed path components using `HYDRALYSIS_ROOT`, or set `root` in `hydralysis.local.json` in the per-user Hydralysis folder (or the file `HYDRALYSIS_CONFIG` names). The working directory is never searched for a configuration, so every harness launch gets the same root; `python -m hydralysis.environment init` writes that file, `describe` and `doctor` report the root, configuration, engine release and file system without starting a JVM, and the same one-line banner is on stderr when the MCP server starts. The default is per user: `%LOCALAPPDATA%\Hydralysis` on Windows, `~/Library/Application Support/Hydralysis` on macOS, `$XDG_DATA_HOME/hydralysis` (when dot-free) or `~/hydralysis` on Linux. Any drive is accepted; a machine that keeps data off some drives says so with `forbidden_drives` in the config or `HYDRALYSIS_FORBIDDEN_DRIVES=C:,D:`.
 
 ```text
 hydralysis backend inspect
