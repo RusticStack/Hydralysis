@@ -1307,10 +1307,12 @@ def default_agent_id() -> tuple[str, str]:
 
 def view_name(agent_id: str) -> str:
     """The name of the view of AGENT_ID: the id itself when it is already a view name, else a slug with a short digest
-    (`claude-code@1f2e...` becomes `claude-code.at.1f2e....<digest>`), so two different ids never share a name."""
-    if _VIEW.fullmatch(agent_id) and agent_id not in RESERVED_VIEWS:
+    (`claude-code@1f2e...` becomes `claude-code.at.1f2e....<digest>`), so two different ids never share a name.
+    The name is also the file name `views/<name>.json`, and Windows file names ignore case: an id that has an upper-case letter
+    always gets the lower-cased slug plus the digest of its exact spelling, so `Alice` and `alice` never share a file."""
+    if _VIEW.fullmatch(agent_id) and agent_id not in RESERVED_VIEWS and agent_id == agent_id.lower():
         return agent_id
-    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", agent_id.replace("@", ".at.")).strip("-._")[:48] or "agent"
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", agent_id.replace("@", ".at.")).strip("-._")[:48].lower() or "agent"
     return "%s.%s" % (slug, hashlib.sha256(agent_id.encode("utf-8")).hexdigest()[:10])
 
 

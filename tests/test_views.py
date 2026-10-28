@@ -1322,6 +1322,25 @@ class PerAgentViews(AgentWorld, unittest.TestCase):
         for name in names:
             workcopy.with_view({"key": "k"}, name)  # every derived name is a valid view name
 
+    def test_two_ids_that_differ_only_in_case_get_two_view_files_even_where_file_names_ignore_case(self):
+        """The view name is a file name (`views/<name>.json`) and NTFS ignores case, so a name that differs only in case collides."""
+        names = [views.view_name(item) for item in ("Alice", "alice", "ALICE", "aLiCe")]
+        self.assertEqual(len({name.lower() for name in names}), 4, names)
+        self.assertEqual(views.view_name("alice"), "alice", "a lower-case id that is a view name is still the name itself")
+        self.rename("Alice", "FromUpper")
+        self.rename("alice", "FromLower", B)
+        self.assertEqual(self.seen("Alice"), "FromUpper")
+        self.assertEqual(self.seen("alice", B), "FromLower")
+        self.assertEqual(self.seen("alice"), "FUN_140001000", "the lower-case agent does not see the upper-case agent's edit")
+        lid = self.lineage_of()
+        listed = views.list_records(self.settings, lid)
+        self.assertEqual(sorted(row["agent"] for row in listed), ["Alice", "alice"], "both agents have their own record")
+        files = [path.name for path in views.views_dir(self.settings, lid).iterdir() if path.suffix == ".json"]
+        self.assertEqual(len({name.lower() for name in files}), len(files), "no two record files differ only in case")
+        self.assertEqual(len(files), 2)
+        status = self.ask("Alice", "status", show="views")
+        self.assertEqual(sorted(row["agent"] for row in status["views"]), ["Alice", "alice"])
+
     def test_an_explicit_view_wins_over_the_agent_and_shared_is_named_explicitly(self):
         self.rename("agent-1", "Mine")
         self.assertEqual(self.ask("agent-1", "type_edit", A, kind="rename", name="Team", source="cited",
@@ -1623,6 +1642,27 @@ class AgentProcesses(AgentWorld, unittest.TestCase):
         again = self.finish(self.agent([self.read_step("owned", "victim", A)]))
         self.assertEqual(json.loads(again[0]["text"])["function"]["name"], "Kept", "a new process rebuilds the same answer")
 
+    def test_a_one_shot_cli_process_is_a_fresh_agent_unless_it_sets_an_id(self):
+        """D59: each `hydralysis ...` invocation is a new process and so a new default id `cli@<boot id>`. An edit-then-read through two
+        invocations only works with HYDRALYSIS_AGENT_ID or `options.as`; without them the second one reads the master (documented)."""
+        first = self.finish(self.agent([self.edit_step("owned", None, "CliEdit", A)]))
+        self.assertTrue(first[0]["ok"], first)
+        edited = json.loads(first[0]["text"])
+        self.assertTrue(edited["agent"].startswith("cli@"), edited["agent"])
+        second = self.finish(self.agent([self.read_step("owned", None, A)]))
+        reply = json.loads(second[0]["text"])
+        self.assertEqual(reply["function"]["name"], "FUN_140001000", "a second one-shot process reads the master, not the first one's view")
+        self.assertEqual(reply["view"], "master")
+        self.assertNotEqual(reply["agent"], edited["agent"])
+        self.assertEqual([row["agent"] for row in reply["adoptable"]], [edited["agent"]], "and it is told where the edit went")
+        stable = {"HYDRALYSIS_AGENT_ID": "cli-user"}  # the documented way to keep edits across invocations
+        self.finish(self.agent([self.edit_step("owned", None, "Kept", B)], env=stable))
+        again = json.loads(self.finish(self.agent([self.read_step("owned", None, B)], env=stable))[0]["text"])
+        self.assertEqual((again["function"]["name"], again["agent"]), ("Kept", "cli-user"))
+        self.finish(self.agent([self.edit_step("owned", "scripted", "ByAs", C)]))  # so is options.as
+        by_as = json.loads(self.finish(self.agent([self.read_step("owned", "scripted", C)]))[0]["text"])
+        self.assertEqual(by_as["function"]["name"], "ByAs")
+
     def mcp(self, name="claude-code", env=None):
         server = McpProcess(self.spec, name=name, env=env)
         self.processes.append(server)
@@ -1638,8 +1678,9 @@ class AgentProcesses(AgentWorld, unittest.TestCase):
         server = self.mcp()
         errors = []
 
-        def both(first, second):
-            """Run FIRST on thread P and SECOND on thread Q, one after the other (P is done before Q starts)."""
+        def both(first, second, together=False):
+            """Run FIRST on thread P and SECOND on thread Q: one after the other (P is done before Q starts), or at the same
+            time with TOGETHER."""
             out = {}
 
             def run(key, call):
@@ -1647,9 +1688,14 @@ class AgentProcesses(AgentWorld, unittest.TestCase):
                     out[key] = call()
                 except Exception as error:  # noqa: BLE001
                     errors.append(repr(error))
+            threads = []
             for key, call in (("P", first), ("Q", second)):
                 thread = threading.Thread(target=run, args=(key, call))
                 thread.start()
+                threads.append(thread)
+                if not together:
+                    thread.join(120)
+            for thread in threads:
                 thread.join(120)
             return out
 
@@ -1678,8 +1724,10 @@ class AgentProcesses(AgentWorld, unittest.TestCase):
         self.assertTrue(rebased["rebased"], "a stale edit on another subject is rebased")
         # (2) P passes as:"P", Q passes as:"Q": two views, no tag crosses until a publish (K11)
         both(lambda: self.call_in(server, "P", "type_edit", C, kind="rename", name="TagP", source="cited", expect_revision=0),
-             lambda: self.call_in(server, "Q", "type_edit", "0x140004000", kind="rename", name="TagQ", source="cited", expect_revision=0))
-        seen = both(lambda: self.call_in(server, "P", "decompile", "0x140004000"), lambda: self.call_in(server, "Q", "decompile", C))
+             lambda: self.call_in(server, "Q", "type_edit", "0x140004000", kind="rename", name="TagQ", source="cited", expect_revision=0), together=True)
+        seen = both(lambda: self.call_in(server, "P", "decompile", "0x140004000"), lambda: self.call_in(server, "Q", "decompile", C),
+                    together=True)
+        self.assertEqual(errors, [])
         self.assertEqual((seen["P"][0]["function"]["name"], seen["Q"][0]["function"]["name"]), ("FUN_140004000", "FUN_140003000"))
         self.assertEqual(self.call_in(server, "P", "decompile", C)[0]["function"]["name"], "TagP")
         self.assertEqual(self.call_in(server, "Q", "decompile", "0x140004000")[0]["function"]["name"], "TagQ")
@@ -1701,9 +1749,12 @@ class AgentProcesses(AgentWorld, unittest.TestCase):
             text = (repo / "skills" / skill / "SKILL.md").read_text(encoding="utf-8")
             self.assertIn("distinct `options.as` for each editing sub-agent", text, skill)
             self.assertIn("conflict control and not isolation", text, skill)
+            self.assertIn("one-shot `hydralysis` command is a new agent", text, skill)
+            self.assertIn("HYDRALYSIS_AGENT_ID", text, skill)
         readme = (repo / "README.md").read_text(encoding="utf-8")
         self.assertNotIn("Clients share the default view", readme)
         self.assertIn("conflict control, not isolation", readme, "the shared-identity behaviour is documented, not promised away")
+        self.assertIn("one-shot `hydralysis` command is a new agent", readme, "the CLI consequence is documented")
         # (4) a native tool call (no options bag) takes no identity: it never reaches a store
         native, failed = server.call("fingerprint", {"exe": str(self.exe)})
         self.assertNotIn("view", json.dumps(native))
