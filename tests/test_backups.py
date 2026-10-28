@@ -338,20 +338,40 @@ class RemoveAndHandler(World, unittest.TestCase):
         self.assertIn("never removed", reasons[0])
         self.assertIn("head", reasons[3])
         self.assertIn("revert target", reasons[2])
-        # a live view's base protects generation 1
+        # every earlier published generation is a revert target too: commit_revert walks back c3, c2, c1
+        chain = backups.remove(self.settings, self.lid, {"generation": 1, "confirm": True})
+        self.assertEqual(chain["refused"], "protected_generation")
+        self.assertIn("revert chain", chain["message"])
+        # a live view's base protects a generation above the head, which nothing else protects
+        lineage.generation_dir(self.settings, self.lid, 4).mkdir(parents=True)
         base = Path(self.settings["root"]) / "bases" / "origin" / "key"
         base.mkdir(parents=True)
-        (base / "COMPLETE.json").write_text(json.dumps({"gpr": "x", "generation": 1, "lineage": self.lid}), encoding="utf-8")
-        self.assertEqual(backups.remove(self.settings, self.lid, {"generation": 1, "confirm": True})["message"], "the base of a live view")
+        (base / "COMPLETE.json").write_text(json.dumps({"gpr": "x", "generation": 4, "lineage": self.lid}), encoding="utf-8")
+        self.assertEqual(backups.remove(self.settings, self.lid, {"generation": 4, "confirm": True})["message"], "the base of a live view")
         (base / "COMPLETE.json").unlink()
-        folder = lineage.generation_dir(self.settings, self.lid, 1)
+        folder = lineage.generation_dir(self.settings, self.lid, 4)
         (folder / "payload.bin").write_bytes(b"x" * 100)
-        dry = backups.remove(self.settings, self.lid, {"generation": 1})
+        dry = backups.remove(self.settings, self.lid, {"generation": 4})
         self.assertEqual((dry["removed"], dry["dry_run"]), (False, True))
         self.assertTrue(folder.exists())
-        done = backups.remove(self.settings, self.lid, {"generation": 1, "confirm": True})
+        done = backups.remove(self.settings, self.lid, {"generation": 4, "confirm": True})
         self.assertTrue(done["removed"])
         self.assertFalse(folder.exists())
+
+    def test_the_revert_chain_stays_protected_after_a_revert_and_a_rolled_back_generation_is_removable(self):
+        for number in (1, 2, 3):
+            lineage.generation_dir(self.settings, self.lid, number).mkdir(parents=True)
+            lineage.append_current(self.settings, self.lid, {"gen": number, "cid": "c-%08x" % number, "reason": "commit", "gpr": "g%d" % number,
+                                                            "manifestSha256": "m"})
+        # reverting c3 appends a rollback line at generation 2: generation 1 is now the next revert target
+        lineage.append_current(self.settings, self.lid, {"gen": 2, "cid": "c-00000003", "reason": "rollback", "gpr": "g2",
+                                                        "manifestSha256": "m"})
+        kept = backups.protected_generations(self.settings, self.lid)
+        self.assertEqual(sorted(kept), [0, 1, 2])
+        self.assertIn("revert target", kept[1])
+        self.assertNotIn(3, kept)
+        self.assertTrue(backups.remove(self.settings, self.lid, {"generation": 3, "confirm": True})["removed"])
+        self.assertEqual(backups.remove(self.settings, self.lid, {"generation": 1, "confirm": True})["refused"], "protected_generation")
 
     def test_op_remove_is_in_the_option_bags_help_text(self):
         self.assertIn("remove", api.OPTION_BAGS["backend"])
