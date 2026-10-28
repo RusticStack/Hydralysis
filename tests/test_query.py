@@ -760,13 +760,37 @@ class ViewsThroughQuery(unittest.TestCase):
         self.assertEqual((job["state"], job["result"]["outcome"], job["result"]["generation"]), ("done", "applied", 1))
         self.assertEqual(self.world.name_of("0x140001000"), "Mine")
 
+    def job_that_ends_in(self, error):
+        """Run a publish job whose publish raises ERROR; return the job as `overlayjobs.status` reads it."""
+        from hydralysis import overlayjobs, views
+        self.edit("Mine", "0x140001000", "one")
+        revision = workcopy.load_store(self.world.settings, self.world.target("one"))["revision"]
+        with patch("hydralysis.proc.popen", return_value=type("Child", (), {"pid": 1111})()),                 patch("hydralysis.overlayjobs.proc_start", return_value=4444):
+            answer = self.ask("type_edit", kind="publish", confirm_one_way_upgrade=True, expect_revision=revision, view="one")
+        path = overlayjobs.job_path(self.world.settings, answer["id"])
+        with patch("hydralysis.overlayjobs.proc_start", return_value=4444), patch.object(views, "run_publish_job", side_effect=error):
+            views.run_job(path, engine=fakehydra.FakeEngine(self.world.settings), watch=False)
+        return overlayjobs.status(self.world.settings, answer["id"])
+
+    def test_a_publish_job_that_ends_in_a_commit_error_keeps_its_payload(self):
+        from hydralysis import commits
+        job = self.job_that_ends_in(commits.CommitError("verify_failed", "planted commit refusal"))
+        self.assertEqual((job["state"], job["error_payload"]["error"]), ("failed", "verify_failed"))
+        self.assertIn("planted commit refusal", job["error"])
+
+    def test_a_publish_job_that_ends_in_a_lineage_error_keeps_its_payload(self):
+        from hydralysis import lineage
+        job = self.job_that_ends_in(lineage.LineageError("tampered", "planted lineage refusal"))
+        self.assertEqual((job["state"], job["error_payload"]["error"]), ("failed", "tampered"))
+        self.assertIn("planted lineage refusal", job["error"])
+
     def test_a_publish_job_whose_changeset_conflicts_fails_with_the_rebase_call_that_works(self):
         from hydralysis import overlayjobs, views
         self.edit("Mine", "0x140001000", "one")  # one never sees "Theirs": its record rests on the old value
         self.edit("Theirs", "0x140001000", "two")
         self.publish_through_the_job("two")
         revision = workcopy.load_store(self.world.settings, self.world.target("one"))["revision"]
-        with patch("hydralysis.proc.popen", return_value=type("Child", (), {"pid": 1111})()),              patch("hydralysis.overlayjobs.proc_start", return_value=4444):
+        with patch("hydralysis.proc.popen", return_value=type("Child", (), {"pid": 1111})()),                 patch("hydralysis.overlayjobs.proc_start", return_value=4444):
             answer = self.ask("type_edit", kind="publish", confirm_one_way_upgrade=True, expect_revision=revision, view="one")
         path = overlayjobs.job_path(self.world.settings, answer["id"])
         with patch("hydralysis.overlayjobs.proc_start", return_value=4444):

@@ -867,6 +867,7 @@ def _verify_candidate(settings: dict, engine, job, target: dict, candidate_gpr: 
                     last[(effect["subject"], effect["field"])] = effect["after"]
         if last:
             live = workcopy.probe(engine, read_only, list(last))
+            # A pair the probe could not read (None) is not a mismatch: None means "could not probe", never "holds a wrong value".
             wrong = [{"subject": pair[0], "field": pair[1], "expected": after, "found": live.get(pair)}
                      for pair, after in last.items() if live.get(pair) is not None and live.get(pair) != _text(after)]
             if wrong:
@@ -894,7 +895,13 @@ def _verify_candidate(settings: dict, engine, job, target: dict, candidate_gpr: 
             if commits._decompile(engine, parent, address, target["sha256"]) != commits._decompile(engine, read_only, address, target["sha256"]):
                 raise PublishFailure("candidate_failed", "untouched function %s decompiles differently in the candidate" % address,
                                      counted=True, address=address)
-        writable = commits._program_of(job, clone["gpr"], target, writable=True, upgrade=False, refresh=True)
+        try:
+            writable = commits._program_of(job, clone["gpr"], target, writable=True, upgrade=False, refresh=True)
+        except hydra.EngineError as error:
+            if error.code in ("closed", "busy"):
+                raise  # the engine is away or occupied: that says nothing about the candidate
+            raise PublishFailure("candidate_failed", "the candidate's clone does not open writable: %s" % error, counted=True,
+                                 engine_error=error.code) from error
         job.call("close_project", project=writable["project"], discard=True)
         job.reset()
     finally:
@@ -1367,6 +1374,10 @@ def run_job(path: Path, engine=None, watch: bool = True) -> None:
         result = run_publish_job(settings, selected, dict(record["options"]), engine, overlayjobs.TIMEOUT_S,
                                  progress=lambda info: overlayjobs._update(path, publish_pending=info))
     except ViewError as error:
+        overlayjobs._update(path, state="failed", error="%s: %s" % (error.code, error), error_payload=error.payload(),
+                            finished_at=time.time())
+        return
+    except (commits.CommitError, lineage.LineageError) as error:
         overlayjobs._update(path, state="failed", error="%s: %s" % (error.code, error), error_payload=error.payload(),
                             finished_at=time.time())
         return

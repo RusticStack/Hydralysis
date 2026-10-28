@@ -787,6 +787,93 @@ class VerificationCanFail(ViewWorld, unittest.TestCase):
         self.assertEqual(self.head()["gen"], 0)
         self.assertEqual(self.run_job(sealed, "one")["outcome"], "applied")
 
+    def assert_candidate_refused(self, sealed, led, message):
+        """The same assertions for every check of the verification: counted, named, never head, the records still pending."""
+        self.assertEqual((led["failure"]["error"], led["failure"]["counted"]), ("candidate_failed", True))
+        self.assertIn(message, led["failure"]["message"])
+        self.assertEqual(self.head()["gen"], 0)
+        self.assertEqual([row["gen"] for row in self.rows()], [0])
+        self.assertIsNone(self.done(sealed["csid"]))  # attempt 1 of 3: still queued
+        self.assertEqual(len(self.pending_ids("one")), 1)
+
+    def test_a_candidate_with_an_invalid_database_header_fails_verification(self):
+        self.edit("Mine", A, view="one")
+        verify = views._verify_candidate
+
+        def damaged(settings, engine, job, target, candidate_gpr, *args, **kwargs):
+            database = Path(candidate_gpr).parent / (Path(candidate_gpr).stem + ".rep") / "idata" / "00" / "~00000000.db"
+            database.mkdir(parents=True, exist_ok=True)
+            (database / "db.1.gbf").write_bytes(b"not a database")  # the newest (and only) version has no valid header
+            return verify(settings, engine, job, target, candidate_gpr, *args, **kwargs)
+        with patch.object(views, "_verify_candidate", damaged):
+            sealed, led = self.drain_one()
+        self.assert_candidate_refused(sealed, led, "without a valid header")
+        self.assertEqual(led["failure"]["report"]["newest_invalid"][0]["file"], "db.1.gbf")
+        self.assertEqual(self.run_job(sealed, "one")["outcome"], "applied")  # an undamaged candidate is published
+
+    def clone_reports(self, **different):
+        """`commits._program_of` as the daemon would answer if the read-only open of the verification clone said something
+        else than the parent says (the clone's folder is the one under publish-verify)."""
+        real = commits._program_of
+
+        def program_of(engine, gpr, target, writable=False, **fields):
+            found = real(engine, gpr, target, writable=writable, **fields)
+            if "publish-verify" in str(gpr).replace("\\", "/") and not writable:
+                found = {**found, **different}
+            return found
+        return program_of
+
+    def test_a_candidate_with_another_function_count_than_its_parent_fails_verification(self):
+        self.edit("Mine", A, view="one")
+        with patch.object(commits, "_program_of", self.clone_reports(functions=999)):  # the fake's program has 2
+            sealed, led = self.drain_one()
+        self.assert_candidate_refused(sealed, led, "function count or analysed flag differs")
+        self.assertEqual(self.run_job(sealed, "one")["outcome"], "applied")
+
+    def test_a_candidate_with_another_analysed_flag_than_its_parent_fails_verification(self):
+        self.edit("Mine", A, view="one")
+        with patch.object(commits, "_program_of", self.clone_reports(analyzed=False)):  # the fake's program is analysed
+            sealed, led = self.drain_one()
+        self.assert_candidate_refused(sealed, led, "function count or analysed flag differs")
+        self.assertEqual(self.run_job(sealed, "one")["outcome"], "applied")
+
+    def test_a_clone_that_does_not_open_writable_fails_verification(self):
+        self.edit("Mine", A, view="one")
+        real = commits._program_of
+
+        def program_of(engine, gpr, target, writable=False, **fields):
+            if writable and "publish-verify" in str(gpr).replace("\\", "/"):
+                raise hydra.EngineError("corrupt", "planted: the database does not open for writing")
+            return real(engine, gpr, target, writable=writable, **fields)
+        with patch.object(commits, "_program_of", program_of):
+            sealed, led = self.drain_one()
+        self.assert_candidate_refused(sealed, led, "does not open writable")
+        self.assertEqual(self.run_job(sealed, "one")["outcome"], "applied")
+
+    def test_an_engine_that_is_away_during_the_writable_open_is_not_held_against_the_candidate(self):
+        self.edit("Mine", A, view="one")
+        real = commits._program_of
+
+        def program_of(engine, gpr, target, writable=False, **fields):
+            if writable and "publish-verify" in str(gpr).replace("\\", "/"):
+                raise hydra.EngineError("closed", "the connection ended")
+            return real(engine, gpr, target, writable=writable, **fields)
+        with patch.object(commits, "_program_of", program_of):
+            sealed, led = self.drain_one()
+        self.assertEqual((led["failure"]["error"], led["failure"]["counted"]), ("engine_refused", False))
+        self.assertEqual(self.head()["gen"], 0)
+
+    def test_an_effect_the_candidate_cannot_report_is_not_a_mismatch(self):
+        """None from the probe means "could not read it", not "holds another value": only a wrong value fails (see `lying_probe`)."""
+        self.edit("Mine", A, view="one")
+        real = workcopy.probe
+
+        def silent(engine, program, probes, *args, **kwargs):
+            found = real(engine, program, probes, *args, **kwargs)
+            return {pair: None for pair in found} if sys._getframe(1).f_code.co_name == "_verify_candidate" else found
+        with patch.object(workcopy, "probe", silent):
+            self.assertEqual(self.publish("one")["outcome"], "applied")
+
     def test_a_rebased_copy_that_does_not_hold_the_kept_values_changes_nothing(self):
         record = self.edit("FromTwo", B, view="two")["overlay_id"]
         self.edit("FromOne", A, view="one")
