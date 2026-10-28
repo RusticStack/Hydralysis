@@ -16,6 +16,9 @@ Replay run (--replay 1,100,1000,4096): a view holding that many pending records 
 copy, as after an idle eviction (D61), and the first call afterwards replays the whole store onto a fresh fork of
 the shared base. That wall time is compared with the 5 s per-call threshold; `viewKeepWarmRecords` (placeholder 1000)
 is the store size from which the view is kept warm instead, so the verdict says which record counts are over it.
+
+Exit status: 0 when every requested measurement was recorded, 1 when any replay record errored (for example a binary
+with fewer label addresses than the requested count, such as the system whoami.exe fixture at 4,096) or a run failed.
 """
 
 from __future__ import annotations
@@ -28,7 +31,7 @@ import time
 import uuid
 from pathlib import Path
 
-import bench_common as common
+import mcp_latency as common
 
 PER_CALL_THRESHOLD_S = 5.0
 KEEP_WARM_RECORDS_PLACEHOLDER = 1000
@@ -132,10 +135,11 @@ def replay_run(runner, settings: dict, target: str, binary: Path, count: int, en
     # An idle eviction: the working copy is gone, the store and the shared base remain.
     directory = workcopy._directory(settings, selected)
     state = workcopy._state(settings, selected)
+    close_error = None
     try:
         workcopy.writer_for(settings, selected).call("close_project", project=state.get("fork_gpr", ""), discard=True)
-    except Exception:
-        pass
+    except Exception as exc:  # a failed discard can leave a stale fork: the record says so and the run is not trusted
+        close_error = "%s: %s" % (type(exc).__name__, str(exc)[:300])
     for child in directory.glob("w-*"):
         shutil.rmtree(child, ignore_errors=True)
     (directory / "state.json").unlink(missing_ok=True)
@@ -150,6 +154,7 @@ def replay_run(runner, settings: dict, target: str, binary: Path, count: int, en
     return {"records": count, "pending_in_store": len(workcopy.pending_of(store)), "fill_s": round(fill, 3),
             "first_call_after_eviction_s": round(first_call, 3), "warm_call_s": round(warm_call, 3),
             "phases_ms": with_unattributed(sync.get("phases_ms")), "applied_now": sync.get("applied_now"), "answered": bool(answered),
+            "close_project_error": close_error,
             "over_5s_threshold": first_call > PER_CALL_THRESHOLD_S,
             "at_or_over_keep_warm_placeholder": count >= KEEP_WARM_RECORDS_PLACEHOLDER}
 

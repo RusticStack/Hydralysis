@@ -20,7 +20,7 @@ import shutil
 import threading
 import time
 
-import bench_common as common
+import mcp_latency as common
 
 
 def lanes(engine) -> dict:

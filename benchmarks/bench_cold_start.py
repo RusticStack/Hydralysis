@@ -16,7 +16,7 @@ import json
 import shutil
 import time
 
-import bench_common as common
+import mcp_latency as common
 
 
 def one_run(settings: dict, root, address: str) -> dict:

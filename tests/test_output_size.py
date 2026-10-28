@@ -24,7 +24,7 @@ from test_engine_integration import BINARY, CLIENT, ENGINE, _prepare, _release
 BENCH = Path(__file__).resolve().parent.parent / "benchmarks"
 sys.path.insert(0, str(BENCH))
 
-import bench_common as common  # noqa: E402
+import mcp_latency as common  # noqa: E402
 import named_view_cost  # noqa: E402
 
 # action -> byte budget of the whole JSON answer for a function of up to 4 KB (fixture scale).

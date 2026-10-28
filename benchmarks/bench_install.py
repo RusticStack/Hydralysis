@@ -16,7 +16,7 @@ import shutil
 import time
 from pathlib import Path
 
-import bench_common as common
+import mcp_latency as common
 
 
 def main(argv=None) -> int:
