@@ -18,6 +18,7 @@ from hydralysis import durable
 from hydralysis.runtime_actions import ActionsMixin
 from hydralysis.runtime_capture import CaptureMixin
 from hydralysis.runtime_events import EventLog
+from hydralysis.runtime_memory import MemoryMixin
 from hydralysis.runtime_agents import (  # noqa: F401  (re-exported: tests and callers import them from here)
     CONTEXT_HELPER, CONTROL, MEMORY_HELPER, _expect, _probe_source)
 from hydralysis.runtime_ipc import serve as ipc_serve
@@ -224,7 +225,7 @@ def _inside_function(path: str, rva: int) -> bool:
 
 
 
-class RuntimeAgent(CaptureMixin, ActionsMixin):
+class RuntimeAgent(MemoryMixin, CaptureMixin, ActionsMixin):
     def __init__(self, directory: Path, device):
         self.directory = directory
         self.device = device
@@ -236,10 +237,12 @@ class RuntimeAgent(CaptureMixin, ActionsMixin):
         self.target_sha256 = ""
         self.paused_spawn = False
         self.detached = False
+        self.detach_reason = ""
         self.ended = ""
         self.scripts = {}
         self.pauses = {}
         self.log = EventLog(directory, directory.name)
+        self.init_memory()
         self.open_capture = None
         self._publish_gate = threading.Lock()
         self._published = 0.0
@@ -273,7 +276,7 @@ class RuntimeAgent(CaptureMixin, ActionsMixin):
                      "detached": self.detached, "scripts": list(self.scripts), "paused_hooks": list(self.pauses),
                      "last_sequence": self.sequence, "dropped_events": self.dropped,
                      "log": self.log.head_info(), "messages_seen": self.log.counters["messages"],
-                     **({"ended": self.ended} if self.ended else {})}
+                     **self.memory_state(), **({"ended": self.ended} if self.ended else {})}
 
     def publish(self):
         state = self.snapshot()
@@ -380,7 +383,8 @@ class RuntimeAgent(CaptureMixin, ActionsMixin):
         return {"target": info, "sha256": initial["sha256"], "state": self.state,
                 "pid": self.pid, "target_created_ms": self.target_created_ms}
 
-    def _detached(self, *args):
+    def _detached(self, reason=None, *args):
+        self.detach_reason = str(reason or "")
         self.detached = True
         self.state = "detached"
         self.publish()
@@ -398,6 +402,7 @@ class RuntimeAgent(CaptureMixin, ActionsMixin):
             time.sleep(0.1)
 
     def cleanup(self) -> dict:
+        self.memory_before_cleanup()  # raises while a watch is not verified clear: the target keeps its handler
         errors = []
         for script_id in list(self.scripts):
             try:
@@ -430,7 +435,7 @@ class RuntimeAgent(CaptureMixin, ActionsMixin):
             self._timer.cancel()
         self.log.close()
         return {"state": "detached", "target_state": "unknown", "pid": self.pid,
-                "spawn_resumed": not self.paused_spawn, "scripts_released": not self.scripts}
+                "spawn_resumed": not self.paused_spawn, "scripts_released": not self.scripts, **self.memory_cleanup_report()}
 
 
 def main() -> int:
@@ -491,7 +496,7 @@ def main() -> int:
         finally:
             done.set()
     try:
-        while not agent.closed and time.monotonic() - touched < int(initial.get("idle_s", 600)):
+        while not agent.closed and (agent.tainted or time.monotonic() - touched < int(initial.get("idle_s", 600))):
             try:
                 connection, _ = listener.accept()
             except socket.timeout:
