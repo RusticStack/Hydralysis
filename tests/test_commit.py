@@ -63,8 +63,9 @@ class World:
         options = {"kind": kind, "source": "cited test evidence", "expect_revision": self.store(view)["revision"], **fields}
         if kind == "rename":
             options["name"] = name
-        if view:
-            options["view"] = view
+        # The commit machinery is tested on the shared view unless a view is named: a caller with no `view` and no `as` has a view
+        # of its own now (Y5, D43), so the shared view is named explicitly.
+        options["view"] = view or "shared"
         return json.loads(self.runner.query("owned", "type_edit", address, options=options))
 
     def ids(self, view=""):
@@ -83,7 +84,7 @@ class World:
 
     def name_of(self, address=A, view=""):
         query._keys.clear()
-        options = {"view": view} if view else {}
+        options = {"view": view or "shared"}
         return json.loads(self.runner.query("owned", "decompile", address, options=options))["function"]["name"]
 
     def generation_tree(self, number):
@@ -320,16 +321,17 @@ class HappyPath(World, unittest.TestCase):
         self.edit("Alpha")
         selected = self.target()
         reply = json.loads(self.runner.query("owned", "type_edit", "", options={
-            **CONFIRMED, "expect_revision": self.store()["revision"], "dry_run": True}))
+            **CONFIRMED, "expect_revision": self.store()["revision"], "dry_run": True, "view": "shared"}))
         self.assertTrue(reply["dry_run"])
         with patch("hydralysis.overlayjobs.start", return_value={"id": "overlay-0123456789ab", "state": "queued", "kind": "commit"}) as start:
-            reply = json.loads(self.runner.query("owned", "type_edit", "", options={**CONFIRMED, "expect_revision": self.store()["revision"]}))
+            reply = json.loads(self.runner.query("owned", "type_edit", "", options={**CONFIRMED, "expect_revision": self.store()["revision"],
+                                                                                    "view": "shared"}))
         self.assertEqual(reply["id"], "overlay-0123456789ab")
         self.assertRegex(reply["cid"], r"^c-[0-9a-f]{8}$")
         self.assertEqual(start.call_args.args[2], "commit")
         self.assertEqual(start.call_args.args[4]["cid"], reply["cid"])
         with self.assertRaises(RuntimeError) as raised:  # a refusal comes back at once, before any worker exists
-            self.runner.query("owned", "type_edit", "", options={"kind": "commit", "expect_revision": self.store()["revision"]})
+            self.runner.query("owned", "type_edit", "", options={"kind": "commit", "expect_revision": self.store()["revision"], "view": "shared"})
         self.assertEqual(json.loads(str(raised.exception))["error"], "confirmation_required")
         self.assertEqual(selected["name"], "owned")
 
@@ -649,7 +651,9 @@ class Archival(World, unittest.TestCase):
 
 class Stale(World, unittest.TestCase):
     def test_another_view_is_stale_after_a_commit_and_refuses_edits_but_keeps_answering(self):
-        self.edit("Mine", A)
+        # The commit changes B, where the other view holds a record too: a clean-only rebase (Y5, 4.10) cannot settle it, so the
+        # edit is refused. (A view behind the head whose records do not conflict is rebased first and its edit goes through.)
+        self.edit("Mine", B)
         self.edit("Theirs", B, view="other")
         self.assertEqual(self.name_of(B, view="other"), "Theirs")
         self.commit()

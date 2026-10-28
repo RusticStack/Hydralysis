@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import fakehydra
 from hydralysis import hydra, query, targets, workcopy
-from support import workdir
+from support import default_to_shared, workdir
 
 
 class EngineCase(unittest.TestCase):
@@ -32,6 +32,7 @@ class EngineCase(unittest.TestCase):
             self.addCleanup(item.stop)
         query._keys.clear()
         self.runner = query.QueryRunner(self.settings, fakehydra.FakeEngine(self.settings))
+        default_to_shared(self.runner)  # these tests exercise the shared view; a bare call has a view of its own now (Y5)
 
     def ask(self, action="decompile", address="0x140001000", **kwargs):
         return json.loads(self.runner.query("owned", action, address, **kwargs))
@@ -824,7 +825,7 @@ class ViewsThroughQuery(unittest.TestCase):
 
     def test_the_stale_view_refusal_names_the_rebase_call_and_the_rebase_settles_it(self):
         self.edit("FromOne", "0x140001000", "one")
-        self.edit("FromTwo", "0x140002000", "two")
+        self.edit("FromTwo", "0x140001000", "two")  # the same subject: a clean-only rebase cannot settle it
         self.publish_through_the_job("one")
         with self.assertRaises(RuntimeError) as raised:
             self.edit("More", "0x140003000", "two")
@@ -832,9 +833,18 @@ class ViewsThroughQuery(unittest.TestCase):
         self.assertEqual(body["error"], "stale_view")
         self.assertEqual(body["next"], {"tool": "ghidra_query", "action": "type_edit",
                                         "options": {"kind": "rebase", "expect_revision": 1}})
-        done = self.ask("type_edit", view="two", **body["next"]["options"])
-        self.assertEqual((done["rebased"], done["outcome"], done["view"]), (True, "clean", "two"))
+        conflict = self.ask("type_edit", view="two", **body["next"]["options"])
+        self.assertEqual((conflict["rebased"], conflict["outcome"]), (False, "conflict"))
+        done = self.ask("type_edit", view="two", **{**body["next"]["options"], "resolve": {conflict["conflicts"][0]["subject"]: "take_mine"}})
+        self.assertEqual((done["rebased"], done["view"]), (True, "two"))
         self.assertEqual(self.edit("More", "0x140003000", "two")["revision"], 3)
+
+    def test_a_view_behind_the_head_is_rebased_first_when_that_is_clean_and_the_edit_goes_through(self):
+        self.edit("FromOne", "0x140001000", "one")
+        self.edit("FromTwo", "0x140002000", "two")
+        self.publish_through_the_job("one")
+        answer = self.edit("More", "0x140003000", "two")
+        self.assertEqual((answer["auto_rebased"]["to_generation"], answer["revision"], answer["base"]["generation"]), (1, 3, 1))
 
     def test_merge_and_publish_to_a_view_answer_at_once_and_a_conflict_is_a_result(self):
         self.edit("Source", "0x140001000", "src")

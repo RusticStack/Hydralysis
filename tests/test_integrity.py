@@ -171,7 +171,7 @@ class BeforeTheEngineOpensIt(unittest.TestCase):
 
     def edit(self, name, expect):
         return json.loads(self.runner.query("owned", "type_edit", "0x140001000", options={
-            "kind": "rename", "name": name, "source": "cited test evidence", "expect_revision": expect}))
+            "kind": "rename", "name": name, "source": "cited test evidence", "expect_revision": expect, "view": "shared"}))
 
     def give_the_fork_a_gbf(self, versions, bad):
         state = workcopy._state(self.settings, self.runner.target("owned"))
@@ -196,7 +196,7 @@ class BeforeTheEngineOpensIt(unittest.TestCase):
         self.assertTrue(reply["sync"]["rebuilt"])
         self.assertEqual(reply["sync"]["integrity"]["ok"], False)
         self.assertNotEqual(workcopy._state(self.settings, self.runner.target("owned"))["fork_gpr"], before)
-        self.assertEqual(json.loads(self.runner.query("owned", "decompile", "0x140001000"))["function"]["name"], "Two")
+        self.assertEqual(json.loads(self.runner.query("owned", "decompile", "0x140001000", options={"view": "shared"}))["function"]["name"], "Two")
 
     def test_a_damaged_shared_base_is_not_repaired_and_is_rebuilt(self):
         self.edit("One", 0)
