@@ -185,6 +185,7 @@ def main(argv=None) -> int:
               "file_system": common.file_system(root), "root": str(root), "runs": args.runs,
               "load_before": common.foreign_load(), "named": {}, "replay": []}
     runner = None
+    failed = False
     try:
         runner, status = common.prepare(settings, scratch, "fixture")
         report["prepare_state"] = status["state"]
@@ -202,10 +203,15 @@ def main(argv=None) -> int:
                 report["named"]["%s/%d" % (mode, count)] = {"aggregate": aggregate(cells), "runs": cells}
         for count in [int(x) for x in args.replay.split(",") if x]:
             report["replay"].append(replay_run(runner, settings, target, scratch, count, addresses[0]))
+        errored = [r["records"] for r in report["replay"] if r.get("error")]
         report["keep_warm_decision"] = {
             "viewKeepWarmRecords_placeholder": KEEP_WARM_RECORDS_PLACEHOLDER, "per_call_threshold_s": PER_CALL_THRESHOLD_S,
             "first_count_over_threshold": next((r["records"] for r in report["replay"] if r.get("over_5s_threshold")), None),
-            "note": "the placeholder stands when no count below it is over the threshold; otherwise lower it to the last count under it"}
+            "incomplete": bool(errored), "counts_with_errors": errored,
+            "note": "fixture only; decided on the KotOR run. The placeholder stands when no count below it is over the "
+                    "threshold; otherwise lower it to the last count under it. When incomplete is true (a replay "
+                    "record errored) there is no verdict for the errored counts."}
+        failed = bool(errored)
         report["publish_latency"] = publish_latency()
         budgets = common.load_budgets()
         judged = []
@@ -228,7 +234,7 @@ def main(argv=None) -> int:
         time.sleep(1)
         if not args.keep_root:
             common.cleanup(root)
-    return 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
