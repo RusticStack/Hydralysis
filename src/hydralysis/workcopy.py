@@ -162,25 +162,34 @@ def stale_reason(store: dict, target: dict) -> str | None:
     return None
 
 
-def refuse_stale(store: dict, target: dict, what: str) -> None:
+def refuse_stale(store: dict, target: dict, what: str, settings: dict | None = None) -> None:
+    """A mutation of a view behind the head is refused with `stale_view`, naming the generations (and views) that moved
+    the head and the `rebase` call that settles it (4.7, 4.10)."""
     if stale_reason(store, target):
-        raise RuntimeError(json.dumps({"error": "stale_view", "stale": "master_generation_changed", "what": what,
-                                       "view": target.get("view", "shared"), "base": store.get("base"),
-                                       "head": lineage_binding(target),
-                                       "next": {"tool": "ghidra_query", "action": "type_edit", "options": {"kind": "rebase"}},
-                                       "suggest": "another view committed a new generation; rebase this view before it edits"}))
+        payload = {"error": "stale_view", "stale": "master_generation_changed", "what": what,
+                   "view": target.get("view", "shared"), "base": store.get("base"), "head": lineage_binding(target),
+                   "next": {"tool": "ghidra_query", "action": "type_edit",
+                            "options": {"kind": "rebase", "expect_revision": store["revision"]}},
+                   "suggest": "another view published a new generation; rebase this view before it edits"}
+        if settings is not None:
+            from hydralysis import views
+            payload["editors"] = views.editors_since(settings, target["lineage"]["id"], (store.get("base") or {}).get("generation", 0))
+        raise RuntimeError(json.dumps(payload))
 
 
 def heal(settings: dict, target: dict) -> None:
-    """Settle a commit or revert that died between its CURRENT.log line and its store write, before the view is used."""
+    """Settle a commit or revert that died between its CURRENT.log line and its store write, and a publish whose view
+    was not finalized by the leader, before the view is used."""
     if target.get("lineage"):
-        from hydralysis import commits
+        from hydralysis import commits, views
+        views.settle(settings, target)
         commits.heal(settings, target)
 
 
 def _empty_store(sha256: str) -> dict:
     return {"version": STORE_VERSION, "sha256": sha256, "revision": 0, "base": dict(DEFAULT_BASE), "edits": [],
-            "reverted": [], "journal": [], "commits": [], "archived": [], "stale": None}
+            "reverted": [], "journal": [], "commits": [], "archived": [], "stale": None,
+            "published_through": {}, "changesets": []}
 
 
 def load_store(settings: dict, target: dict) -> dict:
@@ -218,7 +227,27 @@ def load_store(settings: dict, target: dict) -> dict:
     return {"version": record["version"], "sha256": target["sha256"], "revision": int(record.get("revision", len(clean))),
             "base": base, "edits": clean, "reverted": record.get("reverted", []),
             "journal": revisions.clean_journal(record.get("journal")), "commits": _clean_commits(record.get("commits")),
-            "archived": archived if isinstance(archived, list) else [], "stale": stale if isinstance(stale, str) else None}
+            "archived": archived if isinstance(archived, list) else [], "stale": stale if isinstance(stale, str) else None,
+            "published_through": _clean_through(record.get("published_through")), "changesets": _clean_changesets(record.get("changesets"))}
+
+
+MAX_CHANGESETS = 200
+
+
+def _clean_through(raw) -> dict:
+    """`published_through` (4.8): destination view -> the highest `seq` of this view's records already merged there."""
+    if not isinstance(raw, dict):
+        return {}
+    return {str(name): int(seq) for name, seq in raw.items() if isinstance(seq, int) and not isinstance(seq, bool) and seq >= 0}
+
+
+def _clean_changesets(raw) -> list[dict]:
+    """The publish queue's bookkeeping in this view (4.10): one entry per changeset settled here, so a settle is idempotent."""
+    kept = []
+    for item in raw if isinstance(raw, list) else []:
+        if isinstance(item, dict) and isinstance(item.get("csid"), str):
+            kept.append(item)
+    return kept[-MAX_CHANGESETS:]
 
 
 def _stored_version(path: Path) -> int | None:
@@ -257,7 +286,8 @@ def _v3(store: dict, target: dict) -> dict:
     return {"version": STORE_VERSION, "sha256": store.get("sha256", target["sha256"]), "revision": store["revision"],
             "base": base, "edits": edits, "reverted": store.get("reverted") or [], "journal": store.get("journal") or [],
             "commits": _clean_commits(store.get("commits")), "archived": store.get("archived") or [],
-            "stale": store.get("stale")}
+            "stale": store.get("stale"), "published_through": _clean_through(store.get("published_through")),
+            "changesets": _clean_changesets(store.get("changesets"))}
 
 
 def _save_store(settings: dict, target: dict, store: dict) -> None:
@@ -822,7 +852,7 @@ def reader(settings: dict, engine: hydra.Engine, target: dict) -> dict:
         # A view behind the head keeps answering from the working copy it has, labelled with the generation it came from.
         if Path(state.get("fork_gpr", "")).is_file():
             return open_program(engine, state["fork_gpr"], target["program"], target["sha256"])
-        refuse_stale(store, target, "read")
+        refuse_stale(store, target, "read", settings)
     if state.get("state") != wanted or not Path(state.get("fork_gpr", "")).is_file():
         if heavy(store):
             rebuilding(settings, target)
@@ -899,7 +929,7 @@ def edit(settings: dict, engine: hydra.Engine, target: dict, address: str, optio
     clean = {**_edit(record), "by": _attribution(), "at": time.time()}
     with view_lock(settings, target):
         store = load_store(settings, target)
-        refuse_stale(store, target, "type_edit")
+        refuse_stale(store, target, "type_edit", settings)
         subjects = revisions.subjects_of(address, clean["options"])
         decision = reconcile(store, expect, subjects)
         if len(store["edits"]) >= MAX_OVERLAYS:
@@ -947,7 +977,7 @@ def add_proposals(settings: dict, engine: hydra.Engine, target: dict, records: l
     subjects = sorted({subject for item in clean for subject in revisions.subjects_of(item["address"], item["options"])})
     with view_lock(settings, target):
         store = load_store(settings, target)
-        refuse_stale(store, target, "import_bundle")
+        refuse_stale(store, target, "import_bundle", settings)
         decision = reconcile(store, expect, subjects)
         if len(store["edits"]) + len(clean) > MAX_OVERLAYS:
             raise ValueError("overlay history limit reached; export/review it before adding more edits")
@@ -991,7 +1021,7 @@ def revert(settings: dict, target: dict, ids: list[str], expect: int | None = No
     require_revision(settings, target, expect, "revert")
     with view_lock(settings, target):
         store = load_store(settings, target)
-        refuse_stale(store, target, "revert")
+        refuse_stale(store, target, "revert", settings)
         dropped = _selected(store, ids)
         if not dropped:
             raise ValueError("no overlay record or batch matches %s" % ", ".join(ids))

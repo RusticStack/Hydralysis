@@ -130,6 +130,11 @@ class QueryRunner:
         view = options.pop("view", "")
         if action == "type_edit" and options.get("kind") in ("commit", "commit_revert", "commit_abort"):
             return self._commit(target, options, view, timeout_s)
+        if action == "type_edit" and options.get("kind") in ("publish", "merge", "rebase"):
+            return self._views(target, options, view, timeout_s)
+        if action == "status" and options.get("show") in ("queue", "publish"):
+            selected = workcopy.with_view(self.target(target), view)
+            return json.dumps(_public(self.queue(selected, options.get("csid"))), ensure_ascii=False)
         if action == "status" and options.get("show") == "lineage":
             selected = workcopy.with_view(self.target(target), view)
             return json.dumps(_public({"target": {key: selected[key] for key in ("name", "program", "sha256", "view")},
@@ -223,6 +228,44 @@ class QueryRunner:
             raise RuntimeError(json.dumps(error.payload())) from error
         return json.dumps({**job, "cid": clean["cid"], "view": view, "view_revision": workcopy.load_store(self.settings, selected)["revision"]},
                           ensure_ascii=False)
+
+    def _views(self, target: str, options: dict, view: str, timeout_s: int) -> str:
+        """`type_edit kind=rebase|merge|publish` (4.7, 4.8, 4.10). Rebase and the merge of a view into another answer at once;
+        a publish to the master seals a changeset and answers with a job and its position in the queue."""
+        from hydralysis import commits, overlayjobs, views
+        selected = workcopy.with_view(self.target(target), view)
+        view = selected["view"]
+        try:
+            clean = views.validate(options)
+            if clean["kind"] == "rebase":
+                return json.dumps(_public(views.rebase(self.settings, self.engine, selected, clean, timeout_s)), ensure_ascii=False)
+            if clean["kind"] == "merge" or clean.get("to"):
+                other = workcopy.with_view(self.target(target), clean["from"] if clean["kind"] == "merge" else clean["to"])
+                source, destination = (other, selected) if clean["kind"] == "merge" else (selected, other)
+                return json.dumps(_public(views.merge(self.settings, self.engine, source, destination, clean, timeout_s)), ensure_ascii=False)
+            sealed = views.seal_changeset(self.settings, selected, clean)
+            if sealed.get("state") == "done":  # the same records were decided while this call was being made
+                return json.dumps({**sealed, "view": view}, ensure_ascii=False)
+            job = overlayjobs.start(self.settings, selected["name"], "publish", "", {"csid": sealed["csid"], "lineage": sealed["lineage"]},
+                                    view=view)
+        except (views.ViewError, commits.CommitError) as error:
+            raise RuntimeError(json.dumps(error.payload())) from error
+        except lineage.LineageError as error:
+            raise RuntimeError(json.dumps(error.payload())) from error
+        return json.dumps({**job, "csid": sealed["csid"], "reused": sealed["reused"], "view": view,
+                           "publish_pending": {key: sealed.get(key) for key in ("state", "csid", "position", "etaMs", "leader")},
+                           "position": sealed.get("position"), "etaMs": sealed.get("etaMs"),
+                           "view_revision": workcopy.load_store(self.settings, selected)["revision"]}, ensure_ascii=False)
+
+    def queue(self, selected: dict, csid: str | None = None) -> dict:
+        """`status show=queue`: the publish queue of the target's lineage."""
+        from hydralysis import views
+        link = selected.get("lineage")
+        if not link:
+            return {"target": {key: selected[key] for key in ("name", "view")}, "lineage": None,
+                    "queue": {"length": 0, "leader": False, "changesets": []},
+                    "note": "no publish has been made on this target; there is no queue"}
+        return {"target": {key: selected[key] for key in ("name", "view")}, **views.queue_status(self.settings, link["id"], csid)}
 
     def _ask(self, selected: dict, request: dict, timeout_s: int) -> dict:
         expected_state = workcopy.expected_state(self.settings, selected)
