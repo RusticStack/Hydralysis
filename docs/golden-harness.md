@@ -34,13 +34,13 @@ line up.
 
 | `--path` | What runs | Why it exists |
 | --- | --- | --- |
-| `production` | One `RusticQuery.java` `decompile` request per function through the same `query.run_script` the MCP tools and the export job use. Since 0.5.0 `RusticQuery` calls `DecompileOptions.grabFromProgram` (through one helper, before `openProgram`), so it decompiles on the program's own options, as the Ghidra window does. Before 0.5.0 it opened `DecompInterface` without `setOptions` and ran on the native defaults, so a capture made then is not comparable with one made now. Hydra only. | This is what agents get. |
-| `explicit` | `tools/golden/GoldenExport.java`, one script run for the whole program, with `DecompileOptions` set explicitly. `--options-mode fixed` (default) sets a documented list and reads nothing from the program; `--options-mode program` also calls `grabFromProgram`, which is what the Ghidra window does. The header carries every option value and a hash of them. | The same source runs under Hydra's `script` command and under stock `analyzeHeadless`, so two engines are compared with one driver and identical options. |
+| `production` | One `RusticQuery.java` `decompile` request per function through the same `query.run_script` the MCP tools and the export job use. Since 0.5.0 `RusticQuery` calls `DecompileOptions.grabFromProgram` (through one helper, before `openProgram`), so it decompiles on the program's own options (`DecompileOptions.grabFromProgram`). Before 0.5.0 it opened `DecompInterface` without `setOptions` and ran on the native defaults, so a capture made then is not comparable with one made now. Hydra only. | This is what agents get. |
+| `explicit` | `tools/golden/GoldenExport.java`, one script run for the whole program, with `DecompileOptions` set explicitly. `--options-mode fixed` (default) sets a documented list and reads nothing from the program; `--options-mode program` also calls `grabFromProgram`, which is `DecompileOptions.grabFromProgram`. The header carries every option value and a hash of them. | The same source runs under Hydra's `script` command and under stock `analyzeHeadless`, so two engines are compared with one driver and identical options. |
 
 The options change the output (calling conventions printed on the signature, `in_ECX` versus a
 `this` parameter, constants in read-only memory folded or left as `DAT_` names). `production` and
 `explicit --options-mode program` use the same options and produce the same C (see
-[Parity](#parity-of-the-production-path-with-the-ghidra-window)); `explicit` with the default
+[Parity](#parity-of-the-production-path-with-decompileoptionsgrabfromprogram)); `explicit` with the default
 `--options-mode fixed` reads nothing from the program and differs from both. Never diff captures
 of different options for a gate; `diff` refuses unless `--allow-mismatch`. Compare like with like.
 
@@ -124,12 +124,12 @@ decompile path between the two captures fails the gate (`--allow-mismatch` makes
 The thresholds are a starting proposal: tune them after the first real merge gate, and write down
 why.
 
-## Parity of the production path with the Ghidra window
+## Parity of the production path with `DecompileOptions.grabFromProgram`
 
 `RusticQuery` used to open its decompiler without `setOptions`. The first baselines (2026-10-27,
 Hydra 12.3-hydra.2) showed what that cost, and the comparison that shows it is the easy one to
 get wrong: `explicit` in its default `fixed` mode reads nothing from the program, so it loses the
-calling conventions (`in_ECX` locals instead of `this`) and is the wrong oracle for the window.
+calling conventions (`in_ECX` locals instead of `this`) and is the wrong oracle for the program's own options.
 The right one is `explicit --options-mode program`.
 
 Counts only; the C text of a game stays local. KotOR 1 (8,616 functions), hydra-2 engine:
