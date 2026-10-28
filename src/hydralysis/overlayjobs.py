@@ -74,7 +74,7 @@ def start(settings: dict, target: str, kind: str, address: str = "", options: di
         token = jobowner.issue(record)
         write_json(path, record)
         keys = ("root", "hydra_dir", "hydra_client", "java_home", "hydra_idle_s", "hydra_keep_warm_s", "hydra_max_heap",
-                "hydra_allow_unpinned", "hydra", "fork_mode", "fork_max_copy_mb", "forbidden_drives", "targets", "overlay_save_debounce_s")
+                "hydra_allow_unpinned", "hydra", "fork_mode", "fork_max_copy_mb", "forbidden_drives", "targets", "expected_agents")
         write_json(path.parent / "settings.json", {key: settings[key] for key in keys if key in settings})
         env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent),
                    HYDRALYSIS_HARNESS=hydra.identity()["harness"])

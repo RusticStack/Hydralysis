@@ -181,10 +181,13 @@ class FakeClientModule:
 class FakeEngine:
     """The interface Hydralysis uses from hydra.Engine."""
 
-    def __init__(self, settings: dict, role: str = "reader"):
+    def __init__(self, settings: dict, role: str = "reader", start: bool = True, lane: str = ""):
         self.settings = settings
         self.role = role
-        self.key = "fake|" + role
+        self.lane = lane
+        # One daemon connection per (role, lane): a writer of one view leaving does not release another view's programs.
+        self.conn = role + ("|" + lane if lane else "")
+        self.key = "fake|" + self.conn
         self.daemon = DAEMON
         self.writable: set[str] = set()  # program keys this connection may write
 
@@ -193,7 +196,7 @@ class FakeEngine:
         # Like the real daemon: committed changes in shared mode stay, the writer leaves.
         for key in self.writable:
             program = self._program(key)
-            program["writers"].discard(self.role)
+            program["writers"].discard(self.conn)
         self.writable.clear()
 
     def hello(self):
@@ -251,7 +254,7 @@ class FakeEngine:
             raise EngineError("not_found", "no program " + path)
         key = "%s:%s" % (project, "/" + path.lstrip("/"))
         if writable:
-            program["writers"].add(self.role)
+            program["writers"].add(self.conn)
             self.writable.add(key)
             if program["live"] is None:
                 program["live"] = copy.deepcopy(program["saved"])
@@ -271,8 +274,12 @@ class FakeEngine:
 
     def _close_project(self, project, discard=False, **_):
         for key in [key for key in self.writable if key.startswith(project + ":")]:
-            self._program(key)["writers"].discard(self.role)
+            self._program(key)["writers"].discard(self.conn)
             self.writable.discard(key)
+        if discard:
+            # Closing with discard drops the unsaved changes of the project's programs and keeps its folder.
+            for program in self.daemon.project_by_id(project)["programs"].values():
+                program["live"] = None
         return {"closed": True}
 
     def _close_program(self, program, **_):
@@ -333,7 +340,7 @@ class FakeEngine:
                     if options.get("kind") == "rename":
                         staged["names"][edit["address"]] = options["name"]
                 else:
-                    staged["marker"] = json.dumps(batch["state"], separators=(",", ":"))
+                    staged["marker"] = "" if batch["state"] is None else json.dumps(batch["state"], separators=(",", ":"))
                     entry["live"] = staged
                     out["overlay_state"] = staged["marker"]
         elif action == "decompile":

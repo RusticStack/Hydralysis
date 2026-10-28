@@ -40,7 +40,10 @@ def _prepare(cls, source, label, target):
     binary = cls.root / "fixture.exe"
     shutil.copy2(source, binary)
     cls.settings = {"root": str(cls.root / "data"), "hydra_dir": ENGINE, "hydra_client": CLIENT,
-                    "hydra_idle_s": 600, "overlay_save_debounce_s": 2}
+                    "hydra_idle_s": 600}
+    if _env("INTEGRATION_UNPINNED"):
+        # An engine that is not the release this Hydralysis pins (for instance the published hydra.3 before Y4a bumps the pin).
+        cls.settings["hydra_allow_unpinned"] = True
     if _env("INTEGRATION_JAVA"):
         cls.settings["java_home"] = _env("INTEGRATION_JAVA")
     query._keys.clear()

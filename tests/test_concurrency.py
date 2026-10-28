@@ -13,11 +13,10 @@ Run only against a real Hydra engine (HYDRALYSIS_INTEGRATION_ENGINE and HYDRALYS
 test_engine_integration.py): the same store cases through `QueryRunner.query`, Barrier-started parallel queries at
 N = 2, 3 and `maxLong` + 1, and the two known issues below.
 
-Known issues (red by design until Y2): the multithread `_sync` test (4 and 12 threads building 4 and 12 views in one
-process; the measured `no_project` error, BP20) and the single-base test (N concurrent first-view builds must make
-one base, BP19). They are marked `expectedFailure`, so the suite is green while the defect exists and turns red
-("unexpected success") the day it is fixed: Y2 then deletes the `@known_issue` line. To see them fail as ordinary
-tests set HYDRALYSIS_KNOWN_ISSUES=run.
+The two former known issues (Y2 fixed them, so their markers are gone): the multithread `_sync` test (4 and 12 threads
+building 4 and 12 views in one process; the measured `no_project` error, BP20) and the single-base test (N concurrent
+first-view builds make one base, BP19). `known_issue` stays as the harness for any later defect that is recorded before
+its fix; HYDRALYSIS_KNOWN_ISSUES=run turns such markers off.
 """
 
 from __future__ import annotations
@@ -563,9 +562,8 @@ class Overlap:
 
 @NEEDS_ENGINE
 class SyncThreadSafety(unittest.TestCase):
-    """BP20: `workcopy._sync` shares one writer connection per process, so one sync's disconnect closes the
-    projects another sync is using (`no_project`). Red by design until Y2 gives each sync its own, or a
-    reference-counted, connection.
+    """BP20: `workcopy._sync` shared one writer connection per process, so one sync's disconnect closed the
+    projects another sync was using (`no_project`). Y2 gives each view's sync a connection of its own.
 
     The schedule is forced (see Overlap): left to chance, 4 threads passed in one of two measured runs."""
 
@@ -595,19 +593,17 @@ class SyncThreadSafety(unittest.TestCase):
         self.assertEqual(errors, [], "%d of %d views failed" % (len(errors), count))
         self.assertEqual([value["revision"] for _, value, _ in found], [1] * count)
 
-    @known_issue
     def test_4_threads_build_4_views_in_one_process(self):
         self.build_views(4)
 
-    @known_issue
     def test_12_threads_build_12_views_in_one_process(self):
         self.build_views(12)
 
 
 @NEEDS_ENGINE
 class SingleBase(unittest.TestCase):
-    """BP19: the base (the master in the engine's database format) is built once per master revision. Today every
-    view builds its own, so N concurrent first views make N bases. Red by design until Y2.
+    """BP19: the base (the master in the engine's database format) is built once per master revision. It used to be
+    built by every view, so N concurrent first views made N bases; now one caller builds it and the rest wait for it.
 
     The count is the `fork_project` calls whose destination is a `base-*` folder, as each client sees them."""
 
@@ -623,7 +619,6 @@ class SingleBase(unittest.TestCase):
     def tearDownClass(cls):
         release(cls)
 
-    @known_issue
     def test_concurrent_first_view_builds_make_one_base(self):
         # Four clients (processes, so that the writer-connection defect of SyncThreadSafety is not in the way),
         # each building the first version of its own view of the same master at the same moment.
