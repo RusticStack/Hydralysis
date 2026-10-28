@@ -84,7 +84,15 @@ def window_counts(directory: Path, from_sequence: int, to_sequence: int | None) 
 
 def summarize(directory: Path, session: str, record: dict, stop: dict, hooks: list[dict], end_counters: dict,
               totals: dict, log: dict) -> dict:
-    """The coverage and limitations of a closed capture, from the log window and the probes' own counters."""
+    """The coverage and limitations of a closed capture, from the log window and the probes' own counters.
+
+    Limits of the word "complete": the baseline and end counters are read in calls of their own, apart from the
+    start and stop marker writes. For a probe that is still firing, an event counted just before the stop marker
+    but delivered after it reads as lost, and an event in flight from before the start marker reads as extra; the
+    two can cancel, so seen == recorded does not prove that no event is missing at the window's edges. "complete"
+    is exact for a quiet probe and a statement about the counters, not a proof, for a live one (the diagnostics of
+    a complete capture say so).
+    """
     window = window_counts(directory, record["from_sequence"], stop["n"])
     start_totals = record["baseline"]["counters"]
     delta = {key: totals.get(key, 0) - start_totals.get(key, 0) for key in DELTA_KEYS}
@@ -123,8 +131,10 @@ def summarize(directory: Path, session: str, record: dict, stop: dict, hooks: li
     elif bounding:
         coverage = {"status": "partial", "limitations": bounding}
     else:
-        coverage = {"status": "complete", "diagnostics": ["every event of %d installed probe(s) was recorded; code no "
-                                                           "probe watched is not covered" % len(rows)]}
+        coverage = {"status": "complete", "diagnostics": [
+            "every event of %d installed probe(s) was recorded; code no probe watched is not covered" % len(rows),
+            "counted against the probes' own counters, read apart from the window's markers: an event in flight at "
+            "either edge of a probe that keeps firing can offset another"]}
     codes = sorted(limits | ({"coverage_unknown"} if coverage["status"] == "unknown" else set()))
     return {"events_recorded": window["events"], "hooks": rows, "counters": delta, "coverage": coverage,
             "limitations": codes, "log": {"head": log.get("head"), "records": log.get("records")},
