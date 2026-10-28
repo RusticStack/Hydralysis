@@ -142,6 +142,18 @@ class ContentAddressedId(Ledger):
             evidence.query(self.db, "cp")
         self.assertEqual(caught.exception.code, "evidence_unreadable")
 
+    def test_restating_a_superseding_claim_is_idempotent_even_after_its_predecessor_is_superseded(self):
+        self.add()
+        first = self.add(note="second", supersedes=1)
+        self.assertIn("stored", first)
+        again = self.add(note="second", supersedes=1)  # claim 1 is already superseded by claim 2
+        self.assertIn("already stored", again)
+        self.assertEqual(len(evidence.query(self.db, "cp", include_superseded=True)), 2)
+        with self.assertRaises(ValueError) as caught:  # a different successor of claim 1 is still refused
+            self.add(note="third", supersedes=1)
+        self.assertIn("already superseded", str(caught.exception))
+        self.assertEqual(len(evidence.query(self.db, "cp", include_superseded=True)), 2)
+
     def test_a_claim_stated_twice_is_one_row(self):
         self.add()
         message = self.add()
