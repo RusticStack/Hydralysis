@@ -363,15 +363,51 @@ class IdleFolders(RunnerWorld, unittest.TestCase):
         self.assertEqual(self.seen("gone", A), "Kept-in-the-store", "and the view is rebuilt from the base and the store")
 
     def test_a_view_with_a_live_holder_or_a_recent_use_keeps_its_folder(self):
+        """The idle time `viewIdleDeleteS` (86400 s) decides, with the fork closed in the engine so that nothing else keeps the folder."""
+        limit = viewgov.limits(self.settings)["idle_delete_s"]
+        self.assertEqual(limit, 86400)
         lid = self.rename("live", "Live", A)["base"]["lineage"]
         self.rename("recent", "Recent", B)
         name = self.view_of("recent")
+        recent = time.time()
         record = views.read_record(self.settings, lid, name)
-        durable.write_sealed(views.record_path(self.settings, lid, name), {**record, "holders": {}, "lease_until": 0})
-        old = time.time() + 90_000  # a clock a day and an hour ahead
-        removed = viewgov.delete_idle_folders(self.settings, self.runner.target("owned"), lid, self.runner.engine, now=old - 3000)
-        self.assertEqual(removed, [], "the live holder's folder and the recently used folder stay")
-        self.assertTrue(workcopy._directory(self.settings, self.target(name)).is_dir())
+        durable.write_sealed(views.record_path(self.settings, lid, name),
+                             {**record, "holders": {}, "lease_until": 0, "last_seen": recent})
+        folder = workcopy._directory(self.settings, self.target(name))
+        live_name = self.view_of("live")
+        live_folder = workcopy._directory(self.settings, self.target(live_name))
+        held = views.read_record(self.settings, lid, live_name)  # last used long ago, but this process holds it for a year
+        durable.write_sealed(views.record_path(self.settings, lid, live_name), {
+            **held, "last_seen": recent - 10 * limit,
+            "holders": {boot: {**holder, "lease_until": recent + 365 * limit} for boot, holder in held["holders"].items()}})
+        self.assertEqual(views.holder_state(views.read_record(self.settings, lid, live_name), recent + limit * 30), "mine")
+        self.assertTrue(self.evict("recent"))  # the fork is closed: only the record's age and holder are left to decide
+        for project in self.daemon.projects.values():  # the fake lists a project forever; a real engine stops listing a closed one
+            project.pop("id", None)
+        # last used a minute ago and one hour short of the limit: kept. The live holder's view is kept at any age.
+        for now in (recent + 60, recent + limit - 3600):
+            removed = viewgov.delete_idle_folders(self.settings, self.runner.target("owned"), lid, self.runner.engine, now=now)
+            self.assertEqual(removed, [], "a recent use keeps the folder (now = last_seen + %d s)" % (now - recent))
+            self.assertTrue(folder.is_dir())
+        removed = viewgov.delete_idle_folders(self.settings, self.runner.target("owned"), lid, self.runner.engine, now=recent + limit * 30)
+        self.assertEqual(removed, [name], "the live holder's view stays at any age, the idle one is deleted")
+        self.assertFalse(folder.exists())
+        self.assertTrue(live_folder.is_dir(), "the folder of the view with a live holder stays")
+        self.assertNotEqual(views.read_record(self.settings, lid, live_name).get("state"), "deleted")
+
+    def test_the_folder_is_deleted_only_once_the_last_use_is_older_than_the_limit(self):
+        limit = viewgov.limits(self.settings)["idle_delete_s"]
+        lid = self.rename("edge", "Edge", A)["base"]["lineage"]
+        name = self.view_of("edge")
+        last = time.time()
+        record = views.read_record(self.settings, lid, name)
+        durable.write_sealed(views.record_path(self.settings, lid, name), {**record, "holders": {}, "lease_until": 0, "last_seen": last})
+        self.evict("edge")
+        for project in self.daemon.projects.values():
+            project.pop("id", None)
+        target = self.runner.target("owned")
+        self.assertEqual(viewgov.delete_idle_folders(self.settings, target, lid, self.runner.engine, now=last + limit - 1), [])
+        self.assertEqual(viewgov.delete_idle_folders(self.settings, target, lid, self.runner.engine, now=last + limit + 1), [name])
 
     def test_nothing_the_deletion_does_touches_a_store_a_generation_or_the_master(self):
         lid = self.rename("gone", "X", A)["base"]["lineage"]
