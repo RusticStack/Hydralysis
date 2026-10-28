@@ -236,11 +236,132 @@ def partial(response: dict) -> bool:
     return False
 
 
+CHECKPOINT_S = 1.0
+SNAPSHOT_VERSION = 1
+
+
+def item_key(selected: dict, item: dict) -> str:
+    return str(item.get("path") if selected["mode"] == "types" else item.get("address") or "")
+
+
+def filtered(selected: dict, page: dict, pattern, end) -> tuple[list, dict]:
+    """The rows of one enumeration page that the options select (the same rule for the snapshot and the export)."""
+    page_action = "types" if selected["mode"] == "types" else "functions"
+    items = page.get("types" if page_action == "types" else "functions")
+    if not isinstance(items, list):
+        raise Paused("query returned no enumeration rows")
+    if end is not None and page_action == "functions":
+        beyond = [item for item in items if int(str(item.get("address", "0")), 16) > end]
+        if beyond:
+            items = [item for item in items if item not in beyond]
+            page = {**page, "truncated": False}
+    if pattern is not None:
+        items = [item for item in items
+                 if pattern.search(str(item.get("path") if selected["mode"] == "types" else item.get("name") or ""))]
+    return items, page
+
+
+def snapshot_path(path: Path) -> Path:
+    return path.parent / "snapshot.json"
+
+
+def keys_sha256(keys: list) -> str:
+    return hashlib.sha256("\n".join(keys).encode("utf-8")).hexdigest()
+
+
+def load_snapshot(path: Path, record: dict) -> dict | None:
+    """The snapshot taken at export start, verified against the digest the job recorded; None when none was built yet."""
+    destination = snapshot_path(path)
+    recorded = record.get("snapshot_sha256")
+    if not destination.is_file():
+        if recorded:
+            raise ValueError("export snapshot is missing; resume refused; output preserved")
+        return None
+    snapshot = read_json(destination)
+    keys = snapshot.get("keys")
+    if (snapshot.get("version") != SNAPSHOT_VERSION or not isinstance(keys, list) or snapshot.get("job") != record["id"]
+            or snapshot.get("count") != len(keys) or snapshot.get("keys_sha256") != keys_sha256(keys)
+            or snapshot.get("build_sha256") != record["provenance"]["sha256"]
+            or (recorded and snapshot["keys_sha256"] != recorded)):
+        raise ValueError("export snapshot changed or is invalid; resume refused; output preserved")
+    return snapshot
+
+
+def engine_total(runner, record) -> int | None:
+    """The engine's own count of every function in the program (internal and external), from its open_program reply.
+
+    None when the runner is not backed by an engine (the unit tests' fakes) or the engine does not say."""
+    try:
+        from hydralysis import query
+        selected = workcopy.with_view(runner.target(record["target"]), record["options"].get("view", ""))
+        value = query.open_program(runner.engine, selected["gpr"], selected["program"], selected["sha256"]).get("functions")
+    except Exception:
+        return None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def build_snapshot(path: Path, record: dict, runner, pattern, end, cancelled) -> dict | None:
+    """Enumerate the selected corpus once, before the first row: the expected count and the keys the export must cover.
+
+    The expected count is what the engine enumerates (for functions: its internal functions, thunks included; external
+    ones are not enumerated). Returns None when a cancel arrived during the enumeration."""
+    selected = record["options"]
+    page_action = "types" if selected["mode"] == "types" else "functions"
+    keys, seen, cursor = [], set(), str(selected.get("start") or "")
+    update(path, stage="taking the export snapshot")
+    while True:
+        if cancelled():
+            return None
+        frozen(record)
+        page = _query(runner, record, page_action, limit=100, cursor=cursor,
+                      contains=selected["contains"], timeout_s=selected["timeout_s"])
+        items, page = filtered(selected, page, pattern, end)
+        for item in items:
+            key = item_key(selected, item)
+            if not key:
+                raise Paused("enumeration returned a row with no address/path key")
+            if key in seen:
+                raise Paused("enumeration returned the same key twice: " + key)
+            seen.add(key)
+            keys.append(key)
+        next_cursor = str(page.get("next_cursor") or "")
+        if not page.get("truncated"):
+            break
+        if not next_cursor or next_cursor == cursor:
+            raise Paused("enumeration made no cursor progress; export paused")
+        cursor = next_cursor
+    snapshot = {"version": SNAPSHOT_VERSION, "job": record["id"], "build_sha256": record["provenance"]["sha256"],
+                "mode": selected["mode"], "taken_at": time.time(), "count": len(keys), "keys_sha256": keys_sha256(keys),
+                "engine_function_total": engine_total(runner, record) if selected["mode"] != "types" else None,
+                "keys": keys}
+    write_json(snapshot_path(path), snapshot)
+    update(path, snapshot_sha256=snapshot["keys_sha256"], snapshot_count=len(keys),
+           engine_function_total=snapshot["engine_function_total"])
+    return snapshot
+
+
+def parity(snapshot: dict, selected: dict, progress: dict) -> dict:
+    """Written plus failed rows against the expected count, kept apart from whether every row succeeded."""
+    expected_keys = snapshot["keys"][:selected["limit"]]
+    listed = set(snapshot["keys"])
+    expected = len(expected_keys)
+    missing = sum(1 for key in expected_keys if key not in progress["keys"])
+    unexpected = sum(1 for key in progress["keys"] if key not in listed)
+    accounted = progress["succeeded"] + progress["failed"]
+    return {"expected": expected, "written": progress["succeeded"], "failed": progress["failed"], "accounted": accounted,
+            "missing": missing, "unexpected": unexpected, "snapshot_count": snapshot["count"],
+            "engine_function_total": snapshot.get("engine_function_total"),
+            "non_internal": (snapshot["engine_function_total"] - snapshot["count"]
+                             if isinstance(snapshot.get("engine_function_total"), int) else None),
+            "ok": accounted == expected and missing == 0 and unexpected == 0}
+
+
 def run(path: Path, generation: str, runner_factory=QueryRunner):
     lease = LaneLock(str(path.parent / ".run.lock"))
     if not lease.acquire():
         return
     started = time.monotonic()
+    progress = None
     def finish(**changes):
         return update(path, finished_at=time.time(), elapsed_run_s=round(time.monotonic() - started, 3), **changes)
     try:
@@ -281,6 +402,16 @@ def run(path: Path, generation: str, runner_factory=QueryRunner):
         end = int(selected["end"], 16) if selected.get("end") else None
         output = output_path(path, record)
         exhausted = False
+        cancelled = lambda: bool(read_json(path).get("cancel_requested"))
+        snapshot = load_snapshot(path, record)
+        if snapshot is None:
+            snapshot = build_snapshot(path, record, runner, pattern, end, cancelled)
+            if snapshot is None:
+                finish(state="cancelled", stage="cancelled during the export snapshot", complete=False, all_succeeded=False,
+                       **progress_fields())
+                return
+        snapshot_keys = set(snapshot["keys"])
+        last_checkpoint = 0.0
         with output.open("a", encoding="utf-8", newline="\n") as handle:
             while progress["completed"] < selected["limit"]:
                 if read_json(path).get("cancel_requested"):
@@ -290,21 +421,13 @@ def run(path: Path, generation: str, runner_factory=QueryRunner):
                 page_action = "types" if selected["mode"] == "types" else "functions"
                 page = _query(runner, record, page_action, limit=100, cursor=cursor,
                               contains=selected["contains"], timeout_s=selected["timeout_s"])
-                items = page.get("types" if page_action == "types" else "functions")
-                if not isinstance(items, list):
-                    raise Paused("query returned no enumeration rows")
-                if end is not None and page_action == "functions":
-                    beyond = [item for item in items if int(str(item.get("address", "0")), 16) > end]
-                    if beyond:
-                        items = [item for item in items if item not in beyond]
-                        page = {**page, "truncated": False}
-                if pattern is not None:
-                    items = [item for item in items
-                             if pattern.search(str(item.get("path") if selected["mode"] == "types" else item.get("name") or ""))]
+                items, page = filtered(selected, page, pattern, end)
                 for item in items:
-                    key = str(item.get("path") if selected["mode"] == "types" else item.get("address") or "")
+                    key = item_key(selected, item)
                     if not key:
                         raise Paused("enumeration returned a row with no address/path key")
+                    if key not in snapshot_keys:
+                        raise Paused("enumeration returned %s, which the export snapshot does not list; the corpus changed" % key)
                     if key in progress["keys"]:
                         continue
                     if progress["completed"] >= selected["limit"]:
@@ -349,8 +472,12 @@ def run(path: Path, generation: str, runner_factory=QueryRunner):
                     progress["completed"] += 1
                     progress["succeeded" if row["state"] == "done" else "failed"] += 1
                     progress["truncated"] += bool(row["truncated"])
-                    update(path, stage="exporting " + key, current=key, output_bytes=output.stat().st_size, **progress_fields())
-                pending_in_page = any(str(item.get("path") if selected["mode"] == "types" else item.get("address") or "") not in progress["keys"] for item in items)
+                    # The fsynced row is the durable record (a resume replays the file); job.json is only a progress view,
+                    # so it is rewritten at most once per CHECKPOINT_S (the first row always), not once per row.
+                    if time.monotonic() - last_checkpoint >= CHECKPOINT_S:
+                        update(path, stage="exporting " + key, current=key, output_bytes=output.stat().st_size, **progress_fields())
+                        last_checkpoint = time.monotonic()
+                pending_in_page = any(item_key(selected, item) not in progress["keys"] for item in items)
                 if pending_in_page:
                     # A requested count cap may stop in the middle of a page.
                     # Do not advance past entries that were never exported.
@@ -364,11 +491,16 @@ def run(path: Path, generation: str, runner_factory=QueryRunner):
                 cursor = next_cursor
                 update(path, cursor=cursor)
         limited = not exhausted and progress["completed"] >= selected["limit"]
-        finish(state="done", stage="finished", limited=limited,
-               complete=exhausted and progress["failed"] == 0 and progress["truncated"] == 0,
+        agreement = parity(snapshot, selected, progress)
+        # all_succeeded: every exported row is a success. parity: every expected row was written or failed. They differ
+        # when a known function fails (parity holds, all_succeeded does not) or when rows are missing.
+        all_succeeded = progress["failed"] == 0 and progress["truncated"] == 0
+        finish(state="done", stage="finished", limited=limited, parity=agreement, all_succeeded=all_succeeded,
+               complete=exhausted and all_succeeded and agreement["ok"],
                output_sha256=_sha(output), imports_sha256=_sha(path.parent / "imports.json"), **progress_fields())
     except Paused as exc:
-        finish(state="paused", stage="paused", error=str(exc)[:4000], complete=False)
+        counts = {name: progress[name] for name in ("completed", "succeeded", "failed", "truncated")} if progress else {}
+        finish(state="paused", stage="paused", error=str(exc)[:4000], complete=False, all_succeeded=False, **counts)
         print("EXPORT PAUSED:", str(exc), flush=True)
     except Exception as exc:
         finish(state="failed", stage="failed", error="%s: %s" % (type(exc).__name__, exc), complete=False)
