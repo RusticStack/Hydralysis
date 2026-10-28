@@ -70,6 +70,12 @@ workers: five failed; red log `_logs/Z5/red-ensure.log`). `ensure` now waits up 
 cancellation, and re-reads the backend state once it has the lock (the holder may have finished the install). The same
 tests are green (`_logs/Z5/green-ensure.log`) and so is the full matrix.
 
+*Ownership.* `src/hydralysis/backends.py` is a row of the 8.1 matrix owned by Y0a, not Z5, so this one edit is a declared
+amendment (12 lines, `ensure()` only; `check_ownership.py --package Z5` names exactly this file and no other). Y0a is
+already in the branch base (`c3b318b`, an ancestor of this branch and of `integration/w2`), no other `w2/*` branch
+touches the file, and a trial merge of this branch into `integration/w2` is conflict-free. The coordinator records the
+amendment or moves the hunk to a Y0a follow-up; the tests do not depend on which.
+
 ### Cancel and a killed worker
 
 Both start a prepare of `diff1.exe` (x64), wait until the daemon reports the import running, then interrupt it.
