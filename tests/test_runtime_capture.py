@@ -132,6 +132,30 @@ class EventChain(Case):
         self.assertEqual(result["records"], 3)
         self.assertEqual([event["sequence"] for event in read_events(self.directory, limit=10)["events"]], [1, 2, 3])
 
+    def test_a_flipped_byte_in_the_last_record_is_corrupt_not_torn(self):
+        self.logged(5)
+        data = bytearray((self.directory / LOG_NAME).read_bytes())
+        self.assertEqual(data[-1:], b"\n")
+        data[-12] ^= 0x01                      # inside the last, complete, LF-terminated record
+        (self.directory / LOG_NAME).write_bytes(bytes(data))
+        result = verify_log(self.directory, SESSION)
+        self.assertFalse(result["ok"])
+        self.assertNotIn("torn_tail", result)
+        self.assertEqual(result["first_bad"]["after_sequence"], 4)
+        self.assertEqual(result["records"], 4)
+        self.assertEqual([error for _, error in iter_records(self.directory / LOG_NAME)][-1], "corrupt")
+        self.assertEqual(read_events(self.directory, limit=10)["log_problem"], "corrupt")
+
+    def test_a_last_line_without_its_lf_is_torn_whether_or_not_it_parses(self):
+        self.logged(3)
+        path = self.directory / LOG_NAME
+        data = path.read_bytes()
+        path.write_bytes(data[:-1])            # a complete record that lost only its LF
+        result = verify_log(self.directory, SESSION)
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["torn_tail"])
+        self.assertEqual(result["records"], 2)
+
     def test_the_log_for_another_session_does_not_verify(self):
         self.logged(3)
         self.assertFalse(verify_log(self.directory, "b" * 32)["ok"])
@@ -317,6 +341,44 @@ class CaptureWindow(AgentCase):
         self.assertEqual(len(enters), 6)
         self.assertEqual(closed["coverage"]["status"], "complete")
         self.assertNotIn("event_ring_overflow", closed["limitations"])
+
+    def test_a_clipped_payload_makes_the_capture_partial(self):
+        self.start()
+        probe = self.hook(limit=20)
+        self.agent.message(probe["hook_id"], {"type": "send", "payload": {"event": "log", "hook_id": probe["hook_id"], "pad": "x" * 10000}})
+        closed = self.stop()
+        self.assertEqual(closed["counters"]["clipped"], 1)
+        self.assertEqual(closed["coverage"], {"status": "partial", "limitations": ["payload_clipped"]})
+        self.assertIn("payload_clipped", closed["limitations"])
+        self.assertIn("payload_clipped", closed["evidence"]["limitations"])
+
+    def test_clipped_data_makes_the_capture_partial_too(self):
+        self.start()
+        probe = self.hook(limit=20)
+        self.agent.message(probe["hook_id"], {"type": "send", "payload": {"event": "log", "hook_id": probe["hook_id"]}}, data=bytes(2000))
+        closed = self.stop()
+        self.assertEqual(closed["coverage"], {"status": "partial", "limitations": ["payload_clipped"]})
+
+    def test_a_clipped_payload_before_the_window_does_not_count(self):
+        probe = self.hook(limit=20)
+        self.agent.message(probe["hook_id"], {"type": "send", "payload": {"event": "log", "hook_id": probe["hook_id"], "pad": "x" * 10000}})
+        self.start()
+        closed = self.stop()
+        self.assertEqual(closed["counters"]["clipped"], 0)
+        self.assertEqual(closed["coverage"]["status"], "complete")
+
+    def test_a_failed_log_write_makes_the_capture_partial(self):
+        self.start()
+        probe = self.hook(limit=20)
+        with patch("hydralysis.runtime_events.os.write", side_effect=OSError(28, "no space")):
+            self.agent.message(probe["hook_id"], {"type": "send", "payload": {"event": "log", "hook_id": probe["hook_id"]}})
+        closed = self.stop()
+        self.assertEqual(closed["counters"]["log_failed"], 1)
+        self.assertEqual(closed["coverage"], {"status": "partial", "limitations": ["runtime:event_log_write_failed"]})
+        self.assertIn("runtime:event_log_write_failed", closed["evidence"]["limitations"])
+        with self.assertRaisesRegex(ValueError, "bounds what it covers"):
+            evidence.add_claim(self.root / "ledger.sqlite", game="t", build="1", kind="note", name="x", note="n", source="s",
+                               coverage="complete", limitations=closed["limitations"])
 
     def test_a_full_log_makes_the_capture_partial(self):
         self.agent.cleanup()

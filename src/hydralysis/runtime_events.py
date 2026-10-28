@@ -86,7 +86,13 @@ def _parse(line: bytes):
 def iter_records(path: Path):
     """Yield (record, error) for the log's lines: error is None for a valid line. Stops after the first bad line.
 
-    A bad last line without its LF is a torn tail (error "torn"); a bad line with more after it is "corrupt".
+    A last line without its LF is a torn tail (error "torn"): a writer killed mid-line. A line that has its LF
+    but fails its CRC or is not a record is "corrupt", wherever it sits, the last line included: a flipped byte
+    in the final record is not a torn write.
+
+    Limit: this relies on the writer putting each record and its LF in one write. A torn write that stopped exactly
+    after a complete record's last byte but before its LF is the one case that reads as a torn tail, and a cut that
+    lands exactly on a record boundary (after an LF) cannot be told from a clean end.
     """
     try:
         handle = open(path, "rb")
@@ -94,14 +100,12 @@ def iter_records(path: Path):
         return
     with handle:
         for line in handle:
-            complete = line.endswith(b"\n")
-            record = _parse(line[:-1] if complete else line)
-            if record is None:
-                rest = handle.read(1)
-                yield None, ("corrupt" if complete and rest else "torn")
-                return
-            if not complete:
+            if not line.endswith(b"\n"):
                 yield None, "torn"
+                return
+            record = _parse(line[:-1])
+            if record is None:
+                yield None, "corrupt"
                 return
             yield record, None
 
