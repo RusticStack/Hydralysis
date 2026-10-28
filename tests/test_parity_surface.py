@@ -85,12 +85,15 @@ class ParityTable(unittest.TestCase):
         import verify_fixtures
         for group in ("listing", "callgraph", "namemap"):
             self.assertIn(group, verify_fixtures.CHECKS)
-        source = Path(verify_fixtures.__file__).read_text(encoding="utf-8")
-        labels = set(re.findall(r'_check\("([a-z_]+)', source))
+        import inspect
+        by_group = {g: set(re.findall(r'_check\("([a-z_]+)', inspect.getsource(verify_fixtures.CHECKS[g])))
+                    for g in ("listing", "callgraph", "namemap")}
+        everything = set().union(*by_group.values())
         for tool, (_, evidence) in PARITY.items():
-            for group, label in re.findall(r"(listing|callgraph|namemap|documented_gaps)/([a-z_]+)", evidence):
-                self.assertIn(group, verify_fixtures.CHECKS, tool)
-                self.assertIn(label, labels, "%s cites %s/%s, which the harness never prints" % (tool, group, label))
+            for group, label in re.findall(r"\b(listing|callgraph|namemap)/([a-z_]+)", evidence):
+                self.assertIn(label, by_group[group], "%s cites %s/%s, which that group never prints" % (tool, group, label))
+            if "documented_gaps:" in evidence:
+                self.assertIn("documented_gaps", everything, tool)
 
     def test_documented_gaps_are_the_rows_the_mapping_calls_gaps(self):
         self.assertEqual({tool for tool, (verdict, _) in PARITY.items() if verdict == "gap"}, {"list_classes", "list_namespaces"})
