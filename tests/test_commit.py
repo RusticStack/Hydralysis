@@ -729,6 +729,225 @@ class Abort(World, unittest.TestCase):
         self.assertEqual(late.exception.code, "cancel_too_late")
 
 
+class AfterPublish(World, unittest.TestCase):
+    """Review round 1: once the CURRENT.log line exists the commit is the truth; nothing writes ABORTED over it."""
+
+    def test_a_finalize_that_fails_after_the_publish_leaves_the_log_at_published_and_recovery_rolls_forward(self):
+        self.edit("One", A)
+        cid = "c-fa5e0001"
+        original = commits.finalize
+        calls = []
+
+        def broken(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise commits.CommitError("finalize_failed", "records of the commit are not in the store: x")
+            return original(*args, **kwargs)
+        with patch.object(commits, "finalize", broken), self.assertRaises(commits.CommitError) as raised:
+            self.commit(cid=cid)
+        self.assertEqual(raised.exception.code, "finalize_pending")
+        lid = self.lineage_id()
+        self.assertEqual(self.head()["gen"], 1)
+        self.assertEqual(commits.last_steps(self.settings, lid, cid)["step"], "PUBLISHED")  # never ABORTED
+        self.assertEqual(self.store()["commits"], [])
+        with patch.object(commits, "finalize", broken):  # a read heals it: the line is the truth
+            self.assertEqual(self.name_of(A), "One")
+        self.assertEqual([entry["cid"] for entry in self.store()["commits"]], [cid])
+        self.assertEqual(self.pending_ids(), [])
+        self.assertEqual(commits.last_steps(self.settings, lid, cid)["step"], "FINALIZED")
+        self.oracle({})
+
+    def test_a_lock_failure_in_finalize_takes_the_same_path(self):
+        self.edit("One", A)
+        cid = "c-fa5e0002"
+        original = commits.finalize
+        calls = []
+
+        def busy(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError(json.dumps({"error": "busy", "what": "view lock"}))
+            return original(*args, **kwargs)
+        with patch.object(commits, "finalize", busy), self.assertRaises(commits.CommitError) as raised:
+            self.commit(cid=cid)
+        self.assertEqual(raised.exception.code, "finalize_pending")
+        self.assertEqual(commits.last_steps(self.settings, self.lineage_id(), cid)["step"], "PUBLISHED")
+        again = self.commit(cid=cid)  # a resubmission is answered from the log, not repeated
+        self.assertEqual(again["generation"], 1)
+        self.assertEqual(len(self.published(cid)), 1)
+        self.assertEqual(self.pending_ids(), [])
+
+    def test_a_revert_of_a_selected_record_during_a_commit_is_refused_and_the_commit_finalizes(self):
+        self.edit("One", A)
+        selected_ids = self.ids()
+        cid = "c-fa5e0003"
+        original = commits.Intent.write
+        seen = {}
+
+        def write(intent, step, **data):
+            original(intent, step, **data)
+            if step == "SEALED" and not seen:
+                with self.assertRaises(RuntimeError) as raised:
+                    workcopy.revert(self.settings, self.target(), selected_ids, expect=self.store()["revision"])
+                seen["error"] = json.loads(str(raised.exception))
+        with patch.object(commits.Intent, "write", write):
+            answer = self.commit(cid=cid)
+        self.assertEqual(seen["error"]["error"], "commit_in_flight")
+        self.assertEqual(seen["error"]["ids"], selected_ids)
+        self.assertEqual(answer["generation"], 1)
+        self.assertEqual([entry["cid"] for entry in self.store()["commits"]], [cid])
+        self.assertEqual(self.name_of(A), "One")
+        self.oracle({})
+
+    def test_a_dead_unpublished_commit_does_not_block_a_revert(self):
+        self.edit("One", A)
+        selected_ids = self.ids()
+        env = {"HYDRALYSIS_TEST_MODE": "1", "HYDRALYSIS_TEST_FAULT": "commit.after_backup:raise"}
+        with patch.dict(os.environ, env), self.assertRaises(durable.FaultInjected):
+            self.commit(cid="c-fa5e0004")
+        self.assertEqual(workcopy.revert(self.settings, self.target(), selected_ids, expect=self.store()["revision"])["reverted"], 1)
+
+    def test_a_published_commit_that_is_not_finalized_still_protects_its_records(self):
+        self.edit("One", A)
+        selected_ids = self.ids()
+        env = {"HYDRALYSIS_TEST_MODE": "1", "HYDRALYSIS_TEST_FAULT": "commit.after_publish:raise"}
+        with patch.dict(os.environ, env), self.assertRaises(durable.FaultInjected):
+            self.commit(cid="c-fa5e0005")
+        self.assertEqual(commits.in_flight_ids(self.settings, self.target()), {ident: "c-fa5e0005" for ident in selected_ids})
+
+    def test_a_store_write_without_its_finalized_line_is_closed_and_the_skipped_record_can_be_reverted(self):
+        self.edit("One", A)       # drifts, so it is skipped and stays pending
+        self.edit("Two", B)
+        one, two = self.ids()
+        self.daemon.projects[self.daemon._norm(self.gpr)]["programs"]["/owned.exe"]["saved"]["names"][A] = "OutOfBand"
+        cid = "c-fa5e0007"
+        original = commits.Intent.write
+
+        def write(intent, step, **data):
+            if step == "FINALIZED":
+                raise OSError("disk full")  # the state a crash right after the store write leaves
+            return original(intent, step, **data)
+        with patch.object(commits.Intent, "write", write), self.assertRaises(commits.CommitError) as raised:
+            self.commit(cid=cid, on_drift="skip")
+        self.assertEqual(raised.exception.code, "finalize_pending")
+        lid = self.lineage_id()
+        self.assertEqual([entry["cid"] for entry in self.store()["commits"]], [cid])  # the store write happened
+        self.assertEqual(commits.last_steps(self.settings, lid, cid)["step"], "PUBLISHED")
+        # the store already holds the commit, so nothing is in flight even though the intent log still says PUBLISHED
+        self.assertEqual(commits.in_flight_ids(self.settings, self.target()), {})
+        # a resubmission closes the intent log
+        again = self.commit(cid=cid)
+        self.assertEqual(again["generation"], 1)
+        self.assertEqual(commits.last_steps(self.settings, lid, cid)["step"], "FINALIZED")
+        self.assertEqual(len(self.published(cid)), 1)
+        self.oracle({})
+        revert = workcopy.revert(self.settings, self.target(), [one], expect=self.store()["revision"])
+        self.assertEqual(revert["reverted"], 1)
+
+    def test_recovery_closes_a_commit_whose_store_write_has_no_finalized_line(self):
+        self.edit("One", A)
+        cid = "c-fa5e0008"
+        original = commits.Intent.write
+
+        def write(intent, step, **data):
+            if step == "FINALIZED":
+                raise OSError("disk full")
+            return original(intent, step, **data)
+        with patch.object(commits.Intent, "write", write), self.assertRaises(commits.CommitError):
+            self.commit(cid=cid)
+        lid = self.lineage_id()
+        self.assertEqual(commits.last_steps(self.settings, lid, cid)["step"], "PUBLISHED")
+        self.assertEqual(self.name_of(A), "One")  # a read heals it
+        self.assertEqual(commits.last_steps(self.settings, lid, cid)["step"], "FINALIZED")
+
+    def test_an_abort_requested_just_before_the_publish_is_honoured_and_the_request_is_consumed(self):
+        self.edit("One", A)
+        cid = "c-fa5e0006"
+        original = commits.Intent.write
+        flagged = {}
+
+        def write(intent, step, **data):
+            original(intent, step, **data)
+            if step == "SEALED" and not flagged:
+                flagged["answer"] = commits.request_abort(self.settings, self.target(), cid)
+        with patch.object(commits.Intent, "write", write), self.assertRaises(commits.CommitError) as raised:
+            self.commit(cid=cid)
+        self.assertEqual(raised.exception.code, "aborted")
+        self.assertEqual(self.head()["gen"], 0)
+        flag = lineage.lineage_dir(self.settings, self.lineage_id()) / "commits" / (cid + ".abort")
+        self.assertFalse(flag.exists())
+        answer = self.commit(cid=cid)  # the same cid, resubmitted, is not aborted again
+        self.assertEqual(answer["generation"], 2)  # the aborted attempt kept its reserved number 1
+
+
+class LineageCreation(World, unittest.TestCase):
+    def test_eight_threads_creating_the_lineage_of_one_origin_make_one_lineage(self):
+        base = self.runner.target("owned")
+        barrier = threading.Barrier(8)
+        found, errors = [], []
+
+        def create():
+            try:
+                barrier.wait(30)
+                found.append(lineage.ensure(self.settings, dict(base))["id"])
+            except BaseException as error:  # noqa: BLE001 - the test reports whatever happened
+                errors.append(error)
+        threads = [threading.Thread(target=create) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(60)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(set(found)), 1, found)
+        folders = [item.name for item in lineage.lineages_root(self.settings).iterdir() if item.name.startswith("L-")]
+        self.assertEqual(folders, [found[0]])
+
+    def test_two_first_commits_from_two_threads_make_one_lineage(self):
+        self.edit("One", A)
+        barrier = threading.Barrier(2)
+        outcomes = {}
+        original = commits._backup
+
+        def slow(*args, **kwargs):
+            threading.Event().wait(1.5)  # keeps the winner inside the lock while the other arrives
+            return original(*args, **kwargs)
+
+        def go(name):
+            try:
+                barrier.wait(30)
+                outcomes[name] = self.commit(cid="c-fa5e01%02d" % len(outcomes))
+            except BaseException as error:  # noqa: BLE001 - the test reports whatever happened
+                outcomes[name] = error
+        with patch.object(commits, "_backup", slow):
+            threads = [threading.Thread(target=go, args=(name,)) for name in ("a", "b")]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(120)
+        folders = [item.name for item in lineage.lineages_root(self.settings).iterdir() if item.name.startswith("L-")]
+        self.assertEqual(len(folders), 1, folders)
+        busy = [item for item in outcomes.values() if isinstance(item, commits.CommitError) and item.code == "commit_busy"]
+        done = [item for item in outcomes.values() if isinstance(item, dict) and item.get("ok")]
+        self.assertEqual((len(done), len(busy)), (1, 1), outcomes)
+
+
+class WorkerSettings(World, unittest.TestCase):
+    def test_the_commit_worker_gets_the_backup_and_generation_policy_of_the_caller(self):
+        from hydralysis import backups, overlayjobs
+        settings = {**self.settings, "backup_min_independent": 1, "backup_min_verified": 2, "backup_confirm_gb": 7,
+                    "backup_root_warn_gb": 9, "generations_root": str(self.root / "gens"), "tmp_dir": str(self.root / "tmp"),
+                    "backup_roots": [{"path": str(self.root / "b1")}, {"path": str(self.root / "b2"), "independent": True}]}
+        child = type("Child", (), {"pid": 4242})()
+        with patch("hydralysis.overlayjobs.proc.popen", return_value=child), patch("hydralysis.overlayjobs.proc_start", return_value=1):
+            record = overlayjobs.start(settings, "owned", "commit", "", {"cid": "c-fa5e0007"})
+        worker = json.loads((overlayjobs.job_path(settings, record["id"]).parent / "settings.json").read_text(encoding="utf-8"))
+        for key in overlayjobs.WORKER_POLICY_KEYS:
+            self.assertEqual(worker.get(key), settings.get(key), key)
+        self.assertEqual(backups.policy(worker), backups.policy(settings))
+        self.assertEqual(lineage.lineages_root(worker), lineage.lineages_root(settings))
+        self.assertEqual(worker["generations_root"], settings["generations_root"])
+
+
 class Sealing(World, unittest.TestCase):
     def test_candidate_writable_until_seal(self):
         """The candidate opens writable and saves before 7b; after it a writable open, save and an owner script are refused."""
