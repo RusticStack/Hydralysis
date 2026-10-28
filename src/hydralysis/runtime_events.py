@@ -89,6 +89,10 @@ def iter_records(path: Path):
     A last line without its LF is a torn tail (error "torn"): a writer killed mid-line. A line that has its LF
     but fails its CRC or is not a record is "corrupt", wherever it sits, the last line included: a flipped byte
     in the final record is not a torn write.
+
+    Limit: this relies on the writer putting each record and its LF in one write. A torn write that stopped exactly
+    after a complete record's last byte but before its LF is the one case that reads as a torn tail, and a cut that
+    lands exactly on a record boundary (after an LF) cannot be told from a clean end.
     """
     try:
         handle = open(path, "rb")
