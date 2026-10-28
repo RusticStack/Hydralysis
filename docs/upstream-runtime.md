@@ -64,6 +64,10 @@ propagate with errno, native error when available, and the exact path.
 The answer to `observe` and `break` reports the generated probe's SHA-256 as `script_sha256`. The evidence ledger does
 not take it by itself: a caller that stores a claim from that answer passes it in the claim's `parameters`
 (`{"script_sha256": "..."}`), where it becomes part of the claim's content-addressed `evidence_id`.
+This is possible only through `add_claim` in Python today: the `evidence_add` API and MCP surface forwards none of
+`parameters`, `coverage`, `limitations`, `confidence`, `authority`, `subject_sha256`, `from_capture` or `provenance`,
+so a claim added there has coverage `unknown`. A later package widens `evidence_add`. The `provenance` field (view,
+sequence, generation) is stored and exported, but nothing populates it yet.
 Messages retain at most 1,000 events / 256 KiB, and an individual oversized
 payload is explicitly clipped. Event pagination cannot recover already evicted
 events; `dropped_events` discloses that loss.

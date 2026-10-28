@@ -356,6 +356,74 @@ def verify_content(content: dict, evidence_id: str) -> None:
                                      % (evidence_id, actual), evidence_id=evidence_id)
 
 
+_STRING_FIELDS = ("game", "build", "kind", "name", "address", "prologue", "subsystem", "note", "source", "confidence",
+                  "authority")
+
+
+def check_content(content, evidence_id: str) -> None:
+    """Strictly validate content that arrives from outside (a bundle): the claim rules, exact types, then the id.
+
+    The content is rebuilt with `build_content` from its own fields; the rebuilt content must equal the stated one
+    and hash to `evidence_id`. A hash-consistent record that breaks a rule (complete coverage beside a bounding
+    limitation, an unknown enum, an integer where a string belongs) is refused.
+    """
+    def bad(message: str):
+        return EvidenceIntegrityError("evidence %s has content the evidence model refuses: %s" % (evidence_id, message),
+                                      code="evidence_content_invalid", evidence_id=str(evidence_id))
+
+    if not isinstance(content, dict) or set(content) != set(CONTENT_KEYS):
+        raise bad("its fields are not those of the evidence model")
+    if content["model"] != MODEL:
+        raise bad("model is %r, not %r" % (content["model"], MODEL))
+    for field in _STRING_FIELDS:
+        if not isinstance(content[field], str):
+            raise bad("%s must be a string, not a %s" % (field, type(content[field]).__name__))
+    subject = content["subject"]
+    if subject is not None and not (isinstance(subject, dict) and set(subject) == {"sha256"}
+                                    and isinstance(subject["sha256"], str)):
+        raise bad("subject must be null or {sha256}")
+    if content["from_capture"] is not None and not isinstance(content["from_capture"], str):
+        raise bad("from_capture must be a string or null")
+    if not isinstance(content["parameters"], dict):
+        raise bad("parameters must be an object")
+    if not isinstance(content["coverage"], dict):
+        raise bad("coverage must be an object")
+    for field in ("limitations", "evidence_links"):
+        value = content[field]
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise bad("%s must be a list of strings" % field)
+    try:
+        rebuilt = build_content(
+            **{field: content[field] for field in _STRING_FIELDS if field not in ("confidence", "authority")},
+            parameters=content["parameters"], confidence=content["confidence"], authority=content["authority"],
+            coverage=content["coverage"], limitations=content["limitations"],
+            subject_sha256=(subject or {}).get("sha256", ""), from_capture=content["from_capture"] or "",
+            evidence_links=content["evidence_links"])
+        same = canonical_json(rebuilt) == canonical_json(content)
+    except ValueError as exc:
+        raise bad(str(exc)) from exc
+    if not same:
+        raise bad("it is not in the normal form the model writes (sorted unique codes and links, no empty "
+                  "subject or from_capture)")
+    verify_content(content, evidence_id)
+
+
+def check_meta(meta) -> dict:
+    """A record's volatile meta, validated: an object whose provenance, when present, is an object."""
+    if meta is None:
+        return {}
+    if not isinstance(meta, dict):
+        raise EvidenceIntegrityError("meta must be an object", code="bundle_meta_invalid")
+    for field in ("created", "client", "harness"):
+        if field in meta and not isinstance(meta[field], str):
+            raise EvidenceIntegrityError("meta.%s must be a string" % field, code="bundle_meta_invalid")
+    try:
+        _provenance(meta.get("provenance"))
+    except ValueError as exc:
+        raise EvidenceIntegrityError("meta.provenance: %s" % exc, code="bundle_meta_invalid") from exc
+    return meta
+
+
 # ---- the database ---------------------------------------------------------------------------------------------
 
 def connect(path: Path) -> sqlite3.Connection:
@@ -492,15 +560,15 @@ def add_claim(
                                  (int(supersedes),)).fetchone()
                 if old is None:
                     raise ValueError("no claim %s to supersede" % supersedes)
-                if old["superseded_by"] is not None:
-                    raise ValueError("claim %s is already superseded by claim %s" % (supersedes, old["superseded_by"]))
                 links = [old["evidence_id"]]
             content = build_content(**fields, evidence_links=links)
             evidence_id = compute_evidence_id(content)
             same = db.execute("SELECT id FROM claims WHERE evidence_id = ? ORDER BY id LIMIT 1", (evidence_id,)).fetchone()
-            if same is not None:
+            if same is not None:  # restating a stored claim is a no-op even when its predecessor is already superseded
                 db.execute("COMMIT")
                 return "claim %s already stored %s %s %s evidence_id=%s" % (same["id"], game, kind, name, evidence_id)
+            if supersedes is not None and old["superseded_by"] is not None:
+                raise ValueError("claim %s is already superseded by claim %s" % (supersedes, old["superseded_by"]))
             row_id = _insert(db, content, evidence_id, created=_now(), client=client, harness=harness,
                              provenance=provenance, supersedes=int(supersedes) if supersedes is not None else None)
             if supersedes is not None:
@@ -627,7 +695,8 @@ def import_records(path: Path, records: list[dict]) -> dict:
     """Store verified bundle records. Idempotent: a record whose id is present is skipped. All or nothing."""
     by_id = {}
     for record in records:
-        verify_content(record["content"], record["evidence_id"])
+        check_content(record["content"], record["evidence_id"])  # nothing reaches the ledger unvalidated
+        check_meta(record.get("meta"))
         by_id[record["evidence_id"]] = record
     db = connect(path)
     summary = {"added": 0, "already_present": 0, "history_diverged": 0, "dangling_links": 0}

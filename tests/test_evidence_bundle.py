@@ -205,6 +205,106 @@ class Tampering(Bundles):
         self.assertEqual(self.code()["error"], "bundle_derived_mismatch")
 
 
+def forge_bundle(folder: Path, records: list[dict]) -> None:
+    """Write a bundle whose every hash, derived file and bundle_id is consistent with `records` as given."""
+    import hashlib
+    records = sorted(records, key=lambda record: record["evidence_id"])
+    subjects = evidence_bundle._subjects(records)
+    replay = evidence_bundle._replay(records, set())
+    limitations = evidence_bundle._limitations(records)
+    files = {"evidence.jsonl": evidence_bundle._jsonl(records), "subjects.json": evidence_bundle._json_bytes(subjects),
+             "replay.json": evidence_bundle._json_bytes(replay), "environment.json": evidence_bundle._json_bytes({}),
+             "limitations.md": evidence_bundle._limitations_md(limitations)}
+    manifest = {"format": evidence_bundle.FORMAT,
+                "bundle_id": evidence_bundle.bundle_id_of(records, subjects, {}, replay, limitations),
+                "records": len(records), "filter": {"game": "", "subsystem": "", "build": ""},
+                "files": {name: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+                          for name, data in sorted(files.items())},
+                "volatile": {"exported_at": "2026-01-01T00:00:00Z", "files": []}}
+    files["manifest.json"] = evidence_bundle._json_bytes(manifest)
+    for name, data in files.items():
+        (folder / name).parent.mkdir(parents=True, exist_ok=True)
+        (folder / name).write_bytes(data)
+
+
+def hash_valid_record(**changes) -> dict:
+    """A record whose evidence_id is the true hash of its (possibly invalid) content."""
+    base = dict(game="cp", build="2.5", kind="field", name="forged", note="n", source="s", address="rva:0x10")
+    content = evidence.build_content(**base)
+    content.update(changes)
+    return {"evidence_id": evidence.compute_evidence_id(content), "content": content, "meta": {}}
+
+
+class ForgedRecords(Bundles):
+    """A bundle can be hash-consistent and still break the evidence model; none of it may reach a ledger."""
+
+    CASES = {
+        "complete coverage beside a bounding limitation":
+            dict(coverage={"status": "complete"}, limitations=["event_ring_overflow"]),
+        "an unknown confidence": dict(confidence="bogus"),
+        "an integer address": dict(address=5),
+        "an unknown authority": dict(authority="trust-me"),
+        "an unsorted limitation list": dict(coverage={"status": "unknown", "reason": "r"},
+                                            limitations=["coverage_unknown", "coverage_unknown"]),
+        "a parameters value that is not an object": dict(parameters=["x"]),
+        "a link that is not an evidence id": dict(evidence_links=["not-an-id"]),
+        "an empty note": dict(note=""),
+        "a boolean where a string belongs": dict(name=True),
+    }
+
+    def test_each_hash_valid_but_invalid_record_fails_verify_and_import_and_leaves_the_ledger_empty(self):
+        for label, changes in self.CASES.items():
+            with self.subTest(label):
+                record = hash_valid_record(**changes)
+                folder = self.root / "forged"
+                shutil.rmtree(folder, ignore_errors=True)
+                folder.mkdir()
+                forge_bundle(folder, [record])
+                verdict = evidence_bundle.verify_bundle(folder)
+                self.assertFalse(verdict["ok"], verdict)
+                self.assertEqual(verdict["error"], "evidence_content_invalid", verdict)
+                target = self.root / "forged.db"
+                if target.exists():
+                    target.unlink()
+                with self.assertRaises(BundleError):
+                    evidence_bundle.import_bundle(folder, target)
+                with self.assertRaises(evidence.EvidenceIntegrityError):  # the library is guarded on its own too
+                    evidence.import_records(target, [record])
+                self.assertEqual(evidence.query(target), [])
+                self.assertEqual(evidence.verify_ledger(target)["failed"], [])
+
+    def test_the_forged_bundle_of_the_review_is_refused_and_a_valid_one_still_imports(self):
+        good = hash_valid_record()
+        folder = self.root / "mixed"
+        folder.mkdir()
+        forge_bundle(folder, [good])
+        self.assertTrue(evidence_bundle.verify_bundle(folder)["ok"])
+        target = self.root / "mixed.db"
+        self.assertEqual(evidence_bundle.import_bundle(folder, target)["added"], 1)
+        bad = hash_valid_record(name="forged-two", address=5, confidence="bogus",
+                                coverage={"status": "complete"}, limitations=["event_ring_overflow"])
+        folder2 = self.root / "mixed2"
+        folder2.mkdir()
+        forge_bundle(folder2, [good, bad])
+        with self.assertRaises(BundleError):
+            evidence_bundle.import_bundle(folder2, target)
+        self.assertEqual(len(evidence.query(target)), 1)  # the ledger is as it was, and still readable
+
+    def test_meta_that_is_not_an_object_is_a_bundle_error_with_a_code(self):
+        for meta in ("text", {"provenance": "x"}, {"created": 5}, {"harness": ["x"]}):
+            with self.subTest(meta=meta):
+                record = hash_valid_record()
+                record["meta"] = meta
+                folder = self.root / "meta"
+                shutil.rmtree(folder, ignore_errors=True)
+                folder.mkdir()
+                forge_bundle(folder, [record])
+                verdict = evidence_bundle.verify_bundle(folder)
+                self.assertEqual((verdict["ok"], verdict["error"]), (False, "bundle_meta_invalid"), verdict)
+                with self.assertRaises(evidence.EvidenceIntegrityError):
+                    evidence.import_records(self.root / "meta.db", [record])
+
+
 class Compare(Bundles):
     def test_two_independent_exports_compare_equal_modulo_volatile_fields(self):
         first, second = self.root / "one.db", self.root / "two.db"
