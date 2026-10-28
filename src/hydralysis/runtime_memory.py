@@ -12,6 +12,16 @@ DIVERGED instead of overwriting what changed since. `watch` is a state machine
 thread. A failed disarm taints the session: the worker then refuses to detach (a target left with an armed debug
 register and no handler dies with 0x80000004) unless the owner forces it. A watch also needs the per-architecture
 conformance stamp that `tools/watch_conformance.py` writes after its real-process matrix passes.
+
+Settings (config.json, read by the client, never by the worker):
+
+  * `runtime_fixture_sha256`: list of SHA-256 build hashes of the fixture executables a write or watch may target.
+    Empty or missing means every write and watch is refused. `tools/watch_conformance.py` sets it for the builds it uses.
+  * `runtime_watch_conformance_run`: boolean, set only by `tools/watch_conformance.py` for the duration of its own run
+    so that the run can arm watches before a stamp exists. Leave it unset otherwise.
+
+A detach is treated as "target gone" (no disarm, evidence "target gone") only when Frida reports `process-terminated`
+or the pid is confirmed absent or reused; any other detach reason with a live pid keeps an armed watch tainted.
 """
 
 from __future__ import annotations
@@ -20,6 +30,19 @@ import re
 import time
 import uuid
 from pathlib import Path
+
+
+def _pid_gone(pid, created_ms) -> bool:
+    """Confirm the process is absent (or its pid was reused). Any doubt (access denied, odd error) means not gone."""
+    import errno
+    from hydralysis import runtime_worker
+    try:
+        return runtime_worker._created_ms(pid) != created_ms
+    except OSError as exc:
+        return getattr(exc, "winerror", None) == 87 or exc.errno in (errno.ESRCH, errno.ENOENT)
+    except (ValueError, IndexError, StopIteration):
+        return False
+
 
 FIXTURE_MARKER = b"HYDRALYSIS_FIXTURE_ONLY"
 MEMORY_ACTIONS = ("write", "watch")
@@ -473,12 +496,21 @@ class MemoryMixin:
 
     # ---- lifecycle
 
+    def _target_gone(self) -> bool:
+        """True only when the target process itself is known to be gone. A session that detached for another reason
+        (lost connection, device loss) leaves a live process that may still hold an armed debug register."""
+        if not self.detached:
+            return False
+        if getattr(self, "detach_reason", "") == "process-terminated":
+            return True
+        return _pid_gone(self.pid, self.target_created_ms)
+
     def memory_before_cleanup(self) -> None:
         """Disarm every live watch and prove it clear before the worker lets go of the target."""
         for watch_id, watch in list(self.watches.items()):
             if watch["state"] in ("armed", "arming", "disarming", "tainted"):
-                if self.detached:
-                    # The process or its session is gone: a debug register cannot kill a process that no longer exists.
+                if self._target_gone():
+                    # The process is gone: a debug register cannot kill a process that no longer exists.
                     watch["state"] = "clear"
                     watch["verified"] = {"evidence": "target gone", "at_ms": int(time.time() * 1000)}
                     watch.pop("error", None)

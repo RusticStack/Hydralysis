@@ -227,6 +227,7 @@ class Tainted(Case):
         self.target.readback_unavailable = True      # a gone session: nothing can be created or called on it
         self.target.fail_unset = {1, 2, 3}
         self.agent.detached = True
+        self.agent.detach_reason = "process-terminated"
         calls = len(self.script.calls)
         result = self.detach()
         self.assertEqual(result["state"], "detached")
@@ -238,8 +239,38 @@ class Tainted(Case):
     def test_a_dead_target_clears_an_already_tainted_watch_too(self):
         self.taint()
         self.agent.detached = True
-        self.assertEqual(self.detach()["state"], "detached")
+        with patch("hydralysis.runtime_memory._pid_gone", return_value=True):
+            self.assertEqual(self.detach()["state"], "detached")
         self.assertEqual(self.agent.tainted, "")
+
+    def test_a_connection_loss_with_a_live_pid_stays_tainted(self):
+        watch = self.arm()
+        self.target.fail_unset = {1, 2, 3}
+        self.agent._detached("connection-terminated", None)
+        self.assertEqual(self.agent.detach_reason, "connection-terminated")
+        with patch("hydralysis.runtime_memory._pid_gone", return_value=False):
+            with self.assertRaises(RuntimeError) as raised:
+                self.detach()
+        self.assertIn("0x80000004", str(raised.exception))
+        self.assertNotEqual(self.agent.watches[watch["id"]]["state"], "clear")
+        self.assertTrue(self.agent.tainted)
+
+    def test_a_non_terminated_detach_is_cleared_once_the_pid_is_confirmed_gone(self):
+        watch = self.arm()
+        self.target.readback_unavailable = True
+        self.agent._detached("device-lost", None)
+        with patch("hydralysis.runtime_memory._pid_gone", return_value=True):
+            self.assertEqual(self.detach()["state"], "detached")
+        self.assertEqual(self.agent.watches[watch["id"]]["verified"]["evidence"], "target gone")
+
+    def test_pid_gone_treats_doubt_as_alive(self):
+        from hydralysis import runtime_worker
+        denied = OSError(5, "denied")
+        with patch.object(runtime_worker, "_created_ms", side_effect=denied):
+            self.assertFalse(memory._pid_gone(1, 1))
+        with patch.object(runtime_worker, "_created_ms", return_value=5):
+            self.assertFalse(memory._pid_gone(1, 5))
+            self.assertTrue(memory._pid_gone(1, 6))
 
     def test_a_failed_script_creation_rolls_the_arm_back_and_frees_the_slot(self):
         def broken():

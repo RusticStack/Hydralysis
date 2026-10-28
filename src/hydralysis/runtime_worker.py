@@ -237,6 +237,7 @@ class RuntimeAgent(MemoryMixin, CaptureMixin, ActionsMixin):
         self.target_sha256 = ""
         self.paused_spawn = False
         self.detached = False
+        self.detach_reason = ""
         self.ended = ""
         self.scripts = {}
         self.pauses = {}
@@ -382,7 +383,8 @@ class RuntimeAgent(MemoryMixin, CaptureMixin, ActionsMixin):
         return {"target": info, "sha256": initial["sha256"], "state": self.state,
                 "pid": self.pid, "target_created_ms": self.target_created_ms}
 
-    def _detached(self, *args):
+    def _detached(self, reason=None, *args):
+        self.detach_reason = str(reason or "")
         self.detached = True
         self.state = "detached"
         self.publish()
