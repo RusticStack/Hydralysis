@@ -63,19 +63,23 @@ def _expect(text: str) -> list[int]:
 
 def _probe_source(module: dict, rva: int, expected: list[int], hook_id: str, limit: int, pause: bool,
                   captures: list | None = None, sample: dict | None = None, convention: str = "native",
-                  instruction: bool = False) -> str:
+                  instruction: bool = False, export: str | None = None) -> str:
     parameters = json.dumps({"module": module["path"], "base": module["base"], "rva": rva,
                              "expect": expected, "id": hook_id, "limit": limit, "pause": pause,
                              "captures": [{"arg": c["arg"], "reg": c.get("reg"), "deref": c["deref"], "size": c["size"],
                                            "value_only": c["value_only"], "ptr": c["as"] == "pointer"} for c in (captures or [])],
-                             "sample": sample, "convention": convention, "instruction": instruction})
+                             "sample": sample, "convention": convention, "instruction": instruction,
+                             "export": export})
     return CONTEXT_HELPER + MEMORY_HELPER + r"""const p=PARAMETERS;
 const all=Process.enumerateModules().filter(m=>m.path===p.module);
 if(all.length!==1||all[0].base.toString()!==p.base)throw new Error('module mapping changed before probe installation');
 const site=all[0].base.add(p.rva);
+// A hook named by export: the module's own export table must agree with the file's (checked before this).
+if(p.export!==null){let found=null;try{found=all[0].getExportByName(p.export);}catch(e){}
+ if(found===null||!found.equals(site))throw new Error('EXPORT MISMATCH; probe refused');}
 const got=readExact(site,p.expect.length);
 if(got.some((b,i)=>b!==p.expect[i]))throw new Error('PROLOGUE MISMATCH; probe refused');
-let hits=0;
+let hits=0,seen=0;
 // Bounded copies of what arguments point to; every read is checked against a readable range.
 function readable(q,n){const r=Process.findRangeByAddress(q);return r!==null&&r.protection.indexOf('r')>=0&&q.add(n).compare(r.base.add(r.size))<=0;}
 // Argument i under the probe's calling convention. Native: what Frida reads for this ABI (x64
@@ -106,6 +110,7 @@ function sampleValue(hexed){const b=new Uint8Array(hexed.match(/../g).map(x=>par
   switch(p.sample.as){case 'f32':return v.getFloat32(0,true);case 'f64':return v.getFloat64(0,true);case 'i32':return v.getInt32(0,true);
    case 'u32':return v.getUint32(0,true);case 'i16':return v.getInt16(0,true);case 'u16':return v.getUint16(0,true);case 'u8':return v.getUint8(0);default:return b.byteLength>=8?Number(v.getBigUint64(0,true)):v.getUint32(0,true);}}
 function enter(args){
+  seen++;
   if(p.sample){agg.count++;const c=captureArgs(args,this.context)[p.sample.capture];
    if(c&&c.hex){const x=sampleValue(c.hex);agg.last=x;agg.min=agg.min===null||x<agg.min?x:agg.min;agg.max=agg.max===null||x>agg.max?x:agg.max;}return;}
   this.capture=hits++<p.limit;
@@ -124,5 +129,6 @@ const listener=p.instruction?Interceptor.attach(site,enter):Interceptor.attach(s
  onLeave(retval){if(this.capture)send({event:'return',hook_id:p.id,thread:this.threadId,value:retval.toString()});}
 });
 send({event:'probe_installed',hook_id:p.id,address:site.toString(),verified_bytes:got});
-rpc.exports={status(){return {installed:true};},release(){send({event:'probe_removed',hook_id:p.id});listener.detach();}};
+rpc.exports={status(){return {installed:true};},
+ counters(){return {seen:seen,hits:hits,limit:p.limit};},release(){send({event:'probe_removed',hook_id:p.id});listener.detach();}};
 """.replace("PARAMETERS", parameters)

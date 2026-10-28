@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import collections
 import hashlib
 import json
 import os
@@ -17,6 +16,8 @@ from pathlib import Path
 
 from hydralysis import durable
 from hydralysis.runtime_actions import ActionsMixin
+from hydralysis.runtime_capture import CaptureMixin
+from hydralysis.runtime_events import EventLog
 from hydralysis.runtime_agents import (  # noqa: F401  (re-exported: tests and callers import them from here)
     CONTEXT_HELPER, CONTROL, MEMORY_HELPER, _expect, _probe_source)
 from hydralysis.runtime_ipc import serve as ipc_serve
@@ -221,7 +222,7 @@ def _inside_function(path: str, rva: int) -> bool:
 
 
 
-class RuntimeAgent(ActionsMixin):
+class RuntimeAgent(CaptureMixin, ActionsMixin):
     def __init__(self, directory: Path, device):
         self.directory = directory
         self.device = device
@@ -236,14 +237,29 @@ class RuntimeAgent(ActionsMixin):
         self.ended = ""
         self.scripts = {}
         self.pauses = {}
-        self.events = collections.deque()
-        self.event_bytes = 0
-        self.sequence = 0
-        self.dropped = 0
+        self.log = EventLog(directory, directory.name)
+        self.open_capture = None
         self.lock = threading.RLock()
         self.write_lock = threading.Lock()
         self.state = "starting"
         self.closed = False
+
+    # The ring and the counters live in the event log; these names are what callers and tests have always used.
+    @property
+    def events(self):
+        return self.log.ring
+
+    @property
+    def event_bytes(self) -> int:
+        return self.log.ring_size
+
+    @property
+    def sequence(self) -> int:
+        return self.log.sequence
+
+    @property
+    def dropped(self) -> int:
+        return self.log.dropped
 
     def snapshot(self):
         with self.lock:
@@ -251,6 +267,7 @@ class RuntimeAgent(ActionsMixin):
                      "target_created_ms": self.target_created_ms, "spawn_paused": self.paused_spawn,
                      "detached": self.detached, "scripts": list(self.scripts), "paused_hooks": list(self.pauses),
                      "last_sequence": self.sequence, "dropped_events": self.dropped,
+                     "log": self.log.head_info(), "messages_seen": self.log.counters["messages"],
                      **({"ended": self.ended} if self.ended else {})}
 
     def publish(self):
@@ -259,26 +276,24 @@ class RuntimeAgent(ActionsMixin):
             _write(self.directory / "state.json", state)
 
     def message(self, script_id: str, message: dict, data=None):
+        original = message
         encoded = json.dumps(message, ensure_ascii=False, default=str).encode("utf-8")
+        clipped = False
         if len(encoded) > 8192:
             message = {"type": "truncated", "original_bytes": len(encoded), "head": encoded[:4096].decode("utf-8", "replace")}
+            clipped = True
         if data is not None:
             message = {**message, "data_hex": bytes(data[:1024]).hex(), "data_truncated": len(data) > 1024}
+            clipped = clipped or len(data) > 1024
         with self.lock:
-            self.sequence += 1
-            event = {"sequence": self.sequence, "script": script_id, "message": message}
-            size = len(json.dumps(event, ensure_ascii=False).encode("utf-8"))
-            self.events.append((event, size))
-            self.event_bytes += size
-            while self.event_bytes > 262144 or len(self.events) > 1000:
-                _, old_size = self.events.popleft()
-                self.event_bytes -= old_size
-                self.dropped += 1
+            # Counted as it arrived: neither the clipping above nor the ring or the log below changes the counts.
+            self.log.count_message(script_id, original, clipped)
             payload = message.get("payload", {})
             specs = (self.scripts.get(script_id) or {}).get("captures")
             if specs and isinstance(payload, dict) and payload.get("captures") is not None:
                 from hydralysis.runtime_decode import decode_event
                 payload["decoded"] = decode_event(specs, payload.pop("captures"))
+            self.log.record(script_id, message)
             if message.get("type") == "error" and script_id in self.scripts:
                 self.scripts[script_id]["script_error"] = str(message.get("description") or message.get("stack") or "script error")[:1000]
             if message.get("type") == "send" and isinstance(payload, dict) and payload.get("event") == "break":
@@ -379,6 +394,7 @@ class RuntimeAgent(ActionsMixin):
         if errors:
             raise RuntimeError("runtime cleanup incomplete: " + "; ".join(errors))
         self.closed = True
+        self.log.close()
         return {"state": "detached", "target_state": "unknown", "pid": self.pid,
                 "spawn_resumed": not self.paused_spawn, "scripts_released": not self.scripts}
 
