@@ -25,6 +25,11 @@ from hydralysis.paths import root_path
 
 ACTIVE = ("queued", "running", "cancelling")
 TIMEOUT_S = 4 * 3600
+# What the commit worker reads from the caller's settings besides the engine ones: where generations and backups live, the
+# backup policy and the scratch folder of the verify clone. Without them the worker would publish into <root>/lineages and
+# back up to <root>/backups while the caller looks elsewhere.
+WORKER_POLICY_KEYS = ("generations_root", "tmp_dir", "backup_roots", "backup_min_verified", "backup_min_independent",
+                      "backup_confirm_gb", "backup_root_warn_gb")
 
 
 def job_path(settings: dict, job_id: str) -> Path:
@@ -74,7 +79,8 @@ def start(settings: dict, target: str, kind: str, address: str = "", options: di
         token = jobowner.issue(record)
         write_json(path, record)
         keys = ("root", "hydra_dir", "hydra_client", "java_home", "hydra_idle_s", "hydra_keep_warm_s", "hydra_max_heap",
-                "hydra_allow_unpinned", "hydra", "fork_mode", "fork_max_copy_mb", "forbidden_drives", "targets", "overlay_save_debounce_s")
+                "hydra_allow_unpinned", "hydra", "fork_mode", "fork_max_copy_mb", "forbidden_drives", "targets", "expected_agents",
+                *WORKER_POLICY_KEYS)
         write_json(path.parent / "settings.json", {key: settings[key] for key in keys if key in settings})
         env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent),
                    HYDRALYSIS_HARNESS=hydra.identity()["harness"])
@@ -144,6 +150,13 @@ def run(path: Path) -> None:
             result = crossbuild.run(settings, record, path.parent)
         elif record["kind"] == "edit":
             result = workcopy.edit(settings, engine, selected, record["address"], dict(record["options"]), TIMEOUT_S)
+        elif record["kind"] == "commit":
+            from hydralysis import commits
+            try:
+                result = commits.run_commit(settings, selected, dict(record["options"]), engine, TIMEOUT_S)
+            except commits.CommitError as error:
+                _update(path, state="failed", error="%s: %s" % (error.code, error), error_payload=error.payload(), finished_at=time.time())
+                return
         else:
             result = workcopy.repair(settings, engine, selected, TIMEOUT_S)
         _update(path, state="done", result=result, finished_at=time.time())

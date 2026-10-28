@@ -1,0 +1,382 @@
+"""Backups on hydra.2/3 (PROTOCOL-3.md 4.5, 3.4, D28, D66): a fork with `writable:false`, a Python re-hash, `backup.json` written
+last, the seal, `backups.log`, the policy, and `backend action=backups options.op=list|verify|remove`."""
+
+from __future__ import annotations
+
+import json
+import os
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import fakehydra
+from hydralysis import api, backups, hydra, lineage
+from test_commit import A, B, World
+
+
+class Backups(World, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        selected = self.runner.target("owned")
+        self.lid = lineage.ensure(self.settings, {**selected, "origin_key": selected["key"]})["id"]
+        self.engine = fakehydra.FakeEngine(self.settings)
+
+    def make(self, **kwargs):
+        return backups.make(self.settings, self.engine, self.lid, str(self.gpr), kwargs.pop("purpose", "pre-commit"), "3fa9c2d1aa01bb42", 0, **kwargs)
+
+    # --- making one -----------------------------------------------------------------------------------------------
+    def test_a_backup_is_a_verified_sealed_copy_with_backup_json_written_last(self):
+        made = self.make()["backup"]
+        folder = Path(made["folder"])
+        manifest = json.loads((folder / "backup.json").read_text(encoding="utf-8"))
+        self.assertEqual((manifest["kind"], manifest["writer"], manifest["purpose"], manifest["format"]),
+                         ("ghidra-session-backup", "hydralysis", "pre-commit", 1))
+        self.assertRegex(manifest["id"], r"^\d{8}T\d{6}Z-3fa9c2d1-pre-commit$")
+        self.assertEqual(folder.name, manifest["id"])
+        self.assertEqual(folder.parent.name, self.lid)
+        self.assertEqual(manifest["source"], {"gpr": str(self.gpr), "name": "Owned", "revision": "3fa9c2d1aa01bb42", "lineage": self.lid, "generation": 0})
+        self.assertTrue(manifest["verify"]["ok"])
+        self.assertFalse(manifest["copy"]["independent"])  # a block clone on the same volume protects against a bad commit only
+        self.assertEqual(manifest["selfSha256"], lineage.self_hash(manifest))
+        self.assertTrue(backups.verify(folder)["ok"])
+        project = folder / "project"
+        sidecar = json.loads(next(project.glob("*.fork.json")).read_text(encoding="utf-8"))
+        self.assertEqual((sidecar["purpose"], sidecar["disposable"], sidecar["state"]), ("backup", False, "complete"))
+        self.assertTrue((project / "SEALED.json").is_file())
+        self.assertEqual(lineage.tree_hash(self.gpr.parent), self.master_tree)
+
+    def test_the_fork_is_not_writable(self):
+        self.make()
+        forks = [fields for _, name, fields in self.daemon.calls if name == "fork_project"]
+        self.assertEqual([fields["writable"] for fields in forks], [False])
+        self.assertEqual([name for _, name, _ in self.daemon.calls if name in ("close_project",)], ["close_project"])  # nothing is held open
+
+    def test_backups_log_records_each_copy(self):
+        made = self.make()["backup"]
+        (row,) = backups.logged(self.settings, self.lid)
+        self.assertEqual((row["id"], row["manifestSha256"], row["root"]), (made["id"], made["manifestSha256"], str(self.root / "backups")))
+        self.assertGreater(row["bytes"], 0)
+        self.assertEqual(row["manifestSha256"], lineage.sha256_hex((Path(made["folder"]) / "backup.json").read_bytes()))
+
+    def test_a_backup_never_overwrites_and_a_retry_in_the_same_second_gets_its_own_folder(self):
+        first = self.make()["backup"]
+        second = self.make()["backup"]
+        self.assertNotEqual(first["folder"], second["folder"])
+        self.assertTrue(second["id"].startswith(first["id"].split("-")[0][:8]))
+
+    # --- invisible until verified ---------------------------------------------------------------------------------
+    def test_a_copy_that_does_not_match_its_source_writes_no_manifest_and_stays_invisible(self):
+        original = backups._fork_into
+
+        def corrupt(settings, engine, source, destination, mode):
+            forked = original(settings, engine, source, destination, mode)
+            (Path(destination) / "Owned.rep" / "damaged.bin").write_bytes(b"x")
+            for path in Path(destination).rglob("Owned.gpr"):
+                path.write_text("different", encoding="utf-8")
+            return forked
+        with patch.object(backups, "_fork_into", corrupt), self.assertRaises(backups.BackupError) as raised:
+            self.make()
+        self.assertEqual(raised.exception.code, "backup_failed")
+        self.assertIn("does not match its source", str(raised.exception))
+        listed = backups.listing(self.settings, self.lid)
+        self.assertEqual(listed["backups"], [])
+        self.assertEqual(len(listed["invisible"]), 1)
+        self.assertIn("manual removal", listed["invisible"][0]["note"])
+        self.assertEqual(backups.logged(self.settings, self.lid), [])
+
+    def test_a_source_that_changes_while_it_is_copied_makes_no_backup(self):
+        original = backups._fork_into
+
+        def moving(settings, engine, source, destination, mode):
+            forked = original(settings, engine, source, destination, mode)
+            (Path(source).parent / "Owned.rep" / "moved.bin").write_bytes(b"late")
+            return forked
+        with patch.object(backups, "_fork_into", moving), self.assertRaises(backups.BackupError) as raised:
+            self.make()
+        self.assertIn("source changed", str(raised.exception))
+        self.assertEqual(backups.listing(self.settings, self.lid)["backups"], [])
+
+    def test_a_folder_without_a_valid_backup_json_is_not_a_usable_backup(self):
+        made = self.make()["backup"]
+        (Path(made["folder"]) / "backup.json").write_text("{}", encoding="utf-8")
+        self.assertIsNone(backups.usable(self.settings, self.lid, made["id"]))
+        self.assertEqual(len(backups.listing(self.settings, self.lid)["invisible"]), 1)
+
+    # --- verifying ------------------------------------------------------------------------------------------------
+    def test_verify_rehashes_every_file_and_names_what_changed(self):
+        made = self.make()["backup"]
+        folder = Path(made["folder"])
+        victim = next((folder / "project").rglob("Owned.gpr"))
+        os.chmod(victim, 0o666)
+        victim.write_text("tampered", encoding="utf-8")
+        (folder / "project" / "stray.bin").write_bytes(b"x")
+        result = backups.verify(folder)
+        self.assertFalse(result["ok"])
+        self.assertTrue(any(problem.startswith("changed file project/Owned.gpr") for problem in result["problems"]))
+        self.assertIn("unlisted file project/stray.bin", result["problems"])
+        self.assertIsNone(backups.usable(self.settings, self.lid, made["id"]))
+
+    def test_usable_checks_the_manifest_the_log_names(self):
+        made = self.make()["backup"]
+        self.assertIsNotNone(backups.usable(self.settings, self.lid, made["id"], made["manifestSha256"]))
+        self.assertIsNone(backups.usable(self.settings, self.lid, made["id"], "0" * 64))
+
+    def test_a_replaced_backup_is_detected_by_the_log(self):
+        made = self.make()["backup"]
+        folder = Path(made["folder"])
+        manifest = json.loads((folder / "backup.json").read_text(encoding="utf-8"))
+        manifest["createdAt"] = "2000-01-01T00:00:00Z"
+        manifest["selfSha256"] = lineage.self_hash(manifest)
+        os.chmod(folder / "backup.json", 0o666)
+        (folder / "backup.json").write_bytes(lineage.canonical(manifest))
+        row = backups.listing(self.settings, self.lid)["backups"][0]
+        self.assertTrue(row["replaced"])
+
+    def test_a_deleted_backup_is_reported_as_logged_but_missing(self):
+        import shutil
+        made = self.make()["backup"]
+        backups._writable_tree(Path(made["folder"]))
+        shutil.rmtree(made["folder"])
+        listed = backups.listing(self.settings, self.lid)
+        self.assertEqual(listed["backups"], [])
+        self.assertEqual(listed["logged_but_missing"], [{"id": made["id"], "root": made["root"]}])
+
+    def test_a_newer_format_is_refused_not_guessed(self):
+        made = self.make()["backup"]
+        folder = Path(made["folder"])
+        manifest = json.loads((folder / "backup.json").read_text(encoding="utf-8"))
+        manifest["format"] = 7
+        manifest["selfSha256"] = lineage.self_hash(manifest)
+        os.chmod(folder / "backup.json", 0o666)
+        (folder / "backup.json").write_bytes(lineage.canonical(manifest))
+        self.assertTrue(any("format_unreadable" in problem for problem in backups.verify(folder)["problems"]))
+
+    def test_a_legacy_backup_without_a_seal_is_listed_unsealed_and_verify_adopts_it(self):
+        made = self.make()["backup"]
+        project = Path(made["folder"]) / "project"
+        os.chmod(project / "SEALED.json", 0o666)
+        (project / "SEALED.json").unlink()
+        row = backups.listing(self.settings, self.lid)["backups"][0]
+        self.assertFalse(row["sealed"])
+        self.assertIn("client discipline", row["note"])
+        outcome = backups.adopt_legacy(Path(made["folder"]))
+        self.assertEqual(outcome, {"ok": True, "adopted": True})
+        self.assertTrue(backups.listing(self.settings, self.lid)["backups"][0]["sealed"])
+        self.assertTrue(backups.verify(Path(made["folder"]))["ok"])
+
+    def test_a_legacy_backup_that_fails_the_rehash_is_labelled_and_never_adopted(self):
+        made = self.make()["backup"]
+        project = Path(made["folder"]) / "project"
+        victim = next(project.rglob("Owned.gpr"))
+        os.chmod(victim, 0o666)
+        victim.write_text("bad", encoding="utf-8")
+        os.chmod(project / "SEALED.json", 0o666)
+        (project / "SEALED.json").unlink()
+        outcome = backups.adopt_legacy(Path(made["folder"]))
+        self.assertEqual(outcome["label"], "legacy_unverified")
+        self.assertFalse((project / "SEALED.json").exists())
+
+    # --- policy ---------------------------------------------------------------------------------------------------
+    def test_the_default_policy(self):
+        wanted = backups.policy({"root": str(self.root / "data")})
+        self.assertEqual((wanted["backup_min_verified"], wanted["backup_min_independent"], wanted["backup_confirm_gb"], wanted["backup_root_warn_gb"]),
+                         (1, 0, 50, 200))
+        self.assertEqual(wanted["roots"][0]["path"], str(self.root / "data" / "backups"))
+        with self.assertRaises(ValueError):
+            backups.policy({**self.settings, "backup_roots": [{"path": "x", "mode": "snapshot"}]})
+        with self.assertRaises(ValueError):
+            backups.policy({**self.settings, "backup_min_verified": -1})
+
+    def test_a_secondary_root_is_always_a_full_copy(self):
+        wanted = backups.policy({**self.settings, "backup_roots": [{"path": "a", "mode": "auto"}, {"path": "b", "mode": "auto"}]})
+        self.assertEqual([root["mode"] for root in wanted["roots"]], ["auto", "copy"])
+        self.assertEqual([root["required"] for root in wanted["roots"]], [True, False])
+
+    def test_two_roots_give_two_verified_copies_and_a_failed_secondary_only_warns(self):
+        self.settings["backup_roots"] = [{"path": str(self.root / "backups")}, {"path": str(self.root / "second")}]
+        made = self.make()
+        self.assertEqual(len(made["all"]), 2)
+        self.assertEqual(made["warnings"], [])
+        self.settings["backup_roots"] = [{"path": str(self.root / "backups2")}, {"path": str(self.root / "third")}]
+        original = backups._make_one
+
+        def failing(settings, engine, lid, source, folder, identifier, purpose, revision, generation, root, by):
+            if root["path"].endswith("third"):
+                raise OSError("disk full")
+            return original(settings, engine, lid, source, folder, identifier, purpose, revision, generation, root, by)
+        with patch.object(backups, "_make_one", failing):
+            made = self.make()
+        self.assertEqual(len(made["all"]), 1)
+        self.assertEqual(made["warnings"][0]["root"], str(self.root / "third"))
+
+    def test_a_failed_primary_aborts_and_so_does_a_failed_secondary_the_policy_needs(self):
+        self.settings["backup_roots"] = [{"path": str(self.root / "backups")}, {"path": str(self.root / "second")}]
+        original = backups._make_one
+
+        def failing(settings, engine, lid, source, folder, identifier, purpose, revision, generation, root, by):
+            if "backups" in root["path"] or "second" in root["path"]:
+                raise OSError("disk full")
+            return original(settings, engine, lid, source, folder, identifier, purpose, revision, generation, root, by)
+        with patch.object(backups, "_make_one", failing), self.assertRaises(backups.BackupError) as raised:
+            self.make()
+        self.assertEqual(raised.exception.code, "backup_failed")
+        self.settings["backup_min_verified"] = 2
+        self.settings["backup_roots"] = [{"path": str(self.root / "ok")}, {"path": str(self.root / "bad")}]
+
+        def half(settings, engine, lid, source, folder, identifier, purpose, revision, generation, root, by):
+            if root["path"].endswith("bad"):
+                raise OSError("disk full")
+            return original(settings, engine, lid, source, folder, identifier, purpose, revision, generation, root, by)
+        with patch.object(backups, "_make_one", half), self.assertRaises(backups.BackupError) as raised:
+            self.make()
+        self.assertIn("backup_min_verified=2", str(raised.exception))
+
+    def test_a_policy_that_wants_an_independent_copy_refuses_a_block_clone(self):
+        self.settings["backup_min_independent"] = 1
+        with self.assertRaises(backups.BackupError) as raised:
+            self.make()
+        self.assertIn("backup_min_independent=1", str(raised.exception))
+
+    def test_a_large_backup_needs_confirmation_and_states_the_cumulative_cost(self):
+        self.make()
+        self.settings["backup_confirm_gb"] = 1e-10
+        with self.assertRaises(backups.BackupError) as raised:
+            self.make()
+        self.assertEqual(raised.exception.code, "confirm_large_backup")
+        row = raised.exception.detail["plan"]["roots"][0]
+        self.assertGreater(row["cumulative_bytes_before"], 0)  # the first backup counts
+        self.assertEqual(row["cumulative_bytes_after"], row["cumulative_bytes_before"] + row["this_backup_bytes"])
+        self.assertIsNotNone(row["free_bytes"])
+        self.assertIn("overstates", row["note"])
+        self.assertEqual(len(backups.listing(self.settings, self.lid)["backups"]), 1)  # the refusal made nothing
+        self.assertTrue(self.make(confirm_large=True)["backup"]["id"])
+
+    def test_the_doctor_warning_threshold_is_in_the_plan(self):
+        self.settings["backup_root_warn_gb"] = 1e-10
+        plan = backups.preview(self.settings, self.lid, str(self.gpr))
+        self.assertTrue(plan["roots"][0]["warn"])
+
+
+class RemoveAndHandler(World, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        selected = self.runner.target("owned")
+        self.lid = lineage.ensure(self.settings, {**selected, "origin_key": selected["key"]})["id"]
+        self.engine = fakehydra.FakeEngine(self.settings)
+
+    def call(self, **options):
+        with patch("hydralysis.api.load", return_value=self.settings), patch("hydralysis.api._settings", return_value=self.settings):
+            return json.loads(api.call("backend", {"action": "backups", "options": {"target": "owned", **options}}))
+
+    def make(self):
+        return backups.make(self.settings, self.engine, self.lid, str(self.gpr), "pre-commit", "3fa9c2d1aa01bb42", 0)["backup"]
+
+    def test_the_handler_needs_a_lineage(self):
+        from hydralysis import targets
+        targets.register(self.settings, ["bare"], {"gpr": str(self.gpr), "program": "/owned.exe", "sha256": self.digest, "exe": str(self.exe)})
+        reply = self.call(target="bare")
+        self.assertEqual(reply["error"], "no_lineage")
+        self.assertEqual(self.call(op="list")["lineage"], self.lid)
+        with patch("hydralysis.api.load", return_value=self.settings), patch("hydralysis.api._settings", return_value=self.settings),                 self.assertRaises(ValueError):
+            api.call("backend", {"action": "backups", "options": {"op": "list"}})  # neither target nor lineage
+
+    def test_list_verify_and_remove_through_backend_action_backups(self):
+        # the handler finds the lineage through the registry, so register it the way a commit does
+        selected = self.runner.target("owned")
+        lineage.register(self.settings, selected, self.lid, selected["key"])
+        made = self.make()
+        listed = self.call(op="list")
+        self.assertEqual(listed["op"], "list")
+        self.assertEqual([row["id"] for row in listed["backups"]], [made["id"]])
+        self.assertEqual(listed["independent_verified"], 0)
+        self.assertEqual(listed["policy"]["backup_min_verified"], 1)
+        verified = self.call(op="verify", id=made["id"])
+        self.assertEqual([(row["id"], row["ok"]) for row in verified["results"]], [(made["id"], True)])
+        self.assertEqual(self.call(op="verify", id=made["id"]) and True, True)
+
+    def test_remove_is_a_dry_run_unless_confirmed_and_never_drops_below_the_policy(self):
+        selected = self.runner.target("owned")
+        lineage.register(self.settings, selected, self.lid, selected["key"])
+        made = self.make()
+        refused = self.call(op="remove", id=made["id"], confirm=True)
+        self.assertEqual(refused["refused"], "backup_min_verified")
+        self.assertTrue(Path(made["folder"]).is_dir())
+        second = backups.make(self.settings, self.engine, self.lid, str(self.gpr), "pre-commit", "3fa9c2d1aa01bb42", 0)["backup"]
+        dry = self.call(op="remove", id=made["id"])
+        self.assertTrue(dry["dry_run"])
+        self.assertFalse(dry["removed"])
+        self.assertTrue(Path(made["folder"]).is_dir())
+        self.assertGreater(dry["bytes"], 0)
+        done = self.call(op="remove", id=made["id"], confirm=True)
+        self.assertTrue(done["removed"])
+        self.assertFalse(Path(made["folder"]).exists())
+        self.assertTrue(Path(second["folder"]).is_dir())
+        # the removal is recorded; the other backup stays; a missing id is an error, not a silent success
+        self.assertTrue(any(row.get("removed") for row in backups.logged(self.settings, self.lid)))
+        self.assertEqual(len(backups.listing(self.settings, self.lid)["backups"]), 1)
+        self.assertEqual(backups.listing(self.settings, self.lid)["logged_but_missing"], [])
+
+    def test_remove_needs_exactly_one_selector_and_a_boolean_confirm(self):
+        with self.assertRaises(ValueError):
+            backups.remove(self.settings, self.lid, {})
+        with self.assertRaises(ValueError):
+            backups.remove(self.settings, self.lid, {"id": "x", "generation": 1})
+        with self.assertRaises(ValueError):
+            backups.remove(self.settings, self.lid, {"id": "x", "confirm": "yes"})
+
+    def test_remove_refuses_generation_zero_the_head_the_revert_target_and_a_live_views_base(self):
+        # build a lineage of three published generations by writing the log the way a commit does
+        for number in (1, 2, 3):
+            lineage.generation_dir(self.settings, self.lid, number).mkdir(parents=True)
+            lineage.append_current(self.settings, self.lid, {"gen": number, "cid": "c-%08x" % number, "reason": "commit", "gpr": "g%d" % number,
+                                                            "manifestSha256": "m"})
+        reasons = {}
+        for number in (0, 3, 2):
+            reply = backups.remove(self.settings, self.lid, {"generation": number, "confirm": True})
+            reasons[number] = reply["message"]
+            self.assertEqual(reply["refused"], "protected_generation")
+        self.assertIn("never removed", reasons[0])
+        self.assertIn("head", reasons[3])
+        self.assertIn("revert target", reasons[2])
+        # every earlier published generation is a revert target too: commit_revert walks back c3, c2, c1
+        chain = backups.remove(self.settings, self.lid, {"generation": 1, "confirm": True})
+        self.assertEqual(chain["refused"], "protected_generation")
+        self.assertIn("revert chain", chain["message"])
+        # a live view's base protects a generation above the head, which nothing else protects
+        lineage.generation_dir(self.settings, self.lid, 4).mkdir(parents=True)
+        base = Path(self.settings["root"]) / "bases" / "origin" / "key"
+        base.mkdir(parents=True)
+        (base / "COMPLETE.json").write_text(json.dumps({"gpr": "x", "generation": 4, "lineage": self.lid}), encoding="utf-8")
+        self.assertEqual(backups.remove(self.settings, self.lid, {"generation": 4, "confirm": True})["message"], "the base of a live view")
+        (base / "COMPLETE.json").unlink()
+        folder = lineage.generation_dir(self.settings, self.lid, 4)
+        (folder / "payload.bin").write_bytes(b"x" * 100)
+        dry = backups.remove(self.settings, self.lid, {"generation": 4})
+        self.assertEqual((dry["removed"], dry["dry_run"]), (False, True))
+        self.assertTrue(folder.exists())
+        done = backups.remove(self.settings, self.lid, {"generation": 4, "confirm": True})
+        self.assertTrue(done["removed"])
+        self.assertFalse(folder.exists())
+
+    def test_the_revert_chain_stays_protected_after_a_revert_and_a_rolled_back_generation_is_removable(self):
+        for number in (1, 2, 3):
+            lineage.generation_dir(self.settings, self.lid, number).mkdir(parents=True)
+            lineage.append_current(self.settings, self.lid, {"gen": number, "cid": "c-%08x" % number, "reason": "commit", "gpr": "g%d" % number,
+                                                            "manifestSha256": "m"})
+        # reverting c3 appends a rollback line at generation 2: generation 1 is now the next revert target
+        lineage.append_current(self.settings, self.lid, {"gen": 2, "cid": "c-00000003", "reason": "rollback", "gpr": "g2",
+                                                        "manifestSha256": "m"})
+        kept = backups.protected_generations(self.settings, self.lid)
+        self.assertEqual(sorted(kept), [0, 1, 2])
+        self.assertIn("revert target", kept[1])
+        self.assertNotIn(3, kept)
+        self.assertTrue(backups.remove(self.settings, self.lid, {"generation": 3, "confirm": True})["removed"])
+        self.assertEqual(backups.remove(self.settings, self.lid, {"generation": 1, "confirm": True})["refused"], "protected_generation")
+
+    def test_op_remove_is_in_the_option_bags_help_text(self):
+        self.assertIn("remove", api.OPTION_BAGS["backend"])
+        self.assertIn("dry run", api.OPTION_BAGS["backend"])
+
+
+if __name__ == "__main__":
+    unittest.main()
