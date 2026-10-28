@@ -1,5 +1,5 @@
 ---
-name: hydralysis-hooks
+name: hooks
 description: Find a function worth hooking and prove the bytes still match. Use when attaching a detour, a vtable slot, or an import hook in a binary you own.
 ---
 

@@ -1,5 +1,5 @@
 ---
-name: hydralysis-evidence
+name: evidence
 description: Record a reverse-engineering claim so it survives a Ghidra refresh or a new build of the binary.
 ---
 
