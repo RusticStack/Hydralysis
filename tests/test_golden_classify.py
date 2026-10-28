@@ -143,6 +143,19 @@ class Rules(unittest.TestCase):
         self.assertNotIn("condition-inversion", gc.signals(a, same))
         self.assertIn("condition-inversion", gc.signals(a, demorgan))
 
+    def test_equality_must_be_negated_in_a_compound_condition(self):
+        # == with && must become != with ||; keeping == while only the connective swaps is a different test
+        self.assertFalse(gc._flipped("if (a == 1 && b == 2) {", "if (a == 1 || b == 2) {"))
+        self.assertFalse(gc._flipped("if (a < 0 && b == 3) {", "if (a >= 0 || b == 3) {"))
+        self.assertFalse(gc._flipped("if (a != 1 && b != 2) {", "if (a != 1 || b != 2) {"))
+        self.assertTrue(gc._flipped("if (a == 1 && b == 2) {", "if (a != 1 || b != 2) {"))
+        self.assertTrue(gc._flipped("if (a < 0 && b == 3) {", "if (a >= 0 || b != 3) {"))
+        a = BASE.replace("iVar1 == 0", "iVar1 == 1 && param_1 == 2")
+        wrong = REORDER.replace("iVar1 != 0", "iVar1 == 1 || param_1 == 2")
+        right = REORDER.replace("iVar1 != 0", "iVar1 != 1 || param_1 != 2")
+        self.assertNotIn("condition-inversion", gc.signals(a, wrong))
+        self.assertIn("condition-inversion", gc.signals(a, right))
+
     def test_constants_are_a_multiset(self):
         found = gc.signals(BASE, BASE.replace("iVar1 + 1", "iVar1 + 1 + 1"))
         self.assertIn("constants-data", found)

@@ -79,18 +79,18 @@ lines up to `*/`), so a line that starts with `*` outside a comment is code.
 | WARNING comment text only | 8 | accepted | 8 |
 | calling convention or register notation | 47 | open | |
 | same statements, different order | 75 | accepted | 61 |
-| same conditions, flipped polarity or mirrored operands | 564 | accepted | 548 |
-| different branch, loop or goto count | 254 | open | |
+| same conditions, flipped polarity or mirrored operands | 510 | accepted | 498 |
+| different branch, loop or goto count | 258 | open | |
 | stack variables split, merged or resized | 416 | open | |
 | declared types of locals | 132 | open | |
 | types or pointer casts | 60 | open | |
 | constants or data references | 223 | open | |
 | variable naming only | 0 | accepted | 0 |
-| no rule matched | 184 | open | |
-| **candidate accepted / accepted / open** | **647 / 617 / 1,354** | | |
+| no rule matched | 234 | open | |
+| **candidate accepted / accepted / open** | **593 / 567 / 1,404** | | |
 
-"Candidate accepted" is the count by primary cause alone (647). "Accepted" (617) drops the 30
-candidates where an open-class rule also matched. Open is everything not accepted (1,971 - 617).
+"Candidate accepted" is the count by primary cause alone (593). "Accepted" (567) drops the 26
+candidates where an open-class rule also matched. Open is everything not accepted (1,971 - 567).
 
 Correction to the first version of this page, which reported 821 accepted and 1,150 open: its
 comment rule counted any line starting with `*` as comment (both of its 2 "comment only" functions
@@ -105,6 +105,10 @@ or a pure operand mirror with the same test, and a compound condition needs its 
 swap. Condition inversion went from 580 to 564 and accepted from 633 to 617 (the accepted figure is
 by class and text, not checked per function; 16 lone flips left the class, which lands in the open
 classes: 16 more "no rule matched"). The tests are in `tests/test_golden_classify.py`.
+Third correction (review round 3): in a condition with more than one comparison, `==` must become `!=`
+and `!=` must become `==` (negation), not only the connective swap (`a == 1 && b == 2` against
+`a == 1 || b == 2` is not accepted). Condition inversion went from 564 to 510 and accepted from 617 to
+567 (by class and text, not checked per function); control flow 254 to 258, "no rule matched" 184 to 234.
 The earlier "variable naming only" 21 are now 0 as a primary cause; where they went was not traced one by one. Nothing has been checked per function.
 
 `by_signal` (every rule that matches, not only the first) is in the tool's JSON output; a function

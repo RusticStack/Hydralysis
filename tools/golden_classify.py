@@ -166,7 +166,10 @@ def _flipped(line_a: str, line_b: str) -> bool:
     reversed_order = len(ops_a) == 1 and sides_a is not None and sides_b is not None and sides_a == sides_b[::-1]
     for first, second in zip(ops_a, ops_b):
         if first in _SYMMETRIC:
-            if second not in _SYMMETRIC:
+            if reversed_order:  # single comparison with the sides swapped: == stays ==, != stays != (a mirror)
+                if second not in _SYMMETRIC:
+                    return False
+            elif second != ("!=" if first == "==" else "=="):  # same operand order: negated, never kept
                 return False
         elif same_order:
             if second != _NEG.get(first):
