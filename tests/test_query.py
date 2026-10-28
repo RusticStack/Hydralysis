@@ -26,8 +26,7 @@ class EngineCase(unittest.TestCase):
         self.daemon.add_project(self.gpr, {"/owned.exe": {"sha256": self.digest}})
         self.settings = {"root": str(self.root / "data"), "hydra_dir": "x", "hydra_client": "x",
                          "targets": {"owned": {"gpr": str(self.gpr), "program": "/owned.exe", "exe": str(self.exe)}}}
-        patches = [patch("hydralysis.hydra.Engine", fakehydra.FakeEngine),
-                   patch("hydralysis.workcopy._start_saver")]
+        patches = [patch("hydralysis.hydra.Engine", fakehydra.FakeEngine)]
         for item in patches:
             item.start()
             self.addCleanup(item.stop)
@@ -397,7 +396,7 @@ class Overlays(EngineCase):
         self.edit(kind="rename", name="One")
         state = workcopy._state(self.settings, self.runner.target("owned"))
         fork = self.daemon.projects[self.daemon._norm(state["fork_gpr"])]["programs"]["/owned.exe"]
-        fork["live"] = None  # the daemon restarted before the saver ran
+        fork["live"] = None  # the daemon restarted: nothing ever saved the working copy (D61)
         query._keys.clear()
         self.assertEqual(self.ask()["function"]["name"], "One")
 
@@ -446,6 +445,278 @@ class Overlays(EngineCase):
         self.edit(address="rva:0x1000", kind="rename", name="Named")
         record = workcopy.load_store(self.settings, self.runner.target("owned"))["edits"][0]
         self.assertEqual(record["address"], "0x140001000")
+
+
+
+class ViewLifecycle(EngineCase):
+    """PROTOCOL-3.md D44/D61, 4.10: one lifecycle per view, no second writer, one shared base, a typed `busy`."""
+
+    def sync_calls(self, command):
+        return [fields for _, name, fields in self.daemon.calls if name == command]
+
+    def test_view_lifecycle_has_no_saver_and_no_saved_state(self):
+        import importlib.util
+        import re
+        src = Path(workcopy.__file__).parent
+        self.assertIsNone(importlib.util.find_spec("hydralysis.workcopy_saver"))
+        self.assertFalse((src / "workcopy_saver.py").exists())
+        self.assertFalse(hasattr(workcopy, "_start_saver"))
+        for path in sorted(src.glob("*.py")):
+            text = path.read_text(encoding="utf-8")
+            self.assertIsNone(re.search(r"workcopy_saver|_start_saver|saver\.lock|saver-settings|overlay_save_debounce_s|saved_at", text),
+                              path.name)
+        self.edit(kind="rename", name="Lifecycle")
+        state = workcopy._state(self.settings, self.runner.target("owned"))
+        self.assertNotIn("saved_at", state)
+        status = self.ask("status")
+        self.assertNotIn("saved", status["overlays"])
+        self.assertEqual(status["overlays"]["pending"], 1)
+        # No process other than the caller's ever opened a fork for writing: every writer is a sync's own connection.
+        roles = {role for role, name, fields in self.daemon.calls if name == "open_program" and fields.get("writable")}
+        self.assertEqual(roles, {"writer"})
+
+    def test_closing_a_views_program_with_discard_keeps_the_folder_and_a_reopen_replays_what_was_lost(self):
+        self.edit(kind="rename", name="Kept", view="alice")
+        target = workcopy.with_view(self.runner.target("owned"), "alice")
+        state = workcopy._state(self.settings, target)
+        folder = Path(state["fork_gpr"]).parent
+        project = self.daemon.projects[self.daemon._norm(state["fork_gpr"])]
+        forks = len(self.sync_calls("fork_project"))
+        engine = fakehydra.FakeEngine(self.settings, role="writer", lane="evict")
+        engine.call("close_project", project=project["id"], discard=True)  # what an eviction does
+        self.assertTrue(folder.is_dir())
+        self.assertIsNone(project["programs"]["/owned.exe"]["live"])  # the daemon lost the unsaved change
+        query._keys.clear()
+        self.assertEqual(self.ask(options={"view": "alice"})["function"]["name"], "Kept")  # replayed from the store
+        self.assertEqual(len(self.sync_calls("fork_project")), forks)  # the same folder was reused, nothing re-forked
+        self.assertEqual(workcopy._state(self.settings, target)["fork_gpr"], state["fork_gpr"])
+
+    def test_a_lock_wait_that_runs_out_reaches_the_caller_as_the_structured_busy(self):
+        from hydralysis.locks import LaneLock
+        target = self.runner.target("owned")
+        folder = workcopy._directory(self.settings, target)
+        folder.mkdir(parents=True, exist_ok=True)
+        holder = LaneLock(str(folder / ".view.lock"))
+        self.assertTrue(holder.acquire())
+        self.addCleanup(holder.release)
+        before = self.revision()
+        with patch("hydralysis.workcopy.SYNC_LOCK_S", 0.2):
+            with self.assertRaises(RuntimeError) as raised:
+                self.edit(kind="rename", name="Blocked", expect_revision=before)
+        busy = json.loads(str(raised.exception))
+        self.assertEqual(busy["error"], "busy")
+        self.assertEqual(busy["what"], "working copy")
+        self.assertGreater(busy["retryAfterMs"], 0)
+        self.assertEqual(self.revision(), before)  # nothing was recorded
+        holder.release()
+        self.assertTrue(self.edit(kind="rename", name="Free", expect_revision=before)["ok"])
+
+    def test_the_default_bounds_are_thirty_seconds(self):
+        self.assertEqual(workcopy.SYNC_LOCK_S, 30)
+        self.assertEqual(workcopy.BASE_WAIT_S, 30)
+
+    def test_a_writer_connection_of_one_view_does_not_release_another_views_programs(self):
+        self.edit(kind="rename", name="One", view="a")
+        one = workcopy.with_view(self.runner.target("owned"), "a")
+        two = workcopy.with_view(self.runner.target("owned"), "b")
+        first, second = workcopy.writer_for(self.settings, one), workcopy.writer_for(self.settings, two)
+        self.assertNotEqual(first.key, second.key)
+        project_one = first.call("open_project", path=workcopy._state(self.settings, one)["fork_gpr"], writable=True)
+        project_two = second.call("open_project", path=str(self.gpr), writable=True)
+        key_one = first.call("open_program", path="/owned.exe", project=project_one["id"], writable=True)["key"]
+        key_two = second.call("open_program", path="/owned.exe", project=project_two["id"], writable=True)["key"]
+        first.reset()
+        self.assertEqual(second.writable, {key_two})
+        self.assertEqual(first.writable, set())
+        self.assertIn(second.conn, second._program(key_two)["writers"])
+        self.assertNotIn(first.conn, first._program(key_one)["writers"])
+
+    def test_sync_opens_its_writer_through_writer_for_with_the_views_own_lane(self):
+        # Mutation guard (review round 1): replacing writer_for by a bare hydra.Engine(role="writer") in _sync must fail here.
+        made = []
+        factory = workcopy.hydra.Engine
+
+        def spy(*args, **kwargs):
+            engine = factory(*args, **kwargs)
+            made.append(engine)
+            return engine
+        with patch("hydralysis.hydra.Engine", spy):
+            self.edit(kind="rename", name="One", view="a")
+            self.edit(kind="rename", name="Two", view="b")
+        writers = [engine for engine in made if engine.role == "writer"]
+        lanes = {engine.lane for engine in writers}
+        self.assertTrue(writers)
+        self.assertNotIn("", lanes)
+        for view in ("a", "b"):
+            self.assertIn(workcopy.with_view(self.runner.target("owned"), view)["key"], lanes)
+
+
+class SharedBase(EngineCase):
+    """PROTOCOL-3.md 4.10: one base per (origin, generation, master revision, engine release), shared by every view."""
+
+    def bases(self):
+        return [fields["path"] for _, name, fields in self.daemon.calls
+                if name == "fork_project" and Path(fields["path"]).name.startswith("base-")]
+
+    def folder(self):
+        (folder,) = [path for path in workcopy.bases_root(self.settings, self.runner.target("owned")).iterdir() if path.is_dir()]
+        return folder
+
+    def test_the_first_edits_of_many_views_build_one_base(self):
+        for view in ("a", "b", "c", "d"):
+            self.edit(kind="rename", name="N_" + view, view=view)
+        self.assertEqual(len(self.bases()), 1, self.bases())
+        folder = self.folder()
+        self.assertTrue((folder / "COMPLETE.json").is_file())
+        ready = workcopy._base_ready(folder)
+        phases = {}
+        for view in ("a", "b", "c", "d"):
+            state = workcopy._state(self.settings, workcopy.with_view(self.runner.target("owned"), view))
+            self.assertEqual(state["base"]["gpr"], ready["gpr"])
+            phases[view] = state["last_sync"]["phases_ms"]["base_upgrade"]
+        # Only the builder spent time on the upgrade phase; the second to last view found the base in place.
+        self.assertEqual([phases[view] for view in ("b", "c", "d")], [0, 0, 0])
+
+    def test_a_new_engine_release_is_a_new_base(self):
+        self.edit(kind="rename", name="One", view="a")
+        self.daemon.release = {"hydraVersion": "12.3-hydra.9", "ghidraVersion": "12.3"}
+        self.edit(kind="rename", name="Two", view="b")
+        self.assertEqual(len(self.bases()), 2)
+
+    def test_a_base_without_its_completion_marker_is_invisible_and_is_rebuilt(self):
+        self.edit(kind="rename", name="One", view="a")
+        folder = self.folder()
+        for path in folder.glob("COMPLETE.json*"):
+            path.unlink()
+        self.edit(kind="rename", name="Two", view="b")
+        self.assertEqual(len(self.bases()), 2)
+        self.assertTrue((folder / "COMPLETE.json").is_file())
+
+    def test_a_waiter_gets_a_structured_busy_when_the_builder_never_finishes(self):
+        from hydralysis.locks import LaneLock
+        self.edit(kind="rename", name="One", view="a")
+        folder = self.folder()
+        for path in folder.glob("COMPLETE.json*"):
+            path.unlink()
+        holder = LaneLock(str(workcopy.bases_root(self.settings, self.runner.target("owned")) / (folder.name + ".lock")))
+        self.assertTrue(holder.acquire())
+        self.addCleanup(holder.release)
+        with patch("hydralysis.workcopy.BASE_WAIT_S", 0.3):
+            with self.assertRaises(RuntimeError) as raised:
+                self.edit(kind="rename", name="Two", view="b")
+        busy = json.loads(str(raised.exception))
+        self.assertEqual((busy["error"], busy["what"]), ("busy", "shared base"))
+        self.assertEqual(self.revision("b"), 0)
+
+    def test_a_waiter_takes_the_base_the_builder_finishes(self):
+        import threading
+        import time
+        from hydralysis.locks import LaneLock
+        self.edit(kind="rename", name="One", view="a")
+        folder = self.folder()
+        record = workcopy._base_ready(folder)
+        marker = folder / "COMPLETE.json"
+        saved = marker.read_bytes()
+        for path in folder.glob("COMPLETE.json*"):
+            path.unlink()
+        holder = LaneLock(str(workcopy.bases_root(self.settings, self.runner.target("owned")) / (folder.name + ".lock")))
+        self.assertTrue(holder.acquire())
+
+        def finish():
+            time.sleep(0.3)
+            marker.write_bytes(saved)
+            holder.release()
+        thread = threading.Thread(target=finish)
+        thread.start()
+        self.addCleanup(thread.join)
+        self.edit(kind="rename", name="Two", view="b")
+        self.assertEqual(len(self.bases()), 1)  # the waiter forked nothing of its own
+        self.assertEqual(workcopy._state(self.settings, workcopy.with_view(self.runner.target("owned"), "b"))["base"]["gpr"],
+                         record["gpr"])
+
+    def test_a_stale_overlay_state_on_a_fresh_base_is_cleared_before_a_view_forks_from_it(self):
+        master = self.daemon.projects[self.daemon._norm(self.gpr)]["programs"]["/owned.exe"]
+        master["saved"]["marker"] = json.dumps({"revision": 9, "edits": 9, "ids_sha256": "x"}, separators=(",", ":"))
+        self.edit(kind="rename", name="One")
+        state = workcopy._state(self.settings, self.runner.target("owned"))
+        self.assertTrue(state["base"]["marker_cleared"])
+        base = self.daemon.projects[self.daemon._norm(state["base"]["gpr"])]["programs"]["/owned.exe"]
+        self.assertEqual(base["saved"]["marker"], "")
+        self.assertEqual(self.ask()["function"]["name"], "One")
+
+
+class LaunchConfiguration(unittest.TestCase):
+    """D54: the lane caps of the daemon this client launches come from the expected number of agents."""
+
+    def test_defaults_follow_sixteen_expected_agents(self):
+        config = hydra.daemon_config({"root": "r"})
+        self.assertEqual((config["maxLong"], config["maxQuick"]), (24, 32))
+
+    def test_the_caps_scale_with_expected_agents_and_never_fall_below_the_floor(self):
+        small = hydra.daemon_config({"root": "r", "expected_agents": 2})
+        large = hydra.daemon_config({"root": "r", "expected_agents": 40})
+        self.assertEqual((small["maxLong"], small["maxQuick"]), (8, 16))
+        self.assertEqual((large["maxLong"], large["maxQuick"]), (60, 80))
+
+    def test_an_explicit_hydra_setting_wins(self):
+        config = hydra.daemon_config({"root": "r", "expected_agents": 16, "hydra": {"maxLong": 5, "maxQuick": 7, "maxImports": 3}})
+        self.assertEqual((config["maxLong"], config["maxQuick"], config["maxImports"]), (5, 7, 3))
+
+    def test_a_bad_count_is_refused(self):
+        for bad in (0, 257, -1, True, "16", 1.5):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                hydra.daemon_config({"root": "r", "expected_agents": bad})
+
+    def test_the_launch_writes_the_caps_into_the_config_the_engine_reads(self):
+        with workdir("launch") as folder:
+            path = hydra.write_daemon_config({"root": folder, "expected_agents": 10})
+            written = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual((written["maxLong"], written["maxQuick"]), (15, 20))
+
+class AdoptObservation(EngineCase):
+    """`copied` and `imported` come from what adopt observed, not from a literal (PROTOCOL-3.md 8.1)."""
+
+    def adopt(self, engine_class):
+        with patch("hydralysis.hydra.Engine", engine_class):
+            return targets.adopt(self.settings, engine_class(self.settings), str(self.gpr.parent), exe=str(self.exe), target="adopted")
+
+    def test_an_untouched_project_reports_nothing_observed(self):
+        result = self.adopt(fakehydra.FakeEngine)
+        self.assertEqual((result["copied"], result["imported"], result["written"]), (False, False, False))
+        self.assertIn("no copy, no write", result["note"])
+
+    def test_a_program_that_appears_while_the_project_is_opened_is_an_import(self):
+        class Growing(fakehydra.FakeEngine):
+            lists = 0
+
+            def _list(self, project, **kwargs):
+                type(self).lists += 1
+                if type(self).lists == 2:  # the second listing: something was imported meanwhile
+                    self.daemon.project_by_id(project)["programs"]["/extra.exe"] = {
+                        "sha256": "f" * 64, "analyzed": True, "functions": 1, "imageBase": "0x140000000",
+                        "saved": {"marker": "", "names": {}}, "live": None, "writers": set()}
+                return super()._list(project, **kwargs)
+        result = self.adopt(Growing)
+        self.assertTrue(result["imported"])
+        self.assertIn("imported", result["note"])
+
+    def test_a_file_that_changes_under_the_project_folder_is_a_write(self):
+        class Writing(fakehydra.FakeEngine):
+            def _open_project(self, path, **kwargs):
+                opened = super()._open_project(path, **kwargs)
+                Path(opened["gpr"]).with_name("Owned.rep").joinpath("written.bin").write_bytes(b"x")
+                return opened
+        result = self.adopt(Writing)
+        self.assertTrue(result["written"])
+        self.assertFalse(result["copied"])
+
+    def test_a_project_the_engine_registers_elsewhere_is_a_copy(self):
+        class Copying(fakehydra.FakeEngine):
+            def _open_project(self, path, **kwargs):
+                opened = super()._open_project(path, **kwargs)
+                return {**opened, "gpr": str(Path(self.settings["root"]) / "elsewhere" / "Owned.gpr")}
+        result = self.adopt(Copying)
+        self.assertTrue(result["copied"])
 
 
 if __name__ == "__main__":

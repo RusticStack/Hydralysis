@@ -90,7 +90,7 @@ class Case(unittest.TestCase):
         self.daemon.add_project(self.gpr, {"/owned.exe": {"sha256": self.digest}})
         self.settings = {"root": str(self.root / "data"), "hydra_dir": "x", "hydra_client": "x",
                          "targets": {"owned": {"gpr": str(self.gpr), "program": "/owned.exe", "exe": str(self.exe)}}}
-        for item in (patch("hydralysis.hydra.Engine", self.engine_class), patch("hydralysis.workcopy._start_saver")):
+        for item in (patch("hydralysis.hydra.Engine", self.engine_class),):
             item.start()
             self.addCleanup(item.stop)
         query._keys.clear()
