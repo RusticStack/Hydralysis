@@ -1032,6 +1032,8 @@ FOLLOW_UP = {  # (file, function, kind) -> (category, note)
     ("hydra.py", "sync_scripts", "write_bytes"): ("artifact", "engine script staging"),
     ("hydra.py", "sync_scripts", "Path.replace"): ("artifact", "engine script staging"),
     ("hydra.py", "install", "Path.rename"): ("artifact", "engine install directory rename"),
+    ("environment.py", "init", "write_text"): ("artifact", "the per-user configuration file; hand-edited, so not sealed"),
+    ("environment.py", "init", "Path.replace"): ("artifact", "the per-user configuration file; hand-edited, so not sealed"),
     ("userscripts.py", "_stage", "write_bytes"): ("artifact", "staged user script copy"),
     ("userscripts.py", "_stage", "Path.replace"): ("artifact", "staged user script copy"),
     ("crossbuild.py", "run", "open(w)"): ("artifact", "diff report"),
@@ -1141,8 +1143,8 @@ class WriteGate(unittest.TestCase):
         # Y1 deleted the legacy analysis.save_overlay (its two rows). What is left is the artifact sites that are
         # not records: no record-bearing writer stands outside durable.
         self.assertEqual(len(records), 0)
-        self.assertEqual(len(FOLLOW_UP), 22)
-        self.assertEqual(sum(COUNTS.get(key, 1) for key in FOLLOW_UP), 24)
+        self.assertEqual(len(FOLLOW_UP), 24)
+        self.assertEqual(sum(COUNTS.get(key, 1) for key in FOLLOW_UP), 26)
         self.assertEqual(sorted(key[:2] for key in records), [])
 
 
