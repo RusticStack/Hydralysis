@@ -1012,11 +1012,62 @@ def check_namemap(manifest: dict) -> list[str]:
     return failures
 
 
+def check_scenario(manifest: dict) -> list[str]:
+    """Z11: the runtime scenario of the old toolchain, game-free, on flow_fixture.exe (tools/scenarios/kotor_vfs_lookup.py).
+    The fixture's folder is the install (hashed before and after, never run); a copy of it is the profile that is
+    spawned paused. Twelve steps, run twice, the second bundle compared with the first. fx_exported is probed with a
+    limit of 8 and fires about 20 times a second, so the window ends partial with hit_limit_reached, by design. The
+    writers step needs the prepared analysis target (prepare_fixtures.py); without it the step is a skip that this
+    line says, and the run is judged on the other eleven."""
+    import shutil
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools" / "scenarios"))
+    import kotor_vfs_lookup as scenario
+    from hydralysis import evidence_bundle
+    failures = []
+    for arch in ARCHES:
+        build = manifest[arch + "/flow_fixture.exe"]
+        install = Path(build["path"]).parent
+        work = Path(MANIFEST_DIR[0]) / "_scenario" / arch
+        shutil.rmtree(work, ignore_errors=True)
+        profile = work / "profile"
+        shutil.copytree(install, profile, ignore=shutil.ignore_patterns("*.stop", "*.log"))
+        spec = scenario.fixture_spec(manifest, arch, str(work / "flow.stop"))
+        spec["writers"]["target"] = target(arch, "flow_fixture.exe")
+        try:
+            re.query(spec["writers"]["target"], "writes", limit=1, timeout_s=120, offset="0x4")
+            engine = ""
+        except Exception as error:  # no prepared analysis: the writers step is a skip, said below
+            spec["writers"] = None
+            spec["allowed_skips"]["writers"] = "no analysis engine target (%s)" % str(error)[:80]
+            engine = "writers skipped: " + spec["allowed_skips"]["writers"]
+        result = scenario.run_scenario(spec, re, profile, work / "out", install, twice=True, log=lambda line: print("   " + line))
+        runs = result["runs"]
+        events = []
+        for run in runs:
+            bundle = evidence_bundle.load_bundle(Path(run["bundle"])) if run["bundle"] else {"records": []}
+            hook = [r for r in bundle["records"] if r["content"]["name"].startswith(spec["name"] + ":0x")]
+            events.append(hook[0]["content"]["parameters"]["first_events"] if hook else None)
+        consecutive = all(e and all(b == a + 1 for a, b in zip(e, e[1:])) for e in events)
+        ok = result["ok"] and consecutive and events[0] == events[1]
+        print("%s scenario %s: pass sequence %s (skipped %s), coverage %s %s, silent drops %s, install tree unchanged %s, "
+              "first frames %s, bundles %s%s" % ("PASS" if ok else "FAIL", arch, len(runs[0]["pass_sequence"]), sorted(runs[0]["skipped"]),
+                                                  (runs[0]["coverage"] or {}).get("status"), runs[0]["limitations"],
+                                                  [r["silent_drops"] for r in runs], [r["install_tree"]["unchanged"] for r in runs], events,
+                                                  (result["compare"] or {}).get("status"), ("; " + engine) if engine else ""))
+        if not ok:
+            for run in runs:
+                for row in run["steps"]:
+                    if row["status"] not in ("pass", "skipped"):
+                        print("   %s %s: %s" % (row["step"], row["status"], str(row["detail"])[:300]))
+            failures.append("scenario " + arch)
+    return failures
+
+
 CHECKS = {"value_flow": check_value_flow, "writers": check_writers, "hooked": check_hooked, "diff": check_diff,
           "vcalls": check_vcalls, "sample": check_sample, "mcp_typed_read": check_mcp_typed_read, "ledger": check_ledger,
           "listing": check_listing, "callgraph": check_callgraph, "namemap": check_namemap,
           "break_continue": check_break_continue, "export_hook": check_export_hook, "capture": check_capture,
-          "snapshot": check_snapshot}
+          "snapshot": check_snapshot, "scenario": check_scenario}
 
 
 def main(argv: list[str]) -> int:
