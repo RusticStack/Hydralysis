@@ -123,10 +123,29 @@ class Rules(unittest.TestCase):
     def test_operator_is_compared_not_only_the_operands(self):
         self.assertNotIn("condition-inversion", gc.signals(BASE, BASE.replace("iVar1 == 0", "iVar1 < 0")))
         lt = BASE.replace("iVar1 == 0", "iVar1 < 0")
-        for other in ("iVar1 >= 0", "0 > iVar1"):
-            self.assertIn("condition-inversion", gc.signals(lt, lt.replace("iVar1 < 0", other)), other)
+        # the negation with the branches swapped, and the mirror alone, are presentation differences
+        self.assertIn("condition-inversion", gc.signals(lt, REORDER.replace("iVar1 != 0", "iVar1 >= 0")))
+        self.assertIn("condition-inversion", gc.signals(lt, lt.replace("iVar1 < 0", "0 > iVar1")))
+        self.assertNotIn("condition-inversion", gc.signals(lt, lt.replace("iVar1 < 0", "iVar1 >= 0")))
         self.assertNotIn("condition-inversion", gc.signals(lt, lt.replace("iVar1 < 0", "iVar1 > 0")))
         self.assertNotIn("condition-inversion", gc.signals(lt, lt.replace("iVar1 < 0", "0 < iVar1")))
+
+    def test_lone_polarity_flip_is_not_accepted(self):
+        found = gc.signals(BASE, BASE.replace("iVar1 == 0", "iVar1 != 0"))
+        self.assertNotIn("condition-inversion", found)
+        self.assertFalse(gc.is_accepted(found))
+
+    def test_compound_condition_needs_the_connective_to_swap(self):
+        a = BASE.replace("iVar1 == 0", "iVar1 < 0 && param_1 < 3")
+        moved = REORDER.replace("iVar1 != 0", "iVar1 < 0 && param_1 < 3")  # branches swapped, condition text replaced below
+        same = moved.replace("iVar1 < 0 && param_1 < 3", "iVar1 >= 0 && param_1 >= 3")
+        demorgan = moved.replace("iVar1 < 0 && param_1 < 3", "iVar1 >= 0 || param_1 >= 3")
+        self.assertNotIn("condition-inversion", gc.signals(a, same))
+        self.assertIn("condition-inversion", gc.signals(a, demorgan))
+
+    def test_constants_are_a_multiset(self):
+        found = gc.signals(BASE, BASE.replace("iVar1 + 1", "iVar1 + 1 + 1"))
+        self.assertIn("constants-data", found)
 
     def test_operand_swap_alone_is_not_a_constants_change(self):
         found = gc.signals(BASE, BASE.replace("iVar1 == 0", "0 == iVar1"))
@@ -158,6 +177,15 @@ class Rules(unittest.TestCase):
         self.assertEqual(report["accepted_functions"], 1)
         self.assertEqual(report["open_functions"], 1)
         self.assertEqual(report["accepted_by_cause"]["condition-inversion"], 1)
+
+    def test_accepted_primary_with_an_open_secondary_signal_is_not_accepted(self):
+        # condition-inversion primary (branches swapped) plus a new else: control-flow matches too, so the function stays open
+        with_else = REORDER.replace("  }\n  return 1;", "  } else {\n    return 1;\n  }")
+        found = gc.signals(BASE, with_else)
+        self.assertEqual(gc.primary(found), "condition-inversion")
+        self.assertIn("control-flow", found)
+        self.assertFalse(gc.is_accepted(found))
+        self.assertTrue(gc.is_accepted(gc.signals(BASE, REORDER)))
 
 
 class Reports(unittest.TestCase):

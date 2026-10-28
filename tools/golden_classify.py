@@ -156,6 +156,11 @@ def _flipped(line_a: str, line_b: str) -> bool:
     ops_a, ops_b = _OPS.findall(line_a), _OPS.findall(line_b)
     if len(ops_a) != len(ops_b) or "!" in ops_a or "!" in ops_b:
         return False
+    if len(ops_a) > 1:  # De Morgan: every connective must swap, otherwise this is not the negation
+        swap = {"&&": "||", "||": "&&"}
+        conn_a, conn_b = re.findall(r"&&|\|\|", line_a), re.findall(r"&&|\|\|", line_b)
+        if not conn_a or [swap[c] for c in conn_a] != conn_b:
+            return False
     same_order = words_a == words_b
     sides_a, sides_b = _sides(line_a), _sides(line_b)
     reversed_order = len(ops_a) == 1 and sides_a is not None and sides_b is not None and sides_a == sides_b[::-1]
@@ -174,6 +179,16 @@ def _flipped(line_a: str, line_b: str) -> bool:
     return True
 
 
+def _mirrored(line_a: str, line_b: str) -> bool:
+    """Only the operands swapped sides with the operator mirrored: the same test, no change of polarity."""
+    line_a, line_b = _NUMBERED.sub(r"", line_a), _NUMBERED.sub(r"", line_b)
+    ops_a, ops_b = _OPS.findall(line_a), _OPS.findall(line_b)
+    sides_a, sides_b = _sides(line_a), _sides(line_b)
+    if len(ops_a) != 1 or len(ops_b) != 1 or sides_a is None or sides_b is None or sides_a != sides_b[::-1]:
+        return False
+    return ops_b[0] == ops_a[0] if ops_a[0] in _SYMMETRIC else ops_b[0] == _MIRROR.get(ops_a[0])
+
+
 def _pure_condition_change(minus: list[str], plus: list[str]) -> bool:
     """Every changed line is a condition that is flipped or mirrored, or a statement that only moved
     (the same multiset of statements on both sides). Anything else changed is not a condition inversion."""
@@ -185,7 +200,11 @@ def _pure_condition_change(minus: list[str], plus: list[str]) -> bool:
         return False
     rest_a = Counter(x.strip() for x in minus if not _COND.search(x) and not _BRACE.match(x))
     rest_b = Counter(x.strip() for x in plus if not _COND.search(x) and not _BRACE.match(x))
-    return rest_a == rest_b
+    if rest_a != rest_b:
+        return False
+    # a polarity change is only a presentation difference when statements moved with it (branches swapped);
+    # on its own it is a changed behaviour. A pure operand mirror has no polarity change and needs no move.
+    return bool(rest_a) or all(_mirrored(x, y) for x, y in zip(cond_a, cond_b))
 
 
 def signals(a: str, b: str) -> list[str]:

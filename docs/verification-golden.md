@@ -79,18 +79,18 @@ lines up to `*/`), so a line that starts with `*` outside a comment is code.
 | WARNING comment text only | 8 | accepted | 8 |
 | calling convention or register notation | 47 | open | |
 | same statements, different order | 75 | accepted | 61 |
-| same conditions, flipped polarity or mirrored operands | 580 | accepted | 564 |
+| same conditions, flipped polarity or mirrored operands | 564 | accepted | 548 |
 | different branch, loop or goto count | 254 | open | |
 | stack variables split, merged or resized | 416 | open | |
 | declared types of locals | 132 | open | |
 | types or pointer casts | 60 | open | |
 | constants or data references | 223 | open | |
 | variable naming only | 0 | accepted | 0 |
-| no rule matched | 168 | open | |
-| **candidate accepted / accepted / open** | **663 / 633 / 1,338** | | |
+| no rule matched | 184 | open | |
+| **candidate accepted / accepted / open** | **647 / 617 / 1,354** | | |
 
-"Candidate accepted" is the count by primary cause alone (663). "Accepted" (633) drops the 30
-candidates where an open-class rule also matched. Open is everything not accepted (1,971 - 633).
+"Candidate accepted" is the count by primary cause alone (647). "Accepted" (617) drops the 30
+candidates where an open-class rule also matched. Open is everything not accepted (1,971 - 617).
 
 Correction to the first version of this page, which reported 821 accepted and 1,150 open: its
 comment rule counted any line starting with `*` as comment (both of its 2 "comment only" functions
@@ -98,6 +98,13 @@ were pointer stores with a changed constant; the real comment-only count is 8), 
 rule ignored the operator and every other changed line (744 candidates there, 580 now; 629 of those
 744 also matched an open-class rule). Part of that earlier overlap was noise (a swapped `0 == x`
 counted as a changed constant), which is also fixed: constants are now compared as a multiset.
+Second correction (review round 2): a lone polarity change with no moved statement (`==` to `!=`,
+or `a < 0 && b < 3` against `a >= 0 && b >= 3`) is a changed behaviour, not a presentation
+difference. Condition inversion now needs statements that moved with the flip (swapped branches),
+or a pure operand mirror with the same test, and a compound condition needs its connectives to
+swap. Condition inversion went from 580 to 564 and accepted from 633 to 617 (the accepted figure is
+by class and text, not checked per function; 16 lone flips left the class, which lands in the open
+classes: 16 more "no rule matched"). The tests are in `tests/test_golden_classify.py`.
 The earlier "variable naming only" 21 are now 0 as a primary cause; where they went was not traced one by one. Nothing has been checked per function.
 
 `by_signal` (every rule that matches, not only the first) is in the tool's JSON output; a function
