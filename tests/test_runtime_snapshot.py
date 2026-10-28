@@ -127,6 +127,20 @@ class Comparing(unittest.TestCase):
         text = snap.compare(a, b, predicates=[{"path": "regions/config/bytes", "op": "increased"}])
         self.assertEqual(text["predicates"][0]["reason"], "not numbers")
 
+    def test_thread_and_counter_differences_are_masked_by_default_but_stay_readable(self):
+        a = sample()
+        b = sample(threads={"count": 9}, counters={"messages": 50})
+        default = snap.compare(a, b)
+        self.assertTrue(default["equal"])
+        self.assertGreaterEqual(default["masked_differences"], 2)             # counted, not hidden
+        unmasked = snap.compare(a, b, use_default_mask=False)
+        self.assertFalse(unmasked["equal"])
+        self.assertEqual({row["path"] for row in unmasked["differences"]} & {"threads/count", "counters/messages"},
+                         {"threads/count", "counters/messages"})
+        judged = snap.compare(a, b, predicates=[{"path": "counters/messages", "op": "increased"},
+                                                {"path": "threads/count", "op": "increased"}])
+        self.assertTrue(judged["ok"], judged["predicates"])
+
     def test_anything_outside_the_grammar_is_refused_not_evaluated(self):
         a, b = sample(), sample()
         for predicate, message in (({"path": "x", "op": "exec"}, "op must be one of"), ({"path": "x", "op": "eq"}, "scalar value"),

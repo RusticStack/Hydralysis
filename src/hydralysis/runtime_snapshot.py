@@ -6,7 +6,12 @@ flattens two snapshots to `path -> scalar` rows and reports the rows that differ
 
 Volatile means "differs from run to run for reasons that are not the behavior under test": process ids, creation
 times, load addresses, hook ids, sequence numbers. The default masks cover those; a caller adds its own. A mask
-hides a difference from `equal`; it never deletes the row (`masked` counts them and predicates can still read them).
+hides a difference from `equal`; it never deletes the row (`masked_differences` counts them and predicates can still read them).
+
+Two default masks hide more than ids: `threads/*` (so the recorded thread count never decides equal or unequal; a
+thread count differs with the runtime's own helper threads) and `counters/*` (event counts depend on timing). Their
+differences are counted in `masked_differences`; to judge them, name them in a predicate (for example `increased` on
+`counters/messages`) or compare with `use_default_mask=False`.
 """
 
 from __future__ import annotations
