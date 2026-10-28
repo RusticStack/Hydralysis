@@ -19,7 +19,15 @@
     {"id": "kotor_functions_thunks", "value": 60, "source": "file_number", "path": "docs/pr6-traceability.md",
      "pattern": "`function_counts` total [\\d,]+, internal [\\d,]+, thunks (\\d+)"},
     {"id": "x0_baselines", "value": null, "source": "pending", "package": "X0",
-     "note": "the X0 oracle baselines do not exist yet; no document may quote one until this row carries a value and a source"}
+     "note": "the X0 oracle baselines do not exist yet; no document may quote one until this row carries a value and a source"},
+    {"id": "ghidramcp_tools", "value": 30, "source": "file_number", "path": "docs/data/tool-surfaces.json",
+     "pattern": "\"id\": \"ghidramcp\",[^}]{1,20}\"count\": ([0-9]+)"},
+    {"id": "rea_tools", "value": 207, "source": "file_number", "path": "docs/data/tool-surfaces.json",
+     "pattern": "\"id\": \"rea\",[^}]{1,20}\"count\": ([0-9]+)"},
+    {"id": "mcp_outstanding", "value": 8, "source": "file_number", "path": "src/hydralysis/mcp.py",
+     "pattern": "MAX_OUTSTANDING = ([0-9]+)"},
+    {"id": "mcp_engine_workers", "value": 4, "source": "file_number", "path": "src/hydralysis/mcp.py",
+     "pattern": "TOOL_WORKERS = ([0-9]+)"}
   ],
   "claims": [
     {"id": "C1", "surface": "hydralysis", "class": "true_today", "flips": "Y5, Y3, Z1, gate 9.17",
@@ -132,6 +140,20 @@
      "text": "Hydralysis uses no stock Ghidra: the shipped source and skills do not name its hooks.",
      "evidence": "tests/test_no_stock_ghidra.py",
      "test": "tests/test_no_stock_ghidra.py::StockGhidraSourceScan::test_no_stock_ghidra_hook_is_named_outside_the_ignored_notice",
-     "appears_in": [{"path": "README.md", "contains": "It uses no stock Ghidra and needs none"}]}
+     "appears_in": [{"path": "README.md", "contains": "It uses no stock Ghidra and needs none"}]},
+    {"id": "N1", "surface": "hydralysis", "class": "gated", "flips": "Z13b",
+     "text": "Hydralysis registers {catalog_tools} tools, counted from tool_table(); the {ghidramcp_tools} GhidraMCP and {rea_tools} REA figures are third-party and not reproduced.",
+     "evidence": "docs/data/tool-surfaces.json",
+     "numbers": ["catalog_tools", "ghidramcp_tools", "rea_tools"],
+     "test": "tests/test_tool_mapping.py::ToolMapping::test_the_surface_counts_equal_their_sources",
+     "appears_in": [
+       {"path": "README.md", "contains": "Hydralysis registers {catalog_tools} tools (counted from `tool_table()`). The two figures it is compared with, {ghidramcp_tools} GhidraMCP tools and {rea_tools} for the `reverse-engineer-anything` skill, are third-party figures that were not reproduced"},
+       {"path": "THIRD_PARTY.md", "contains": "The {rea_tools}-tool server"}]},
+    {"id": "N2", "surface": "hydralysis", "class": "gated", "flips": "Z13b",
+     "text": "One MCP process runs {mcp_engine_workers} engine workers and accepts {mcp_outstanding} outstanding calls per lane; the next concurrent call on that lane gets Server busy with a retry hint.",
+     "evidence": "src/hydralysis/mcp.py",
+     "numbers": ["mcp_outstanding", "mcp_engine_workers"],
+     "test": "tests/test_tool_mapping.py::ToolMapping::test_the_mcp_cap_is_documented_and_is_the_code_constant",
+     "appears_in": [{"path": "README.md", "contains": "One MCP process runs {mcp_engine_workers} engine workers and accepts {mcp_outstanding} outstanding calls per lane"}]}
   ]
 }
