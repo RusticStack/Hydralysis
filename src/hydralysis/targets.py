@@ -107,8 +107,14 @@ def resolve(settings: dict, name: str) -> dict:
         raise ValueError("target %s has no program" % name)
     gpr = gpr_of(item)
     validate_project_path(gpr)
-    return {"name": name, "gpr": gpr, "program": program, "sha256": expected, "exe": item.get("exe", ""),
-            "key": target_key(gpr, program), "scripts": item.get("scripts", "")}
+    resolved = {"name": name, "gpr": gpr, "program": program, "sha256": expected, "exe": item.get("exe", ""),
+                "key": target_key(gpr, program), "scripts": item.get("scripts", "")}
+    # A target with a lineage resolves to the head generation of CURRENT.log (the registry's `gpr` stays the adopted
+    # project, a cache) and keeps the key it was created with, so its overlay stores and working directories survive
+    # every generation flip (PROTOCOL-3.md 4.4, D11).
+    from hydralysis import lineage
+    resolved.update(lineage.resolve(settings, item, resolved["key"]))
+    return resolved
 
 
 def target_key(gpr: str, program: str) -> str:
@@ -138,9 +144,11 @@ def adopt(settings: dict, engine, path: str, exe: str = "", expected: str = "", 
         if expected and actual != expected:
             raise ValueError("sha256 does not match exe %s (%s)" % (exe, actual))
         expected = actual
+    before = _signature(source)
     opened = engine.call("open_project", path=str(source.resolve()))
     listing = engine.call("list", project=opened["id"], programsOnly=True, limit=200,
                           **({"sha256": expected} if expected else {}))
+    listed_before = len([entry for entry in listing.get("entries", []) if entry.get("program")])
     programs = [entry for entry in listing.get("entries", []) if entry.get("program")]
     if program:
         programs = [entry for entry in programs if entry.get("path") in (program, "/" + program.lstrip("/"))
@@ -168,6 +176,39 @@ def adopt(settings: dict, engine, path: str, exe: str = "", expected: str = "", 
               "adopted_at": time.time(), "functions": info.get("functions"), "image_base": info.get("imageBase"),
               "project_revision": opened.get("revision"), "engine": "hydra"}
     register(settings, [name], record)
+    # `copied` and `imported` are observed, not asserted: the registered project is not the one the caller named, or the
+    # project's program list grew while it was opened; `written` is whether anything under the project folder changed.
+    again = engine.call("list", project=opened["id"], programsOnly=True, limit=200)
+    imported = len([entry for entry in again.get("entries", []) if entry.get("program")]) != listed_before
+    copied = not _inside(opened["gpr"], source)
+    written = _signature(source) != before
+    note = ("opened in place through a read-only view: no lock, no copy, no write" if not (copied or imported or written)
+            else "opened through the engine, but the observation found a change: " + ", ".join(
+                name for name, flag in (("copied", copied), ("imported", imported), ("written", written)) if flag))
     return {"kind": "adopt", "state": "registered", "registered": True, "target": name, **record,
-            "copied": False, "imported": False,
-            "note": "opened in place through a read-only view: no lock, no copy, no write"}
+            "copied": copied, "imported": imported, "written": written, "note": note}
+
+
+def _inside(gpr: str, source: Path) -> bool:
+    """Whether the opened project's path lies under what the caller named (a parent folder holds the project below it)."""
+    try:
+        Path(gpr).resolve().relative_to((source if source.is_dir() else source.parent).resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _signature(source: Path) -> tuple:
+    """(files, bytes, newest mtime) under the project folder, from stat alone: cheap, and enough to see a write."""
+    folder = source if source.is_dir() else source.parent
+    count = size = newest = 0
+    for item in folder.rglob("*"):
+        try:
+            info = item.stat()
+        except OSError:
+            continue
+        if item.is_file() and not item.name.endswith((".lock", ".lock~")) and item.name != "projectState":
+            count += 1
+            size += info.st_size
+            newest = max(newest, info.st_mtime_ns)
+    return count, size, newest
