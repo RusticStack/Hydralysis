@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 from pathlib import Path
 
@@ -76,13 +77,53 @@ CATALOG_EPOCH = 2
 # in the schema, so a later package changes a handler, never the schema.
 OPTION_BAGS = {
     "ghidra_query": "type_edit options.kind (commit, commit_revert, rebase, publish, merge, export_bundle, "
-                    "import_bundle, plus today's kinds), options.view, options.expect_revision; "
-                    "status options.show (changes, views, lineage, queue, health)",
-    "backend": "action=backups options.op (list, verify) and selectors; action=doctor options (sections, verbose)",
-    "ghidra_run": "options.isolation (private, shared, exclusive), options.readonly",
-    "job": "reserved: status/cancel filters (kind, cid) for commit and backup jobs",
+                    "import_bundle, plus today's kinds), options.view, options.expect_revision, options.as (the agent "
+                    "identity of the call, D59); status options.show (changes, views, lineage, queue, health)",
+    "backend": "action=backups options.op (list, verify, remove: remove is a dry run unless confirm:true) and "
+               "selectors; action=doctor options (sections, verbose)",
+    "ghidra_run": "options.isolation (private, shared, exclusive), options.readonly, options.as (the agent identity "
+                  "of the call, D59)",
+    "job": "status/cancel filters (kind, cid) for commit and backup jobs",
     "runtime": "per-action options (exists)",
 }
+
+# The handler registry (PROTOCOL-3.md 8.2, D34). A capability name maps to the module that implements it. The module is
+# imported lazily, at call time, so a test can patch this table and a later package registers its handler by creating
+# its module, never by editing this file. A module that does not exist yet, or that has no `handle`, answers
+# `not_available` (a result, not an error). `handle(capability, request)` returns the reply text; `request` carries
+# `tool`, `action`, `options`, `args` and `settings`.
+HANDLER_MODULES = {
+    "backups": "hydralysis.backups",
+    "doctor": "hydralysis.doctor",
+    "jobOptions": "hydralysis.commits",
+    "scriptIsolation": "hydralysis.userscripts",
+    "views": "hydralysis.views",
+    "publish": "hydralysis.publish",
+    "environment": "hydralysis.environment",
+    "evidenceBundle": "hydralysis.evidence_bundle",
+}
+
+
+def handler(capability: str):
+    """The module registered for CAPABILITY, or None while it does not exist (or has no `handle`)."""
+    name = HANDLER_MODULES.get(capability)
+    if not name:
+        return None
+    try:
+        module = importlib.import_module(name)
+    except ModuleNotFoundError as exc:
+        if exc.name and (name == exc.name or name.startswith(exc.name + ".")):
+            return None
+        raise
+    return module if callable(getattr(module, "handle", None)) else None
+
+
+def dispatch(capability: str, message: str, request: dict, **detail) -> str:
+    """Hand REQUEST to the registered handler; `not_available` with MESSAGE when there is none."""
+    module = handler(capability)
+    if module is None:
+        return not_available(capability, message, **detail)
+    return module.handle(capability, request)
 
 
 def catalog_hash(table: list[dict] | None = None) -> str:
@@ -365,10 +406,10 @@ def _workflow(name: str, args: dict) -> str:
             raise ValueError("component must be analysis or runtime")
         options = _options_bag(args)
         if action in ("doctor", "backups"):
-            return _backend_stub(action, options)
+            return _backend_action(action, options, args)
         if action == "help":
             from hydralysis.workflow_help import operation_help
-            return json.dumps({**operation_help(component), "catalog": catalog()}, indent=2)
+            return json.dumps({**operation_help(component), "catalog": catalog(), "option_bags": OPTION_BAGS}, indent=2)
         if action == "install":
             from hydralysis.preparation import start_install
             return json.dumps(start_install(settings, component), indent=2)
@@ -423,8 +464,9 @@ def _workflow(name: str, args: dict) -> str:
     if name == "job":
         options = _options_bag(args)
         if options:
-            return not_available("jobOptions", "job options are reserved for commit and backup jobs and are not implemented yet; "
-                                 "call job without options", tool="job", options=sorted(options))
+            return dispatch("jobOptions", "job options are not implemented in this release; call job without options",
+                            {"tool": "job", "action": args.get("action", "status"), "options": options, "args": args,
+                             "settings": settings}, tool="job", options=sorted(options))
         from hydralysis.preparation import cancel, status
         job_id = str(args.get("id") or "")
         action = args.get("action", "status")
@@ -495,16 +537,18 @@ def _options_bag(args: dict) -> dict:
     return options
 
 
-def _backend_stub(action: str, options: dict) -> str:
-    """doctor and backups: carriers only until Y4b (doctor.py) and Y2 (backups.py) dispatch them here."""
+def _backend_action(action: str, options: dict, args: dict) -> str:
+    """doctor and backups: validated here, then handed to the registered handler (backups.py, doctor.py)."""
     if action == "backups":
         op = options.get("op", "list")
-        if op not in ("list", "verify"):
-            raise ValueError("backups options.op must be list or verify")
-        return not_available("backups", "backend action=backups is not implemented in this release; no backup was listed or verified",
-                             tool="backend", action=action, op=op)
-    return not_available("doctor", "backend action=doctor is not implemented in this release; use backend status and inspect",
-                         tool="backend", action=action)
+        if op not in ("list", "verify", "remove"):
+            raise ValueError("backups options.op must be list, verify or remove")
+        return dispatch("backups", "backend action=backups is not implemented in this release; no backup was listed or verified",
+                        {"tool": "backend", "action": action, "options": options, "args": args, "settings": None},
+                        tool="backend", action=action, op=op)
+    return dispatch("doctor", "backend action=doctor is not implemented in this release; use backend status and inspect",
+                    {"tool": "backend", "action": action, "options": options, "args": args, "settings": None},
+                    tool="backend", action=action)
 
 
 def _script_options(options) -> str:
@@ -523,9 +567,10 @@ def _script_options(options) -> str:
         raise ValueError("ghidra_run options.isolation must be private, shared or exclusive")
     if "readonly" in options and not isinstance(options["readonly"], bool):
         raise ValueError("ghidra_run options.readonly must be a boolean")
-    return not_available("scriptIsolation", "ghidra_run options are not implemented in this release; the script was not run. "
-                         "Call ghidra_run without options for today's contained mode",
-                         tool="ghidra_run", options=sorted(options))
+    return dispatch("scriptIsolation", "ghidra_run options are not implemented in this release; the script was not run. "
+                    "Call ghidra_run without options for today's contained mode",
+                    {"tool": "ghidra_run", "action": "run", "options": options, "args": {}, "settings": None},
+                    tool="ghidra_run", options=sorted(options))
 
 
 def _live(result: dict, args: dict, image: Image) -> None:
