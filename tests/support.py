@@ -40,3 +40,19 @@ class WorkDir:
 
 def workdir(prefix: str = "t") -> WorkDir:
     return WorkDir(prefix)
+
+
+def default_to_shared(runner) -> None:
+    """Make a QueryRunner name the `shared` view for every call that names neither a `view` nor an agent (`as`).
+
+    A caller with neither has a view of its own now (Y5, D43), and reads the sealed master until its first edit. Tests that
+    exercise the store, the replay or the commit machinery of the shared view say so here, in one place."""
+    ask = runner.query
+
+    def shared_unless_named(target, action="decompile", address="", limit=40, cursor="", contains="", timeout_s=30, options=None):
+        options = dict(options or {})
+        if "view" not in options and "as" not in options:
+            options["view"] = "shared"
+        return ask(target, action, address, limit, cursor, contains, timeout_s, options)
+
+    runner.query = shared_unless_named

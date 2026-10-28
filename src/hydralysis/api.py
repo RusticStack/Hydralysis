@@ -365,13 +365,19 @@ def call(name: str, args: dict | None) -> str:
             return json.dumps(decoded, ensure_ascii=False)
         return result
     if name == "ghidra_run":
-        stub = _script_options(args.get("options"))
+        options = args.get("options")
+        if options is not None and not isinstance(options, dict):
+            raise ValueError("options must be an object")
+        options = dict(options or {})
+        from hydralysis import views
+        who = views.identify(options)  # `options.as` rides this bag too (D59); it is not an option of the script itself
+        stub = _script_options(options)
         if stub:
             return stub
         from hydralysis.userscripts import run
         return run(_settings(), target, str(args.get("script") or ""),
                    [str(item) for item in _list(args.get("args"))], int(args.get("timeout_s") or 600),
-                   args.get("view", ""))
+                   args.get("view", ""), who=who)
     if name == "ghidra_scripts":
         from hydralysis.userscripts import list_scripts
         return list_scripts(load(), target, str(args.get("filter") or ""))

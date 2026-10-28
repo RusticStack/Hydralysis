@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import fakehydra
 from hydralysis import hydra, query, targets, workcopy
-from support import workdir
+from support import default_to_shared, workdir
 
 
 class EngineCase(unittest.TestCase):
@@ -32,6 +32,7 @@ class EngineCase(unittest.TestCase):
             self.addCleanup(item.stop)
         query._keys.clear()
         self.runner = query.QueryRunner(self.settings, fakehydra.FakeEngine(self.settings))
+        default_to_shared(self.runner)  # these tests exercise the shared view; a bare call has a view of its own now (Y5)
 
     def ask(self, action="decompile", address="0x140001000", **kwargs):
         return json.loads(self.runner.query("owned", action, address, **kwargs))
@@ -717,6 +718,98 @@ class AdoptObservation(EngineCase):
                 return {**opened, "gpr": str(Path(self.settings["root"]) / "elsewhere" / "Owned.gpr")}
         result = self.adopt(Copying)
         self.assertTrue(result["copied"])
+
+
+class ViewsThroughQuery(unittest.TestCase):
+    """`type_edit kind=rebase|merge|publish` and `status show=queue` as the tools call them (PROTOCOL-3.md 4.7, 4.8, 4.10)."""
+
+    def setUp(self):
+        from test_commit import World
+
+        class Inner(World, unittest.TestCase):
+            def runTest(self):
+                pass
+        self.world = Inner()
+        self.world.setUp()
+        self.addCleanup(self.world.doCleanups)
+        self.runner = self.world.runner
+
+    def ask(self, action, address="", **options):
+        return json.loads(self.runner.query("owned", action, address, options=options))
+
+    def edit(self, name, address, view):
+        revision = workcopy.load_store(self.world.settings, self.world.target(view))["revision"]
+        return self.ask("type_edit", address, kind="rename", name=name, source="cited test evidence", expect_revision=revision, view=view)
+
+    def publish_through_the_job(self, view):
+        """The publish call starts a job; the job's worker is the function the overlay worker calls."""
+        from hydralysis import overlayjobs, views
+        revision = workcopy.load_store(self.world.settings, self.world.target(view))["revision"]
+        with patch("hydralysis.overlayjobs.start", return_value={"id": "overlay-0123456789ab", "state": "queued", "kind": "publish"}) as start:
+            answer = self.ask("type_edit", kind="publish", confirm_one_way_upgrade=True, expect_revision=revision, view=view)
+        options = start.call_args.args[4]
+        views.run_publish_job(self.world.settings, self.world.target(view), options, fakehydra.FakeEngine(self.world.settings), 60)
+        return answer, start
+
+    def test_publish_returns_a_job_with_its_position_and_the_worker_publishes(self):
+        self.edit("Mine", "0x140001000", "one")
+        answer, start = self.publish_through_the_job("one")
+        self.assertEqual((start.call_args.args[2], answer["id"], answer["state"]), ("publish", "overlay-0123456789ab", "queued"))
+        self.assertEqual((answer["position"], answer["publish_pending"]["state"], answer["reused"]), (1, "publish_pending", False))
+        self.assertTrue(answer["csid"].startswith("c-"))
+        self.assertEqual(self.world.name_of("0x140001000"), "Mine")
+        queue = self.ask("status", show="queue", csid=answer["csid"])
+        self.assertEqual((queue["queue"]["length"], queue["changeset"]["state"], queue["changeset"]["outcome"]),
+                         (0, "done", "applied"))
+
+    def test_the_stale_view_refusal_names_the_rebase_call_and_the_rebase_settles_it(self):
+        self.edit("FromOne", "0x140001000", "one")
+        self.edit("FromTwo", "0x140001000", "two")  # the same subject: a clean-only rebase cannot settle it
+        self.publish_through_the_job("one")
+        with self.assertRaises(RuntimeError) as raised:
+            self.edit("More", "0x140003000", "two")
+        body = json.loads(str(raised.exception))
+        self.assertEqual(body["error"], "stale_view")
+        self.assertEqual(body["next"], {"tool": "ghidra_query", "action": "type_edit",
+                                        "options": {"kind": "rebase", "expect_revision": 1}})
+        conflict = self.ask("type_edit", view="two", **body["next"]["options"])
+        self.assertEqual((conflict["rebased"], conflict["outcome"]), (False, "conflict"))
+        done = self.ask("type_edit", view="two", **{**body["next"]["options"], "resolve": {conflict["conflicts"][0]["subject"]: "take_mine"}})
+        self.assertEqual((done["rebased"], done["view"]), (True, "two"))
+        self.assertEqual(self.edit("More", "0x140003000", "two")["revision"], 3)
+
+    def test_a_view_behind_the_head_is_rebased_first_when_that_is_clean_and_the_edit_goes_through(self):
+        self.edit("FromOne", "0x140001000", "one")
+        self.edit("FromTwo", "0x140002000", "two")
+        self.publish_through_the_job("one")
+        answer = self.edit("More", "0x140003000", "two")
+        self.assertEqual((answer["auto_rebased"]["to_generation"], answer["revision"], answer["base"]["generation"]), (1, 3, 1))
+
+    def test_merge_and_publish_to_a_view_answer_at_once_and_a_conflict_is_a_result(self):
+        self.edit("Source", "0x140001000", "src")
+        self.edit("Dest", "0x140001000", "dst")
+        revision = workcopy.load_store(self.world.settings, self.world.target("dst"))["revision"]
+        conflict = self.ask("type_edit", kind="merge", **{"from": "src"}, view="dst", expect_revision=revision)
+        self.assertEqual((conflict["ok"], conflict["outcome"], conflict["conflicts"][0]["theirs"], conflict["conflicts"][0]["mine"]),
+                         (False, "conflict", "Dest", "Source"))
+        taken = self.ask("type_edit", kind="merge", **{"from": "src"}, view="dst", expect_revision=revision,
+                         resolve={conflict["conflicts"][0]["subject"]: "take_mine"})
+        self.assertEqual((taken["outcome"], taken["merged"]), ("merged", 1))
+        self.edit("Later", "0x140002000", "src")
+        pushed = self.ask("type_edit", kind="publish", to="dst", view="src", expect_revision=workcopy.load_store(
+            self.world.settings, self.world.target("dst"))["revision"])
+        self.assertEqual(pushed["merged"], 1)
+
+    def test_bad_options_are_refused_before_anything_is_created(self):
+        self.edit("Mine", "0x140001000", "one")
+        for options in ({"kind": "publish"}, {"kind": "merge", "expect_revision": 1}, {"kind": "rebase", "expect_revision": "1"},
+                        {"kind": "publish", "expect_revision": 1, "colour": "red"}, {"kind": "rebase", "expect_revision": 1, "resolve": {"x": "maybe"}}):
+            with self.assertRaises(ValueError, msg=options):
+                self.runner.query("owned", "type_edit", "", options={**options, "view": "one"})
+        self.assertFalse((workcopy.root_path(self.world.settings) / "lineages").exists())
+
+    def test_the_queue_of_a_target_that_never_published_is_empty(self):
+        self.assertEqual(self.ask("status", show="queue")["queue"]["length"], 0)
 
 
 if __name__ == "__main__":
