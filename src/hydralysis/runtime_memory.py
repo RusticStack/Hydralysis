@@ -39,7 +39,9 @@ def _pid_gone(pid, created_ms) -> bool:
     try:
         return runtime_worker._created_ms(pid) != created_ms
     except OSError as exc:
-        return getattr(exc, "winerror", None) == 87 or exc.errno in (errno.ESRCH, errno.ENOENT)
+        # Windows: _created_ms raises OSError(87, msg) for an absent pid, with errno 87 and winerror None
+        # (ERROR_INVALID_PARAMETER). Access denied (5) is not listed, so it stays alive.
+        return getattr(exc, "winerror", None) == 87 or exc.errno in (87, errno.ESRCH, errno.ENOENT)
     except (ValueError, IndexError, StopIteration):
         return False
 

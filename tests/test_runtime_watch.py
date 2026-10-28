@@ -272,6 +272,16 @@ class Tainted(Case):
             self.assertFalse(memory._pid_gone(1, 5))
             self.assertTrue(memory._pid_gone(1, 6))
 
+    def test_pid_gone_accepts_the_windows_absent_pid_error_shape(self):
+        # _created_ms raises OSError(87, msg) for an absent pid on Windows: errno 87, winerror None.
+        from hydralysis import runtime_worker
+        absent = OSError(87, "cannot query selected process identity")
+        self.assertEqual(absent.errno, 87)
+        with patch.object(runtime_worker, "_created_ms", side_effect=absent):
+            self.assertTrue(memory._pid_gone(1, 1))
+        with patch.object(runtime_worker, "_created_ms", side_effect=OSError(5, "denied")):
+            self.assertFalse(memory._pid_gone(1, 1))
+
     def test_a_failed_script_creation_rolls_the_arm_back_and_frees_the_slot(self):
         def broken():
             raise RuntimeError("session is gone")
