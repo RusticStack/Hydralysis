@@ -43,7 +43,7 @@ PARITY = {
     "list_namespaces": ("gap", "documented_gaps: no namespace action"),
     "list_segments": ("partial", "listing/segments: PE sections equal the header; Ghidra memory blocks are not listed"),
     "list_imports": ("tested", "listing/imports: equals the linker map's __imp_ rows"),
-    "list_exports": ("tested", "listing/exports: empty export table of the fixtures (a non-empty table is not covered by a fixture)"),
+    "list_exports": ("partial", "listing/exports: empty export table of the fixtures (a non-empty table is not covered by a fixture)"),
     "list_data_items": ("partial", "listing/data: per address only (no enumeration); RTTI vftable labels equal the map names"),
     "list_strings": ("tested", "listing/strings: the source literals, at their bytes"),
     "get_function_by_address": ("tested", "callgraph/function_by_address: an address inside a body answers the entry"),
@@ -51,7 +51,7 @@ PARITY = {
     "get_current_function": ("gui", "no equivalent: GUI-only"),
     "decompile_function": ("partial", "namemap/decompile_by_name: through a cited address map, name:<name> decompiles the function of the address form"),
     "decompile_function_by_address": ("tested", "namemap/decompile_by_name: the address form is the reference of the by-name check"),
-    "disassemble_function": ("tested", "namemap: instruction bytes of the analysis equal the file bytes (scan); disasm itself is unit-tested elsewhere"),
+    "disassemble_function": ("partial", "namemap: instruction bytes of the analysis equal the file bytes (scan); disasm itself is unit-tested elsewhere"),
     "get_xrefs_to": ("tested", "callgraph/xrefs_to: callers equal the call sites; other references are not calls"),
     "get_xrefs_from": ("tested", "callgraph/callees: the callee edges of the dossier, with sites inside the body"),
     "get_function_xrefs": ("tested", "callgraph/xrefs_to and callgraph/callees"),
@@ -85,8 +85,12 @@ class ParityTable(unittest.TestCase):
         import verify_fixtures
         for group in ("listing", "callgraph", "namemap"):
             self.assertIn(group, verify_fixtures.CHECKS)
-        cited = {part.split("/")[0] for _, evidence in PARITY.values() for part in re.findall(r"\b(listing|callgraph|namemap|documented_gaps)\b", evidence)}
-        self.assertLessEqual(cited, {"listing", "callgraph", "namemap", "documented_gaps"})
+        source = Path(verify_fixtures.__file__).read_text(encoding="utf-8")
+        labels = set(re.findall(r'_check\("([a-z_]+)', source))
+        for tool, (_, evidence) in PARITY.items():
+            for group, label in re.findall(r"(listing|callgraph|namemap|documented_gaps)/([a-z_]+)", evidence):
+                self.assertIn(group, verify_fixtures.CHECKS, tool)
+                self.assertIn(label, labels, "%s cites %s/%s, which the harness never prints" % (tool, group, label))
 
     def test_documented_gaps_are_the_rows_the_mapping_calls_gaps(self):
         self.assertEqual({tool for tool, (verdict, _) in PARITY.items() if verdict == "gap"}, {"list_classes", "list_namespaces"})

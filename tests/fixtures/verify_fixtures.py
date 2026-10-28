@@ -19,6 +19,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from prepare_fixtures import target_name  # noqa: E402
 
 re = Client()
+# The engine's exact refusal texts (hydra-2 engine, measured): an unknown action, a name outside every map, a map of another build.
+UNKNOWN_ACTION = "unknown saved-analysis query action"
+REFUSAL_TEXT = {"unknown name": "no address map entry for name:not_in_any_map", "other build": "address map build SHA-256 mismatch"}
 ARCHES = ("x64", "x86")
 
 
@@ -770,13 +773,14 @@ def check_namemap(manifest: dict) -> list[str]:
                 call()
                 refusals.append(what + " accepted")
             except Exception as error:  # the client raises the engine's refusal
-                if not any(word in str(error).lower() for word in ("not found", "no address", "mismatch", "unknown", "not in", "no map")):
+                if REFUSAL_TEXT[what] not in str(error):
                     refusals.append("%s: unexpected %s" % (what, str(error)[:160]))
         for variant, rva in (("a", 0x1000), ("b", 0x1010)):
             path = out_dir / ("conflict-%s-%s.json" % (arch, variant))
             path.write_text(json.dumps({"sha256": build["sha256"], "source": "Z8 conflict probe " + variant,
                                         "entries": [{"name": "z8_conflict", "rva": "0x%x" % rva}]}))
             re.query(name, "address_map", path=str(path))
+            path.unlink()  # the rows are loaded; do not leave the probe files in the fixtures dir
         try:
             re.query(name, "function", "name:z8_conflict")
             refusals.append("conflicting rows resolved")
@@ -791,10 +795,13 @@ def check_namemap(manifest: dict) -> list[str]:
             try:
                 re.query(name, action, build["functions"]["fx_read"])
                 gaps.append(action + " exists")
-            except Exception:
-                pass
+            except Exception as error:
+                # Only the engine's explicit unknown-action refusal proves the action does not exist;
+                # any other failure (daemon, permission, module load) is a real error, not a "no match".
+                if UNKNOWN_ACTION not in str(error):
+                    gaps.append("%s: unexpected error %s" % (action, str(error)[:160]))
         _check("documented_gaps %s" % arch, not gaps,
-               "no ghidra_query action for memory, segments, classes or namespaces (the tool-mapping gaps); found %s" % gaps, failures)
+               "no ghidra_query action for memory, segments, classes or namespaces (the tool-mapping gaps); found or unexpected %s" % gaps, failures)
     return failures
 
 
