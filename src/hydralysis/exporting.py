@@ -118,6 +118,11 @@ def provenance(settings: dict, target: str, view: str = "") -> tuple[dict, dict]
               "engine_release": hydra.RELEASE, "query_key": selected["key"]}
     if selected["view"] != "shared":
         result["view"] = selected["view"]
+    if selected.get("lineage"):
+        # The header names the generation the export reads (4.7): a commit moves it, and a resume is then refused because
+        # the recorded provenance no longer equals the observed one (generation, master revision and engine release included).
+        result["lineage"] = selected["lineage"]["id"]
+        result["generation"] = selected["lineage"]["generation"]
     if project.get("exe"):
         stat = Path(project["exe"]).stat()
         result["exe_stat"] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
@@ -180,7 +185,9 @@ def start(settings: dict, target: str, options: dict | None = None) -> dict:
             project, observed = provenance(settings, target, record["options"].get("view", ""))
             if observed != record["provenance"]:
                 raise ValueError("export source/build/code/overlays changed; resume refused; old output preserved")
-            from hydralysis.export_worker import replay, validate_completed
+            from hydralysis.export_worker import load_snapshot, replay, validate_completed
+            # The snapshot taken at export start is part of what a resume stands on: a missing or edited one is refused.
+            load_snapshot(path, record)
             if record.get("state") == "done":
                 validate_completed(path, record)
                 return {**record, "reused": True}
@@ -248,4 +255,11 @@ def cancel(settings: dict, job_id: str, owner: str = "") -> dict:
     record = status(settings, job_id)
     if record.get("state") in ACTIVE:
         update(path, cancel_requested=True, state="cancelling", stage="waiting for the current bounded query")
+    elif record.get("state") in ("paused", "interrupted"):
+        # No worker is running: nothing will observe a flag, so the job is closed here, under the control lock that
+        # also serialises a resume. The output stays for a later resume; the cancel is not lost.
+        with locked(path.parent / ".control.lock"):
+            if not _held(str(path.parent / ".run.lock")) and read_json(path).get("state") in ("paused", "interrupted"):
+                update(path, state="cancelled", stage="cancelled while " + record["state"], cancel_requested=False,
+                       complete=False, all_succeeded=False)
     return status(settings, job_id)

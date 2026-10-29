@@ -17,6 +17,26 @@ except ImportError:  # pragma: no cover - Windows
     fcntl = None
 
 
+class LockBusy(ValueError):
+    """A bounded wait for an OS lock ran out (PROTOCOL-3.md 4.10, D44).
+
+    It is a ValueError, so every caller that caught the old "is busy" ValueError still does. A caller that
+    owns a reply turns it into the structured `busy` with `payload()`; `retry_after_ms` is a hint, not a promise.
+    """
+
+    def __init__(self, what: str, path, waited_s: float, retry_after_ms: int = 1000):
+        self.what = what
+        self.path = str(path)
+        self.waited_s = round(float(waited_s), 3)
+        self.retry_after_ms = int(retry_after_ms)
+        super().__init__("%s is busy (%s); retry shortly" % (what, Path(self.path).name))
+
+    def payload(self) -> dict:
+        return {"error": "busy", "what": self.what, "lock": Path(self.path).name, "waited_s": self.waited_s,
+                "retryAfterMs": self.retry_after_ms,
+                "suggest": "another client holds this lock; retry after retryAfterMs, nothing was changed"}
+
+
 class LaneLock:
     def __init__(self, path: str):
         self.path = path
@@ -81,10 +101,11 @@ def locked(path: Path, timeout_s: float = 5, what: str = "registry"):
     """Wait a bounded time for an exclusive lock; never queue forever."""
     path.parent.mkdir(parents=True, exist_ok=True)
     lease = LaneLock(str(path))
-    deadline = time.monotonic() + timeout_s
+    started = time.monotonic()
+    deadline = started + timeout_s
     while not lease.acquire():
         if time.monotonic() >= deadline:
-            raise ValueError("%s is busy (%s); retry shortly" % (what, path.name))
+            raise LockBusy(what, path, time.monotonic() - started)
         time.sleep(0.05)
     try:
         yield

@@ -1,0 +1,26 @@
+{
+  "about": "The three tool counts that docs/tool-mapping.md, THIRD_PARTY.md and docs/verification.md quote. tools/count_surfaces.py writes the counts; tests/test_tool_mapping.py checks them. Only the Hydralysis count is read from this repository; the other two are recorded figures of third parties and are not reproduced here.",
+  "status": "skeleton",
+  "status_note": "docs/tool-mapping.md still has rows marked 'to verify'. Set status to 'complete' only when no row says so; the test then fails on any remaining 'to verify'.",
+  "surfaces": [
+    {
+      "id": "hydralysis",
+      "count": 20,
+      "source": "tool_table() in src/hydralysis/api.py (names: TOOL_NAMES)",
+      "reproduced": true
+    },
+    {
+      "id": "ghidramcp",
+      "count": 30,
+      "source": "@mcp.tool functions in src/ghidra_mcp/server.py of the bridge at revision 1e98025",
+      "owner_reported": 28,
+      "reproduced": false
+    },
+    {
+      "id": "rea",
+      "count": 207,
+      "source": "tool_count field of the reverse-engineer-anything skill metadata; no live tools/list was enumerated",
+      "reproduced": false
+    }
+  ]
+}

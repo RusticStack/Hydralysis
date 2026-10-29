@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 import fakehydra
 from hydralysis import durable, hydra, query, revisions, workcopy
-from support import workdir
+from support import default_to_shared, workdir
 
 ADDRESS_A, ADDRESS_B = "0x140001000", "0x140002000"
 SOURCE = "cited test evidence"
@@ -90,12 +90,13 @@ class Case(unittest.TestCase):
         self.daemon.add_project(self.gpr, {"/owned.exe": {"sha256": self.digest}})
         self.settings = {"root": str(self.root / "data"), "hydra_dir": "x", "hydra_client": "x",
                          "targets": {"owned": {"gpr": str(self.gpr), "program": "/owned.exe", "exe": str(self.exe)}}}
-        for item in (patch("hydralysis.hydra.Engine", self.engine_class), patch("hydralysis.workcopy._start_saver")):
+        for item in (patch("hydralysis.hydra.Engine", self.engine_class),):
             item.start()
             self.addCleanup(item.stop)
         query._keys.clear()
         self.runner = query.QueryRunner(self.settings, self.engine_class(self.settings))
         self.target = workcopy.with_view(self.runner.target("owned"))
+        default_to_shared(self.runner)  # these tests exercise the shared view; a bare call has a view of its own now (Y5)
 
     def store(self, view=""):
         return workcopy.load_store(self.settings, workcopy.with_view(self.runner.target("owned"), view))
@@ -353,7 +354,7 @@ class Effects(Case):
         with patch("hydralysis.hydra.Engine", fakehydra.FakeEngine):
             runner = query.QueryRunner(self.settings, fakehydra.FakeEngine(self.settings))
             answer = json.loads(runner.query("owned", "type_edit", ADDRESS_A, options={
-                "kind": "rename", "name": "Quiet", "source": SOURCE, "expect_revision": 0}))
+                "kind": "rename", "name": "Quiet", "source": SOURCE, "expect_revision": 0, "view": "shared"}))
         self.assertTrue(answer["before_unknown"])
         record = self.store()["edits"][0]
         self.assertEqual((record["effects"], record["before_unknown"]), (None, True))

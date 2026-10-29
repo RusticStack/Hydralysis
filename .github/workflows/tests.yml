@@ -82,3 +82,15 @@ jobs:
           HYDRALYSIS_INTEGRATION_JAVA: ${{ env.JAVA_HOME }}
           HYDRALYSIS_TEST_ROOT: ${{ runner.temp }}\hydralysis-tests
         run: python -m unittest discover -s tests -p test_engine_integration.py -v
+      - name: Concurrency tests on the real engine (Z1)
+        env:
+          HYDRALYSIS_INTEGRATION_JAVA: ${{ env.JAVA_HOME }}
+          HYDRALYSIS_TEST_ROOT: ${{ runner.temp }}\hydralysis-tests
+        run: python -m unittest discover -s tests -p test_concurrency.py -v
+      - name: No-stock end-to-end proof and harness audit (Z4)
+        env:
+          HYDRALYSIS_INTEGRATION_JAVA: ${{ env.JAVA_HOME }}
+          HYDRALYSIS_TEST_ROOT: ${{ runner.temp }}\hydralysis-tests
+        run: |
+          python -m unittest discover -s tests -p test_engine_nostock.py -v
+          python tools/audit_harness.py --self --skills skills

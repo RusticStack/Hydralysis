@@ -282,10 +282,27 @@ def daemon_config(settings: dict) -> dict:
                         "-Dapplication.cachedir=" + str(root / "hydra" / "ghidra-cache")]
     if settings.get("hydra_max_heap"):
         config["maxHeap"] = str(settings["hydra_max_heap"])
+    # The lane caps of the daemon this client launches (PROTOCOL-3.md D54): sized from the number of agents the owner
+    # expects to work at once, so that a seventh client's quick call is not queued behind six long scripts. An
+    # explicit `hydra` setting wins; a daemon that is already running keeps the caps it started with.
+    agents = expected_agents(settings)
+    config["maxLong"] = max(8, -(-agents * 3 // 2))
+    config["maxQuick"] = max(16, agents * 2)
     for key in ("maxImports", "maxQuick", "maxLong", "forkCopyLimitMb"):
         if key in (settings.get("hydra") or {}):
             config[key] = settings["hydra"][key]
     return config
+
+
+DEFAULT_EXPECTED_AGENTS = 16
+
+
+def expected_agents(settings: dict) -> int:
+    """How many agents are expected at once (`expected_agents`, 1..256, default 16)."""
+    value = settings.get("expected_agents", DEFAULT_EXPECTED_AGENTS)
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 256:
+        raise ValueError("expected_agents must be an integer 1..256")
+    return value
 
 
 def write_daemon_config(settings: dict) -> Path:
@@ -319,13 +336,18 @@ def identity() -> dict:
 
 
 class Engine:
-    """One connection per process and root, shared by every thread."""
+    """One connection per process, root and role, shared by every thread.
+
+    A `lane` gives a caller its own connection of that role (PROTOCOL-3.md 4.10, BP20): a working-copy sync
+    uses one writer connection per view, so one sync's `reset` closes only the connection it opened, never the
+    projects another thread's sync is using.
+    """
 
     _connections: dict[str, object] = {}
     _used: dict[str, float] = {}  # connection key -> time.monotonic() when it last carried a call
     _guard = threading.Lock()
 
-    def __init__(self, settings: dict, role: str = "reader", start: bool = True):
+    def __init__(self, settings: dict, role: str = "reader", start: bool = True, lane: str = ""):
         # Reads use one long-lived connection and run contained (in parallel, rolled back).
         # A writer gets its own connection: a client that may write a program runs its
         # scripts as owner, exclusively, which reads must not do.
@@ -335,9 +357,10 @@ class Engine:
         self.client_path = Path(settings["hydra_client"])
         self.allow_unpinned = bool(settings.get("hydra_allow_unpinned"))
         self.role = role
-        # A background helper (the saver) joins a running daemon but never starts one.
+        # A helper that must not launch a daemon passes start=False: it joins a running one or fails.
         self.start = start
-        self.key = (str(self.root).lower() if os.name == "nt" else str(self.root)) + "|" + role
+        self.lane = lane
+        self.key = (str(self.root).lower() if os.name == "nt" else str(self.root)) + "|" + role + ("|" + lane if lane else "")
 
     def module(self):
         return load_client(self.client_path, self.allow_unpinned)
