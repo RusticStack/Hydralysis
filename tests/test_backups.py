@@ -3,6 +3,7 @@ last, the seal, `backups.log`, the policy, and `backend action=backups options.o
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import unittest
@@ -378,8 +379,92 @@ class RemoveAndHandler(World, unittest.TestCase):
         self.assertIn("dry run", api.OPTION_BAGS["backend"])
 
 
-if __name__ == "__main__":
-    unittest.main()
+class E2Engine(fakehydra.FakeEngine):
+    """The E2 surface Y4d needs (Y4a owns fakehydra.py and left it declared): `format` in project info, `backup_required` on the
+    upgrade gate, `fork_project purpose:"backup"` written by the engine (writer "engine"), `seal_project`. Kept here so that no
+    file outside Y4d's rows is edited. Daemon switches: e2, format_info, backup_required, sealed_by_call, break_engine_backup."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        for name, value in (("e2", False), ("format_info", None), ("backup_required", False), ("sealed_by_call", []),
+                            ("break_engine_backup", None)):
+            if not hasattr(self.daemon, name):
+                setattr(self.daemon, name, value)
+
+    def capabilities(self):
+        found = {"laneHint": 1, "queueInfo": 1} if self.daemon.queue_info else {}
+        if self.daemon.e2:
+            found.update(forkPurposes=1, upgradeGate=1, format=1, backup=1)
+        return found
+
+    def _open_project(self, path, writable=False, **_):
+        opened = super()._open_project(path, writable=writable)
+        if self.daemon.e2 and self.daemon.format_info is not None:
+            opened["format"] = dict(self.daemon.format_info)
+        return opened
+
+    def _check_backup_gate(self, project, backup):
+        sidecar = self._sidecar(project)
+        if sidecar is not None and sidecar.get("disposable") is not False:
+            return
+        problem = "no backup was given"
+        if backup:
+            try:
+                manifest = json.loads(Path(backup).read_text(encoding="utf-8"))
+                body = {key: item for key, item in manifest.items() if key != "selfSha256"}
+                if manifest.get("kind") != "ghidra-session-backup" or not (manifest.get("verify") or {}).get("ok"):
+                    problem = "the backup does not say it verified"
+                elif manifest.get("selfSha256") != hashlib.sha256(lineage.canonical(body)).hexdigest():
+                    problem = "the backup's selfSha256 is wrong"
+                else:
+                    return
+            except (OSError, ValueError):
+                problem = "the backup cannot be read"
+        raise hydra.EngineError("backup_required", "upgrading %s is one-way: %s" % (project["gpr"], problem),
+                                {"project": project["gpr"], "suggest": "fork_project purpose backup"})
+
+    def _open_program(self, path, project, writable=False, share=False, upgrade=False, backup=None, **rest):
+        if writable and upgrade and self.daemon.backup_required:
+            self._check_backup_gate(self.daemon.project_by_id(project), backup)
+        return super()._open_program(path, project, writable=writable, share=share, upgrade=upgrade, **rest)
+
+    def _fork_project(self, project, path, writable=True, mode="auto", purpose=None, open=True, verify="hash", **rest):
+        if not (purpose == "backup" and open is False):
+            return super()._fork_project(project, path, writable=writable, mode=mode, purpose=purpose, **rest)
+        source = self.daemon.projects[self.daemon._norm(project)]
+        result = super()._fork_project(project, path, writable=writable, mode=mode, purpose=purpose, **rest)
+        gpr = Path(result["gpr"])
+        destination, name = gpr.parent, gpr.stem
+        sidecar_path = destination / (name + ".fork.json")
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        sidecar.update(disposable=False, state="complete")
+        sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+        (destination / "SEALED.json").write_text(json.dumps({"by": "engine"}), encoding="utf-8")
+        self.daemon.projects.pop(self.daemon._norm(gpr), None)   # open:false registers nothing
+        if self.daemon.break_engine_backup:
+            self.daemon.break_engine_backup(destination)
+        rows = []
+        for item in sorted(destination.rglob("*")):
+            if item.is_file() and item.name not in ("SEALED.json", "backup.json", "projectState") and not item.name.endswith((".lock", ".lock~")):
+                data = item.read_bytes()
+                if item.name.endswith(".fork.json"):
+                    record = json.loads(data.decode("utf-8"))
+                    record.pop("state", None)
+                    data = lineage.canonical(record)
+                rows.append({"path": item.relative_to(destination).as_posix(), "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+        manifest = {"format": 1, "kind": "ghidra-session-backup", "writer": "engine", "id": destination.name, "purpose": "backup",
+                    "createdAt": "2026-10-29T00:00:00Z", "source": {"gpr": source["gpr"], "name": name},
+                    "files": rows, "filesetSha256": hashlib.sha256(lineage.canonical(rows)).hexdigest(),
+                    "copy": {"method": "clone", "sameVolume": True, "independent": False},
+                    "verify": {"level": "hash", "ok": True}}
+        manifest["selfSha256"] = hashlib.sha256(lineage.canonical(manifest)).hexdigest()
+        (destination / "backup.json").write_bytes(lineage.canonical(manifest))
+        return {"project": None, "gpr": str(gpr), "purpose": "backup", "method": "clone", "cloned": True, "bytes": 1,
+                "manifest": {"path": str(destination / "backup.json"), "verified": True, "files": len(rows)}}
+
+    def _seal_project(self, project, lineage=None, **_):
+        self.daemon.sealed_by_call.append(project)
+        return {"sealed": True}
 
 
 class EngineBackups(World, unittest.TestCase):
@@ -387,11 +472,17 @@ class EngineBackups(World, unittest.TestCase):
 
     def setUp(self):
         super().setUp()
+        patcher = patch.object(fakehydra, "FakeEngine", E2Engine)   # test_commit's helpers build their engine through the module
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.daemon.e2 = True
         self.daemon.backup_required = True
+        self.daemon.sealed_by_call = []
+        self.daemon.break_engine_backup = None
+        self.daemon.format_info = None
         selected = self.runner.target("owned")
         self.lid = lineage.ensure(self.settings, {**selected, "origin_key": selected["key"]})["id"]
-        self.engine = fakehydra.FakeEngine(self.settings)
+        self.engine = E2Engine(self.settings)
 
     def make(self, **kwargs):
         return backups.make(self.settings, self.engine, self.lid, str(self.gpr), "pre-commit", "3fa9c2d1aa01bb42", 0, **kwargs)
@@ -480,6 +571,7 @@ class EngineBackups(World, unittest.TestCase):
         os.chmod(sidecar, 0o666)
         sidecar.write_text(json.dumps(record), encoding="utf-8")
         self.assertFalse(backups.listing(self.settings, self.lid)["backups"][0]["sealed"])
+        self.assertEqual(backups.listing(self.settings, self.lid)["backups"][0]["label"], "legacy_unverified")
         outcome = backups.adopt_legacy(folder, self.engine, self.lid)
         self.assertEqual((outcome["ok"], outcome["adopted"], outcome["engine_sealed"]), (True, True, True))
         self.assertTrue(backups.listing(self.settings, self.lid)["backups"][0]["sealed"])
@@ -504,3 +596,7 @@ class EngineBackups(World, unittest.TestCase):
         self.assertEqual(self.daemon.sealed_by_call, [])
         self.assertFalse((project / "SEALED.json").exists())
         self.assertIsNone(backups.usable(self.settings, self.lid, made["id"]))
+
+
+if __name__ == "__main__":
+    unittest.main()

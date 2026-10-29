@@ -392,6 +392,7 @@ def listing(settings: dict, lineage_id: str, verify_all: bool = False) -> dict:
                "independent": bool((manifest.get("copy") or {}).get("independent")), "sealed": (project_dir(folder) / lineage.SEAL_MARKER).is_file(),
                "manifestSha256": digest, "logged": entry is not None, "replaced": bool(entry and entry["manifestSha256"] != digest)}
         if not row["sealed"]:
+            row["label"] = "legacy_unverified"
             row["note"] = "legacy: not sealed; protected by client discipline only until `op=verify` adopts it"
         if verify_all:
             checked = verify(folder)
