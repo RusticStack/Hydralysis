@@ -381,9 +381,12 @@ class RemoveAndHandler(World, unittest.TestCase):
 
 
 class E2Engine(fakehydra.FakeEngine):
-    """The E2 surface Y4d needs (Y4a owns fakehydra.py and left it declared): `format` in project info, `backup_required` on the
-    upgrade gate, `fork_project purpose:"backup"` written by the engine (writer "engine"), `seal_project`. Kept here so that no
-    file outside Y4d's rows is edited. Daemon switches: e2, format_info, backup_required, sealed_by_call, break_engine_backup."""
+    """The E2 surface Y4d needs on top of fakehydra's own (`format_info`, `backup_required` and the engine-written manifest of
+    `fork_project purpose:"backup"` live in fakehydra.py since Y4a): a stricter gate that reads the manifest the client passes
+    (verify.ok, selfSha256), a `fork_project open:false` that registers nothing and seals, `seal_project`, and the capabilities.
+    The gate here runs first and then hands `backup` on to fakehydra's own gate, which refuses an upgrading writable open of a
+    non-disposable project that carries no backup: dropping `backup` on that hand-over was what made every commit of the E2
+    matrix refuse with `backup_required`. Daemon switches: e2, format_info, backup_required, sealed_by_call, break_engine_backup."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -427,7 +430,7 @@ class E2Engine(fakehydra.FakeEngine):
     def _open_program(self, path, project, writable=False, share=False, upgrade=False, backup=None, **rest):
         if writable and upgrade and self.daemon.backup_required:
             self._check_backup_gate(self.daemon.project_by_id(project), backup)
-        return super()._open_program(path, project, writable=writable, share=share, upgrade=upgrade, **rest)
+        return super()._open_program(path, project, writable=writable, share=share, upgrade=upgrade, backup=backup, **rest)
 
     def _fork_project(self, project, path, writable=True, mode="auto", purpose=None, open=True, verify="hash", **rest):
         if not (purpose == "backup" and open is False):
