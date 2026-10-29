@@ -21,7 +21,8 @@ and ``hydra-client-<release>.zip`` in a folder and cross-checks ``SHA256SUMS`` w
 What it writes, and nothing else (``EDIT_SET``; ``tests/test_bump_hydra.py`` asserts it):
 
 * ``src/hydralysis/hydra.py``: ``RELEASE``, ``PROTOCOL``, ``CLIENT_VERSION`` and ``ASSETS`` (SHA-256 and size);
-* ``tests/fakehydra.py``: the release and protocol constants of the fake daemon's ``hello``;
+* ``tests/fakehydra.py``: the release (``hydraVersion``) of the fake daemon's ``hello``; its base protocol stays 2, a protocol 3
+  engine is modelled through ``hello_extra``;
 * ``README.md`` (the ``backend install`` paragraph), ``THIRD_PARTY.md`` (the engine row) and
   ``docs/upstream-setup.md``: the one pin sentence of each.
 
@@ -180,17 +181,23 @@ def edit_hydra_py(text: str, info: dict, observed: str) -> str:
     text = replace_exact(text, r'^RELEASE = "%s"(?=\r?$)' % LITERAL, 'RELEASE = "%s"' % release, 1, what)
     text = replace_exact(text, r"^PROTOCOL = \d+(?=\r?$)", "PROTOCOL = %d" % info["protocol"], 1, what)
     text = replace_exact(text, r'^CLIENT_VERSION = "\d+\.\d+\.\d+"(?=\r?$)', 'CLIENT_VERSION = "%s"' % info["client_version"], 1, what)
-    block = (
-        "# SHA256SUMS of the release, observed %s and checked after download.\n"
-        "ASSETS = {\n"
-        '    "engine": {"url": _BASE + "hydra-engine-" + RELEASE + "-win_x86_64.zip",\n'
-        '               "sha256": "%s", "size": %d},\n'
-        '    "client": {"url": _BASE + "hydra-client-" + RELEASE + ".zip",\n'
-        '               "sha256": "%s", "size": %d},\n'
-        "}\n") % (observed, info["assets"]["engine"]["sha256"], info["assets"]["engine"]["size"],
-                  info["assets"]["client"]["sha256"], info["assets"]["client"]["size"])
-    if "\r\n" in text:
-        block = block.replace("\n", "\r\n")
+    def make_block(date: str) -> str:
+        block = (
+            "# SHA256SUMS of the release, observed %s and checked after download.\n"
+            "ASSETS = {\n"
+            '    "engine": {"url": _BASE + "hydra-engine-" + RELEASE + "-win_x86_64.zip",\n'
+            '               "sha256": "%s", "size": %d},\n'
+            '    "client": {"url": _BASE + "hydra-client-" + RELEASE + ".zip",\n'
+            '               "sha256": "%s", "size": %d},\n'
+            "}\n") % (date, info["assets"]["engine"]["sha256"], info["assets"]["engine"]["size"],
+                      info["assets"]["client"]["sha256"], info["assets"]["client"]["size"])
+        return block.replace("\n", "\r\n") if "\r\n" in text else block
+
+    # Same hashes as the file already has: keep its date, so --check gives the same answer on every day.
+    seen = re.search(r"^# SHA256SUMS of the release, observed ([^\r\n]*?) and checked after download\.", text, re.M)
+    if seen and make_block(seen.group(1)) in text:
+        return text
+    block = make_block(observed)
     pattern = r"^# SHA256SUMS of the release, observed [^\n]*\n(?:ASSETS = \{\r?\n.*?^\}\r?\n)"
     return replace_exact(text, pattern, lambda _m: block, 1, what, re.M | re.S)
 
@@ -198,7 +205,8 @@ def edit_hydra_py(text: str, info: dict, observed: str) -> str:
 def edit_fake(text: str, info: dict) -> str:
     what = FAKE
     text = replace_exact(text, r'("hydraVersion": ")%s(")' % LITERAL, lambda m: m.group(1) + info["release"] + m.group(2), 1, what)
-    return replace_exact(text, r'("protocol": )\d+(, \*\*(?:self\.)?daemon\.release)', lambda m: m.group(1) + str(info["protocol"]) + m.group(2), 2, what)
+    # The base hello stays protocol 2: a protocol 3 engine is modelled through hello_extra (tests/fakehydra.py).
+    return text
 
 
 def edit_readme(text: str, info: dict) -> str:
@@ -266,11 +274,24 @@ def plan(root: Path, info: dict, observed: str, site_root: Path | None) -> dict[
 
 
 def write_all(changes: dict[Path, str]) -> None:
-    for path, text in changes.items():
-        temp = path.with_name(path.name + ".bump-tmp")
-        with open(temp, "w", encoding="utf-8", newline="") as handle:
-            handle.write(text)
-        os.replace(temp, path)
+    """Write every temp file first, then swap them in; leftover temps are removed on any failure."""
+    temps: list[tuple[Path, Path]] = []
+    try:
+        for path, text in changes.items():
+            temp = path.with_name(path.name + ".bump-tmp")
+            temps.append((temp, path))
+            with open(temp, "w", encoding="utf-8", newline="") as handle:
+                handle.write(text)
+        while temps:
+            temp, path = temps[0]
+            os.replace(temp, path)
+            temps.pop(0)
+    finally:
+        for temp, _ in temps:
+            try:
+                temp.unlink()
+            except OSError:
+                pass
 
 
 def main(argv: list[str] | None = None) -> int:

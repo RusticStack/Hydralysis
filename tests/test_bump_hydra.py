@@ -132,7 +132,8 @@ class EditSet(Sandbox):
             self.assertIn(RELEASE, (self.tree / rel).read_text(encoding="utf-8"), rel)
         fake = (self.tree / bump.FAKE).read_text(encoding="utf-8")
         self.assertIn('"hydraVersion": "%s"' % RELEASE, fake)
-        self.assertEqual(fake.count('"protocol": 3, **'), 2)
+        self.assertEqual(fake.count('"protocol": 2, **'), 2)
+        self.assertNotIn('"protocol": 3, **', fake)
 
     def test_second_run_changes_nothing(self):
         self.sums()
@@ -141,6 +142,28 @@ class EditSet(Sandbox):
         self.assertEqual(self.run_bump("--write"), 0)
         self.assertEqual(self.snapshot(self.tree), once)
         self.assertEqual(self.run_bump("--check"), 0)
+
+    def test_check_is_stable_across_days(self):
+        self.sums()
+        self.assertEqual(self.run_bump("--write"), 0)
+        args = ["--release", RELEASE, "--dist", str(self.dist), "--root", str(self.tree), "--observed", "2026-11-02", "--check"]
+        self.assertEqual(bump.main(args), 0)
+
+    def test_temp_files_removed_when_a_replace_fails(self):
+        a, b = self.tree / "a.txt", self.tree / "b.txt"
+        a.write_text("x"); b.write_text("y")
+        real = bump.os.replace
+        def failing(src, dst):
+            if str(dst).endswith("b.txt"):
+                raise OSError("boom")
+            return real(src, dst)
+        bump.os.replace = failing
+        try:
+            with self.assertRaises(OSError):
+                bump.write_all({a: "1", b: "2"})
+        finally:
+            bump.os.replace = real
+        self.assertEqual(list(self.tree.rglob("*.bump-tmp")), [])
 
     def test_default_run_shows_and_does_not_write(self):
         before = self.snapshot(self.tree)
