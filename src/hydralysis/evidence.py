@@ -31,6 +31,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -426,12 +427,27 @@ def check_meta(meta) -> dict:
 
 # ---- the database ---------------------------------------------------------------------------------------------
 
+def _enter_wal(db: sqlite3.Connection) -> None:
+    """`PRAGMA journal_mode = WAL` while another process is switching the same file answers "database is locked" at once:
+    SQLite does not run the busy handler for that change (it would deadlock two switchers), so the busy timeout does not cover
+    it. The switch is idempotent, so retry it within the same budget."""
+    end = time.monotonic() + BUSY_TIMEOUT_MS / 1000
+    while True:
+        try:
+            db.execute("PRAGMA journal_mode = WAL")
+            return
+        except sqlite3.OperationalError as error:
+            if "locked" not in str(error) or time.monotonic() >= end:
+                raise
+            time.sleep(0.02)
+
+
 def connect(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(path, timeout=BUSY_TIMEOUT_MS / 1000)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA busy_timeout = %d" % BUSY_TIMEOUT_MS)
-    db.execute("PRAGMA journal_mode = WAL")
+    _enter_wal(db)
     db.executescript(SCHEMA)
     present = {row["name"] for row in db.execute("PRAGMA table_info(claims)")}
     if set(COLUMNS) - present:
