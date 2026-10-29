@@ -7,7 +7,7 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from hydralysis import backends
+from hydralysis import backends, hydra
 
 from support import workdir
 
@@ -18,7 +18,7 @@ class BackendSetupTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
 
-    def installed(self, release="12.3-hydra.2", client_release="12.3-hydra.2"):
+    def installed(self, release=hydra.RELEASE, client_release=hydra.RELEASE):
         engine, java = self.root / "hydra-engine", self.root / "existing-jdk"
         native = engine / "Ghidra/Features/Decompiler/os" / ("win_x86_64" if os.name == "nt" else "linux_x86_64") / ("decompile.exe" if os.name == "nt" else "decompile")
         native.parent.mkdir(parents=True)
@@ -35,7 +35,7 @@ class BackendSetupTests(unittest.TestCase):
                 jar.writestr("hydra.properties", "hydra.version=%s\n" % release)
         client = self.root / "client" / "ghidra_session.py"
         client.parent.mkdir()
-        client.write_text('PROTOCOL = 2\nCLIENT_VERSION = "1.0.0"\nHYDRA_RELEASE = "%s"\n' % client_release)
+        client.write_text('PROTOCOL = %d\nCLIENT_VERSION = "%s"\nHYDRA_RELEASE = "%s"\n' % (hydra.PROTOCOL, hydra.CLIENT_VERSION, client_release))
         (java / "bin").mkdir(parents=True)
         extension = ".exe" if os.name == "nt" else ""
         for name in ("java", "javac"):
@@ -98,7 +98,7 @@ class BackendSetupTests(unittest.TestCase):
         settings = self.installed(release="12.4-hydra.1", client_release="12.4-hydra.1")
         report = self.inspect(settings)
         self.assertFalse(report["ready"])
-        self.assertTrue(any("pins 12.3-hydra.2" in item.get("reason", "") for item in report["checks"]))
+        self.assertTrue(any("pins %s" % hydra.RELEASE in item.get("reason", "") for item in report["checks"]))
         self.assertTrue(self.inspect({**settings, "hydra_allow_unpinned": True})["engine"]["ready"])
 
     def test_client_of_another_release_is_refused(self):
