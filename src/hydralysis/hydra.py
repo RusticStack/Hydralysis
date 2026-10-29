@@ -1040,8 +1040,13 @@ class Pool:
                         self._cond.wait(left)
                         continue
             # `retire` runs `on_retire` (which takes the query row guard) and the gate: never under `_cond` (lock order).
-            for entry in dead:
-                entry.retire()
+            try:
+                for entry in dead:
+                    entry.retire()
+            except BaseException:
+                if chosen is not None:
+                    self.release(chosen)   # it was begun and counted live: give the slot back instead of holding it for good
+                raise
             if chosen is not None:
                 return chosen
 

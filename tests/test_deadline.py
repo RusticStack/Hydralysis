@@ -450,13 +450,27 @@ class ProductionWiring(Base):
         self.pool.release(got[0])
 
     def test_acquire_retires_every_dead_idle_entry_even_when_a_live_one_follows(self):
-        first, second = self.idle_entries(2)
-        first.session._closed = True        # idle is [first, second]: the pop order takes `second`, then `first`
-        second.session._closed = True
-        third = self.pool.acquire(5)
-        self.assertTrue(first.finished and second.finished, "dead entries are retired, not leaked, on every path")
-        self.assertNotIn(third, (first, second))
-        self.pool.release(third)
+        live, dead1, dead2 = self.idle_entries(3)
+        dead1.session._closed = True        # idle is [live, dead1, dead2]: the pop order takes dead2, then dead1, then `live`
+        dead2.session._closed = True
+        got = self.pool.acquire(5)
+        self.assertIs(got, live, "the live entry that follows the dead ones is the one handed out")
+        self.assertTrue(dead1.finished and dead2.finished, "dead entries are retired, not leaked, on the live-found path")
+        self.assertEqual({key[0] for key in query._keys}, {live.key}, "the dead entries' rows are gone, the live one's stay")
+        self.pool.release(got)
+
+    def test_acquire_releases_the_chosen_entry_when_retiring_a_dead_one_raises(self):
+        live, dead = self.idle_entries(2)
+        dead.session._closed = True         # idle is [live, dead]: dead is popped first, then live is chosen
+
+        def boom(entry):
+            raise RuntimeError("on_retire failed")
+
+        dead.on_retire = boom
+        with self.assertRaises(RuntimeError):
+            self.pool.acquire(5)
+        self.assertIn(live, self.pool._idle, "the chosen entry went back to the pool, it does not hold a slot for good")
+        self.assertIs(self.pool.acquire(5), live)
 
     def test_a_closed_answer_invalidates_the_other_idle_entries_before_the_retry(self):
         self.daemon.scoped = True
