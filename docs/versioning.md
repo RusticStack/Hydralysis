@@ -53,14 +53,14 @@ library protocols 2 to 3.
 
 `.github/workflows/release.yml`:
 
-- `workflow_dispatch` is the dry run: it runs the unit tests, builds the sdist and the wheel, installs the wheel in a
+- `workflow_dispatch` is the dry run: it first runs the unit and engine jobs of `tests.yml` (called as a reusable
+  workflow), then builds the sdist and the wheel, installs the wheel in a
   fresh environment, checks that it reports the package version and that `backend inspect` reports `ready: true`, writes
   `SHA256SUMS` and attaches everything as a workflow artifact. Nothing is published.
 - A tag push `v*` runs the same steps, requires the tag to equal the package version, and creates a **draft**
   GitHub release with the files and `SHA256SUMS`. The owner decides whether to tag and whether to publish. This
   repository is private; making it public is a separate owner decision that this workflow does not take.
-- The engine integration job lives in `tests.yml` (it can be started with `workflow_dispatch` on the same commit
-  before tagging); the release workflow does not duplicate it.
+- The unit and engine jobs are defined once, in `tests.yml`; the release workflow calls them instead of copying them.
 
 Release notes come from `CHANGELOG.md` and carry the limits: Windows x64, copy-on-write only on ReFS (a full copy
 on NTFS), the one-way upgrade, a harness restart once.

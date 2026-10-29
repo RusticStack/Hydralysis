@@ -4,7 +4,7 @@ Hydralysis follows the version policy in [docs/versioning.md](docs/versioning.md
 engine, what 0.x means, and how to roll back a pin. Every release states only the claims whose tests pass.
 Nothing here is a tag: a release is tagged by the owner.
 
-## Unreleased (0.5.0, "qualified")
+## 0.5.0 ("qualified", not tagged)
 
 Client only. The 0.5.0 release is pinned to the Hydra Engine `12.3-hydra.3` line (protocol 2); the current tree already carries the `12.3-hydra.4` pin (protocol 3), see below. A 0.5.0 tag therefore has to be cut from a commit before that pin bump; the tree as it stands is 0.6.0 material. The engine's locking is the engine's;
 heavy parallel use is something to measure, not something this release promises.
@@ -40,7 +40,7 @@ heavy parallel use is something to measure, not something this release promises.
 - The one-way upgrade: a commit may write a generation that older engines cannot open.
 - A harness restart is needed once, for the catalog epoch.
 
-## 0.6.0 (planned, label OD11)
+## Unreleased (0.6.0, label OD11)
 
 Pins the Hydra Engine `12.3-hydra.4` (protocol 3). Hydralysis still speaks protocol 2 to a released hydra.3 engine
 when `hydra_allow_unpinned` is set. Adoption of the engine's capabilities: protocol negotiation, the deadline helper
