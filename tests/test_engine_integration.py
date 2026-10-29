@@ -19,7 +19,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from support import workdir
+from support import default_to_shared, workdir
 
 def _env(name):
     """HYDRALYSIS_<name>, else the old RUSTICRE_<name>."""
@@ -440,6 +440,10 @@ class EngineCommit(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         _prepare(cls, BINARY, "commit", "fixture")
+        # The round trip below drives commits.run_commit on the `shared` view, so a bare call must name it too. A caller with
+        # neither a view nor an agent has a view of its own since Y5 (D43): its edits would land there, and a commit of the
+        # shared view would find nothing pending. `test_caller_commit_without_a_view_sees_its_own_edits` covers that path.
+        default_to_shared(cls.runner)
 
     @classmethod
     def tearDownClass(cls):
@@ -447,6 +451,31 @@ class EngineCommit(unittest.TestCase):
 
     def ask(self, action, address="", **kwargs):
         return json.loads(self.runner.query("fixture", action, address, **kwargs))
+
+    def test_caller_commit_without_a_view_sees_its_own_edits(self):
+        """D43/D59: a commit that names no view is the caller's own view's commit. The edit of an agent (`as`) lands in its view;
+        the same agent's dry-run commit finds that record, and a commit of the `shared` view does not (isolation, K11). It
+        runs before the round trip, which leaves records pending in the shared view."""
+        from hydralysis import commits, workcopy
+        agent = "y6-own-edits"  # already a view name, so the agent's view is called the same
+        first = self.ask("functions", limit=5)["functions"][0]["address"]
+        base = self.runner.target("fixture")
+        mine = workcopy.with_view(base, agent)
+        edited = json.loads(self.runner.query("fixture", "type_edit", first, timeout_s=300, options={
+            "kind": "rename", "name": "own_edit_probe", "source": "commit integration test", "as": agent,
+            "expect_revision": workcopy.load_store(self.settings, mine).get("revision")}))
+        self.assertEqual(edited["view"], agent, edited)
+        plan = json.loads(self.runner.query("fixture", "type_edit", "", timeout_s=300, options={
+            "kind": "commit", "dry_run": True, "confirm_one_way_upgrade": True, "as": agent,
+            "expect_revision": workcopy.load_store(self.settings, mine)["revision"]}))
+        self.assertTrue(plan["dry_run"] and plan["ok"], plan)
+        self.assertEqual(plan["view"], agent)
+        with self.assertRaises(RuntimeError) as refused:  # the shared view holds none of it
+            self.runner.query("fixture", "type_edit", "", timeout_s=300, options={
+                "kind": "commit", "dry_run": True, "confirm_one_way_upgrade": True, "view": "shared",
+                "expect_revision": workcopy.load_store(self.settings, workcopy.with_view(base, ""))["revision"]})
+        self.assertEqual(json.loads(str(refused.exception))["error"], "nothing_to_commit")
+        self.assertNotEqual(self.ask("decompile", first, options={"view": "shared"})["function"]["name"], "own_edit_probe")
 
     def test_commit_round_trip_archival_and_revert_chain(self):
         from hydralysis import commits, hydra, lineage, workcopy
