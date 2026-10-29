@@ -47,7 +47,9 @@ _BASE = "https://github.com/RusticStack/hydra-engine/releases/download/v" + RELE
 # PENDING PUBLICATION: the release v12.3-hydra.4 is not tagged yet. The sizes and digests below were taken from a hand-built
 # stand-in dist (engine 338,530 bytes, not the real archive), so `backend install` cannot succeed until the coordinator
 # publishes the release and re-runs `tools/bump_hydra.py --release 12.3-hydra.4 --dist <published files> --write`.
-# Until then the digests and sizes below are those of the stand-in dist, not the SHA256SUMS of a published release.
+# Until then the next line (the one `bump_hydra.py` rewrites) is NOT true: the digests and sizes are those of the stand-in
+# dist, not a published SHA256SUMS, and nothing was checked after a download.
+# SHA256SUMS of the release, observed 2026-10-29 and checked after download.
 ASSETS = {
     "engine": {"url": _BASE + "hydra-engine-" + RELEASE + "-win_x86_64.zip",
                "sha256": "7b5a0bfe98449d3397e8804fe0e8b38112527be94286356152db34e46b9e2ea8", "size": 338530},
