@@ -180,8 +180,16 @@ class WorkflowTests(unittest.TestCase):
     def test_actions_are_pinned_by_sha(self):
         for line in self.text.splitlines():
             m = re.match(r"\s*(?:- )?uses:\s+(\S+)", line)
-            if m:
+            if m and not m.group(1).startswith("./.github/workflows/"):   # a workflow of this repository, same commit
                 self.assertRegex(m.group(1), r"@[0-9a-f]{40}$", line)
+
+    def test_the_release_waits_for_the_unit_and_engine_jobs(self):
+        self.assertRegex(self.text, r"\n  tests:\n    uses: \./\.github/workflows/tests\.yml\n")
+        self.assertRegex(self.text, r"\n  build:\n    needs: tests\n")
+        tests = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
+        self.assertIn("\n  workflow_call:\n", tests)
+        self.assertRegex(tests, r"\n  unit:\n")
+        self.assertRegex(tests, r"\n  engine:\n")
 
     def test_runs_unit_tests_and_installs_the_wheel(self):
         self.assertIn("python -m unittest discover -s tests", self.text)
