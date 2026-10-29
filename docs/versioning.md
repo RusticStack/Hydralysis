@@ -31,7 +31,7 @@ library protocols 2 to 3.
 1. Check out the Hydralysis release that carries the older pin (`git checkout vX.Y.Z`), or run
    `python tools/bump_hydra.py --release <older release> --write` against the older engine's distribution and
    review the diff.
-2. Run `python tools/bump_hydra.py --release <older release> --check`: exit 0 means the pin statements agree.
+2. Run `python tools/bump_hydra.py --release <older release> --dist <folder> --check`: exit 0 means the pin statements agree.
 3. Run `hydralysis backend install`, then `hydralysis backend inspect`.
 4. Read "Upgrade and backup" below before opening a project with the older engine.
 

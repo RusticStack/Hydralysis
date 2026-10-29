@@ -1,6 +1,6 @@
 """Release preparation (Z14): version consistency, the changelog, the policy text and the release workflow.
 
-Text checks only: nothing here tags, builds or publishes.
+Text checks only (line-level existence checks: the workflow itself and a wheel build were never run): nothing here tags, builds or publishes.
 """
 
 from __future__ import annotations
@@ -70,8 +70,11 @@ class WorkflowTests(unittest.TestCase):
 
     def test_builds_both_and_checksums(self):
         self.assertIn("--sdist --wheel", self.text)
-        self.assertIn("SHA256SUMS", self.text)
+        self.assertIn("sha256sum *.whl *.tar.gz > SHA256SUMS", self.text)
         self.assertIn("upload-artifact", self.text)
+
+    def test_tag_must_equal_version(self):
+        self.assertIn('"${GITHUB_REF_NAME}" != "v${version}"', self.text)
 
     def test_release_is_a_draft_on_tags_only(self):
         self.assertIn("--draft", self.text)
@@ -82,13 +85,14 @@ class WorkflowTests(unittest.TestCase):
 
     def test_actions_are_pinned_by_sha(self):
         for line in self.text.splitlines():
-            m = re.match(r"\s*- uses: (\S+)", line)
+            m = re.match(r"\s*(?:- )?uses: (\S+)", line)
             if m:
                 self.assertRegex(m.group(1), r"@[0-9a-f]{40}$", line)
 
     def test_checks_the_installed_wheel(self):
         self.assertIn("backend inspect", self.text)
-        self.assertIn("__version__", self.text)
+        self.assertIn("assert hydralysis.__version__ == v", self.text)
+        self.assertIn("assert r.get('ready') is True", self.text)
 
 
 if __name__ == "__main__":
