@@ -85,9 +85,13 @@ class WorkflowTests(unittest.TestCase):
 
     def test_actions_are_pinned_by_sha(self):
         for line in self.text.splitlines():
-            m = re.match(r"\s*(?:- )?uses: (\S+)", line)
+            m = re.match(r"\s*(?:- )?uses:\s+(\S+)", line)
             if m:
                 self.assertRegex(m.group(1), r"@[0-9a-f]{40}$", line)
+
+    def test_runs_unit_tests_and_installs_the_wheel(self):
+        self.assertIn("python -m unittest discover -s tests", self.text)
+        self.assertIn("pip install dist/*.whl", self.text)
 
     def test_checks_the_installed_wheel(self):
         self.assertIn("backend inspect", self.text)
