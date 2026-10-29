@@ -21,7 +21,7 @@ upstream bridge, MCP server or implementation was copied into this repository.
   its own headless scripts rather than installing that extension/PyGhidra MCP.
 
 Since 0.4.0 analysis runs on [Hydra Engine](https://github.com/RusticStack/hydra-engine)
-release 12.3-hydra.2, a Ghidra 12.3 build with a headless session daemon that
+release 12.3-hydra.4, a Ghidra 12.3 build with a headless session daemon that
 keeps programs open between requests and serves several clients. Hydralysis
 admits that pinned release and its pinned client (`hydra.py`), validates the
 engine and the client's protocol version, and selects a full JDK satisfying

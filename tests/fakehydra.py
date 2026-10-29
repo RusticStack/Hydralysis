@@ -10,9 +10,11 @@ with small canned results; apply_overlays records renames so reads can see them.
 from __future__ import annotations
 
 import copy
+import itertools
 import json
 import shutil
 import threading
+import time
 from pathlib import Path
 
 from hydralysis.hydra import EngineError
@@ -26,7 +28,7 @@ class Daemon:
         self.lock = threading.RLock()
         self.fail_next: dict[str, EngineError] = {}
         # What hello reports; tests change it to model an engine upgrade between syncs.
-        self.release = {"hydraVersion": "12.3-hydra.2", "ghidraVersion": "12.3"}
+        self.release = {"hydraVersion": "12.3-hydra.4", "ghidraVersion": "12.3"}
         self.fork_copy_ms = 7
         # What a real hydra.Engine sees through FakeClientModule (see FakeSession):
         # drops: connection losses to inject, {"command", "when": "before"|"after", "action": a script
@@ -50,6 +52,25 @@ class Daemon:
         # Type names that a signature may only use once a struct record defined them (fail closed otherwise): models the
         # engine refusing a prototype with an undefined type, so a subset commit that leaves the struct behind aborts.
         self.typed_names: set[str] = set()
+        # Y4a (deadlines, pool, supervisor). All of it is opt-in and off by default, so that no frozen test changes.
+        # scoped: a connection-scoped context like the engine's (a call on a connection that has not seen open_project and
+        #   open_program answers no_project / no_program). holds: command -> {"event", "cooperative", "times"}: a request of
+        #   that command blocks in `wait` until the event is set (a cooperative one also ends on `cancel`). The log lists
+        #   what reached a connection: cancels, closes (time, session id, reads in flight) and violations (a close or a
+        #   shutdown while a request of the session is in flight: the mechanism of 7.6 must never do either).
+        self.scoped = False
+        self.holds: dict[str, dict] = {}
+        self.cancels: list[tuple[int, int]] = []
+        self.close_log: list[tuple[float, int, int]] = []
+        self.violations: list[str] = []
+        self.reads_in_flight = 0
+        self.session_ids = itertools.count(1)
+        self.sessions_open: set[int] = set()
+        self.queue_info = False   # models a v3 engine that reports queue information and the lane hint
+        # E2 surface for Y4d's tests: `format` in project info, `backup_required` on the upgrade gate and a backup written by
+        # the engine (`fork_project purpose:"backup"`, manifest with writer "engine").
+        self.format_info: dict | None = None
+        self.backup_required = False
 
     def add_project(self, gpr: Path, programs: dict[str, dict]) -> dict:
         gpr.parent.mkdir(parents=True, exist_ok=True)
@@ -117,6 +138,58 @@ class FakeSession:
         self.last_response = None
         self.on_event = None
         self.hello = {"protocol": 2, **daemon.release, "installId": "fake", **daemon.hello_extra}
+        self.id = next(daemon.session_ids)
+        daemon.sessions_open.add(self.id)
+        self.supports_deadline = False
+        self._rids = itertools.count(1)
+        self._pending: dict[int, tuple[str, dict]] = {}
+        self._cancel_events: dict[int, threading.Event] = {}
+        self._blocked = 0
+        self.joined_projects: set[str] = set()
+        self.opened_programs: set[str] = set()
+        self.closes = 0
+
+    # --- send / wait: what the abandon helper of 7.6 uses (library 1.0.0) --------------------------------------------
+    def send(self, command, **fields):
+        rid = next(self._rids)
+        if command == "cancel":
+            self.daemon.cancels.append((self.id, fields.get("target")))
+            event = self._cancel_events.get(fields.get("target"))
+            if event is not None:
+                event.set()
+            return rid
+        self._pending[rid] = (command, fields)
+        self._cancel_events[rid] = threading.Event()
+        return rid
+
+    def wait(self, rid):
+        command, fields = self._pending.pop(rid)
+        cancelled = self._cancel_events[rid]
+        hold = self.daemon.holds.get(command)
+        if hold is not None and hold.get("times", 1) > 0:
+            hold["times"] = hold.get("times", 1) - 1
+            self._blocked += 1
+            if command == "script":
+                with self.daemon.lock:
+                    self.daemon.reads_in_flight += 1
+            try:
+                end = time.monotonic() + hold.get("timeout", 30)
+                while not hold["event"].is_set() and time.monotonic() < end:
+                    if hold.get("cooperative") and cancelled.is_set():
+                        break
+                    hold["event"].wait(0.01)
+            finally:
+                self._blocked -= 1
+                if command == "script":
+                    with self.daemon.lock:
+                        self.daemon.reads_in_flight -= 1
+            if cancelled.is_set() and hold.get("cooperative"):
+                raise self.module.SessionError("cancelled", "the request was cancelled")
+        return self.call(command, **fields)
+
+    def shutdown(self, *_):
+        if self._blocked:
+            self.daemon.violations.append("shutdown while a request is in flight")
 
     @staticmethod
     def _action(fields):
@@ -135,9 +208,28 @@ class FakeSession:
             raise ConnectionResetError("the connection was reset")
         raise self.module.SessionError("closed", "the session connection ended")
 
+    def _check_scope(self, command, fields):
+        """The engine's rule (opt-in): a project or a program a connection has not opened is refused."""
+        if not self.daemon.scoped:
+            return
+        if command == "open_program" and fields.get("project") not in self.joined_projects:
+            raise self.module.SessionError("no_project", "this client has not joined project %s; send open_project" % fields.get("project"))
+        if command == "script" and fields.get("program") and fields["program"] not in self.opened_programs:
+            raise self.module.SessionError("no_program", "%s is not open for this client; send open_program first" % fields["program"])
+
     def call(self, command, **fields):
         if self._closed:
             raise self.module.SessionError("closed", "the session connection ended")
+        self._check_scope(command, fields)
+        result = self._call(command, **fields)
+        if self.daemon.scoped and isinstance(result, dict):
+            if command == "open_project" and result.get("id"):
+                self.joined_projects.add(result["id"])
+            if command == "open_program" and result.get("key"):
+                self.opened_programs.add(result["key"])
+        return result
+
+    def _call(self, command, **fields):
         labels = {key: fields.pop(key) for key in ("client", "harness", "parallel") if key in fields}
         drop = next((item for item in self.daemon.drops if item["command"] == command and
                      item.get("action") in (None, self._action(fields))), None)
@@ -167,6 +259,11 @@ class FakeSession:
     call_raw = call
 
     def close(self):
+        if self._blocked:
+            self.daemon.violations.append("close while a request is in flight")
+        self.closes += 1
+        self.daemon.close_log.append((time.monotonic(), self.id, self.daemon.reads_in_flight))
+        self.daemon.sessions_open.discard(self.id)
         self._closed = True
         self.engine.reset()
 
@@ -188,6 +285,45 @@ class FakeClientModule:
     @classmethod
     def connect(cls, client="", harness="", **_):
         return FakeSession(cls, DAEMON, client, harness)
+
+
+class FakePooledEngine:
+    """What the abandon helper, the pool and `QueryRunner` need from a real hydra.Engine, over the fake daemon (Y4a, opt-in).
+
+    The shared connection is a FakeEngine; entries are FakeSessions with send/wait (library 1.0.0)."""
+
+    def __init__(self, settings: dict | None = None, role: str = "reader"):
+        self.shared = FakeEngine(settings or {}, role)
+        self.role = role
+        self.key = "fake|" + role
+        self.settings = settings or {}
+        self._pool = None
+
+    def module(self):
+        return FakeClientModule
+
+    def connect_entry(self):
+        return FakeSession(FakeClientModule, DAEMON)
+
+    def _error(self, session, exc, command):
+        return EngineError(exc.code, exc.message, dict(exc.details or {}), command)
+
+    def capabilities(self):
+        if not DAEMON.queue_info:
+            return {}
+        return {"laneHint": 1, "queueInfo": 1}
+
+    def deadline_mode(self):
+        return "helper"
+
+    def pool(self):
+        from hydralysis import hydra, query
+        if self._pool is None:
+            self._pool = hydra.Pool(self, on_retire=query.forget)
+        return self._pool
+
+    def __getattr__(self, name):   # call, hello, reset, stop ... on the shared connection
+        return getattr(self.shared, name)
 
 
 class FakeEngine:
