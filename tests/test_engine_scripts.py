@@ -220,7 +220,8 @@ class ScriptStaging(unittest.TestCase):
         self.assertNotEqual(original_name, "zz_mutated_by_script")
         output = self.run_script("Mutate", target="scripted-copy")
         self.assertIn("renamed=zz_mutated_by_script", output)
-        self.assertIn("mode=contained", output)
+        # hydra.3 runs a script on a program as "contained"; on hydra.4 (Y4e) it runs "private". Both roll the change back.
+        self.assertRegex(output, r"mode=(contained|private)")
         self.assertEqual(lineage.tree_hash(self.copy), before_copy, "the script changed the copy's tree")
         self.assertEqual(lineage.tree_hash(self.folder), self.original_hash, "the script changed the original's tree")
         # contained: the rename is rolled back, so the next reader sees the original name
