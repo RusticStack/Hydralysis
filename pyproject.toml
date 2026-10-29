@@ -3,7 +3,7 @@ name = "hydralysis"
 version = "0.5.0.dev0"
 description = "Small reverse-engineering server: PE evidence, analysis setup, reusable saved-project queries and verified runtime sessions."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 license = "MIT"
 authors = [{ name = "KelpHect", email = "kellhect@gmail.com" }]
 dependencies = [

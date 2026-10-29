@@ -8,7 +8,7 @@ PEs and the engine ships as a Windows build. There are two jobs.
 
 | Job | Runs | Needs | Does not need |
 | --- | --- | --- | --- |
-| `unit` (Python 3.11, 3.13, 3.14) | `python -m unittest discover -s tests`: the whole unit suite, the synthetic golden-harness tests (`tests/test_golden.py`) and the no-stock-Ghidra source scan (`tests/test_no_stock_ghidra.py`) | Python and `pip install -e .` | an engine, a JDK, game data |
+| `unit` (Python 3.13, 3.14, 3.15) | `python -m unittest discover -s tests`: the whole unit suite, the synthetic golden-harness tests (`tests/test_golden.py`) and the no-stock-Ghidra source scan (`tests/test_no_stock_ghidra.py`) | Python and `pip install -e .` | an engine, a JDK, game data |
 | `engine` (Python 3.13) | `tests/test_engine_integration.py` against the real pinned Hydra release: prepare, query, overlays, revert, adopt, archive import, bulk export, and the mandatory `expect_revision` rules; then `tests/test_concurrency.py` (the Z1 concurrency guard, whose engine-backed cases are skipped without an engine); then `tests/test_engine_nostock.py` and `tools/audit_harness.py --self` (below) | JDK 25 (Temurin, `actions/setup-java`), the pinned engine and client archives | game data, a stock Ghidra |
 
 The integration tests analyse a small PE that every Windows host has (`whoami.exe`, or the file named by
