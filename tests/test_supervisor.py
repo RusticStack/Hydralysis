@@ -123,9 +123,12 @@ class Policy(unittest.TestCase):
         self.assertIn("abandoned", event["doctor"])
         self.assertEqual(len(self.world.restarts), 3)
         self.assertTrue(self.supervisor.unhealthy)
-        # the window moves on: 10 minutes after the first restart one slot is free again
+        # no further attempt, even when the window has moved on: only an operator's decision probes again
         self.world.now = 601.0
         self.world.alive, self.world.lock_free = False, True
+        self.assertEqual(self.supervisor.tick()["event"], "daemon_unhealthy")
+        self.assertEqual(len(self.world.restarts), 3)
+        self.supervisor.reset_budget()
         self.assertEqual(self.supervisor.tick()["event"], "restarted")
 
     def test_lost_on_restart_lists_non_recoverable_edits_and_jobs_and_marks_them(self):

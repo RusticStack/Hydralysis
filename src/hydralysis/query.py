@@ -566,6 +566,8 @@ class QueryRunner:
                         response, raw = run_script(entry, program, request, timeout_s, self.requests)
             except hydra.EngineError as error:
                 if attempt == 0 and error.code in ("no_program", "not_found", "no_project", "closed"):
+                    if pool is not None and error.code == "closed":
+                        pool.invalidate()   # the daemon went away: the idle entries are as dead as the one that failed
                     forget(self.engine)   # the entry that failed was retired by the pool and its rows dropped with it
                     continue
                 raise
@@ -631,7 +633,8 @@ class QueryRunner:
         pool = self._pool()
 
         def belongs(key):
-            if (key[0] != self.engine.key and not (pool is not None and pool.owns(key[0])))                     or key[2].lstrip("/") != selected["program"].lstrip("/"):
+            if (key[0] != self.engine.key and not (pool is not None and pool.owns(key[0]))) \
+                    or key[2].lstrip("/") != selected["program"].lstrip("/"):
                 return False
             if key[1] in (master, adopted) and selected.get("view", "shared") == "shared":
                 return True

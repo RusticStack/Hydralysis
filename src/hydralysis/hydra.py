@@ -44,6 +44,9 @@ CLIENT_VERSION = "1.1.0"
 INSTANCE = "rusticre"
 ATTRIBUTION = "rusticre"
 _BASE = "https://github.com/RusticStack/hydra-engine/releases/download/v" + RELEASE + "/"
+# PENDING PUBLICATION: the release v12.3-hydra.4 is not tagged yet. The sizes and digests below were taken from a hand-built
+# stand-in dist (engine 338,530 bytes, not the real archive), so `backend install` cannot succeed until the coordinator
+# publishes the release and re-runs `tools/bump_hydra.py --release 12.3-hydra.4 --dist <published files> --write`.
 # SHA256SUMS of the release, observed 2026-10-29 and checked after download.
 ASSETS = {
     "engine": {"url": _BASE + "hydra-engine-" + RELEASE + "-win_x86_64.zip",
@@ -419,8 +422,13 @@ class Engine:
         with self._guard:
             found = self._pools.get(self.key)
             if found is None:
-                found = self._pools[self.key] = Pool(self)
-            return found
+                found = self._pools[self.key] = Pool(self, on_retire=_forget_rows)
+                fresh = True
+            else:
+                fresh = False
+        if fresh:
+            supervise(self)
+        return found
 
     def protocol(self) -> int:
         """The protocol this connection negotiated: what hello reports; an engine that reports nothing speaks 2."""
@@ -443,9 +451,14 @@ class Engine:
             return session
 
     def reset(self) -> None:
+        """Drop the shared connection, and with it every pool entry of the role: a daemon restart (or a connection that
+        died) takes the context of all of them (7.6, I2; 7.2 lists the restart as a retire event)."""
         with self._guard:
             session = self._connections.pop(self.key, None)
             self._used.pop(self.key, None)
+            pool = self._pools.get(self.key)
+        if pool is not None:
+            pool.invalidate()
         if session is not None:
             try:
                 session.close()
@@ -585,6 +598,7 @@ class Engine:
 
     def stop(self, force: bool = False) -> dict:
         module = self.module()
+        unsupervise(self)   # a stopped daemon is not restarted behind the caller's back
         pool = self._pools.pop(self.key, None)
         if pool is not None:
             pool.close_all(0.0)
@@ -610,6 +624,18 @@ WAITING_COMMANDS = frozenset({"open_project", "open_program", "script"})
 
 class DeadlineError(EngineError):
     """`deadline_exceeded` and `abandoned_cap`: errors of the client-side deadline, not of the engine."""
+
+
+def _forget_rows(entry) -> None:
+    """The pool's `on_retire` in production: the retired entry's rows of `query._keys` go with it (I2). `query` imports this
+    module, so it is imported here, when an entry retires."""
+    from hydralysis import query
+    query.forget(entry)
+
+
+def _forget_role_rows(engine) -> None:
+    from hydralysis import query
+    query.forget_role(engine)
 
 
 def supports(engine, name: str) -> bool:
@@ -648,6 +674,7 @@ class Registry:
         with self.lock:
             self._ids += 1
             self.abandoned[self._ids] = {"id": self._ids, "kind": entry.kind, "cmd": command, "program": program,
+                                         "label": "%s/%s" % (_IDENTITY["client"], _IDENTITY["harness"]),
                                          "entry": entry.key, "since": time.monotonic()}
             return self._ids
 
@@ -665,7 +692,8 @@ class Registry:
         with self.lock:
             if self.count(kind) < cap:
                 return
-            listing = [{"cmd": item["cmd"], "program": item["program"], "ageS": round(time.monotonic() - item["since"], 1)}
+            listing = [{"cmd": item["cmd"], "label": item["label"], "program": item["program"],
+                        "ageS": round(time.monotonic() - item["since"], 1)}
                        for item in self.abandoned.values() if item["kind"] == kind]
         raise DeadlineError("abandoned_cap", "%d requests that ignore cancel are still running on the engine; "
                             "no further call is sent until some end" % cap, {"cap": cap, "abandoned": listing},
@@ -702,7 +730,7 @@ class Registry:
         Returns "dropped" (its connection had failed: nothing to leave), "closed" or "deferred". A ninth entry in the
         list closes the oldest regardless (L3)."""
         if entry.broken:
-            entry.finished = True
+            entry.close_now()   # its connection failed: no request is in flight and it holds no lock; free the socket
             return "dropped"
         with self.lock:
             if entry.joined and self._busy(entry):
@@ -771,6 +799,7 @@ class Entry:
         self._retired = False
         self._token = None
         self.pending_close: set[str] = set()
+        self.generation = 0
 
     def begin(self, deadline_s: float) -> "Entry":
         """Start the attempt's clock (when the entry is acquired)."""
@@ -931,9 +960,33 @@ class Pool:
         self._idle: list[Entry] = []
         self._live: set[Entry] = set()
         self._probe: Entry | None = None
+        self.generation = 0   # bumped by `invalidate`: an entry of an older generation is never reused
 
     def _new(self, kind: str = "user") -> Entry:
-        return Entry(self.engine, self.engine.connect_entry(), kind, self.registry, self.on_retire)
+        entry = Entry(self.engine, self.engine.connect_entry(), kind, self.registry, self.on_retire)
+        entry.generation = self.generation
+        return entry
+
+    def invalidate(self) -> None:
+        """The daemon restarted (or the connection died): retire every idle entry, mark the checked-out ones stale (they
+        retire when returned) and drop every row of the role (`forget_role`). The pool makes new entries on demand."""
+        with self._cond:
+            self.generation += 1
+            idle, self._idle = self._idle, []
+            probe, self._probe = self._probe, None
+            for entry in idle:
+                self._live.discard(entry)
+            self._cond.notify_all()
+        for entry in idle:
+            if not entry.abandoned:
+                entry.broken = True
+                entry.retire()
+        if probe is not None:
+            probe.broken = True   # a probe in flight is not closed under its request; the next probe opens a new connection
+            if not probe._inflight and not probe.abandoned:
+                probe.retire()
+        if self.on_retire is not None:
+            _forget_role_rows(self.engine)
 
     def live(self) -> int:
         with self._cond:
@@ -955,9 +1008,14 @@ class Pool:
             while True:
                 while self._idle:
                     entry = self._idle.pop()
-                    if not (entry.abandoned or entry.broken or entry.finished):
+                    if getattr(entry.session, "_closed", False) and not entry.abandoned:
+                        entry.broken = True   # the library closed it (the daemon went away): never handed out
+                    if not (entry.abandoned or entry.broken or entry.finished) and entry.generation == self.generation:
                         return entry.begin(deadline_s)
                     self._live.discard(entry)
+                    if not entry.abandoned:
+                        entry.broken = True
+                        entry.retire()   # its rows go with it (I2) and its socket is freed
                 if len(self._live) < self.size:
                     entry = self._new()
                     self._live.add(entry)
@@ -970,6 +1028,9 @@ class Pool:
 
     def release(self, entry: Entry, error: BaseException | None = None) -> None:
         """Return ENTRY after an attempt: a healthy one goes back; an abandoned, broken or error-retired one does not."""
+        stale = entry.generation != self.generation
+        if stale and not entry.abandoned:
+            entry.broken = True
         retire = entry.abandoned or entry.broken or (isinstance(error, EngineError) and error.code in RETIRE_CODES)
         if retire and not entry.abandoned:
             entry.retire()
@@ -1116,6 +1177,8 @@ class Supervisor:
             return self._tick(force)
 
     def _tick(self, force: bool) -> dict:
+        if self.unhealthy:
+            return {"event": "daemon_unhealthy"}   # the budget is spent: no further attempt, whatever the window says (7.2)
         alive = self.pid_alive()
         if not alive and self.lock_free():
             self.misses = 0
@@ -1172,6 +1235,14 @@ class Supervisor:
         self.last_status = {}
         return self.record({"event": "restarted", "why": why, "lost_on_restart": lost})
 
+    def reset_budget(self) -> None:
+        """An operator's decision (after the doctor's report): forget the restarts and the verdict, and probe again."""
+        with self._guard:
+            self.restarts.clear()
+            self.unhealthy = False
+            self.misses = 0
+        self.record({"event": "budget_reset"})
+
     def summary(self) -> dict:
         """The doctor summary: both abandoned budgets are reported as a finding of their own (7.2)."""
         return {"misses": self.misses, "restarts_in_window": len(self.restarts), "unhealthy": self.unhealthy,
@@ -1185,8 +1256,6 @@ class Supervisor:
 
         def loop():
             while not self._stop.wait(period_s):
-                if self.unhealthy:
-                    continue
                 try:
                     self.tick()
                 except Exception:   # noqa: BLE001 - the loop never dies; the next tick looks again
@@ -1203,9 +1272,26 @@ class Supervisor:
 
     @classmethod
     def for_engine(cls, engine: "Engine", settings: dict, **overrides) -> "Supervisor":
-        """A supervisor over the real daemon of ENGINE: probes on the pool's own connection, restarts through the library's Daemon."""
+        """A supervisor over the real daemon of ENGINE, fed by real sources:
+
+        * `pid_alive`: the pid in the daemon's endpoint file exists as a process; `lock_free`: the instance lock
+          (`<instance>.lock`, held by the JVM for its whole life) is free: two different facts, as 7.2 needs them;
+        * `probe`: `health` (or `ping` on hydra.2/3) on the pool's own probe connection, with a deadline;
+        * `status`: the engine `status`, kept for `lost_on_restart`; a program is recoverable when it lives under
+          `working/` or `lineages/` of the root (the store or the intent log is its record);
+        * `publish_in_flight` and `mark_lost`: the job records of the root (`overlay-jobs/*/job.json`): an active publish or
+          commit job refuses the restart (stricter than 7.2, which allows it once an intent is recorded), and every active
+          job of the root is marked `lost_on_restart` when the restart goes ahead;
+        * `durable_journal`: `journal_durable` (see there)."""
         module = engine.module()
         daemon = module.Daemon(str(engine.engine_dir), str(state_dir(settings)), INSTANCE)
+        root = root_path(settings)
+        keep: set[str] = set()   # program keys found recoverable in the last `status`
+
+        def pid_alive() -> bool:
+            from hydralysis.preparation import process_start_ms
+            found = (daemon.read_endpoint() or {}).get("pid")
+            return isinstance(found, int) and not isinstance(found, bool) and process_start_ms(found) > 0
 
         def probe():
             if "health" in engine.capabilities():
@@ -1223,20 +1309,108 @@ class Supervisor:
                 raise RuntimeError("the daemon process did not exit within %d s" % EXIT_WAIT_S)
             engine.session()
 
-        found = dict(probe=probe, pid_alive=daemon.jvm_alive, lock_free=lambda: not daemon.jvm_alive(), restart=restart,
-                     status=lambda: engine.call("status"), abandoned=REGISTRY.snapshot,
-                     durable_journal=lambda: journal_durable(settings))
+        def status():
+            found = engine.call("status")
+            places = [root / "working", root / "lineages"]
+            keep.clear()
+            for program in (found.get("programs") or []) if isinstance(found, dict) else []:
+                name = program.get("key") or program.get("path") or program.get("program")
+                texts = [value for value in program.values() if isinstance(value, str)]
+                if name and any(_under(text, places) for text in texts):
+                    keep.add(name)
+            return found
+
+        def publish_in_flight() -> bool:
+            return any(job.get("kind") in ("publish", "commit") for job in active_jobs(settings))
+
+        def mark_lost(entries):
+            from hydralysis import overlayjobs
+            for job in active_jobs(settings):
+                overlayjobs._update(overlayjobs.job_path(settings, job["id"]), lost_on_restart=True,
+                                    lost_on_restart_at=time.time(), lost_on_restart_programs=[item.get("program") for item in entries])
+
+        found = dict(probe=probe, pid_alive=pid_alive, lock_free=lambda: not daemon.jvm_alive(), restart=restart, status=status,
+                     recoverable=lambda program: program in keep, abandoned=REGISTRY.snapshot,
+                     durable_journal=lambda: journal_durable(settings), publish_in_flight=publish_in_flight, mark_lost=mark_lost)
         found.update(overrides)
         return cls(state_dir(settings) / "supervisor.json", **found)
 
 
-def journal_durable(settings: dict) -> bool:
-    """`journal.durable` (D55): the store v3 write-ahead record exists and its start-up self-test (write, read back) passes.
+def _under(text: str, places: list[Path]) -> bool:
+    try:
+        path = Path(text).resolve()
+    except (OSError, ValueError):
+        return False
+    return any(path.is_relative_to(place.resolve()) for place in places)
 
-    The kill step of the self-test is the crash tests' (`durable.fault`); here a record is appended to a log under the
-    state directory and must read back exactly through the same sealed, fsynced path the intent logs use."""
+
+def active_jobs(settings: dict, limit: int = 50) -> list[dict]:
+    """The Hydralysis jobs of the root that are queued, running or cancelling (the 50 newest records)."""
+    from hydralysis import overlayjobs
+    folder = root_path(settings) / "overlay-jobs"
+    if not folder.is_dir():
+        return []
+    found = []
+    paths = sorted(folder.glob("overlay-*/job.json"), key=lambda item: item.stat().st_mtime_ns, reverse=True)[:limit]
+    for path in paths:
+        try:
+            record = overlayjobs.status(settings, path.parent.name)
+        except Exception:   # noqa: BLE001 - a record that cannot be read is not an active job
+            continue
+        if record.get("state") in overlayjobs.ACTIVE:
+            found.append(record)
+    return found
+
+
+_SUPERVISORS: dict[str, Supervisor] = {}
+
+
+def _root_key(engine) -> str:
+    return str(engine.root).lower() if os.name == "nt" else str(engine.root)
+
+
+def supervise(engine, settings: dict | None = None) -> "Supervisor | None":
+    """Start the supervisor of ENGINE's root, once per process (7.2: probes while the engine is in use). It is called when the
+    first pool of a root is made, which is the first deadline-bound read of a long-lived process. Anything that keeps a
+    supervisor from being built (a client without `Daemon`, `hydra_supervisor: false`) leaves the engine unsupervised and
+    never fails the read. `Engine.stop` stops it."""
+    settings = settings if settings is not None else getattr(engine, "settings", {})
+    if settings.get("hydra_supervisor") is False or not isinstance(engine, Engine):
+        return None
+    key = _root_key(engine)
+    with Engine._guard:
+        found = _SUPERVISORS.get(key)
+        if found is not None:
+            return found
+        try:
+            found = _SUPERVISORS[key] = Supervisor.for_engine(engine, settings)
+        except Exception:   # noqa: BLE001 - see above
+            return None
+    found.start()
+    return found
+
+
+def unsupervise(engine) -> None:
+    if not isinstance(engine, Engine):
+        return
+    with Engine._guard:
+        found = _SUPERVISORS.pop(_root_key(engine), None)
+    if found is not None:
+        found.stop()
+
+
+def journal_durable(settings: dict) -> bool:
+    """`journal.durable` (D55): the overlay store is version 3 (its edits are sealed and flushed before they are applied, 4.10
+    W1 to W4) and a start-up self-test (write, read back) passes.
+
+    The "kill the writer" step of D55 is the crash tests' (`durable.fault`) and is not done here: this checks that a record
+    appended to a log under the state directory reads back exactly through the sealed, fsynced path the intent logs use,
+    and that the store this Hydralysis writes is v3. It does not prove the write-ahead record against a killed writer."""
     path = state_dir(settings) / "journal-selftest.log"
     try:
+        from hydralysis import workcopy
+        if workcopy.STORE_VERSION < 3:
+            return False
         path.parent.mkdir(parents=True, exist_ok=True)
         path.unlink(missing_ok=True)
         log = durable.AppendLog(path)

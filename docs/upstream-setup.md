@@ -26,7 +26,8 @@ keeps programs open between requests and serves several clients. Hydralysis
 admits that pinned release and its pinned client (`hydra.py`), validates the
 engine and the client's protocol version, and selects a full JDK satisfying
 the installation's declared Java bounds. Other releases are reported as
-incompatible unless `hydra_allow_unpinned` is set. When requested, a background
+incompatible unless `hydra_allow_unpinned` is set. (That release is not published yet: until it is tagged and
+its checksums are written into the pin by `tools/bump_hydra.py`, the download cannot work.) When requested, a background
 setup job installs the pinned engine and client archives and a portable
 [Adoptium JDK 25.0.4.1+1](https://github.com/adoptium/temurin25-binaries/releases/tag/jdk-25.0.4.1%2B1)
 privately under the configured root, verifies their full SHA-256 before
