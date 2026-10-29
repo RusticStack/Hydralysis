@@ -428,16 +428,20 @@ def check_meta(meta) -> dict:
 # ---- the database ---------------------------------------------------------------------------------------------
 
 def _enter_wal(db: sqlite3.Connection) -> None:
-    """`PRAGMA journal_mode = WAL` while another process is switching the same file answers "database is locked" at once:
-    SQLite does not run the busy handler for that change (it would deadlock two switchers), so the busy timeout does not cover
-    it. The switch is idempotent, so retry it within the same budget."""
-    end = time.monotonic() + BUSY_TIMEOUT_MS / 1000
+    """Switch an old (rollback-journal) ledger to WAL. SQLite does not apply the busy timeout to that switch: with
+    several processes opening the same old ledger it fails at once with 'database is locked'. Only the first one has
+    to switch, so ask for the mode first and retry the switch until the busy deadline."""
+    deadline = time.monotonic() + BUSY_TIMEOUT_MS / 1000
     while True:
         try:
+            if str(db.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
+                return
             db.execute("PRAGMA journal_mode = WAL")
             return
-        except sqlite3.OperationalError as error:
-            if "locked" not in str(error) or time.monotonic() >= end:
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            if time.monotonic() >= deadline:
                 raise
             time.sleep(0.02)
 
