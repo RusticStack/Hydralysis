@@ -449,6 +449,53 @@ class ProductionWiring(Base):
         self.assertTrue(stopped and stopped[0]["ok"])
         self.pool.release(got[0])
 
+    def test_the_pool_lock_and_the_row_guard_are_never_nested_in_either_order(self):
+        """Lock order, stated as the invariant instead of one interleaving: no thread ever takes the query row guard
+        (`query._keys_guard`) while it holds the pool's `_cond`, and none takes `_cond` while it holds the row guard. The two
+        orders together were the inversion (`stop` held the guard and asked the pool, `acquire` held `_cond` and retired an entry,
+        whose `on_retire` takes the guard); either one alone cannot deadlock, so this watches both on every path that touches
+        both: acquire over a dead idle entry, `stop`, `invalidate`, and a release that retires."""
+        violations, held = [], threading.local()
+
+        class Guard:
+            def __init__(self, inner):
+                self.inner = inner
+
+            def __enter__(self):
+                if pool._cond._is_owned():
+                    violations.append("row guard taken under the pool lock")
+                self.inner.acquire()
+                held.guard = True
+                return self
+
+            def __exit__(self, *exc):
+                held.guard = False
+                self.inner.release()
+
+        class Cond(threading.Condition):
+            def __enter__(self):
+                if getattr(held, "guard", False):
+                    violations.append("pool lock taken under the row guard")
+                return super().__enter__()
+
+        pool = self.pool
+        pool._cond = Cond()
+        patcher = patch.object(query, "_keys_guard", Guard(query._keys_guard))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        runner = self.runner()
+        live, dead = self.idle_entries(2)            # idle is [live, dead]: acquire pops `dead` first, then takes `live`
+        dead.session._closed = True
+        pool.release(pool.acquire(5))                # retires the dead idle entry, which forgets its rows
+        stopped = runner.stop(runner.target("owned"))   # reads the pool, then the guard
+        self.assertNotIn("error", stopped)
+        taken = pool.acquire(5)
+        self.program(taken)
+        pool.release(taken, hydra.EngineError("no_program", "gone"))   # a retiring release forgets rows
+        pool.invalidate()                            # retires the idle entries, forgets the role
+        self.assertTrue(dead.finished and live.finished)
+        self.assertEqual(violations, [], "the pool lock and the row guard must not be nested")
+
     def test_acquire_retires_every_dead_idle_entry_even_when_a_live_one_follows(self):
         first, second = self.idle_entries(2)
         first.session._closed = True        # idle is [first, second]: the pop order takes `second`, then `first`
