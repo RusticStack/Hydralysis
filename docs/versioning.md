@@ -54,7 +54,7 @@ library protocols 2 to 3.
 `.github/workflows/release.yml`:
 
 - `workflow_dispatch` is the dry run: it runs the unit tests, builds the sdist and the wheel, installs the wheel in a
-  fresh environment, checks that it reports the package version and that `backend inspect` answers, writes
+  fresh environment, checks that it reports the package version and that `backend inspect` reports `ready: true`, writes
   `SHA256SUMS` and attaches everything as a workflow artifact. Nothing is published.
 - A tag push `v*` runs the same steps, requires the tag to equal the package version, and creates a **draft**
   GitHub release with the files and `SHA256SUMS`. The owner decides whether to tag and whether to publish. This
