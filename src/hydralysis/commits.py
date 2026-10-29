@@ -328,10 +328,22 @@ def _force_files(folder: Path) -> dict:
 
 # ---- the commit ------------------------------------------------------------------------------------------------
 
-def _plan_confirmation(options: dict) -> None:
-    if not options.get("confirm_one_way_upgrade"):
-        # `open_project.format.upgradeRequired` is unknown on hydra.2/3 (no `format`), and unknown needs the confirmation (4.6).
-        raise CommitError("confirmation_required", CONFIRMATION, confirm="confirm_one_way_upgrade")
+def _plan_confirmation(options: dict, engine=None, source_gpr: str | None = None) -> None:
+    if options.get("confirm_one_way_upgrade"):
+        return
+    # `open_project.format.upgradeRequired` is unknown on hydra.2/3 (no `format`), and unknown needs the confirmation (4.6).
+    # An engine with the `format` capability says it: the confirmation is skipped only for an explicit `false`, and the
+    # refusal carries what the engine reported.
+    info = None
+    if engine is not None and source_gpr and "format" in _capabilities(engine):
+        try:
+            info = (engine.call("open_project", path=source_gpr) or {}).get("format")
+        except hydra.EngineError:
+            info = None
+    if isinstance(info, dict) and info.get("upgradeRequired") is False:
+        return
+    detail = {"format": info} if isinstance(info, dict) else {}
+    raise CommitError("confirmation_required", CONFIRMATION, confirm="confirm_one_way_upgrade", **detail)
 
 
 def _head_for(settings: dict, selected: dict) -> tuple[str | None, dict]:
@@ -407,7 +419,7 @@ def run_commit(settings: dict, selected: dict, options: dict, engine=None, timeo
             if prior is not None:
                 return prior
     facts = preconditions(settings, selected, options, engine)
-    _plan_confirmation(options)
+    _plan_confirmation(options, engine, facts["head"]["gpr"])
     # A commit is a lineage: create it now, at the first commit, recording the current key (4.4).
     link = lineage.ensure(settings, {**selected, "origin_key": selected.get("origin_key") or selected["key"]})
     lineage_id = link["id"]
