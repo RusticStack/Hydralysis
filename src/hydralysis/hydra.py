@@ -47,7 +47,7 @@ _BASE = "https://github.com/RusticStack/hydra-engine/releases/download/v" + RELE
 # PENDING PUBLICATION: the release v12.3-hydra.4 is not tagged yet. The sizes and digests below were taken from a hand-built
 # stand-in dist (engine 338,530 bytes, not the real archive), so `backend install` cannot succeed until the coordinator
 # publishes the release and re-runs `tools/bump_hydra.py --release 12.3-hydra.4 --dist <published files> --write`.
-# SHA256SUMS of the release, observed 2026-10-29 and checked after download.
+# Until then the digests and sizes below are those of the stand-in dist, not the SHA256SUMS of a published release.
 ASSETS = {
     "engine": {"url": _BASE + "hydra-engine-" + RELEASE + "-win_x86_64.zip",
                "sha256": "7b5a0bfe98449d3397e8804fe0e8b38112527be94286356152db34e46b9e2ea8", "size": 338530},
@@ -599,7 +599,8 @@ class Engine:
     def stop(self, force: bool = False) -> dict:
         module = self.module()
         unsupervise(self)   # a stopped daemon is not restarted behind the caller's back
-        pool = self._pools.pop(self.key, None)
+        with self._guard:
+            pool = self._pools.pop(self.key, None)
         if pool is not None:
             pool.close_all(0.0)
         self.reset()
@@ -1002,29 +1003,45 @@ class Pool:
         with self._cond:
             return next((entry for entry in self._idle if entry.key == key), None)
 
+    def owned_keys(self) -> set:
+        """The keys of the live entries, taken under `_cond` alone (a caller that holds another lock reads this first)."""
+        with self._cond:
+            return {entry.key for entry in self._live}
+
     def acquire(self, deadline_s: float = DEADLINE_S) -> Entry:
         end = time.monotonic() + deadline_s
-        with self._cond:
-            while True:
+        while True:
+            dead: list[Entry] = []
+            chosen: Entry | None = None
+            with self._cond:
                 while self._idle:
                     entry = self._idle.pop()
                     if getattr(entry.session, "_closed", False) and not entry.abandoned:
                         entry.broken = True   # the library closed it (the daemon went away): never handed out
                     if not (entry.abandoned or entry.broken or entry.finished) and entry.generation == self.generation:
-                        return entry.begin(deadline_s)
+                        chosen = entry.begin(deadline_s)
+                        break
                     self._live.discard(entry)
                     if not entry.abandoned:
                         entry.broken = True
-                        entry.retire()   # its rows go with it (I2) and its socket is freed
-                if len(self._live) < self.size:
-                    entry = self._new()
-                    self._live.add(entry)
-                    return entry.begin(deadline_s)
-                left = end - time.monotonic()
-                if left <= 0:
-                    raise EngineError("busy", "all %d connections of this process are in use" % self.size,
-                                      {"reason": "pool_full"}, retry_after_ms=2000)
-                self._cond.wait(left)
+                        dead.append(entry)
+                if chosen is None and not dead:
+                    if len(self._live) < self.size:
+                        chosen = self._new()
+                        self._live.add(chosen)
+                        chosen.begin(deadline_s)
+                    else:
+                        left = end - time.monotonic()
+                        if left <= 0:
+                            raise EngineError("busy", "all %d connections of this process are in use" % self.size,
+                                              {"reason": "pool_full"}, retry_after_ms=2000)
+                        self._cond.wait(left)
+                        continue
+            # `retire` runs `on_retire` (which takes the query row guard) and the gate: never under `_cond` (lock order).
+            for entry in dead:
+                entry.retire()
+            if chosen is not None:
+                return chosen
 
     def release(self, entry: Entry, error: BaseException | None = None) -> None:
         """Return ENTRY after an attempt: a healthy one goes back; an abandoned, broken or error-retired one does not."""

@@ -417,6 +417,47 @@ class ProductionWiring(Base):
         self.assertTrue(self.ask(runner), "the read takes a fresh entry; no `closed` reaches the caller")
         self.assertEqual(self.daemon.refused_closed, 0, "no request was ever sent to a dead entry")
 
+    def test_acquire_retiring_a_dead_entry_and_stop_do_not_deadlock(self):
+        """Lock order: the pool lock is never held while `on_retire` takes the row guard, and `stop` reads the pool before it
+        takes the row guard. Thread B acquires over a dead idle entry whose retirement is slow; thread A stops the target."""
+        (dead,) = self.idle_entries(1)
+        dead.session._closed = True
+        runner = self.runner()
+        retiring, go = threading.Event(), threading.Event()
+        original = dead.on_retire
+
+        def slow(entry):
+            retiring.set()
+            go.wait(10)          # the window: B is inside `retire`; before the fix it held the pool lock here
+            original(entry)
+
+        dead.on_retire = slow
+        self.addCleanup(go.set)
+        got, stopped = [], []
+        b = threading.Thread(target=lambda: got.append(self.pool.acquire(5)), daemon=True)
+        b.start()
+        self.assertTrue(retiring.wait(5), "B is retiring the dead entry")
+        a = threading.Thread(target=lambda: stopped.append(runner.stop(runner.target("owned"))), daemon=True)
+        a.start()
+        time.sleep(0.2)          # A is past the pool read and holds (or waits for) the row guard
+        go.set()
+        a.join(8)
+        b.join(8)
+        self.assertFalse(a.is_alive() or b.is_alive(), "DEADLOCK: stop and acquire wait for each other")
+        self.assertEqual(len(got), 1)
+        self.assertIsNot(got[0], dead)
+        self.assertTrue(stopped and stopped[0]["ok"])
+        self.pool.release(got[0])
+
+    def test_acquire_retires_every_dead_idle_entry_even_when_a_live_one_follows(self):
+        first, second = self.idle_entries(2)
+        first.session._closed = True        # idle is [first, second]: the pop order takes `second`, then `first`
+        second.session._closed = True
+        third = self.pool.acquire(5)
+        self.assertTrue(first.finished and second.finished, "dead entries are retired, not leaked, on every path")
+        self.assertNotIn(third, (first, second))
+        self.pool.release(third)
+
     def test_a_closed_answer_invalidates_the_other_idle_entries_before_the_retry(self):
         self.daemon.scoped = True
         runner = self.runner()
@@ -696,8 +737,21 @@ class SupervisorWiring(unittest.TestCase):
             engine.pool()
             engine.pool()
             self.assertEqual(log, ["start"], "once per root")
-            hydra.unsupervise(engine)
-            self.assertEqual(log, ["start", "stop"])
+            stubs = []
+
+            class StubDaemon:
+                def __init__(self, *args):
+                    stubs.append(args)
+
+                def stop(self, force=False):
+                    log.append("daemon.stop")
+                    return True
+
+            with patch.object(hydra.Engine, "module", lambda self: type("M", (), {"Daemon": StubDaemon})):
+                self.assertEqual(engine.stop(), {"stopped": True})
+            self.assertEqual(log, ["start", "stop", "daemon.stop"], "Engine.stop stops the supervisor before the daemon")
+            self.assertEqual(len(stubs), 1)
+            self.assertNotIn(hydra._root_key(engine), hydra._SUPERVISORS)
         hydra._SUPERVISORS.clear()
         with patch.object(hydra.Supervisor, "for_engine", side_effect=AttributeError("no Daemon")):
             self.assertIsNone(hydra.supervise(engine), "a client without Daemon leaves the engine unsupervised, no error")

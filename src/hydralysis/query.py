@@ -631,9 +631,12 @@ class QueryRunner:
         adopted = str(Path(selected.get("adopted_gpr") or selected["gpr"])).lower()
 
         pool = self._pool()
+        # Read the pool's entries before taking `_keys_guard`: the pool takes its own lock first and then (through
+        # `on_retire`) the row guard, so the other order would be a lock-order inversion.
+        owned = pool.owned_keys() if pool is not None else set()
 
         def belongs(key):
-            if (key[0] != self.engine.key and not (pool is not None and pool.owns(key[0]))) \
+            if (key[0] != self.engine.key and key[0] not in owned) \
                     or key[2].lstrip("/") != selected["program"].lstrip("/"):
                 return False
             if key[1] in (master, adopted) and selected.get("view", "shared") == "shared":
