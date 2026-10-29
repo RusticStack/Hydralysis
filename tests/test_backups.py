@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import fakehydra
 from hydralysis import api, backups, hydra, lineage
+import test_commit
 from test_commit import A, B, World
 
 
@@ -596,6 +597,28 @@ class EngineBackups(World, unittest.TestCase):
         self.assertEqual(self.daemon.sealed_by_call, [])
         self.assertFalse((project / "SEALED.json").exists())
         self.assertIsNone(backups.usable(self.settings, self.lid, made["id"]))
+
+
+class FaultMatrixOnE2(test_commit.FaultMatrix):
+    """Y4d spec test "fault matrix re-run": the whole commit fault matrix of test_commit, with the E2 engine (engine-written backups,
+    the format gate, the backup argument) in place of the plain fake."""
+
+    def setUp(self):
+        patcher = patch.object(fakehydra, "FakeEngine", E2Engine)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        super().setUp()
+        self.daemon.e2 = True
+        self.daemon.backup_required = True
+
+    def test_the_e2_path_is_the_one_exercised(self):
+        self.edit("One", A)
+        self.assertTrue(self.commit(cid=self.CID)["ok"])
+        self.assertTrue(self.daemon.e2 and isinstance(fakehydra.FakeEngine(self.settings), E2Engine))
+        backups_made = list(Path(self.settings["backup_roots"][0]["path"]).rglob("backup.json"))
+        engine_written = [path for path in backups_made if json.loads(path.read_text(encoding="utf-8")).get("writer") == "engine"]
+        self.assertTrue(backups_made, "the commit made a backup")
+        self.assertEqual(len(engine_written), len(backups_made), "every backup the commit made is the engine's")
 
 
 if __name__ == "__main__":
