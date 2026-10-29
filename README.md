@@ -192,9 +192,10 @@ Tool counts: Hydralysis registers 20 tools (counted from `tool_table()`). The tw
 ## Development
 
 ```text
-set HYDRALYSIS_TEST_ROOT=D:/hydralysis-data/test-work
-.venv/Scripts/python.exe -m unittest discover -s tests -v
+python tools/run_tests.py --root D:/hydralysis-data/test-work
 git diff --check
 ```
+
+`tools/run_tests.py` is the quick way to run the unit suite: it splits the tests into tasks, runs them on all cores and prints one result (about half a minute on 24 threads with the root on an NVMe disk; the same suite takes about 25 minutes serially with the root on a hard disk, because the durable-write tests fsync). A test that fails under that load is run again alone; it fails the run only if it fails alone too (`--strict` fails on both). `python -m unittest discover -s tests` still works and is what CI runs. `--record` rewrites `tests/timings.json`, which only orders the tasks. Put the root on a fast local disk.
 
 Unit tests run without launching the engine or games; they work under `HYDRALYSIS_TEST_ROOT` (default `test-work/`). CI runs them on Windows. `tests/test_engine_integration.py` runs the real engine when `HYDRALYSIS_INTEGRATION_ENGINE` and `HYDRALYSIS_INTEGRATION_CLIENT` name a Hydra install and its `ghidra_session.py` (`HYDRALYSIS_INTEGRATION_JAVA` a JDK). It uses its own data root and daemon. [Verification on fixtures](docs/verification-fixtures.md) builds small x64 and x86 programs with known answers and checks each capability against them (`tests/fixtures/verify_fixtures.py`). There is no configured formatter or lint command. Only `pefile` and `capstone` are mandatory Python dependencies; engines are discovered or explicitly installed separately.

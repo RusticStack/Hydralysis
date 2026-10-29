@@ -375,7 +375,7 @@ already has, read for this revision (none of it was re-run for this document):
   `continue`.
 - **Manual, not CI.** The checks are scripts, not `test_*.py`, so `unittest discover` never runs them. They need
   MSVC build tools (`vswhere`), a prepared Hydra engine and the optional pinned Frida install, and exit with the
-  number of failures. CI (`tests.yml`) runs the unit matrix (Python 3.11, 3.13, 3.14) and
+  number of failures. CI (`tests.yml`) runs the unit matrix (Python 3.13, 3.14, 3.15; the minimum was raised from 3.11 to 3.13 on 2026-10-29) and
   `test_engine_integration.py`; the one env-gated fixture test, `tests/test_engine_options.py`
   (`HYDRALYSIS_INTEGRATION_FIXTURES`), is skipped in CI (`docs/ci.md`). Of the 459 unit tests, 9 are skipped: 7
   (`test_engine_integration`) and 2 (`test_engine_options`).
