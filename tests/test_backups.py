@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import fakehydra
-from hydralysis import api, backups, hydra, lineage, query
+from hydralysis import api, backups, hydra, lineage, query, workcopy
 import test_commit
 from test_commit import A, B, World
 
@@ -454,6 +454,9 @@ class E2Engine(fakehydra.FakeEngine):
                     problem = "the backup does not say it verified"
                 elif manifest.get("selfSha256") != hashlib.sha256(lineage.canonical(body)).hexdigest():
                     problem = "the backup's selfSha256 is wrong"
+                elif getattr(self.daemon, "copy_revisions", False) and (manifest.get("source") or {}).get("revision") != project["revision"]:
+                    problem = "revision: the backup was made at revision %s, the project is at %s" % (
+                        (manifest.get("source") or {}).get("revision"), project["revision"])
                 else:
                     return
             except (OSError, ValueError):
@@ -468,7 +471,12 @@ class E2Engine(fakehydra.FakeEngine):
 
     def _fork_project(self, project, path, writable=True, mode="auto", purpose=None, open=True, verify="hash", **rest):
         if not (purpose == "backup" and open is False):
-            return super()._fork_project(project, path, writable=writable, mode=mode, purpose=purpose, **rest)
+            result = super()._fork_project(project, path, writable=writable, mode=mode, purpose=purpose, **rest)
+            if getattr(self.daemon, "copy_revisions", False):
+                # A full copy (NTFS): the copied files have new modification times, so the fork is another revision than its
+                # source (the engine's Revision.of hashes path, size and mtime of every project file).
+                self.daemon.projects[self.daemon._norm(result["gpr"])]["revision"] = "rev-copy-%d" % next(self.daemon.backup_seq)
+            return result
         source = self.daemon.projects[self.daemon._norm(project)]
         result = super()._fork_project(project, path, writable=writable, mode=mode, purpose=purpose, **rest)
         gpr = Path(result["gpr"])
@@ -489,7 +497,7 @@ class E2Engine(fakehydra.FakeEngine):
                 data = item.read_bytes()
                 rows.append({"path": item.relative_to(destination).as_posix(), "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
         manifest = {"format": 1, "kind": "ghidra-session-backup", "writer": "engine", "id": destination.name, "purpose": "backup",
-                    "createdAt": "2026-10-29T00:00:00Z", "source": {"gpr": source["gpr"], "name": name},
+                    "createdAt": "2026-10-29T00:00:00Z", "source": {"gpr": source["gpr"], "name": name, "revision": source["revision"]},
                     "files": rows, "filesetSha256": hashlib.sha256(lineage.canonical(rows)).hexdigest(),
                     "copy": {"method": "clone", "sameVolume": True, "independent": False},
                     "verify": {"level": "hash", "ok": True}}
@@ -516,6 +524,7 @@ class EngineBackups(World, unittest.TestCase):
         self.daemon.sealed_by_call = []
         self.daemon.break_engine_backup = None
         self.daemon.format_info = None
+        self.daemon.copy_revisions = False
         selected = self.runner.target("owned")
         self.lid = lineage.ensure(self.settings, {**selected, "origin_key": selected["key"]})["id"]
         self.engine = E2Engine(self.settings)
@@ -587,6 +596,7 @@ class EngineBackups(World, unittest.TestCase):
         self.assertFalse(backups.logged(self.settings, self.lid))
 
     def test_commit_uses_the_engine_backup_and_passes_it_to_the_candidate_open(self):
+        self.daemon.format_info = {"upgradeRequired": False}   # a project at this engine's format: no pre-upgrade backup
         self.edit("renamed")
         result = self.commit()
         self.assertTrue(result.get("backup"))
@@ -594,6 +604,32 @@ class EngineBackups(World, unittest.TestCase):
         self.assertEqual([Path(fields["backup"]).name for fields in gated], ["backup.json"])  # the candidate's open names the backup
         (row,) = [row for row in backups.listing(self.settings, self.lid)["backups"]]
         self.assertEqual(row["writer"], "engine")
+
+    def test_an_older_format_project_commits_when_the_candidate_is_a_full_copy(self):
+        """Defect 3 (Y4d2): a full-copy fork (NTFS) is another revision than its source, so the gate refuses the backup of
+        the source generation for the candidate. The commit backs up the candidate itself (`pre-upgrade`) and names that."""
+        self.daemon.copy_revisions = True
+        self.daemon.format_info = {"upgradeRequired": True, "programDb": 32}
+        self.edit("renamed")
+        result = self.commit()
+        self.assertTrue(result["ok"], result)
+        purposes = sorted(row["purpose"] for row in backups.logged(self.settings, self.lid))
+        self.assertEqual(purposes, ["pre-commit", "pre-upgrade"])
+        gated = [fields["backup"] for _, name, fields in self.daemon.calls if name == "open_program" and fields.get("backup")]
+        (pre_upgrade,) = [row for row in backups.logged(self.settings, self.lid) if row["purpose"] == "pre-upgrade"]
+        self.assertEqual([Path(item).parent.name for item in gated], [pre_upgrade["id"]])
+        manifest = json.loads((lineage.generation_dir(self.settings, self.lid, result["generation"]) / "MANIFEST.json")
+                              .read_text(encoding="utf-8"))
+        self.assertEqual(len(manifest["backups"]), 2, "the manifest names both backups")
+        rows = lineage.intent_log(self.settings, self.lid, result["cid"]).scan().records
+        self.assertTrue(any(row["step"] == "FORKED" and row.get("gate_backup") == pre_upgrade["id"] for row in rows))
+
+    def test_a_project_at_this_engines_format_gets_no_pre_upgrade_backup(self):
+        self.daemon.copy_revisions = True
+        self.daemon.format_info = {"upgradeRequired": False}
+        self.edit("renamed")
+        self.assertTrue(self.commit()["ok"])
+        self.assertEqual([row["purpose"] for row in backups.logged(self.settings, self.lid)], ["pre-commit"])
 
     def test_the_format_the_engine_reports_decides_the_confirmation(self):
         from hydralysis import commits
@@ -672,6 +708,104 @@ class FaultMatrixOnE2(test_commit.FaultMatrix):
 
 # ---- the real engine (Y4d against hydra.4: the engine-written backup, the upgrade gate, the fault matrix re-run) ------------------
 #
+class CallerEngine(fakehydra.FakeEngine):
+    """The fake daemon with callers, for the spot check of a commit: CALLEES[address] lists the functions it calls (its
+    decompile prints their current names) and ROWS replaces the one-row `functions` listing."""
+
+    CALLEES: dict[str, list[str]] = {}
+    ROWS: list[dict] | None = None
+
+    def _script(self, script, program=None, args=(), **rest):
+        result = super()._script(script, program=program, args=args, **rest)
+        if script != "RusticQuery.java":
+            return result
+        out = json.loads(result["output"])
+        if "function" in out and self.CALLEES.get(out["function"]["address"]):
+            entry = self._program(program)
+            view = self._view(entry) if program in self.writable or entry["live"] is not None else entry["saved"]
+            calls = "".join("  %s();\n" % view["names"].get(callee, "FUN_" + callee.removeprefix("0x"))
+                            for callee in self.CALLEES[out["function"]["address"]])
+            out["c"] = "void %s(void) {\n%s}\n" % (out["function"]["name"], calls)
+        elif "functions" in out and self.ROWS is not None:
+            out["functions"] = [dict(row) for row in self.ROWS]
+        return {**result, "output": json.dumps(out) + "\n"}
+
+
+class CommitHygiene(World, unittest.TestCase):
+    """Y4d2 on the fake daemon: what a commit leaves on the caller's connection (defect 1) and the spot check's treatment of the
+    callers of a renamed function (defect 2)."""
+
+    def shared_rows(self, engine):
+        return {key[1] for key in list(query._keys) if key[0] == engine.key}
+
+    def test_a_commit_leaves_nothing_of_its_own_open_on_the_callers_connection(self):
+        from hydralysis import commits
+        self.edit("renamed")
+        engine = fakehydra.FakeEngine(self.settings)
+        working = workcopy._state(self.settings, self.target()).get("fork_gpr")
+        body = {**test_commit.CONFIRMED, "expect_revision": self.store()["revision"]}
+        result = commits.run_commit(self.settings, self.target(), body, engine)
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("unreleased", result)
+        left = self.shared_rows(engine)
+        for gpr in (str(self.gpr), working):
+            self.assertNotIn(str(Path(gpr)).lower(), left, "the superseded head and working copy are let go")
+        self.assertFalse([gpr for gpr in left if "commit-verify" in gpr], "the verify clone is closed")
+        closes = [fields for role, name, fields in self.daemon.calls if role == engine.role and name == "close_program"]
+        self.assertTrue(closes, "the programs are closed on the daemon, not only forgotten")
+
+    def test_a_close_that_fails_is_reported_not_swallowed(self):
+        from hydralysis import commits
+        self.edit("renamed")
+        engine = fakehydra.FakeEngine(self.settings)
+        real = fakehydra.FakeEngine.call
+
+        def call(engine_self, command, **fields):
+            if command == "close_program" and engine_self.role == "reader":
+                raise hydra.EngineError("busy", "the program is busy", {})
+            return real(engine_self, command, **fields)
+
+        body = {**test_commit.CONFIRMED, "expect_revision": self.store()["revision"]}
+        with patch.object(fakehydra.FakeEngine, "call", call):
+            with self.assertRaises(commits.CommitError) as raised:
+                commits.run_commit(self.settings, self.target(), body, engine)
+        self.assertEqual(raised.exception.code, "release_failed")
+        self.assertTrue(raised.exception.payload()["left_open"])
+
+    def callers(self, rows, callees):
+        patcher = patch.multiple(CallerEngine, ROWS=rows, CALLEES=callees)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in ("hydralysis.hydra.Engine", "fakehydra.FakeEngine"):
+            engine = patch(name, CallerEngine)
+            engine.start()
+            self.addCleanup(engine.stop)
+
+    def test_a_rename_of_a_function_with_callers_passes_the_spot_check(self):
+        self.callers([{"address": A, "name": "FUN_140001000"}, {"address": B, "name": "FUN_140002000"},
+                      {"address": test_commit.C, "name": "FUN_140003000"}], {B: [A]})   # B calls A: it prints A's name
+        self.edit("renamed_callee", address=A)
+        result = self.commit()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["spot_check"]["users_of_changed_symbols"], [B])
+        self.assertEqual(result["spot_check"]["compared"], 1, "C, which does not use A, is still compared")
+
+    def test_a_caller_that_changes_for_another_reason_still_fails_the_spot_check(self):
+        from hydralysis import commits
+        self.callers([{"address": A, "name": "FUN_140001000"}, {"address": test_commit.C, "name": "FUN_140003000"}], {})
+        self.edit("renamed_callee", address=A)
+        real = commits._decompile
+
+        def drifted(engine, program, address, sha256):
+            text = real(engine, program, address, sha256)
+            return text + "x" if address == test_commit.C and "commit-verify" in str(program.get("gpr", "")).lower() else text
+
+        with patch.object(commits, "_decompile", drifted):
+            with self.assertRaises(commits.CommitError) as raised:
+                self.commit()
+        self.assertEqual((raised.exception.code, raised.exception.detail.get("address")), ("verify_failed", test_commit.C))
+
+
 # Gated like test_engine_integration.py: HYDRALYSIS_INTEGRATION_ENGINE (a Hydra install) and HYDRALYSIS_INTEGRATION_CLIENT (its
 # ghidra_session.py); HYDRALYSIS_INTEGRATION_UNPINNED for a build that is not the pinned release. The gate cases need a project in an
 # older format: HYDRALYSIS_INTEGRATION_LEGACY_PROJECT names one (the engine's examples/fixtures/legacy-12.1.4, a Ghidra 12.1.4
@@ -700,25 +834,6 @@ def _legacy_copy(source: str, destination: Path) -> Path:
                                prp.read_bytes()))
         os.utime(prp, ns=(stat.st_atime_ns, stat.st_mtime_ns))
     return next(destination.glob("*.gpr"))
-
-
-def _known_issue(test):
-    """A defect found on the real engine and not Hydralysis's to fix (as test_concurrency.known_issue): only a failed assertion counts
-    as the known defect and is an expected failure; any other exception is a real error. HYDRALYSIS_KNOWN_ISSUES=run turns it off."""
-    import functools
-    if integration._env("KNOWN_ISSUES") == "run":
-        return test
-
-    @functools.wraps(test)
-    def wrapper(self):
-        try:
-            test(self)
-        except (AssertionError, unittest.SkipTest):
-            raise
-        except BaseException as exc:  # noqa: BLE001
-            self.addCleanup(self.fail, "the known-issue test broke with %s instead of failing an assertion: %s" % (type(exc).__name__, exc))
-            raise
-    return unittest.expectedFailure(wrapper)
 
 
 @unittest.skipUnless(HAVE_ENGINE, "set HYDRALYSIS_INTEGRATION_ENGINE/CLIENT")
@@ -854,33 +969,32 @@ class RealEngineBackups(unittest.TestCase):
         # 3.4: the engine's gate checks sizes, not content (by design); the client's re-hash is the content check.
         self.assertIn("key", self.gate_open(gpr, made["json"]))
 
-    @_known_issue
-    def test_a_generation_candidate_of_an_older_project_opens_through_the_gate_with_the_sources_backup(self):
-        """Step 4 of 4.6 as commits.run_commit does it: the candidate is forked with purpose "generation" (gated, not disposable) and
-        opened writable with upgrade and the backup of the generation it was forked from.
-
-        KNOWN ISSUE (engine/spec, found here 2026-10-29): 4.6 step 4 says the gate passes "because the backup is of this revision",
-        which holds for a ReFS block clone only. On NTFS the engine's fork copy has another revision than its source
-        (d5ba6dcc1b0ebf72 against ec708e61cd7f1b7f on the 12.1.4 fixture), so the gate refuses the source's backup with
-        backupCheck.reason "revision" and a commit of an older-format project cannot open its candidate. NTFS is the baseline."""
+    def test_a_generation_candidate_of_an_older_project_opens_through_the_gate(self):
+        """Step 4 of 4.6 as commits._commit does it (Y4d2, defect 3): the candidate is forked with purpose "generation" (gated,
+        not disposable) and opened writable with upgrade by the job alone. A full-copy fork (NTFS, the baseline) is another
+        revision than its source, so the backup of the source generation alone does not pass the gate (it was the known issue
+        here); `_open_candidate` backs up the candidate itself and names that backup, and the gate accepts it."""
+        from hydralysis import commits
         gpr = self.copy("candidate-source")
         made = self.make(gpr)
-        candidate = self.root / ("candidate-%d" % self.serial)
-        forked = self.engine.call("fork_project", project=str(gpr), path=str(candidate), writable=True, purpose="generation")
+        opened = self.engine.call("open_project", path=str(gpr))
+        (entry,) = [row for row in self.engine.call("list", project=opened["id"])["entries"] if row.get("program")]
         self.close(gpr)
-        if forked.get("project"):
-            try:
-                self.engine.call("close_project", project=forked["project"])
-            except hydra.EngineError:
-                pass
-        sidecar = json.loads(next(candidate.glob("*.fork.json")).read_text(encoding="utf-8"))
-        self.assertEqual((sidecar.get("purpose"), sidecar.get("disposable")), ("generation", False), sidecar)
-        self.refused(Path(forked["gpr"]), None)
+        target = {"program": LEGACY_PROGRAM, "sha256": entry["sha256"].lower()}
+        candidate = self.root / ("candidate-%d" % self.serial)
+        job = hydra.Engine(self.settings, role="commit", lane="y4d2-gate-%d" % self.serial)
         try:
-            opened = self.gate_open(Path(forked["gpr"]), made["json"])
-        except hydra.EngineError as error:
-            self.fail("the gate refused the source's backup for its generation candidate: %s" % (error.details or {}).get("backupCheck"))
-        self.assertIn("key", opened)
+            forked = job.call("fork_project", project=str(gpr), path=str(candidate), writable=True, purpose="generation")
+            sidecar = json.loads(next(candidate.glob("*.fork.json")).read_text(encoding="utf-8"))
+            self.assertEqual((sidecar.get("purpose"), sidecar.get("disposable")), ("generation", False), sidecar)
+            program, gate_backup = commits._open_candidate(self.settings, self.engine, job, target, made["lid"], forked["gpr"],
+                                                           forked, {"backup": made}, 1, {}, True)
+            self.assertIn("key", program)
+            self.assertIsNotNone(gate_backup, "an older-format candidate gets its own pre-upgrade backup")
+            self.assertTrue(backups.verify(Path(gate_backup["folder"]))["ok"])
+            job.call("close_project", project=program["project"], discard=True)
+        finally:
+            job.reset()
 
 
 @unittest.skipUnless(HAVE_ENGINE and integration.BINARY and Path(integration.BINARY).is_file(), "set HYDRALYSIS_INTEGRATION_ENGINE/CLIENT")
@@ -936,21 +1050,49 @@ class RealEngineFaultMatrix(unittest.TestCase):
         clients = [client for client in engine.call("status").get("clients") or [] if client.get("id") == me]
         return list(clients[0].get("programs") or []) if clients else []
 
-    @_known_issue
-    def test_a_commit_leaves_no_program_open_on_the_shared_connection(self):
-        """KNOWN ISSUE (found here on the real hydra.4, 2026-10-29): commits.run_commit runs its read-only checks on the caller's
-        shared connection and leaves programs open there: the verify clone (`_verify_candidate`, `_program_of(engine, clone)`; the
-        `close_project` in its `finally` names the job's project id and its failure is swallowed) and, through the next read, the
-        new head generation beside the old one. hydra.4 caps a connection at maxViewsPerClient (4), so after one commit the next
-        commit's verify is refused `busy` (`client_cap`) and every new open of the process's reader fails until it reconnects."""
+    def test_commits_leave_no_program_open_on_the_shared_connection(self):
+        """Y4d2, defect 1 (found here on the real hydra.4): a commit opened the working copy, the old head and the verify clone
+        on the caller's shared connection and left them there (the clone's close named the job's project id and its failure
+        was swallowed). hydra.4 caps a connection at maxViewsPerClient (4), so the second commit of a process was refused
+        `busy`. Now the commit closes what it opened and lets go of the superseded head and working copy: three commits in a
+        row on one connection, and after each the connection holds no more programs than before."""
         self.fresh_reader()
-        functions = [row["address"] for row in self.ask("functions", limit=2)["functions"]]
-        self.edit(functions[-1], "leak_probe")
-        before = self.reader_programs()
-        self.assertTrue(self.commit("c-d4e1aa01")["ok"])
-        self.ask("decompile", functions[-1])
-        after = self.reader_programs()
-        self.assertLessEqual(len(after), len(before), "programs left open on the shared connection: %s -> %s" % (before, after))
+        functions = [row["address"] for row in self.ask("functions", limit=4)["functions"]]
+        for index, cid in enumerate(("c-d4e1aa01", "c-d4e1aa02", "c-d4e1aa03")):
+            with self.subTest(commit=cid):
+                address = functions[index % len(functions)]
+                self.edit(address, "leak_probe_%d" % index, kind="comment")
+                self.ask("decompile", address)
+                before = self.reader_programs()
+                result = self.commit(cid)
+                self.assertTrue(result["ok"], result)
+                self.assertNotIn("unreleased", result)
+                self.ask("decompile", address)
+                after = self.reader_programs()
+                self.assertLessEqual(len(after), len(before), "programs left open on the shared connection: %s -> %s" % (before, after))
+
+    def test_a_rename_of_a_function_with_callers_commits(self):
+        """Y4d2, defect 2: renaming a function changes how its callers decompile; the verify's spot check of untouched
+        functions sets those users aside (reported) instead of refusing the commit, and still compares the others."""
+        import re
+        self.fresh_reader()
+        rows = self.ask("functions", limit=200)["functions"]
+        texts = {row["address"]: json.dumps(self.ask("decompile", row["address"])) for row in rows[:60]}
+        callee = None
+        for row in rows:
+            pattern = re.compile(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(row["name"]))
+            if any(other != row["address"] and pattern.search(text) for other, text in texts.items()):
+                callee = row["address"]
+                break
+        if callee is None:
+            self.skipTest("the fixture has no function called by another among the first 60")
+        self.edit(callee, "renamed_callee_y4d2")
+        result = self.commit("c-d4e2bb01")
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["spot_check"]["users_of_changed_symbols"], result["spot_check"])
+        self.assertGreater(result["spot_check"]["compared"], 0, result["spot_check"])
+        query._keys.clear()
+        self.assertIn("renamed_callee_y4d2", json.dumps(self.ask("decompile", callee)))
 
     def test_every_fault_point_leaves_the_old_or_the_new_state_and_a_resubmission_ends_with_one_commit(self):
         from hydralysis import durable, workcopy
@@ -962,14 +1104,13 @@ class RealEngineFaultMatrix(unittest.TestCase):
         lid = None
         for index, point in enumerate(self.POINTS):
             with self.subTest(point=point):
-                # A fresh shared connection per point: each commit leaves programs on it (the known issue below), and hydra.4 caps a
-                # connection at maxViewsPerClient (4); the faults are tested here, the leak by its own test.
+                # A fresh shared connection per point: it keeps the points independent of each other; what a
+                # commit leaves on a connection is tested by its own test.
                 self.fresh_reader()
                 cid = "c-d4e0%04x" % index
                 name = "fault_%s" % point
                 address = functions[index]
-                # A plate comment, not a rename: a rename changes the decompile of the function's callers, which the commit's
-                # spot check of untouched functions refuses (a separate defect, reported with this package, not a fault case).
+                # A plate comment, so the head generation's decompile shows it; renames have their own test.
                 self.edit(address, name, kind="comment")
                 link = self.selected().get("lineage")
                 before = lineage.head(self.settings, link["id"])["gen"] if link else 0
