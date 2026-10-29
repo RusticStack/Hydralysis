@@ -6,7 +6,7 @@ Nothing here is a tag: a release is tagged by the owner.
 
 ## Unreleased (0.5.0, "qualified")
 
-Client only. The 0.5.0 release is pinned to the Hydra Engine `12.3-hydra.3` line (protocol 2); the current tree already carries the `12.3-hydra.4` pin (protocol 3), see below. The engine's locking is the engine's;
+Client only. The 0.5.0 release is pinned to the Hydra Engine `12.3-hydra.3` line (protocol 2); the current tree already carries the `12.3-hydra.4` pin (protocol 3), see below. A 0.5.0 tag therefore has to be cut from a commit before that pin bump; the tree as it stands is 0.6.0 material. The engine's locking is the engine's;
 heavy parallel use is something to measure, not something this release promises.
 
 ### Changes in 0.5.0
