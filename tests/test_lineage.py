@@ -16,7 +16,38 @@ from support import workdir
 from test_commit import World
 
 SRC = Path(__file__).resolve().parent.parent / "src"
-VECTOR = Path(__file__).resolve().parent / "vectors" / "canonical-manifest.json"
+VECTOR = Path(__file__).resolve().parent / "vectors" / "generation-manifest.json"
+# Gate 9.8 (PROTOCOL-3.md 3.4): one fixed vector, `examples/vectors/canonical-manifest.json` of the engine, kept here as a
+# byte-identical copy and verified by both languages (the engine's `dt_e2` `manifest_canonical` in Python and Java).
+SHARED_VECTOR = Path(__file__).resolve().parent / "vectors" / "canonical-manifest.json"
+# SHA-256 of the engine's committed blob (integration/w3 3b8a2f751a, git cat-file of
+# Ghidra/Features/HeadlessSession/examples/vectors/canonical-manifest.json), line ends normalised to LF so a CRLF checkout
+# compares equal. A new engine vector changes this constant and the copy together.
+SHARED_VECTOR_SHA256 = "a4391e92765682e65d5df8bcd30818b2760190fa467d86ada174ac5971a210eb"
+
+
+class SharedVector(unittest.TestCase):
+    """The engine's canonical-manifest vector, held byte for byte and reproduced by `lineage` (gate 9.8)."""
+
+    def test_the_copy_is_byte_identical_to_the_engine_vector(self):
+        data = SHARED_VECTOR.read_bytes().replace(b"\r\n", b"\n")
+        self.assertEqual(hashlib.sha256(data).hexdigest(), SHARED_VECTOR_SHA256)
+
+    def test_lineage_reproduces_the_engine_hashes(self):
+        vector = json.loads(SHARED_VECTOR.read_text(encoding="utf-8"))
+        manifest = vector["object"]
+        self.assertNotIn("selfSha256", manifest)
+        self.assertEqual(len(lineage.canonical(manifest)), vector["canonicalBytes"])
+        self.assertEqual(len(lineage.canonical(manifest["files"])), vector["canonicalLengthFiles"])
+        self.assertEqual(lineage.self_hash(manifest), vector["selfSha256"])
+        self.assertEqual(lineage.fileset_sha256(manifest["files"]), vector["filesetSha256"])
+        # with its self hash added, the manifest still hashes to the same value (selfSha256 is outside the hashed body)
+        self.assertEqual(lineage.self_hash({**manifest, "selfSha256": vector["selfSha256"]}), vector["selfSha256"])
+
+    def test_the_engine_vector_holds_the_awkward_paths_of_the_spec(self):
+        paths = [row["path"] for row in json.loads(SHARED_VECTOR.read_text(encoding="utf-8"))["object"]["files"]]
+        for needle in ("é", "中", "\U0001F600", " ", " ", "\x01", '"', "\\"):
+            self.assertTrue(any(needle in path for path in paths), ascii(needle))
 
 
 class CanonicalForm(unittest.TestCase):
