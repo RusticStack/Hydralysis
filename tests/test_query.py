@@ -875,3 +875,89 @@ class ViewsThroughQuery(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CappedEngine:
+    """A connection with hydra.4's per-client view cap (`maxViewsPerClient`, Governor.tryReserveView): the next
+    `open_program` past CAP open programs is `busy` with resource `client_cap`."""
+
+    def __init__(self, cap: int = 4, key: str = "capped|query"):
+        self.key = key
+        self.cap = cap
+        self.open: list[str] = []
+        self.calls: list[tuple] = []
+        self.capabilities = {}
+
+    def call(self, command, **fields):
+        self.calls.append((command, dict(fields)))
+        if command == "open_project":
+            return {"id": "p-" + Path(fields["path"]).stem, "gpr": fields["path"], "revision": "r"}
+        if command == "open_program":
+            key = "%s:%s" % (fields["project"], fields["path"])
+            if key not in self.open:
+                if len(self.open) >= self.cap:
+                    raise hydra.EngineError("busy", "this client has %d programs open or opening; the limit is %d per "
+                                            "client (maxViewsPerClient). Close one first." % (len(self.open), self.cap),
+                                            {"reason": "capacity", "resource": "client_cap", "have": len(self.open),
+                                             "need": self.cap, "retryAfterMs": 1000}, "open_program", retry_after_ms=1000)
+                self.open.append(key)
+            return {"key": key, "sha256": "ab" * 32, "revision": "r", "functions": 1, "analyzed": True}
+        if command == "close_program":
+            if fields["program"] not in self.open:
+                raise hydra.EngineError("no_program", "not open", {}, "close_program")
+            self.open.remove(fields["program"])
+            return {"closed": True}
+        raise AssertionError("unexpected command " + command)
+
+
+class ClientCap(unittest.TestCase):
+    """hydra.4 caps a connection at maxViewsPerClient (4) programs; the process-wide program cache must not run into it.
+    Found by gate 9.8 (the suite against the hydra.4 candidate): test_engine_integration.EngineIntegration opened a fifth
+    working copy on its shared connection and four tests failed with `busy` (client_cap)."""
+
+    def setUp(self):
+        query._keys.clear()
+        self.addCleanup(query._keys.clear)
+        self.engine = CappedEngine()
+
+    def open(self, name, writable=False):
+        return query.open_program(self.engine, "C:/views/%s/%s.gpr" % (name, name), "/fixture.exe", "ab" * 32,
+                                  writable=writable)
+
+    def test_a_fifth_view_closes_the_least_recently_used_read_only_program(self):
+        for name in ("a", "b", "c", "d"):
+            self.open(name)
+        self.open("a")                       # a cache hit makes "a" the most recently used
+        fifth = self.open("e")
+        self.assertEqual(fifth["key"], "p-e:/fixture.exe")
+        self.assertEqual(self.engine.open, ["p-a:/fixture.exe", "p-c:/fixture.exe", "p-d:/fixture.exe", "p-e:/fixture.exe"])
+        self.assertIn(("close_program", {"program": "p-b:/fixture.exe"}), self.engine.calls)
+        cached = {value["key"] for key, value in query._keys.items() if key[0] == self.engine.key}
+        self.assertEqual(cached, set(self.engine.open))
+        # the evicted view opens again (and evicts the next oldest), it is not answered from a stale key
+        self.assertEqual(self.open("b")["key"], "p-b:/fixture.exe")
+        self.assertNotIn("p-c:/fixture.exe", self.engine.open)
+
+    def test_a_writable_program_is_never_closed_and_the_refusal_stands_when_nothing_read_only_is_left(self):
+        for name in ("w1", "w2", "w3", "w4"):
+            self.open(name, writable=True)
+        with self.assertRaises(hydra.EngineError) as refused:
+            self.open("r")
+        self.assertEqual((refused.exception.code, refused.exception.details["resource"]), ("busy", "client_cap"))
+        self.assertFalse([call for call in self.engine.calls if call[0] == "close_program"])
+        self.assertEqual(len(self.engine.open), 4)
+
+    def test_another_busy_is_not_taken_for_the_cap(self):
+        engine = self.engine
+        original = engine.call
+
+        def call(command, **fields):
+            if command == "open_program" and fields["path"] == "/fixture.exe" and "held" in fields["project"]:
+                raise hydra.EngineError("busy", "held", {"reason": "capacity", "resource": "heap"}, "open_program")
+            return original(command, **fields)
+        engine.call = call
+        self.open("a")
+        with self.assertRaises(hydra.EngineError) as refused:
+            query.open_program(engine, "C:/views/held/held.gpr", "/fixture.exe", "ab" * 32)
+        self.assertEqual(refused.exception.details["resource"], "heap")
+        self.assertEqual(engine.open, ["p-a:/fixture.exe"])

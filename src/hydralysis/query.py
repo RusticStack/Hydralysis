@@ -59,8 +59,9 @@ def open_program(engine: hydra.Engine, gpr: str, program: str, sha256: str, *, w
     cache_key = (engine.key, str(Path(gpr)).lower(), program, writable)
     with _keys_guard:
         known = _keys.get(cache_key)
-    if known and not refresh:
-        return known
+        if known and not refresh:
+            _keys[cache_key] = _keys.pop(cache_key)   # most recently used last: eviction takes the oldest first
+            return known
     wait = hydra.patience_ms(engine, BUSY_WAIT_MS)
     opened = engine.call("open_project", path=gpr, writable=writable, wait=wait)
     fields = {"path": program, "project": opened["id"]}
@@ -68,7 +69,12 @@ def open_program(engine: hydra.Engine, gpr: str, program: str, sha256: str, *, w
         fields.update(writable=True, share=share, upgrade=upgrade)
         if backup:
             fields["backup"] = backup
-    info = engine.call("open_program", wait=wait, **fields)
+    try:
+        info = engine.call("open_program", wait=wait, **fields)
+    except hydra.EngineError as error:
+        if not at_client_cap(error):
+            raise
+        info = _open_after_eviction(engine, cache_key, fields, wait, error)
     if str(info.get("sha256", "")).lower() != sha256:
         raise ValueError("%s in %s reports SHA-256 %s, not the target build %s; nothing was answered"
                          % (program, opened.get("gpr", gpr), info.get("sha256"), sha256))
@@ -78,6 +84,43 @@ def open_program(engine: hydra.Engine, gpr: str, program: str, sha256: str, *, w
     with _keys_guard:
         _keys[cache_key] = result
     return result
+
+
+def at_client_cap(error: hydra.EngineError) -> bool:
+    """hydra.4's per-connection view cap (`maxViewsPerClient`, PROTOCOL-3.md 3.11): `busy` with resource `client_cap`."""
+    return error.code == "busy" and error.details.get("resource") == "client_cap"
+
+
+_GONE = ("no_program", "no_project", "not_found", "closed")
+
+
+def _open_after_eviction(engine: hydra.Engine, cache_key: tuple, fields: dict, wait: int, error: hydra.EngineError) -> dict:
+    """Open again after closing this connection's least recently used read-only programs, one at a time.
+
+    The cache keeps every program it opened on a connection, so a process that reads several views (each a working copy)
+    reaches hydra.4's cap of `maxViewsPerClient` (4) programs per connection and every later open was refused `busy`. Only
+    read-only rows are closed (a writable program may hold unsaved edits); a read that still uses a closed key gets
+    `no_program` and reopens once (`QueryRunner._ask`). When nothing is left to close, the engine's refusal stands."""
+    while True:
+        with _keys_guard:
+            rows = [(key, value) for key, value in _keys.items() if key[0] == engine.key and key != cache_key and not key[3]]
+        if not rows:
+            raise error
+        program = rows[0][1]["key"]
+        try:
+            engine.call("close_program", program=program)
+        except hydra.EngineError as closing:
+            if closing.code not in _GONE:
+                raise error from closing
+        with _keys_guard:
+            for key in [key for key, value in _keys.items() if key[0] == engine.key and value["key"] == program]:
+                _keys.pop(key, None)
+        try:
+            return engine.call("open_program", wait=wait, **fields)
+        except hydra.EngineError as again:
+            if not at_client_cap(again):
+                raise
+            error = again
 
 
 def forget(engine: hydra.Engine) -> None:
