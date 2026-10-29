@@ -2,7 +2,7 @@
 
     python tools/run_tests.py                 # all cores, work directories under the system temp
     python tools/run_tests.py -j 12 --root C:/dev-overflow/hydralysis-tests
-    python tools/run_tests.py --record        # also rewrite tests/timings.json from this run (Python 3.12+)
+    python tools/run_tests.py --record        # also rewrite tests/timings.json from this run
     python tools/run_tests.py -k views        # only tests whose id contains "views"
 
 The suite is wall-clock bound (many tests start processes and fsync), so it splits into tasks: a class is one task,
@@ -48,7 +48,6 @@ SPLIT_S = 40.0          # a class costing more than this is split
 SLOW_S = 12.0           # inside a split class, a test at least this slow gets its own task
 DEFAULT_COST_S = 1.5    # a test with no recorded timing
 CHUNK = 60              # most test ids on one command line
-HAS_DURATIONS = sys.version_info >= (3, 12)
 DURATION = re.compile(r"^\s*([0-9]+\.[0-9]+)s\s+\S+ \(([\w.]+)\)\s*$", re.M)
 HEADER = re.compile(r"^(?:FAIL|ERROR): \S+ \(([\w.]+)\)", re.M)
 RAN = re.compile(r"^Ran (\d+) tests? in ", re.M)
@@ -140,7 +139,7 @@ def run_task(task: dict, root: Path, label: str, integration: bool = False, time
            if not k.upper().startswith("GHIDRA") and (integration or not k.upper().startswith("HYDRALYSIS_INTEGRATION"))}
     env.update(PYTHONPATH=os.pathsep.join([str(REPOSITORY / "src")] + ([os.environ["PYTHONPATH"]] if os.environ.get("PYTHONPATH") else [])),
                HYDRALYSIS_TEST_ROOT=str(work / "root"), TEMP=str(tmp), TMP=str(tmp), TMPDIR=str(tmp), PYTHONUNBUFFERED="1")
-    command = [sys.executable, "-m", "unittest"] + (["--durations", "0"] if HAS_DURATIONS else []) + task["args"]
+    command = [sys.executable, "-m", "unittest"] + (["--durations", "0"]) + task["args"]
     started = time.monotonic()
     proc = subprocess.Popen(command, cwd=TESTS, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                             encoding="utf-8", errors="replace", start_new_session=(os.name != "nt"))
@@ -168,12 +167,10 @@ def main() -> int:
     ap.add_argument("--strict", action="store_true", help="a test that failed under load fails the run even if it passes alone")
     ap.add_argument("--task-timeout", type=float, default=1800.0, help="seconds before one task is killed and counted as failed")
     ap.add_argument("--integration", action="store_true", help="keep HYDRALYSIS_INTEGRATION_* in the tests' environment")
-    ap.add_argument("--record", action="store_true", help="rewrite tests/timings.json from this run (needs Python 3.12+)")
+    ap.add_argument("--record", action="store_true", help="rewrite tests/timings.json from this run")
     ap.add_argument("--keep", action="store_true", help="keep this run's work directory and logs")
     ap.add_argument("--list", action="store_true", help="print the plan and exit")
     args = ap.parse_args()
-    if args.record and not HAS_DURATIONS:
-        ap.error("--record needs Python 3.12 or newer (unittest --durations)")
 
     started = time.monotonic()
     data = json.loads(TIMINGS.read_text(encoding="utf-8")) if TIMINGS.exists() else {}
