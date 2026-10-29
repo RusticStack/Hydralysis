@@ -147,7 +147,8 @@ class EditSet(Sandbox):
         self.sums()
         self.assertEqual(self.run_bump("--write"), 0)
         args = ["--release", RELEASE, "--dist", str(self.dist), "--root", str(self.tree), "--observed", "2026-11-02", "--check"]
-        self.assertEqual(bump.main(args), 0)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(bump.main(args), 0)
 
     def test_temp_files_removed_when_a_replace_fails(self):
         a, b = self.tree / "a.txt", self.tree / "b.txt"
@@ -164,6 +165,8 @@ class EditSet(Sandbox):
         finally:
             bump.os.replace = real
         self.assertEqual(list(self.tree.rglob("*.bump-tmp")), [])
+        self.assertEqual(a.read_text(), "x", "the file swapped before the failure is rolled back")
+        self.assertEqual(b.read_text(), "y")
 
     def test_default_run_shows_and_does_not_write(self):
         before = self.snapshot(self.tree)

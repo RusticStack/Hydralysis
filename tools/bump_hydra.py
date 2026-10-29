@@ -274,8 +274,14 @@ def plan(root: Path, info: dict, observed: str, site_root: Path | None) -> dict[
 
 
 def write_all(changes: dict[Path, str]) -> None:
-    """Write every temp file first, then swap them in; leftover temps are removed on any failure."""
+    """Write every temp file first, then swap them in.
+
+    Not atomic across files: a crash between two swaps leaves some files changed. A failing swap
+    is rolled back (the files already swapped get their old bytes back) and leftover temps are
+    removed on any failure.
+    """
     temps: list[tuple[Path, Path]] = []
+    done: list[tuple[Path, bytes | None]] = []
     try:
         for path, text in changes.items():
             temp = path.with_name(path.name + ".bump-tmp")
@@ -284,8 +290,20 @@ def write_all(changes: dict[Path, str]) -> None:
                 handle.write(text)
         while temps:
             temp, path = temps[0]
+            before = path.read_bytes() if path.exists() else None
             os.replace(temp, path)
             temps.pop(0)
+            done.append((path, before))
+    except BaseException:
+        for path, before in reversed(done):
+            try:
+                if before is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(before)
+            except OSError:
+                pass
+        raise
     finally:
         for temp, _ in temps:
             try:
