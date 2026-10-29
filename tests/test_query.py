@@ -285,7 +285,7 @@ class Overlays(EngineCase):
     def test_base_is_rebuilt_when_the_engine_release_changes_and_reused_otherwise(self):
         self.edit(kind="rename", name="One")
         base = workcopy._state(self.settings, self.runner.target("owned"))["base"]
-        self.assertEqual(base["engine"], {"hydraVersion": "12.3-hydra.2", "ghidraVersion": "12.3"})
+        self.assertEqual(base["engine"], {"hydraVersion": fakehydra.Daemon().release["hydraVersion"], "ghidraVersion": "12.3"})
         self.edit(kind="rename", name="Two")
         self.assertEqual(workcopy._state(self.settings, self.runner.target("owned"))["base"]["gpr"], base["gpr"])
         self.daemon.release = {"hydraVersion": "12.3-hydra.3", "ghidraVersion": "12.3"}
