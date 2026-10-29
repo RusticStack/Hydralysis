@@ -164,6 +164,27 @@ class Doctor(World, unittest.TestCase):
         self.assertIn("lineage_torn_tail", ids)
         self.assertIn("backups_none", ids)
 
+    def test_unfinished_candidates_follow_the_last_intent_step(self):
+        from hydralysis import commits
+        selected = self.runner.target("owned")
+        lid = lineage.ensure(self.settings, {**selected, "origin_key": selected["key"]})["id"]
+        lineage.append_current(self.settings, lid, {"gen": 1, "gpr": str(self.gpr), "reason": "commit"})
+        done, aborted, open_ = "c-0123456789ab", "c-0123456789ac", "c-0123456789ad"
+        for cid, steps in ((done, ("PREPARE", "PUBLISHED", "FINALIZED")), (aborted, ("PREPARE", "ABORTED")), (open_, ("PREPARE", "PUBLISHED"))):
+            intent = commits.Intent(self.settings, lid, cid, 1)
+            for step in steps:
+                intent.write(step)
+        reply = self.run_doctor()
+        row = [item for item in reply["findings"] if item["id"] == "lineage_unfinished_candidates"]
+        self.assertEqual(len(row), 1)
+        self.assertIn(open_, row[0]["what"] if "what" in row[0] else json.dumps(row[0]))
+        self.assertNotIn(done, json.dumps(row[0]))
+        self.assertNotIn(aborted, json.dumps(row[0]))
+        # a finished-only lineage has no such finding
+        intent = commits.Intent(self.settings, lid, open_, 1)
+        intent.write("FINALIZED")
+        self.assertNotIn("lineage_unfinished_candidates", [item["id"] for item in self.run_doctor()["findings"]])
+
     def test_sections_option_limits_and_rejects_unknown(self):
         self.assertEqual(list(self.run_doctor(sections=["jdk"], verbose=True)["sections"]), ["jdk"])
         with self.assertRaises(ValueError):

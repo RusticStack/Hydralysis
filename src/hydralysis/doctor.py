@@ -354,7 +354,13 @@ def _lineages(settings: dict, report: Report) -> None:
                 records = hydra_records(path)
             except Exception:
                 continue
-            if records and not any(item.get("state") in ("done", "published", "aborted", "complete") or item.get("event") in ("done", "published", "aborted") for item in records):
+            steps = [item for item in records if isinstance(item, dict) and "step" in item]
+            if steps:
+                newest = max(item.get("attempt", 0) for item in steps)
+                last = [item for item in steps if item.get("attempt", 0) == newest][-1]["step"]
+                if last in ("FINALIZED", "ABORTED"):
+                    continue
+            if records:
                 unfinished.append(path.name[:-len(".intent.log")])
         if unfinished:
             row["unfinished_candidates"] = unfinished
