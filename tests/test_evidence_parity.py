@@ -21,7 +21,7 @@ from hydralysis import evidence, evidence_bundle
 from support import workdir
 
 REVISION = "f196ebf80665107aedc16892af25a1e1f9f26f43"
-REFERENCE = Path(os.environ.get("HYDRALYSIS_REA_REFERENCE") or r"F:\dev-cache\ref-repos\rusticre-rea-reference")
+REFERENCE = Path(os.environ.get("HYDRALYSIS_REA_REFERENCE") or r"D:\Projects\Hydra\_data\ref-repos\rusticre-rea-reference")
 NODE = shutil.which("node")
 
 
