@@ -61,13 +61,14 @@ def open_program(engine: hydra.Engine, gpr: str, program: str, sha256: str, *, w
         known = _keys.get(cache_key)
     if known and not refresh:
         return known
-    opened = engine.call("open_project", path=gpr, writable=writable, wait=BUSY_WAIT_MS)
+    wait = hydra.patience_ms(engine, BUSY_WAIT_MS)
+    opened = engine.call("open_project", path=gpr, writable=writable, wait=wait)
     fields = {"path": program, "project": opened["id"]}
     if writable:
         fields.update(writable=True, share=share, upgrade=upgrade)
         if backup:
             fields["backup"] = backup
-    info = engine.call("open_program", wait=BUSY_WAIT_MS, **fields)
+    info = engine.call("open_program", wait=wait, **fields)
     if str(info.get("sha256", "")).lower() != sha256:
         raise ValueError("%s in %s reports SHA-256 %s, not the target build %s; nothing was answered"
                          % (program, opened.get("gpr", gpr), info.get("sha256"), sha256))
@@ -80,14 +81,26 @@ def open_program(engine: hydra.Engine, gpr: str, program: str, sha256: str, *, w
 
 
 def forget(engine: hydra.Engine) -> None:
+    """Drop the rows of one connection: the shared Engine, or a pool entry (`forget(entry)`, I2). Its key is the rows' first element."""
     with _keys_guard:
         for key in [key for key in _keys if key[0] == engine.key]:
             _keys.pop(key, None)
 
 
+def forget_role(engine: hydra.Engine) -> None:
+    """Drop every row of the role: the shared connection's and every pool entry's (`<root>|<role>|`)."""
+    prefix = engine.key + "|"
+    with _keys_guard:
+        for key in [key for key in _keys if key[0] == engine.key or key[0].startswith(prefix)]:
+            _keys.pop(key, None)
+
+
 def run_script(engine: hydra.Engine, program: dict, request: dict, timeout_s: int, request_dir: Path | None = None,
-               wait_ms: int = 0) -> tuple[dict, dict]:
-    """One RusticQuery run. Large requests travel as a file, not a command argument."""
+               wait_ms: int = 0, deadline_s: float | None = None) -> tuple[dict, dict]:
+    """One RusticQuery run. Large requests travel as a file, not a command argument.
+
+    A read goes to the quick lane when the engine has the lane hint (7.6); `deadline_s` is passed to a client library that
+    times its own wait (library 1.1.0). On hydra.2/3 the deadline is the attempt's, kept by the pool entry that is `engine`."""
     body = json.dumps(request, ensure_ascii=False)
     argument = body
     path = None
@@ -99,8 +112,12 @@ def run_script(engine: hydra.Engine, program: dict, request: dict, timeout_s: in
         path.write_text(body, encoding="utf-8")
         argument = "@" + str(path)
     try:
+        extra = {"lane": "quick"} if hydra.supports(engine, "laneHint") else {}
+        if deadline_s is not None:
+            extra["deadline"] = deadline_s
         result = engine.call("script", script="RusticQuery.java", program=program["key"], args=[argument],
-                             maxChars=MAX_CHARS, timeout=timeout_s + 5, wait=wait_ms or BUSY_WAIT_MS)
+                             maxChars=MAX_CHARS, timeout=timeout_s + 5, wait=wait_ms or hydra.patience_ms(engine, BUSY_WAIT_MS),
+                             **extra)
     finally:
         if path is not None:
             path.unlink(missing_ok=True)
@@ -120,11 +137,38 @@ class QueryRunner:
     def target(self, name: str) -> dict:
         return targets.resolve(self.settings, name)
 
-    def program_for(self, target: dict, *, for_overlays: bool = True) -> dict:
-        """The master's read-only view, or the working copy that holds the view's overlays (never for a master read)."""
+    def program_for(self, target: dict, *, for_overlays: bool = True, engine=None) -> dict:
+        """The master's read-only view, or the working copy that holds the view's overlays (never for a master read).
+
+        ENGINE is the pool entry of an attempt (7.6); it defaults to the shared connection."""
+        engine = engine or self.engine
         if for_overlays and not target.get("master_read") and workcopy.has_overlays(self.settings, target):
-            return workcopy.reader(self.settings, self.engine, target)
-        return open_program(self.engine, target["gpr"], target["program"], target["sha256"])
+            return workcopy.reader(self.settings, engine, target)
+        return open_program(engine, target["gpr"], target["program"], target["sha256"])
+
+    def _pool(self):
+        """The pool of deadline-bound attempts, or None: only a real engine on hydra.2/3 (library 1.0.0) uses it. On hydra.4
+        the library times its own wait and nothing is abandoned; a stand-in without `connect_entry` runs as before."""
+        engine = self.engine
+        if not hasattr(engine, "connect_entry") or not hasattr(engine, "pool"):
+            return None
+        try:
+            return engine.pool() if engine.deadline_mode() == "helper" else None
+        except Exception:
+            return None
+
+    def _native_deadline(self, timeout_s: int) -> float | None:
+        """The deadline a hydra.4 client library enforces itself (P1b); None on hydra.2/3 (the pool does) and on a stand-in."""
+        try:
+            native = hasattr(self.engine, "deadline_mode") and self.engine.deadline_mode() == "native"
+        except Exception:
+            native = False
+        return self._deadline(timeout_s) if native else None
+
+    @staticmethod
+    def _deadline(timeout_s: int) -> float:
+        """`deadline_s` of a quick-lane attempt: 60 s, and never below the script's own timeout plus its margin."""
+        return max(hydra.DEADLINE_S, timeout_s + 10.0)
 
     # --- identity, routing, the governor (Y5: D43, D59, 4.10) -----------------------------------------------------------
 
@@ -508,12 +552,21 @@ class QueryRunner:
     def _ask(self, selected: dict, request: dict, timeout_s: int, trace: dict | None = None) -> dict:
         expected_state = None if selected.get("master_read") else workcopy.expected_state(self.settings, selected)
         for attempt in (0, 1):
-            program = self.program_for(selected)
+            pool = self._pool()
+            if pool is None:
+                program = self.program_for(selected)
             try:
-                response, raw = run_script(self.engine, program, request, timeout_s, self.requests)
+                if pool is None:
+                    response, raw = run_script(self.engine, program, request, timeout_s, self.requests,
+                                               deadline_s=self._native_deadline(timeout_s))
+                else:
+                    # One attempt, one entry: the opens and the script run on it with one clock (7.6). A retry takes another.
+                    with pool.attempt(self._deadline(timeout_s)) as entry:
+                        program = self.program_for(selected, engine=entry)
+                        response, raw = run_script(entry, program, request, timeout_s, self.requests)
             except hydra.EngineError as error:
                 if attempt == 0 and error.code in ("no_program", "not_found", "no_project", "closed"):
-                    forget(self.engine)
+                    forget(self.engine)   # the entry that failed was retired by the pool and its rows dropped with it
                     continue
                 raise
             state = response.get("overlay_state") or ""
@@ -575,8 +628,10 @@ class QueryRunner:
             roots.append(lineage.lineage_dir(self.settings, selected["lineage"]["id"]).resolve())
         adopted = str(Path(selected.get("adopted_gpr") or selected["gpr"])).lower()
 
+        pool = self._pool()
+
         def belongs(key):
-            if key[0] != self.engine.key or key[2].lstrip("/") != selected["program"].lstrip("/"):
+            if (key[0] != self.engine.key and not (pool is not None and pool.owns(key[0])))                     or key[2].lstrip("/") != selected["program"].lstrip("/"):
                 return False
             if key[1] in (master, adopted) and selected.get("view", "shared") == "shared":
                 return True
@@ -584,20 +639,44 @@ class QueryRunner:
 
         with _keys_guard:
             entries = [(key, value) for key, value in _keys.items() if belongs(key)]
-        # Several cache entries can refer to one daemon program.
+        # Several cache entries can refer to one daemon program, on the shared connection and on pool entries.
         groups = {}
         for key, value in entries:
             groups.setdefault(value["key"], []).append((key, value))
+        if pool is not None:
+            pool.registry.drain(hydra.DEADLINE_GRACE_S)   # the gate for the target's programs, at most the grace
+        closed = deferred = 0
         for program, group in groups.items():
-            try:
-                self.engine.call("close_program", program=program)
-            except hydra.EngineError as exc:
-                failed.append({"program": program, "error": str(exc)})
-                continue
-            released.append(program)
-            with _keys_guard:
-                for key, value in group:
-                    if _keys.get(key) is value:
-                        _keys.pop(key, None)
-        return {"ok": not failed, "released": released, "failed": failed,
-                "note": "the shared engine keeps warm programs for keepWarm seconds"}
+            by_connection = {}
+            for key, value in group:
+                by_connection.setdefault(key[0], []).append((key, value))
+            done = False
+            for connection, rows in by_connection.items():
+                holder = self.engine if connection == self.engine.key else (pool.entry_for(connection) if pool is not None else None)
+                try:
+                    if holder is None:
+                        deferred += 1   # a checked-out or retired entry closes it on its return or through the gate
+                    elif holder is self.engine:
+                        holder.call("close_program", program=program)
+                        closed += 1
+                        done = True
+                    elif holder.close_program(program):
+                        closed += 1
+                        done = True
+                    else:
+                        deferred += 1
+                        continue
+                except hydra.EngineError as exc:
+                    failed.append({"program": program, "entry": "shared" if holder is self.engine else connection, "error": str(exc)})
+                    continue
+                with _keys_guard:
+                    for key, value in rows:
+                        if _keys.get(key) is value:
+                            _keys.pop(key, None)
+            if done:
+                released.append(program)
+        result = {"ok": not failed, "released": released, "failed": failed,
+                  "note": "the shared engine keeps warm programs for keepWarm seconds"}
+        if pool is not None:
+            result["entries"] = {"closed": closed, "deferred": deferred}
+        return result
