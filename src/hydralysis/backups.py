@@ -147,6 +147,53 @@ def _fork_into(settings: dict, engine: hydra.Engine, source_gpr: str, destinatio
     return forked
 
 
+def project_dir(folder: Path) -> Path:
+    """Where the project files of a backup live: `<folder>/project` for the Python writer, the folder itself for the engine's."""
+    nested = Path(folder) / "project"
+    return nested if nested.is_dir() else Path(folder)
+
+
+def _engine_backup(engine) -> bool:
+    try:
+        return "forkPurposes" in engine.capabilities()
+    except Exception:  # an engine that cannot say is a hydra.2/3 engine
+        return False
+
+
+def _make_engine(settings: dict, engine: hydra.Engine, lineage_id: str, source_gpr: str, folder: Path, identifier: str,
+                 purpose: str, revision: str, generation: int, root: dict) -> dict:
+    """hydra.4: `fork_project purpose:"backup"` copies, hashes both sides, writes backup.json (writer "engine") and seals.
+
+    The client does not trust the reply: it re-reads and re-hashes every file against the manifest with hashlib, checks the
+    self-hash, and compares the copy with the source it hashed before (4.5)."""
+    if folder.exists():
+        raise BackupError("backup_failed", "%s exists; a backup never overwrites" % folder)
+    folder.parent.mkdir(parents=True, exist_ok=True)
+    expected = {row["path"]: row for row in lineage.tree_files(Path(source_gpr).parent)}
+    try:
+        forked = engine.call("fork_project", project=source_gpr, path=str(folder), purpose="backup", open=False, verify="hash",
+                             mode=root["mode"] if root["mode"] in ("auto", "copy") else "auto",
+                             maxCopyMb=int(settings.get("fork_max_copy_mb", 8192)))
+    except hydra.EngineError as error:
+        raise BackupError("backup_failed", "the engine could not make the backup: %s" % error, folder=str(folder)) from error
+    checked = verify(folder)
+    if not checked["ok"]:
+        raise BackupError("backup_verify_failed", "the engine's backup does not verify: %s; the folder stays invisible and is listed "
+                          "for manual removal" % "; ".join(checked["problems"][:5]), folder=str(folder))
+    manifest = checked["manifest"]
+    mismatches = [{"path": row["path"], "expected": expected[row["path"]]["sha256"], "actual": row["sha256"]}
+                  for row in manifest.get("files") or [] if row["path"] in expected and expected[row["path"]]["sha256"] != row["sha256"]
+                  and not row["path"].endswith(".fork.json")]
+    if mismatches:
+        raise BackupError("backup_verify_failed", "the backup does not match its source", mismatches=mismatches[:20], folder=str(folder))
+    digest = lineage.sha256_hex((folder / "backup.json").read_bytes())
+    lineage.backups_log(settings, lineage_id).append({
+        "id": identifier, "manifestSha256": digest, "root": root["path"], "verifiedAt": lineage.now_iso(), "bytes": size_of(folder),
+        "independent": bool((manifest.get("copy") or {}).get("independent")), "purpose": purpose, "generation": generation})
+    return {"id": identifier, "folder": str(folder), "project": str(project_dir(folder)), "gpr": forked.get("gpr") or "",
+            "manifest": manifest, "manifestSha256": digest, "root": root["path"], "writer": manifest.get("writer")}
+
+
 def _sidecar_path(folder: Path) -> Path | None:
     found = sorted(Path(folder).glob("*.fork.json"))
     return found[0] if found else None
@@ -219,6 +266,8 @@ def _make_one(settings: dict, engine: hydra.Engine, lineage_id: str, source_gpr:
               revision: str, generation: int, root: dict, by: dict) -> dict:
     started = time.monotonic()
     source_folder = Path(source_gpr).parent
+    if _engine_backup(engine):
+        return _make_engine(settings, engine, lineage_id, source_gpr, folder, identifier, purpose, revision, generation, root)
     if folder.exists():
         raise BackupError("backup_failed", "%s exists; a backup never overwrites" % folder)
     project = folder / "project"
@@ -340,7 +389,7 @@ def listing(settings: dict, lineage_id: str, verify_all: bool = False) -> dict:
         entry = rows_logged.get(folder.name + "|" + found["root"])
         row = {"id": folder.name, "root": found["root"], "purpose": manifest.get("purpose"), "createdAt": manifest.get("createdAt"),
                "generation": (manifest.get("source") or {}).get("generation"), "writer": manifest.get("writer"),
-               "independent": bool((manifest.get("copy") or {}).get("independent")), "sealed": (folder / "project" / lineage.SEAL_MARKER).is_file(),
+               "independent": bool((manifest.get("copy") or {}).get("independent")), "sealed": (project_dir(folder) / lineage.SEAL_MARKER).is_file(),
                "manifestSha256": digest, "logged": entry is not None, "replaced": bool(entry and entry["manifestSha256"] != digest)}
         if not row["sealed"]:
             row["note"] = "legacy: not sealed; protected by client discipline only until `op=verify` adopts it"
@@ -431,16 +480,32 @@ def remove(settings: dict, lineage_id: str, options: dict) -> dict:
     return {**plan, "removed": True}
 
 
-def adopt_legacy(folder: Path) -> dict:
-    """`op=verify` on a backup without a seal: re-hash against backup.json, then seal it (a failed one is `legacy_unverified`)."""
+def adopt_legacy(folder: Path, engine=None, lineage_id: str | None = None) -> dict:
+    """`op=verify` on a backup without a seal: re-hash against backup.json, then seal it (a failed one is `legacy_unverified`).
+
+    On an engine with `seal_project` the engine's registry is told as well (a best effort: the client's SEALED.json and the
+    sidecar are already a witness of the union, D66)."""
     result = verify(folder)
     if not result["ok"]:
         return {"ok": False, "label": "legacy_unverified", "problems": result["problems"]}
-    project = Path(folder) / "project"
-    if not (project / lineage.SEAL_MARKER).is_file():
-        seal(project, lineage.sha256_hex((Path(folder) / "backup.json").read_bytes()))
-        return {"ok": True, "adopted": True}
-    return {"ok": True, "adopted": False}
+    project = project_dir(folder)
+    if (project / lineage.SEAL_MARKER).is_file():
+        return {"ok": True, "adopted": False}
+    seal(project, lineage.sha256_hex((Path(folder) / "backup.json").read_bytes()))
+    outcome: dict = {"ok": True, "adopted": True}
+    if engine is not None and _engine_backup(engine):
+        gpr = next(iter(sorted(project.glob("*.gpr"))), None)
+        try:
+            if gpr is None:
+                raise hydra.EngineError("not_found", "no .gpr in the backup")
+            fields = {"project": str(gpr)}
+            if lineage_id:
+                fields["lineage"] = lineage_id
+            engine.call("seal_project", **fields)
+            outcome["engine_sealed"] = True
+        except hydra.EngineError as error:
+            outcome.update(engine_sealed=False, engine_seal_error=str(error))
+    return outcome
 
 
 # ---- the handler `backend action=backups` ----------------------------------------------------------------------
@@ -470,10 +535,15 @@ def handle(capability: str, request: dict) -> str:
             result = listing(settings, lineage_id, verify_all=bool(options.get("verify_all")))
         elif op == "verify":
             result = {"lineage": lineage_id, "results": []}
+            try:
+                adopter = hydra.Engine(settings) if any(not (project_dir(f["folder"]) / lineage.SEAL_MARKER).is_file()
+                                                         for f in scan_roots(settings, lineage_id)["visible"]) else None
+            except Exception:  # no engine: the client's seal alone
+                adopter = None
             for found in scan_roots(settings, lineage_id)["visible"]:
                 if options.get("id") and found["folder"].name != options["id"]:
                     continue
-                outcome = adopt_legacy(found["folder"])
+                outcome = adopt_legacy(found["folder"], adopter, lineage_id)
                 result["results"].append({"id": found["folder"].name, "root": found["root"], **outcome})
             if options.get("id") and not result["results"]:
                 raise ValueError("no backup %s under the configured roots" % options["id"])

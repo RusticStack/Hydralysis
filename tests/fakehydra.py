@@ -20,6 +20,10 @@ from pathlib import Path
 from hydralysis.hydra import EngineError
 
 
+def canonical(value) -> bytes:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True, allow_nan=False).encode("utf-8")
+
+
 class Daemon:
     def __init__(self):
         self.projects: dict[str, dict] = {}   # normalized gpr -> project
@@ -69,8 +73,13 @@ class Daemon:
         self.queue_info = False   # models a v3 engine that reports queue information and the lane hint
         # E2 surface for Y4d's tests: `format` in project info, `backup_required` on the upgrade gate and a backup written by
         # the engine (`fork_project purpose:"backup"`, manifest with writer "engine").
+        # e2 turns the surface on: capabilities forkPurposes/upgradeGate/format. format_info is what open_project reports as
+        # `format`; backup_required makes a writable upgrade open of a non-disposable project demand a valid `backup`.
+        self.e2 = False
         self.format_info: dict | None = None
         self.backup_required = False
+        self.sealed_by_call: list[str] = []
+        self.break_engine_backup = None   # a callable(destination) that damages the engine's backup before it is reported
 
     def add_project(self, gpr: Path, programs: dict[str, dict]) -> dict:
         gpr.parent.mkdir(parents=True, exist_ok=True)
@@ -309,9 +318,10 @@ class FakePooledEngine:
         return EngineError(exc.code, exc.message, dict(exc.details or {}), command)
 
     def capabilities(self):
-        if not DAEMON.queue_info:
-            return {}
-        return {"laneHint": 1, "queueInfo": 1}
+        found = {"laneHint": 1, "queueInfo": 1} if DAEMON.queue_info else {}
+        if DAEMON.e2:
+            found.update(forkPurposes=1, upgradeGate=1, format=1, backup=1)
+        return found
 
     def deadline_mode(self):
         return "helper"
@@ -365,6 +375,12 @@ class FakeEngine:
         return program["live"] if program["live"] is not None else program["saved"]
 
     # --- commands --------------------------------------------------------------------------
+    def capabilities(self):
+        found = {"laneHint": 1, "queueInfo": 1} if self.daemon.queue_info else {}
+        if self.daemon.e2:
+            found.update(forkPurposes=1, upgradeGate=1, format=1, backup=1)
+        return found
+
     def call(self, command: str, raw: bool = False, **fields):
         with self.daemon.lock:
             self.daemon.calls.append((self.role, command, fields))
@@ -384,7 +400,32 @@ class FakeEngine:
         if "id" not in project:
             self.daemon.ids += 1
             project["id"] = "p%d" % self.daemon.ids
-        return {"id": project["id"], "gpr": project["gpr"], "revision": project["revision"], "writable": writable}
+        opened = {"id": project["id"], "gpr": project["gpr"], "revision": project["revision"], "writable": writable}
+        if self.daemon.e2 and self.daemon.format_info is not None:
+            opened["format"] = dict(self.daemon.format_info)
+        return opened
+
+    def _check_backup_gate(self, project, backup):
+        """The E2 gate: a non-disposable project needs a backup.json that parses, says verify.ok and carries a good self-hash."""
+        import hashlib
+        sidecar = self._sidecar(project)
+        if sidecar is not None and sidecar.get("disposable") is not False:
+            return
+        problem = "no backup was given"
+        if backup:
+            try:
+                manifest = json.loads(Path(backup).read_text(encoding="utf-8"))
+                body = {key: item for key, item in manifest.items() if key != "selfSha256"}
+                if manifest.get("kind") != "ghidra-session-backup" or not (manifest.get("verify") or {}).get("ok"):
+                    problem = "the backup does not say it verified"
+                elif manifest.get("selfSha256") != hashlib.sha256(canonical(body)).hexdigest():
+                    problem = "the backup's selfSha256 is wrong"
+                else:
+                    return
+            except (OSError, ValueError):
+                problem = "the backup cannot be read"
+        raise EngineError("backup_required", "upgrading %s is one-way: %s" % (project["gpr"], problem),
+                          {"project": project["gpr"], "suggest": "fork_project purpose backup"})
 
     def _list(self, project, sha256=None, **_):
         entries = []
@@ -395,8 +436,10 @@ class FakeEngine:
                             "format": "Portable Executable (PE)", "language": "x86:LE:64:default"})
         return {"entries": entries}
 
-    def _open_program(self, path, project, writable=False, share=False, upgrade=False, **_):
+    def _open_program(self, path, project, writable=False, share=False, upgrade=False, backup=None, **_):
         programs = self.daemon.project_by_id(project)["programs"]
+        if writable and upgrade and self.daemon.backup_required:
+            self._check_backup_gate(self.daemon.project_by_id(project), backup)
         program = programs.get(path) or programs.get("/" + path.lstrip("/"))
         if program is None:
             raise EngineError("not_found", "no program " + path)
@@ -471,7 +514,7 @@ class FakeEngine:
         self.writable.discard(program)
         return {"closed": True}
 
-    def _fork_project(self, project, path, writable=True, mode="auto", purpose=None, **_):
+    def _fork_project(self, project, path, writable=True, mode="auto", purpose=None, open=True, verify="hash", **_):
         source = (self.daemon.project_by_id(project) if not Path(project).suffix and not Path(project).exists()
                   else self.daemon.projects[self.daemon._norm(project)])
         destination = Path(path)
@@ -498,9 +541,45 @@ class FakeEngine:
         if purpose == "generation":
             sidecar["state"] = "candidate"
         (destination / (name + ".fork.json")).write_text(json.dumps(sidecar), encoding="utf-8")
+        if purpose == "backup" and open is False:
+            return self._finish_engine_backup(source, destination, gpr, name)
         opened = self._open_project(str(gpr), writable=True)
         return {"project": opened["id"], "gpr": str(gpr), "method": "clone", "cloned": True, "bytes": 1,
                 "copyMs": self.daemon.fork_copy_ms}
+
+    def _finish_engine_backup(self, source, destination, gpr, name):
+        """What hydra.4 does for `purpose:"backup"`: seal, then backup.json (writer "engine") written last, same canonical form."""
+        import hashlib
+        sidecar_path = destination / (name + ".fork.json")
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        sidecar.update(disposable=False, state="complete")
+        sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+        (destination / "SEALED.json").write_text(json.dumps({"by": "engine"}), encoding="utf-8")
+        self.daemon.projects.pop(self.daemon._norm(gpr), None)   # open:false registers nothing
+        if self.daemon.break_engine_backup:
+            self.daemon.break_engine_backup(destination)
+        rows = []
+        for item in sorted(destination.rglob("*")):
+            if item.is_file() and item.name not in ("SEALED.json", "backup.json", "projectState") and not item.name.endswith((".lock", ".lock~")):
+                data = item.read_bytes()
+                if item.name.endswith(".fork.json"):
+                    record = json.loads(data.decode("utf-8"))
+                    record.pop("state", None)
+                    data = canonical(record)
+                rows.append({"path": item.relative_to(destination).as_posix(), "size": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+        manifest = {"format": 1, "kind": "ghidra-session-backup", "writer": "engine", "id": destination.name, "purpose": "backup",
+                    "createdAt": "2026-10-29T00:00:00Z", "source": {"gpr": source["gpr"], "name": name},
+                    "files": rows, "filesetSha256": hashlib.sha256(canonical(rows)).hexdigest(),
+                    "copy": {"method": "clone", "sameVolume": True, "independent": False},
+                    "verify": {"level": "hash", "ok": True}}
+        manifest["selfSha256"] = hashlib.sha256(canonical(manifest)).hexdigest()
+        (destination / "backup.json").write_bytes(canonical(manifest))
+        return {"project": None, "gpr": str(gpr), "purpose": "backup", "method": "clone", "cloned": True, "bytes": 1,
+                "manifest": {"path": str(destination / "backup.json"), "verified": True, "files": len(rows)}}
+
+    def _seal_project(self, project, lineage=None, **_):
+        self.daemon.sealed_by_call.append(project)
+        return {"sealed": True}
 
     def _status(self, **_):
         return {"projects": [{"gpr": item["gpr"], "id": item.get("id")} for item in self.daemon.projects.values()

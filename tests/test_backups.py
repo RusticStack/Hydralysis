@@ -380,3 +380,127 @@ class RemoveAndHandler(World, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EngineBackups(World, unittest.TestCase):
+    """Y4d: on hydra.4 (E2) the backup is the engine's (`fork_project purpose:"backup"`, writer "engine"); one schema, two writers."""
+
+    def setUp(self):
+        super().setUp()
+        self.daemon.e2 = True
+        self.daemon.backup_required = True
+        selected = self.runner.target("owned")
+        self.lid = lineage.ensure(self.settings, {**selected, "origin_key": selected["key"]})["id"]
+        self.engine = fakehydra.FakeEngine(self.settings)
+
+    def make(self, **kwargs):
+        return backups.make(self.settings, self.engine, self.lid, str(self.gpr), "pre-commit", "3fa9c2d1aa01bb42", 0, **kwargs)
+
+    def python_backup(self):
+        with patch.object(backups, "_engine_backup", return_value=False):
+            return self.make()["backup"]
+
+    def gate_open(self, backup_json):
+        opened = self.engine.call("open_project", path=str(self.gpr))
+        return self.engine.call("open_program", path="/owned.exe", project=opened["id"], writable=True, upgrade=True,
+                                **({"backup": backup_json} if backup_json else {}))
+
+    def test_the_engine_writes_the_backup_with_purpose_backup_and_the_client_reverifies_it(self):
+        made = self.make()["backup"]
+        forks = [fields for _, name, fields in self.daemon.calls if name == "fork_project"]
+        self.assertEqual([(f["purpose"], f["open"], f["verify"]) for f in forks], [("backup", False, "hash")])
+        self.assertEqual(made["manifest"]["writer"], "engine")
+        folder = Path(made["folder"])
+        self.assertTrue(backups.verify(folder)["ok"])
+        self.assertEqual(backups.listing(self.settings, self.lid)["backups"][0]["sealed"], True)
+        self.assertEqual(backups.logged(self.settings, self.lid)[0]["manifestSha256"], made["manifestSha256"])
+        self.assertEqual(lineage.tree_hash(self.gpr.parent), self.master_tree)
+
+    def test_an_engine_backup_is_accepted_by_the_gate_and_the_python_one_too(self):
+        engine_made = self.make()["backup"]
+        self.assertIn("key", self.gate_open(str(Path(engine_made["folder"]) / "backup.json")))
+        python_made = self.python_backup()
+        self.assertEqual(python_made["manifest"]["writer"], "hydralysis")
+        self.assertIn("key", self.gate_open(str(Path(python_made["folder"]) / "backup.json")))
+
+    def test_the_gate_refuses_without_a_backup_and_with_a_tampered_manifest(self):
+        with self.assertRaises(hydra.EngineError) as raised:
+            self.gate_open(None)
+        self.assertEqual(raised.exception.code, "backup_required")
+        made = self.python_backup()
+        path = Path(made["folder"]) / "backup.json"
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        manifest["id"] = "changed"
+        os.chmod(path, 0o666)
+        path.write_bytes(lineage.canonical(manifest))
+        with self.assertRaises(hydra.EngineError):
+            self.gate_open(str(path))
+
+    def test_an_engine_backup_that_does_not_verify_is_refused_and_stays_invisible_to_use(self):
+        def flip(destination):
+            victim = next(destination.rglob("Owned.gpr"))
+            victim.write_text("flipped after the engine hashed", encoding="utf-8")
+        self.daemon.break_engine_backup = flip
+        with self.assertRaises(backups.BackupError) as raised:
+            self.make()
+        self.assertEqual(raised.exception.code, "backup_failed")
+        self.assertFalse(backups.logged(self.settings, self.lid))
+
+    def test_commit_uses_the_engine_backup_and_passes_it_to_the_candidate_open(self):
+        self.edit("renamed")
+        result = self.commit()
+        self.assertTrue(result.get("backup"))
+        gated = [fields for _, name, fields in self.daemon.calls if name == "open_program" and fields.get("backup")]
+        self.assertEqual([Path(fields["backup"]).name for fields in gated], ["backup.json"])  # the candidate's open names the backup
+        (row,) = [row for row in backups.listing(self.settings, self.lid)["backups"]]
+        self.assertEqual(row["writer"], "engine")
+
+    def test_the_format_the_engine_reports_decides_the_confirmation(self):
+        from hydralysis import commits
+        selected = self.target()
+        self.edit("renamed")
+        body = {"kind": "commit", "expect_revision": self.store()["revision"]}
+        self.daemon.format_info = {"upgradeRequired": True, "programDb": 32}
+        with self.assertRaises(commits.CommitError) as raised:
+            commits.run_commit(self.settings, selected, body, self.engine)
+        self.assertEqual(raised.exception.code, "confirmation_required")
+        self.assertEqual(raised.exception.payload()["format"]["programDb"], 32)
+        self.daemon.format_info = {"upgradeRequired": False}
+        self.assertTrue(commits.run_commit(self.settings, self.target(), body, self.engine))
+
+    def test_legacy_backup_adoption(self):
+        made = self.python_backup()
+        folder = Path(made["folder"])
+        project = folder / "project"
+        os.chmod(project / "SEALED.json", 0o666)
+        (project / "SEALED.json").unlink()
+        sidecar = next(project.glob("*.fork.json"))
+        record = json.loads(sidecar.read_text(encoding="utf-8"))
+        record["state"] = "candidate"
+        os.chmod(sidecar, 0o666)
+        sidecar.write_text(json.dumps(record), encoding="utf-8")
+        self.assertFalse(backups.listing(self.settings, self.lid)["backups"][0]["sealed"])
+        outcome = backups.adopt_legacy(folder, self.engine, self.lid)
+        self.assertEqual((outcome["ok"], outcome["adopted"], outcome["engine_sealed"]), (True, True, True))
+        self.assertTrue(backups.listing(self.settings, self.lid)["backups"][0]["sealed"])
+        self.assertEqual(len(self.daemon.sealed_by_call), 1)
+        # adopted, so a writable open is refused (sealed)
+        opened = self.engine.call("open_project", path=str(project / "Owned.gpr"))
+        with self.assertRaises(hydra.EngineError) as raised:
+            self.engine.call("open_program", path="/owned.exe", project=opened["id"], writable=True)
+        self.assertEqual(raised.exception.code, "sealed")
+
+    def test_a_legacy_backup_with_a_flipped_byte_is_labelled_and_unusable_as_a_source(self):
+        made = self.python_backup()
+        folder = Path(made["folder"])
+        project = folder / "project"
+        os.chmod(project / "SEALED.json", 0o666)
+        (project / "SEALED.json").unlink()
+        victim = next(project.rglob("Owned.gpr"))
+        os.chmod(victim, 0o666)
+        victim.write_bytes(victim.read_bytes() + b"x")
+        outcome = backups.adopt_legacy(folder, self.engine, self.lid)
+        self.assertEqual(outcome["label"], "legacy_unverified")
+        self.assertEqual(self.daemon.sealed_by_call, [])
+        self.assertFalse((project / "SEALED.json").exists())
+        self.assertIsNone(backups.usable(self.settings, self.lid, made["id"]))
