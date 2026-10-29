@@ -327,6 +327,24 @@ class NoStockEndToEnd(unittest.TestCase):
         self.assertEqual(os.environ[HOOK], str(self.canary), "the scrubbed environment was changed during the run")
 
 
+def pid_alive(pid):
+    if os.name == "nt":
+        done = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/NH", "/FO", "CSV"], capture_output=True)
+        return ('"%d"' % pid).encode() in done.stdout
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def kill_pid(pid):
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
+    else:
+        os.kill(pid, 9)
+
+
 class AuditHarnessTool(unittest.TestCase):
     """tools/audit_harness.py fails on planted stock names and passes on clean input."""
 
@@ -381,6 +399,35 @@ class AuditHarnessTool(unittest.TestCase):
         catalog = report["configs"][0]["servers"][0]["catalog"]
         self.assertTrue(catalog["launched"])
         self.assertEqual(catalog["tool_count"], 1)
+
+    def test_a_server_that_leaves_a_helper_running_is_ended_and_its_directory_released(self):
+        """The helper inherits the server's working directory; a bare terminate() of the server leaves it running."""
+        pidfile = self.root / "helper.pid"
+        server = self.root / "helper_server.py"
+        server.write_text(
+            "import json, subprocess, sys\n"
+            "helper = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])\n"
+            "open(%r, 'w').write(str(helper.pid))\n"
+            "for raw in sys.stdin:\n"
+            "    m = json.loads(raw)\n"
+            "    if m.get('method') == 'initialize':\n"
+            "        r = {'protocolVersion': '2025-06-18', 'serverInfo': {'name': 'hydralysis', 'version': '0'}, 'instructions': ''}\n"
+            "    elif m.get('method') == 'tools/list':\n"
+            "        r = {'tools': []}\n"
+            "    else:\n"
+            "        continue\n"
+            "    print(json.dumps({'jsonrpc': '2.0', 'id': m['id'], 'result': r}), flush=True)\n" % str(pidfile), encoding="utf-8")
+        config = self.write("helper.json", {"mcpServers": {"hydralysis": {"command": sys.executable, "args": [str(server)]}}})
+        code, report = self.audit("--config", str(config), "--skills", str(self.skill("fine")))
+        self.assertTrue(pidfile.exists(), "the helper was never started")
+        pid = int(pidfile.read_text())
+        deadline = time.time() + 10
+        while time.time() < deadline and pid_alive(pid):
+            time.sleep(0.1)
+        alive = pid_alive(pid)
+        if alive:
+            kill_pid(pid)
+        self.assertFalse(alive, "the helper of the audited server is still running after the audit")
 
     def test_a_stock_server_in_a_configuration_fails(self):
         config = self.write("stock.json", {"mcpServers": {"ghidra-mcp": {"command": "python", "args": ["bridge.py"]}}})

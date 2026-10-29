@@ -30,10 +30,13 @@ import argparse
 import json
 import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 # Built from parts so the repository's own text scan finds no stock name in this tool.
@@ -142,57 +145,108 @@ def scrubbed_environment(entry_env: dict, data_root: str) -> dict:
     return env
 
 
+def stop_tree(process: subprocess.Popen) -> None:
+    """End the server and every process it started, then wait until all of them are gone.
+
+    A bare terminate() ends only the direct child: a launcher, wrapper or helper it started keeps running, and
+    on Windows a live process pins its working directory and open files, so the private root cannot be removed."""
+    if process.poll() is None or os.name != "nt":
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], capture_output=True, timeout=30)
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, subprocess.SubprocessError, ProcessLookupError):
+            pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        process.wait(15)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def remove_tree(path: str, attempts: int = 40, pause: float = 0.25) -> None:
+    """Bounded retry for rmtree: on Windows a handle can outlive its process by a moment (scanner, handle table).
+
+    Only reached after stop_tree() returned, so a retry waits for the system, never for a process we left running."""
+    for attempt in range(attempts):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(pause)
+
+
 def launch(argv: list[str], entry_env: dict) -> dict:
     """initialize + tools/list against one server; kills it afterwards. Returns {info, tools} or {error}."""
-    with tempfile.TemporaryDirectory(prefix="audit-harness-") as root:
-        requests = [{"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                     "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "audit-harness", "version": "1"}}},
-                    {"jsonrpc": "2.0", "method": "notifications/initialized"},
-                    {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}]
+    root = tempfile.mkdtemp(prefix="audit-harness-")
+    try:
+        return _launch(argv, entry_env, root)
+    finally:
         try:
-            process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                       env=scrubbed_environment(entry_env, root), cwd=root)
-        except OSError as error:
-            return {"error": "cannot start: %s" % error}
-        answers: dict = {}
-        done = threading.Event()
+            remove_tree(root)
+        except OSError as error:      # never lose the report over a leftover scratch directory
+            print("audit-harness: could not remove %s: %s" % (root, error), file=sys.stderr)
 
-        def read():
-            for raw in process.stdout:
-                try:
-                    message = json.loads(raw.decode("utf-8", "replace"))
-                except ValueError:
-                    continue
-                if isinstance(message, dict) and "id" in message:
-                    answers[message["id"]] = message
-                    if 2 in answers:
-                        done.set()
-                        return
 
-        reader = threading.Thread(target=read, daemon=True)
-        reader.start()
+def _launch(argv: list[str], entry_env: dict, root: str) -> dict:
+    requests = [{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                 "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "audit-harness", "version": "1"}}},
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}]
+    try:
+        process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   env=scrubbed_environment(entry_env, root), cwd=tempfile.gettempdir(),
+                                   start_new_session=(os.name != "nt"))   # never cwd=root: a cwd pins the directory
+    except OSError as error:
+        return {"error": "cannot start: %s" % error}
+    answers: dict = {}
+    done = threading.Event()
+
+    def read():
+        for raw in process.stdout:
+            try:
+                message = json.loads(raw.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            if isinstance(message, dict) and "id" in message:
+                answers[message["id"]] = message
+                if 2 in answers:
+                    done.set()
+                    return
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    try:
+        for item in requests:
+            process.stdin.write((json.dumps(item) + "\n").encode("utf-8"))
+            process.stdin.flush()
+        done.wait(LAUNCH_TIMEOUT_S)
+    except OSError:
+        pass
+    finally:
+        stop_tree(process)           # before closing stdin: a server that exits on EOF would orphan its helpers
         try:
-            for item in requests:
-                process.stdin.write((json.dumps(item) + "\n").encode("utf-8"))
-                process.stdin.flush()
-            done.wait(LAUNCH_TIMEOUT_S)
+            process.stdin.close()
         except OSError:
             pass
-        finally:
-            try:
-                process.stdin.close()
-            except OSError:
-                pass
-            process.terminate()
-            try:
-                process.wait(10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-        if 2 not in answers:
-            return {"error": "no tools/list answer within %d s" % LAUNCH_TIMEOUT_S}
-        result = answers[1].get("result", {}) if 1 in answers else {}
-        return {"info": result.get("serverInfo", {}), "tools": answers[2].get("result", {}).get("tools", []),
-                "instructions": result.get("instructions", "")}
+        reader.join(10)
+        try:
+            process.stdout.close()
+        except OSError:
+            pass
+    if 2 not in answers:
+        return {"error": "no tools/list answer within %d s" % LAUNCH_TIMEOUT_S}
+    result = answers[1].get("result", {}) if 1 in answers else {}
+    return {"info": result.get("serverInfo", {}), "tools": answers[2].get("result", {}).get("tools", []),
+            "instructions": result.get("instructions", "")}
 
 
 def expected_tools() -> set[str] | None:
