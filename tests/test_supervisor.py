@@ -1,12 +1,17 @@
-"""The supervisor policy (PROTOCOL-3.md 7.2, D55; Y4a), against scripted stand-ins for the daemon.
+"""The supervisor policy (PROTOCOL-3.md 7.2, D55; Y4a), against scripted stand-ins for the daemon, and `RealPolicy` against a
+real daemon (only when HYDRALYSIS_INTEGRATION_ENGINE and HYDRALYSIS_INTEGRATION_CLIENT name a Hydra install, see
+tests/test_deadline.py `RealEngine`).
 
-Fresh state roots only; no process is started or touched."""
+Fresh state roots only; the real tests start their own daemon and touch no other process."""
 
 from __future__ import annotations
 
+import os
+import time
 import unittest
 from pathlib import Path
 
+import test_deadline
 from hydralysis import hydra
 from support import workdir
 
@@ -186,6 +191,93 @@ class Journal(unittest.TestCase):
         blocker = Path(temp.name) / "blocked"
         blocker.write_text("a file where the state directory should be", encoding="utf-8")
         self.assertFalse(hydra.journal_durable({"root": str(blocker)}))
+
+
+def _suspend(pid: int, resume: bool = False) -> None:
+    """Freeze (or thaw) process PID: a daemon that is alive and holds its lock but answers nothing."""
+    import ctypes
+    kernel = ctypes.windll.kernel32
+    handle = kernel.OpenProcess(0x0800, False, pid)   # PROCESS_SUSPEND_RESUME
+    if not handle:
+        raise OSError("cannot open process %d" % pid)
+    try:
+        (ctypes.windll.ntdll.NtResumeProcess if resume else ctypes.windll.ntdll.NtSuspendProcess)(handle)
+    finally:
+        kernel.CloseHandle(handle)
+
+
+@unittest.skipUnless(test_deadline.HAVE_REAL, "set HYDRALYSIS_INTEGRATION_ENGINE/CLIENT")
+class RealPolicy(test_deadline.RealEngine):
+    """7.2 on a real daemon: `Supervisor.for_engine` with its real pid, lock, probe, status and restart."""
+
+    def supervisor(self, **overrides):
+        self.assertTrue(hydra.journal_durable(self.base), "the journal self-test passes on a fresh root (D55)")
+        engine = self.engine("supervised-%d" % len(self.engines), self.base)
+        engine.session()
+        return engine, hydra.Supervisor.for_engine(engine, self.base, **overrides)
+
+    @unittest.skipUnless(os.name == "nt", "suspends the daemon process with NtSuspendProcess")
+    def test_supervisor_policy_suspended_daemon(self):
+        engine, supervisor = self.supervisor()
+        self.assertEqual(supervisor.tick()["event"], "ok")
+        self.assertIsInstance(supervisor.last_status.get("programs"), list, "the status is kept at each probe")
+        pid = engine.hello()["pid"]
+        _suspend(pid)
+        try:
+            self.assertTrue(supervisor.pid_alive())
+            self.assertFalse(supervisor.lock_free())
+            first = supervisor.tick()
+            self.assertEqual((first["event"], first["signal"], first["misses"]), ("miss", "no_answer", 1))
+            self.assertEqual(supervisor.tick()["misses"], 2, "a long silence is not a wedge until the third probe")
+            self.assertLessEqual(hydra.REGISTRY.count("probe"), hydra.PROBE_CAP)
+            started = time.monotonic()
+            third = supervisor.tick()
+        finally:
+            try:
+                _suspend(pid, resume=True)
+            except OSError:
+                pass   # the restart killed it
+        self.assertEqual(third["event"], "restarted", third)
+        self.assertEqual(third["why"], "wedged:no_answer")
+        self.assertLess(time.monotonic() - started, 5.0 + 5.0 + hydra.EXIT_WAIT_S + 60.0)
+        self.assertNotEqual(engine.hello()["pid"], pid, "a new daemon answers")
+        self.assertEqual(supervisor.tick()["event"], "ok")
+        self.assertIn("restarted", [item["event"] for item in supervisor.events()], "every event is in supervisor.json")
+        self.assertTrue(test_deadline.until(lambda: hydra.REGISTRY.count("probe") == 0, 10.0),
+                        "the abandoned probes end with the old daemon")
+        type(self).observer.reset()   # the observer's connection went with the old daemon
+
+    def test_supervisor_slow_daemon_with_unsaved_edits(self):
+        holder = self.engine("editor", self.base)
+        holder.call("open_project", path=self.gpr, writable=True, wait=60000)
+        key = holder.call("open_program", path=self.PROGRAM, writable=True, wait=60000)["key"]
+        holder.call("script", script="TestEdit.java", program=key, args=[], timeout=60, wait=60000)
+        slow = {"on": False}
+
+        def probe():
+            reply = real_probe()
+            return dict(reply, state="suspect") if slow["on"] else reply
+
+        engine, supervisor = self.supervisor(probe=probe)
+        real_probe = hydra.Supervisor.for_engine(engine, self.base).probe
+        self.assertEqual(supervisor.tick()["event"], "ok")
+        edited = [item for item in supervisor.last_status.get("programs", []) if item.get("unsavedEdits")]
+        self.assertTrue(edited, supervisor.last_status.get("programs"))
+        pid = engine.hello()["pid"]
+        slow["on"] = True
+        self.assertEqual(supervisor.tick()["signal"], "suspect")
+        supervisor.tick()
+        refused = supervisor.tick()
+        self.assertEqual((refused["event"], refused["reason"]), ("restart_refused", "unsaved_edits"), refused)
+        self.assertTrue(refused["lost_on_restart"] and refused["lost_on_restart"][0]["unsavedEdits"] >= 1, refused)
+        self.assertEqual(engine.hello()["pid"], pid, "a daemon that is merely slow is not restarted")
+        engine.call("ping")   # it answers
+        forced = supervisor.tick(force=True)
+        self.assertEqual(forced["event"], "restarted", forced)
+        self.assertTrue(forced["lost_on_restart"], "the restart reports what died with the daemon")
+        self.assertNotEqual(engine.hello()["pid"], pid)
+        holder.reset()
+        type(self).observer.reset()
 
 
 if __name__ == "__main__":

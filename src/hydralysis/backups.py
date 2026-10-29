@@ -153,9 +153,14 @@ def project_dir(folder: Path) -> Path:
     return nested if nested.is_dir() else Path(folder)
 
 
+# The capability a hydra.4 engine advertises for `fork_project` purposes and the engine-written backup (PROTOCOL-3.md 3.1,
+# `Advertised.java`; 7.3 names `format`, `backup`, `upgradeGate`). No engine advertises a `forkPurposes`.
+ENGINE_BACKUP_CAPABILITY = "backup"
+
+
 def _engine_backup(engine) -> bool:
     try:
-        return "forkPurposes" in engine.capabilities()
+        return ENGINE_BACKUP_CAPABILITY in engine.capabilities()
     except Exception:  # an engine that cannot say is a hydra.2/3 engine
         return False
 
@@ -192,6 +197,19 @@ def _make_engine(settings: dict, engine: hydra.Engine, lineage_id: str, source_g
         "independent": bool((manifest.get("copy") or {}).get("independent")), "purpose": purpose, "generation": generation})
     return {"id": identifier, "folder": str(folder), "project": str(project_dir(folder)), "gpr": forked.get("gpr") or "",
             "manifest": manifest, "manifestSha256": digest, "root": root["path"], "writer": manifest.get("writer")}
+
+
+def _sidecar(path: str) -> bool:
+    return path.rsplit("/", 1)[-1].endswith(".fork.json")
+
+
+def manifest_files(rows: list[dict]) -> list[dict]:
+    """The file set a backup.json lists: the project's own files, as the engine lists them (`<name>.gpr` and the `.rep` tree,
+    `UpgradeCache.sourceFiles`), without the fork sidecar. The sidecar is rewritten when the backup is sealed (its `state`), so
+    a listed sidecar could never match by size, which is all the engine's upgrade gate checks: a Python-written backup that listed
+    it was refused by the real gate (`file_size`), and an engine-written one, which does not list it, failed the client's
+    `unlisted file` check. One schema, two writers (3.4): the sidecar is outside the file set for both."""
+    return [row for row in rows if not _sidecar(row["path"])]
 
 
 def _sidecar_path(folder: Path) -> Path | None:
@@ -276,6 +294,7 @@ def _make_one(settings: dict, engine: hydra.Engine, lineage_id: str, source_gpr:
     expected = {row["path"]: row for row in lineage.tree_files(source_folder)}
     forked = _fork_into(settings, engine, source_gpr, project, root["mode"])
     _rewrite_sidecar(project, purpose="backup", disposable=False, state="candidate")
+    # The comparison with the source covers the sidecar too (by its state-free hash); the manifest's file set does not (below).
     files = lineage.tree_files(folder)
     mismatches = []
     for row in files:
@@ -295,7 +314,7 @@ def _make_one(settings: dict, engine: hydra.Engine, lineage_id: str, source_gpr:
         "createdBy": by,
         "source": {"gpr": source_gpr, "name": Path(source_gpr).stem, "revision": revision, "lineage": lineage_id, "generation": generation},
         "engine": {key: value for key, value in (engine.hello() or {}).items() if key in ("hydraVersion", "ghidraVersion")},
-        "files": files, "filesetSha256": lineage.fileset_sha256(files),
+        "files": manifest_files(files), "filesetSha256": lineage.fileset_sha256(manifest_files(files)),
         "copy": {"method": forked.get("method") or ("clone" if forked.get("cloned") else "copy"), "sameVolume": same_volume,
                  "independent": not same_volume and root["mode"] == "copy", "ms": int((time.monotonic() - started) * 1000)},
         "verify": {"level": "hash", "ok": True, "at": lineage.now_iso(), "sourceUnchanged": lineage.fileset_sha256(after) == lineage.fileset_sha256(list(expected.values()))},
@@ -346,7 +365,7 @@ def verify(folder: Path) -> dict:
         elif found["sha256"] != row["sha256"] or found["size"] != row["size"]:
             problems.append("changed file %s" % path)
     for path in actual:
-        if path not in listed:
+        if path not in listed and not _sidecar(path):
             problems.append("unlisted file %s" % path)
     return {"ok": not problems, "problems": problems[:20], "manifest": manifest}
 

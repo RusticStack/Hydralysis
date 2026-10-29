@@ -2,8 +2,11 @@
 
 Against the fake daemon: the abandon helper (never a `close()` or a `shutdown` while a request is in flight), one deadline per
 attempt, the two budgets, the pool entry with its context (I1 to I3), the leave gate, `QueryRunner.stop` over the entries.
-The real hydra.3 cases (L, S, C, `replacement_context`, `wait_below_deadline`, `leave_gate_no_freeze`) are in
-`RealHydra3` at the end of this file: skipped unless HYDRALYSIS_REAL_HYDRA3 names an engine install (see there).
+The real-engine cases (L, S, C, `replacement_context`, `wait_below_deadline`, `leave_gate_no_freeze`, the 7.5 degrade
+matrix) are at the end of this file: `RealHelper` (the hydra.2/3 helper of 7.6), `RealNative` (P1b's deadline on hydra.4) and
+`RealDegrade`. They run only when HYDRALYSIS_INTEGRATION_ENGINE and HYDRALYSIS_INTEGRATION_CLIENT name a Hydra install, as
+for tests/test_engine_integration.py (see `RealEngine` there for the variables); the 7.2 policy on the real daemon is in
+tests/test_supervisor.py.
 """
 
 from __future__ import annotations
@@ -11,6 +14,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
+import shutil
 import tempfile
 import threading
 import time
@@ -819,23 +824,555 @@ class SupervisorWiring(unittest.TestCase):
         self.assertIsNone(hydra.supervise(engine, {**self.settings, "hydra_supervisor": False}))
 
 
-@unittest.skipUnless(os.environ.get("HYDRALYSIS_REAL_HYDRA3"), "HYDRALYSIS_REAL_HYDRA3 (a hydra.3 install with its client) is not set")
-class RealHydra3(unittest.TestCase):
-    """The cases of 7.6 and 7.2 that need a real hydra.3 engine. NOT WRITTEN: the real-engine run did not happen (daemon
-    spawns belong to the coordinator, with a stamped private copy of the engine install). Each case below skips with its
-    name when HYDRALYSIS_REAL_HYDRA3 is set, so the gap is listed by the runner and not hidden: L, S and C,
-    `replacement_context`, `wait_below_deadline`, `leave_gate_no_freeze`, the 7.2 policy and the 7.5 degrade matrix."""
+def _env(name):
+    """HYDRALYSIS_<name>, else the old RUSTICRE_<name> (as tests/test_engine_integration.py)."""
+    return os.environ.get("HYDRALYSIS_" + name) or os.environ.get("RUSTICRE_" + name)
 
 
-def _not_written(name):
-    def case(self):
-        self.skipTest("%s: not written; needs a real hydra.3 engine (see the class docstring)" % name)
-    return case
+# The real engine (PROTOCOL-3.md 7.6 "Tests (Y4a)"). HYDRALYSIS_INTEGRATION_ENGINE is a Hydra install and
+# HYDRALYSIS_INTEGRATION_CLIENT its ghidra_session.py, as for the other integration tests (an engine that is not the pinned
+# release is accepted here: these tests are about the mechanism, not the pin). The hydra.2/3 helper needs a library that does
+# not time its own wait (1.0.0): the client itself when it is one (a hydra.3 install), else
+# HYDRALYSIS_INTEGRATION_HELPER_CLIENT (for instance the hydra.3 client against the same daemon, which negotiates protocol 2).
+REAL_ENGINE = _env("INTEGRATION_ENGINE")
+REAL_CLIENT = _env("INTEGRATION_CLIENT")
+REAL_BINARY = _env("INTEGRATION_BINARY") or (
+    os.path.join(os.environ.get("SystemRoot", "C:/Windows"), "System32", "whoami.exe") if os.name == "nt" else "")
+HAVE_REAL = bool(REAL_ENGINE and REAL_CLIENT and REAL_BINARY and Path(REAL_BINARY).is_file())
 
 
-for _name in ("case_L", "case_S", "case_C", "replacement_context", "wait_below_deadline", "leave_gate_no_freeze",
-              "supervisor_policy_suspended_daemon", "supervisor_slow_daemon_with_unsaved_edits", "degrade_matrix_7_5"):
-    setattr(RealHydra3, "test_" + _name, _not_written(_name))
+def _library_version(path) -> tuple:
+    text = Path(path).read_text(encoding="utf-8", errors="replace")
+    found = re.search(r'^CLIENT_VERSION\s*=\s*"([0-9.]+)"', text, re.M)
+    return tuple(int(part) for part in found.group(1).split(".")) if found else (0,)
+
+
+def _helper_client():
+    if not HAVE_REAL:
+        return None
+    return REAL_CLIENT if _library_version(REAL_CLIENT) < (1, 1, 0) else _env("INTEGRATION_HELPER_CLIENT")
+
+
+def _native_client():
+    return REAL_CLIENT if HAVE_REAL and _library_version(REAL_CLIENT) >= (1, 1, 0) else None
+
+
+SCRIPTS = {
+    "TestMakeProject": """import ghidra.app.script.GhidraScript;
+import ghidra.base.project.GhidraProject;
+public class TestMakeProject extends GhidraScript {
+    @Override protected void run() throws Exception {
+        GhidraProject.createProject(getScriptArgs()[0], getScriptArgs()[1], false).close();
+    }
+}
+""",
+    # C: a cooperative script (polls its monitor).
+    "TestSleep": """import ghidra.app.script.GhidraScript;
+public class TestSleep extends GhidraScript {
+    @Override protected void run() throws Exception {
+        long end = System.currentTimeMillis() + Long.parseLong(getScriptArgs()[0]);
+        while (System.currentTimeMillis() < end) { monitor.checkCancelled(); Thread.sleep(20); }
+        println("slept");
+    }
+}
+""",
+    # S: a script that ignores cancel and swallows interrupts; its length does not depend on a race.
+    "TestNoCoop": """import ghidra.app.script.GhidraScript;
+public class TestNoCoop extends GhidraScript {
+    @Override protected void run() throws Exception {
+        long end = System.currentTimeMillis() + Long.parseLong(getScriptArgs()[0]);
+        while (System.currentTimeMillis() < end) {
+            try { Thread.sleep(50); } catch (InterruptedException e) { /* ignored on purpose */ }
+        }
+        println("spun");
+    }
+}
+""",
+    # An unsaved edit on a writable program (the supervisor's `lost_on_restart`, tests/test_supervisor.py).
+    "TestEdit": """import ghidra.app.script.GhidraScript;
+import ghidra.program.model.listing.CodeUnit;
+public class TestEdit extends GhidraScript {
+    @Override protected void run() throws Exception {
+        currentProgram.getListing().setComment(currentProgram.getImageBase(), CodeUnit.EOL_COMMENT, "y4a unsaved");
+    }
+}
+""",
+}
+
+
+class RealEngine(unittest.TestCase):
+    """One data root, one daemon and one unanalysed fixture project per class; the daemon is stopped at the end.
+
+    `settings` loads the library of the class (`client()`); `base` the install's own client, which makes the fixture and is
+    the observer that reads `status`. Every wait for the engine is a poll with a bound."""
+
+    PROGRAM = "/fixture.exe"
+
+    @classmethod
+    def client(cls):
+        return REAL_CLIENT
+
+    @classmethod
+    def setUpClass(cls):
+        if not HAVE_REAL:
+            raise unittest.SkipTest("set HYDRALYSIS_INTEGRATION_ENGINE/CLIENT")
+        if not cls.client():
+            raise unittest.SkipTest("no client library for %s: set HYDRALYSIS_INTEGRATION_HELPER_CLIENT to a library 1.0.0 "
+                                    "(the hydra.2/3 helper) or use an install whose library is 1.1.0" % cls.__name__)
+        cls.work = workdir("real-" + cls.__name__.lower())
+        cls.root = Path(cls.work.name)
+        scripts = cls.root / "hydra" / "user-scripts"   # on the daemon's scriptPath (hydra.script_dirs)
+        scripts.mkdir(parents=True, exist_ok=True)
+        for name, text in SCRIPTS.items():
+            (scripts / (name + ".java")).write_text(text, encoding="utf-8")
+        binary = cls.root / "fixture.exe"
+        shutil.copy2(REAL_BINARY, binary)
+        cls.sha256 = hashlib.sha256(binary.read_bytes()).hexdigest()
+        cls.base = {"root": str(cls.root), "hydra_dir": REAL_ENGINE, "hydra_client": REAL_CLIENT,
+                    "hydra_allow_unpinned": True, "hydra_supervisor": False, "hydra_idle_s": 600}
+        if _env("INTEGRATION_JAVA"):
+            cls.base["java_home"] = _env("INTEGRATION_JAVA")
+        cls.settings = dict(cls.base, hydra_client=cls.client())
+        cls.engines = []
+        cls.observer = cls.engine("observer", cls.base)
+        try:
+            project = cls.root / "project"
+            project.mkdir()
+            cls.observer.call("script", script="TestMakeProject.java", program=None, args=[str(project), "Fixture"])
+            cls.gpr = str(project / "Fixture.gpr")
+            cls.observer.call("open_project", path=cls.gpr, writable=True, wait=60000)
+            imported = cls.observer.call("import", file=str(binary), analyze=False, timeout=300, wait=300000)
+            cls.PROGRAM = imported.get("path") or cls.PROGRAM
+            cls.observer.call("close_project")
+        except BaseException:
+            cls.tearDownClass()
+            raise
+
+    @classmethod
+    def engine(cls, role, settings=None):
+        found = hydra.Engine(settings or cls.settings, role=role)
+        cls.engines.append(found)
+        return found
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            for engine in cls.engines:
+                hydra.unsupervise(engine)
+                pool = hydra.Engine._pools.pop(engine.key, None)
+                if pool is not None:
+                    pool.close_all(0.0)
+            cls.observer.stop(force=True)
+        finally:
+            daemon = cls.observer.module().Daemon(str(cls.observer.engine_dir), str(hydra.state_dir(cls.base)), hydra.INSTANCE)
+            if daemon.jvm_alive() or daemon.read_endpoint():
+                daemon.kill()
+            for engine in cls.engines:
+                engine.reset()
+            time.sleep(1)
+            cls.work.cleanup()
+
+    # --- what the engine says ----------------------------------------------------------------------------------------
+
+    def status(self) -> dict:
+        return self.observer.call("status")
+
+    def clients(self) -> dict:
+        return {item["id"]: item for item in self.status().get("clients", [])}
+
+    def requests_of(self, client_id) -> list:
+        return (self.clients().get(client_id) or {}).get("requests") or []
+
+    def users(self, key) -> set:
+        found = set()
+        for program in self.status().get("programs", []):
+            if program.get("key") == key or "%s:%s" % (program.get("project"), program.get("path")) == key:
+                found.update(program.get("users") or [])
+        return found
+
+    @staticmethod
+    def ident(entry) -> int:
+        return (getattr(entry.session, "hello", {}) or {}).get("client")
+
+    @staticmethod
+    def ident_of_engine(engine) -> int:
+        return (getattr(engine.session(), "hello", {}) or {}).get("client")
+
+    # --- the fixture's program ---------------------------------------------------------------------------------------
+
+    def join(self, entry, deadline_s=30.0) -> str:
+        """Re-establish ENTRY's context (the two opens, as the query layer sends them) and return the daemon's program key."""
+        entry.begin(deadline_s)
+        opened = entry.call("open_project", path=self.gpr, wait=180000)
+        return entry.call("open_program", path=self.PROGRAM, project=opened["id"], wait=180000)["key"]
+
+    def read(self, entry, key, ms, deadline_s=30.0, script="TestSleep.java"):
+        entry.begin(deadline_s)
+        return entry.call("script", script=script, program=key, args=[str(int(ms))], timeout=120, wait=180000)
+
+    def hold(self, ms):
+        """Another client holds the program exclusively for MS: an owner's cooperative script on the writable program
+        (case L). Returns (thread, box); the box gets the holder's reply."""
+        holder = self.engine("holder-%d" % len(self.engines), self.base)
+        holder.call("open_project", path=self.gpr, writable=True, wait=60000)
+        key = holder.call("open_program", path=self.PROGRAM, writable=True, wait=60000)["key"]
+        box = {}
+
+        def run():
+            try:
+                box["reply"] = holder.call("script", script="TestSleep.java", program=key, args=[str(int(ms))], timeout=120,
+                                           wait=60000)
+            except Exception as exc:   # noqa: BLE001 - asserted by the test
+                box["error"] = exc
+            finally:
+                try:
+                    holder.call("close_program", program=key)
+                except Exception:   # noqa: BLE001
+                    pass
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        ident = self.ident_of_engine(holder)
+        self.assertTrue(until(lambda: self.requests_of(ident), 10.0), "the holder's script runs")
+        return thread, box
+
+
+@unittest.skipUnless(HAVE_REAL and _helper_client(), "set HYDRALYSIS_INTEGRATION_ENGINE/CLIENT, and HYDRALYSIS_INTEGRATION_HELPER_CLIENT "
+                     "to a client library 1.0.0 when the install's own is 1.1.0 (the hydra.2/3 helper)")
+class RealHelper(RealEngine):
+    """7.6 on a real daemon with the hydra.2/3 helper: L, S, C, `replacement_context`, `wait_below_deadline`,
+    `leave_gate_no_freeze` (this module's pool, registry and leave gate, on real connections)."""
+
+    @classmethod
+    def client(cls):
+        return _helper_client()
+
+    def setUp(self):
+        self.registry = hydra.Registry()
+        self.reader = self.engine("reader-%d" % len(self.engines))
+        self.assertEqual(self.reader.deadline_mode(), "helper", "a library 1.0.0 has no deadline of its own")
+        self.pool = hydra.Pool(self.reader, registry=self.registry)
+        self.addCleanup(self.pool.close_all, 0.0)
+
+    def take(self, deadline_s=30.0, grace_s=hydra.DEADLINE_GRACE_S):
+        entry = self.pool.acquire(deadline_s)
+        entry.grace_s = grace_s
+        return entry
+
+    def abandon_noncoop(self, entry, key, ms, deadline_s=2.0):
+        """Case S on ENTRY: a non-cooperative script, `cancel` at the deadline, nothing at all after the grace."""
+        started = time.monotonic()
+        with self.assertRaises(hydra.DeadlineError) as raised:
+            self.read(entry, key, ms, deadline_s=deadline_s, script="TestNoCoop.java")
+        self.assertEqual(raised.exception.code, "deadline_exceeded")
+        self.assertTrue(raised.exception.details.get("connection_abandoned"))
+        self.assertLess(time.monotonic() - started, deadline_s + entry.grace_s + 2.0, "the caller never waits for the engine")
+        self.assertTrue(entry.abandoned)
+        self.pool.release(entry, raised.exception)
+
+    def engine_has_fast_leave(self) -> bool:
+        """hydra.4 (E3c) makes a plain reader's leave harmless; hydra.2/3 stalls the other readers behind it (3.5)."""
+        return "health" in self.observer.capabilities()
+
+    def join_during_queued_leave(self, key, deadline_s):
+        """A read R runs on one entry; another entry that joined the program is closed at once (its leave queues behind R);
+        a new entry then joins and reads with `wait = remaining / 2`. Returns (refused, seconds, error)."""
+        running = self.take()
+        self.join(running)
+        leaving = self.take()
+        self.join(leaving)
+        box = {}
+        reader = threading.Thread(target=lambda: box.setdefault("r", self.read(running, key, 6000)), daemon=True)
+        reader.start()
+        self.assertTrue(until(lambda: self.requests_of(self.ident(running)), 5.0))
+        leaving.close_now()   # what rule L2 forbids: a leave while a read runs
+        leaving.broken = True
+        self.pool.release(leaving)
+        time.sleep(0.3)   # the close sends nothing back to wait for; give the engine's leave a moment to queue
+        fresh = self.take(deadline_s=deadline_s)
+        started = time.monotonic()
+        error = None
+        try:
+            self.join(fresh, deadline_s)
+            self.read(fresh, key, 10, deadline_s)
+        except hydra.EngineError as exc:
+            error = exc
+        elapsed = time.monotonic() - started
+        self.pool.release(fresh, error)
+        reader.join(30)
+        self.pool.release(running)
+        self.assertIn("r", box)
+        self.assertNotIsInstance(error, hydra.DeadlineError, "the join is answered, never abandoned")
+        return error is not None, elapsed, error
+
+    def test_case_C_a_cooperative_script_is_ended_by_cancel_and_nothing_is_abandoned(self):
+        entry = self.take(grace_s=5.0)
+        key = self.join(entry)
+        ident = self.ident(entry)
+        started = time.monotonic()
+        with self.assertRaises(hydra.EngineError) as raised:
+            self.read(entry, key, 30000, deadline_s=2.0)
+        self.assertNotIsInstance(raised.exception, hydra.DeadlineError, "the engine answered within the grace")
+        self.assertLess(time.monotonic() - started, 2.0 + 5.0)
+        self.assertFalse(entry.abandoned)
+        self.assertEqual(self.registry.count("user"), 0)
+        self.assertTrue(until(lambda: not self.requests_of(ident), 1.5), "C is released within 1 s of the cancel")
+        self.pool.release(entry, raised.exception)
+        again = self.take()
+        self.assertIs(again, entry, "a reply leaves the connection healthy: the entry goes back to the pool")
+        self.assertEqual(self.read(again, key, 10)["output"].strip(), "slept")
+        self.pool.release(again)
+
+    def test_case_S_a_script_that_ignores_cancel_is_abandoned_and_closed_after_its_reply(self):
+        entry = self.take(grace_s=1.0)
+        key = self.join(entry)
+        ident = self.ident(entry)
+        self.abandon_noncoop(entry, key, 9000)
+        self.assertEqual(self.registry.count("user"), 1)
+        self.assertTrue(until(lambda: any(r.get("cancelled") for r in self.requests_of(ident)), 2.0),
+                        "the engine shows the cancelled flag within 1 s of the cancel: %s" % self.requests_of(ident))
+        self.assertIn(ident, self.users(key), "S stays registered while the script runs")
+        self.assertTrue(until(lambda: self.registry.count("user") == 0, 30.0), "the abandoned worker gets the reply")
+        self.assertTrue(until(lambda: entry.finished, 10.0), "no other read is in flight: the gate closes it")
+        self.assertTrue(until(lambda: ident not in self.clients(), 10.0), "the engine lets the client go")
+        self.assertEqual(self.registry.closing, [])
+
+    def test_case_L_a_lock_wait_is_answered_busy_below_the_deadline(self):
+        entry = self.take()
+        key = self.join(entry)
+        self.pool.release(entry)
+        thread, box = self.hold(12000)
+        entry = self.take(deadline_s=6.0)
+        started = time.monotonic()
+        with self.assertRaises(hydra.EngineError) as raised:
+            entry.call("script", script="TestSleep.java", program=key, args=["10"], timeout=120, wait=180000)
+        self.assertEqual(raised.exception.code, "busy", raised.exception)
+        self.assertLess(time.monotonic() - started, 6.0, "the engine's `wait` (min(25 s, remaining / 2)) ends L, not the deadline")
+        self.assertFalse(entry.abandoned)
+        self.assertEqual(self.registry.count("user"), 0)
+        self.pool.release(entry, raised.exception)
+        thread.join(30)
+        self.assertIn("reply", box, "the holder's script is untouched: %s" % box)
+
+    def test_wait_below_deadline(self):
+        entry = self.take()
+        key = self.join(entry)
+        self.pool.release(entry)
+        thread, box = self.hold(10000)
+        entry = self.take(deadline_s=6.0)
+        with self.assertRaises(hydra.EngineError) as raised:
+            entry.call("script", script="TestSleep.java", program=key, args=["10"], timeout=120, wait=180000)
+        self.assertEqual(raised.exception.code, "busy")
+        self.pool.release(entry, raised.exception)
+        self.assertIs(self.take(), entry, "the entry returned to the pool")
+        self.pool.release(entry)
+        self.assertEqual(self.registry.snapshot()["abandoned"]["user"], 0)
+        thread.join(30)
+        self.assertIn("reply", box)
+        # The two opens: a new entry joins while a leave is queued behind a running read (the hazard of 3.5, made real).
+        refused, elapsed, error = self.join_during_queued_leave(key, deadline_s=3.0)
+        if refused:
+            self.assertEqual(error.code, "busy", "an open blocked by the queued leave is answered `busy` at its `wait`")
+            self.assertLess(elapsed, 3.0)
+        elif not self.engine_has_fast_leave():
+            self.fail("hydra.2/3: the join was expected to wait behind the queued leave (exp13 A)")
+        self.assertEqual(self.registry.count("user"), 0, "nothing is abandoned either way")
+
+    def test_replacement_context(self):
+        warm = self.take()
+        key = self.join(warm)
+        self.read(warm, key, 10)
+        # (1) A fresh connection without the two opens is refused: the premise of the entry's context.
+        bare = self.reader.connect_entry()
+        try:
+            with self.assertRaises(self.reader.module().SessionError) as refused:
+                bare.call("script", script="TestSleep.java", program=key, args=["1"], parallel=True)
+            self.assertIn(refused.exception.code, ("no_project", "no_program"))
+        finally:
+            bare.close()
+        stalled = self.take(grace_s=1.0)
+        self.join(stalled)
+        self.pool.release(warm)
+        before = self.clients()
+        self.abandon_noncoop(stalled, key, 9000)
+        # (2) The next read takes a new entry (the warm one is busy elsewhere), re-establishes its context and is answered.
+        busy = self.take()
+        self.assertIs(busy, warm)
+        fresh = self.take()
+        self.assertGreater(fresh.serial, stalled.serial, "a retired entry's key is never reused (I1)")
+        self.assertEqual(self.join(fresh), key)
+        self.assertEqual(self.read(fresh, key, 10)["output"].strip(), "slept", "answered, with no no_project")
+        after = self.clients()
+        self.assertEqual(set(after) - set(before), {self.ident(fresh)}, "exactly one new client, which sent the two opens")
+        self.assertTrue(after[self.ident(fresh)].get("programs"))
+        # (3) The other entries are unchanged: the same ids, no request added.
+        self.assertIn(self.ident(warm), after)
+        self.assertFalse(after[self.ident(warm)].get("requests"))
+        # (4) users = the live entries + the new entry + the abandoned one, while S runs.
+        users = self.users(key)
+        self.assertTrue({self.ident(warm), self.ident(fresh), self.ident(stalled)} <= users, users)
+        self.pool.release(busy)
+        self.pool.release(fresh)
+        # (5) S ends: the worker gets the reply; no read is in flight, so the gate closes it and users drops it.
+        self.assertTrue(until(lambda: self.registry.count("user") == 0, 30.0))
+        self.assertTrue(until(lambda: self.ident(stalled) not in self.users(key), 10.0))
+        self.assertEqual(self.users(key) & {self.ident(warm), self.ident(fresh)}, {self.ident(warm), self.ident(fresh)})
+        self.assertEqual(self.registry.closing, [])
+
+    def test_leave_gate_no_freeze(self):
+        warm = self.take()
+        key = self.join(warm)
+        stalled = self.take(grace_s=1.0)
+        self.join(stalled)
+        self.abandon_noncoop(stalled, key, 6000)
+        # R: a cooperative 14 s read on another entry, in flight when S ends.
+        box = {}
+        reader = threading.Thread(target=lambda: box.setdefault("r", self.read(warm, key, 14000, deadline_s=60.0)), daemon=True)
+        reader.start()
+        self.assertTrue(until(lambda: self.registry.count("user") == 0, 30.0), "S ended and its worker got the reply")
+        self.assertTrue(reader.is_alive(), "R is still running when S ends")
+        self.assertIn(stalled, self.registry.closing, "the close is deferred while R is in flight")
+        self.assertIn(self.ident(stalled), self.users(key), "users still lists the deferred entry")
+        further = self.take(deadline_s=10.0)
+        started = time.monotonic()
+        self.join(further, 10.0)
+        self.assertEqual(self.read(further, key, 10, 10.0)["output"].strip(), "slept", "a further read is answered, not busy")
+        self.assertLess(time.monotonic() - started, 3.0)
+        self.pool.release(further)
+        reader.join(60)
+        self.pool.release(warm)
+        self.assertIn("r", box)
+        self.assertTrue(until(lambda: not self.registry.closing and stalled.finished, 5.0), "the list drains when R ends")
+        self.assertTrue(until(lambda: self.ident(stalled) not in self.users(key), 10.0))
+        self.assertEqual(self.registry.snapshot()["abandoned"]["user"], 0)
+        # The control: the same close done at once while a read runs. It stalls on hydra.2/3 (if it stops stalling there,
+        # rule L2 is dropped, as E0's convention says); on hydra.4 E3c's fast leave makes it harmless.
+        refused, _elapsed, error = self.join_during_queued_leave(key, deadline_s=3.0)
+        if self.engine_has_fast_leave():
+            self.assertFalse(refused, "hydra.4: a plain reader's leave takes no exclusive lock (%s)" % error)
+        else:
+            self.assertTrue(refused, "hydra.3: closing at once while a read runs stalls the next join (exp13 E)")
+            self.assertEqual(error.code, "busy")
+
+
+@unittest.skipUnless(_native_client(), "set HYDRALYSIS_INTEGRATION_ENGINE/CLIENT to an install with client library 1.1.0 "
+                     "(hydra.4)")
+class RealNative(RealEngine):
+    """7.6 on hydra.4 (library 1.1.0, P1b): the library times its own wait, sends `cancel` and raises `deadline_exceeded`;
+    the connection stays usable and nothing is abandoned (no entry, no registry, no gate)."""
+
+    @classmethod
+    def client(cls):
+        return _native_client()
+
+    def setUp(self):
+        self.reader = self.engine("native-%d" % len(self.engines))
+        self.assertEqual(self.reader.deadline_mode(), "native")
+        self.program = query.open_program(self.reader, self.gpr, self.PROGRAM, self.sha256)
+        self.addCleanup(query.forget, self.reader)
+        self.abandoned_before = hydra.REGISTRY.count("user")
+
+    def deadline_read(self, script, ms, deadline_s, wait=180000):
+        started = time.monotonic()
+        with self.assertRaises(hydra.EngineError) as raised:
+            self.reader.call("script", script=script, program=self.program["key"], args=[str(ms)], timeout=120, wait=wait,
+                             lane="quick", deadline=deadline_s)
+        return raised.exception, time.monotonic() - started
+
+    def assert_connection_survives(self):
+        before = self.reader.session()
+        self.assertEqual(self.reader.call("script", script="TestSleep.java", program=self.program["key"], args=["10"],
+                                          timeout=60, wait=60000, deadline=30.0)["output"].strip(), "slept")
+        self.assertIs(self.reader.session(), before, "the connection survives a deadline: nothing is abandoned")
+        self.assertEqual(hydra.REGISTRY.count("user"), self.abandoned_before)
+
+    def test_case_C(self):
+        error, elapsed = self.deadline_read("TestSleep.java", 30000, 2.0)
+        self.assertEqual(error.code, "deadline_exceeded")
+        self.assertLess(elapsed, 4.0)
+        ident = self.ident_of_engine(self.reader)
+        self.assertTrue(until(lambda: not self.requests_of(ident), 1.5), "C is released within 1 s of the cancel")
+        self.assert_connection_survives()
+
+    def test_case_S(self):
+        error, elapsed = self.deadline_read("TestNoCoop.java", 8000, 2.0)
+        self.assertEqual(error.code, "deadline_exceeded")
+        self.assertLess(elapsed, 4.0, "the caller is answered at the deadline although the script ignores cancel")
+        self.assert_connection_survives()
+        ident = self.ident_of_engine(self.reader)
+        self.assertTrue(until(lambda: not self.requests_of(ident), 30.0), "S ends by itself and leaves no request behind")
+
+    def test_case_L(self):
+        thread, box = self.hold(10000)
+        error, elapsed = self.deadline_read("TestSleep.java", 10, 3.0)
+        self.assertEqual(error.code, "deadline_exceeded")
+        self.assertLess(elapsed, 5.0)
+        ident = self.ident_of_engine(self.reader)
+        self.assertTrue(until(lambda: not self.requests_of(ident), 2.0), "hydra.4 ends a lock wait on cancel (cancelWait)")
+        thread.join(30)
+        self.assertIn("reply", box, "the holder is untouched: %s" % box)
+        self.assert_connection_survives()
+
+    def test_wait_below_deadline(self):
+        thread, box = self.hold(10000)
+        error, elapsed = self.deadline_read("TestSleep.java", 10, 30.0, wait=2000)
+        self.assertEqual(error.code, "busy", "the engine's `wait` answers before the deadline")
+        self.assertLess(elapsed, 6.0)
+        thread.join(30)
+        self.assertIn("reply", box)
+        self.assert_connection_survives()
+
+
+@unittest.skipUnless(HAVE_REAL, "set HYDRALYSIS_INTEGRATION_ENGINE/CLIENT")
+class RealDegrade(RealEngine):
+    """The 7.5 degrade matrix on a real daemon: each row with the library 1.0.0 (protocol 2, the degraded side) and with the
+    install's library 1.1.0 (hydra.4, the capabilities). A side without its library is skipped with its reason."""
+
+    def test_degrade_matrix_7_5(self):
+        from hydralysis import backups, commits
+        for side, client in (("degraded", _helper_client()), ("hydra4", _native_client())):
+            with self.subTest(side=side):
+                if not client:
+                    self.skipTest("no library for the %s side (HYDRALYSIS_INTEGRATION_HELPER_CLIENT)" % side)
+                settings = dict(self.base, hydra_client=client)
+                engine = self.engine("degrade-" + side, settings)
+                degraded = side == "degraded"
+                self.assertEqual(engine.protocol() < 3, degraded)
+                # lane hint, queue info, `next`: not sent; waits keep the client budgets.
+                self.assertEqual(hydra.supports(engine, "laneHint"), not degraded)
+                self.assertEqual(hydra.patience_ms(engine, query.BUSY_WAIT_MS),
+                                 query.BUSY_WAIT_MS if degraded else int(hydra.PATIENCE_S * 1000))
+                # deadlines: the 7.6 helper (and its pool) on hydra.2/3, P1b's deadline with library 1.1.0.
+                self.assertEqual(engine.deadline_mode(), "helper" if degraded else "native")
+                runner = query.QueryRunner(settings, engine)
+                self.assertEqual(runner._pool() is not None, degraded)
+                self.assertEqual(runner._native_deadline(30) is None, degraded)
+                # format: unknown on hydra.2/3, so the commit always needs the one-way confirmation.
+                if degraded:
+                    with self.assertRaises(commits.CommitError) as raised:
+                        commits._plan_confirmation({}, engine, self.gpr)
+                    self.assertEqual(raised.exception.code, "confirmation_required")
+                    self.assertNotIn("format", raised.exception.detail)
+                else:
+                    self.assertIsInstance(engine.call("open_project", path=self.gpr).get("format"), dict)
+                    try:
+                        commits._plan_confirmation({}, engine, self.gpr)
+                    except commits.CommitError as exc:
+                        self.assertIn("format", exc.detail, "a refusal on hydra.4 carries what the engine reported")
+                    engine.call("close_project")
+                # backup: a Python-written manifest over a plain fork, or the engine's.
+                self.assertEqual(backups._engine_backup(engine), not degraded)
+                # health: `ping` with a deadline on the probe's own connection; wedge detection needs the pid and the lock.
+                supervisor = hydra.Supervisor.for_engine(engine, settings)
+                reply = supervisor.probe()
+                if degraded:
+                    self.assertEqual(reply, {})
+                else:
+                    self.assertEqual(reply.get("state"), "ok", reply)
+                self.assertIsNone(hydra.wedge_signal(reply))
+                self.assertTrue(supervisor.pid_alive())
+                self.assertFalse(supervisor.lock_free())
+                self.assertEqual(supervisor.tick()["event"], "ok")
 
 
 if __name__ == "__main__":
