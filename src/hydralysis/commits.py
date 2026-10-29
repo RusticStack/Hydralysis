@@ -528,7 +528,7 @@ def _commit(settings: dict, selected: dict, options: dict, engine, lineage_id: s
         candidate_folder.parent.mkdir(parents=True, exist_ok=True)
         forked = job.call("fork_project", project=source_gpr, path=str(candidate_folder), writable=True,
                           mode=str(settings.get("fork_mode", "auto")), maxCopyMb=int(settings.get("fork_max_copy_mb", 8192)),
-                          **({"purpose": "generation"} if "forkPurposes" in _capabilities(engine) else {}))
+                          **({"purpose": "generation"} if backups.ENGINE_BACKUP_CAPABILITY in _capabilities(engine) else {}))
         candidate_gpr = forked["gpr"]
         # hydra.2/3 has no purpose: the job rewrites the sidecar so that a later engine does not take the generation for a
         # disposable fork (D12) nor for a sealed one (D38). It happens before step 7 hashes the folder.
@@ -766,7 +766,7 @@ def _verify_candidate(settings: dict, engine, job, selected: dict, candidate_gpr
     clone_folder.parent.mkdir(parents=True, exist_ok=True)
     clone = job.call("fork_project", project=candidate_gpr, path=str(clone_folder), writable=True,
                      mode=str(settings.get("fork_mode", "auto")), maxCopyMb=int(settings.get("fork_max_copy_mb", 8192)),
-                     **({"purpose": "fork"} if "forkPurposes" in _capabilities(engine) else {}))
+                     **({"purpose": "fork"} if backups.ENGINE_BACKUP_CAPABILITY in _capabilities(engine) else {}))
     try:
         master = _program_of(engine, source_gpr, selected)
         read_only = _program_of(engine, clone["gpr"], selected, refresh=True)
