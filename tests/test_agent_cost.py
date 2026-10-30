@@ -23,9 +23,9 @@ class ResolvedPaths(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        cache = getattr(paths, "_resolved_cache", {})
-        cache.clear()
-        self.addCleanup(cache.clear)
+        for cache in (getattr(paths, "_resolved_cache", {}), getattr(paths, "_roots", {})):
+            cache.clear()
+            self.addCleanup(cache.clear)
 
     def count_resolves(self):
         real = Path.resolve
@@ -45,6 +45,14 @@ class ResolvedPaths(unittest.TestCase):
                 self.assertEqual(paths.root_path(settings), first)
         self.assertLessEqual(len(calls), 2, calls[:6])
         self.assertEqual(first, (Path(self.tmp.name) / "data").resolve())
+
+    def test_a_remembered_root_still_honours_forbidden_drives(self):
+        root = str(Path(self.tmp.name) / "data")
+        drive = Path(root).resolve().drive
+        self.assertTrue(paths.root_path({"root": root}))
+        with self.assertRaises(ValueError):
+            paths.root_path({"root": root, "forbidden_drives": [drive]})
+        self.assertEqual(paths.root_path({"root": root}), Path(root).resolve())
 
     def test_an_old_answer_is_resolved_again(self):
         target = Path(self.tmp.name) / "p.gpr"

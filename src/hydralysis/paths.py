@@ -92,10 +92,29 @@ def forbidden_drives(settings: dict) -> list[str]:
     return [item.strip().upper().rstrip("\\/") for item in value]
 
 
+_roots: dict[tuple, tuple[float, Path]] = {}
+
+
 def root_path(settings: dict) -> Path:
     raw = settings.get("root") or compat.env("ROOT") or default_root()
-    root = resolved(raw)
     banned = forbidden_drives(settings)
+    # A query asks for the root a few dozen times; the checked answer is kept as long as `resolved` keeps its part.
+    key = (str(raw), tuple(banned), "" if os.path.isabs(str(raw)) else os.getcwd())
+    now = time.monotonic()
+    with _resolved_guard:
+        found = _roots.get(key)
+    if found is not None and now - found[0] < RESOLVE_TTL_S:
+        return found[1]
+    checked = _root_path(raw, banned)
+    with _resolved_guard:
+        if len(_roots) >= _RESOLVE_CAP:
+            _roots.clear()
+        _roots[key] = (now, checked)
+    return checked
+
+
+def _root_path(raw, banned: list[str]) -> Path:
+    root = resolved(raw)
     if root.drive and root.drive.upper() in banned:
         raise ValueError("Hydralysis data root %s is on %s, which this configuration forbids (forbidden_drives=%s); "
                          "set root or HYDRALYSIS_ROOT to an allowed location" % (root, root.drive, ",".join(banned)))
