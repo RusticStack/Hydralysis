@@ -1,43 +1,80 @@
 {
-  "description": "Canonical form of a backup or generation manifest (PROTOCOL-3.md 3.4): UTF-8, sorted keys, no whitespace, integers only, only the quote, the backslash and U+0000..U+001F escaped. Authored by Hydralysis (Y2); the copy that E2 ships must be byte-identical (gate 9.8) and both languages must reproduce every hash below.",
-  "manifest": {
-    "format": 1,
-    "cid": "c-00000001",
-    "base": {
-      "generation": 0,
-      "revision": "3fa9c2d1aa01bb42"
-    },
-    "engine": {
-      "hydraVersion": "12.3-hydra.3",
-      "ghidraVersion": "12.3"
-    },
-    "files": [
-      {
-        "path": "café/日本語/😀.bin",
-        "size": 3,
-        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-      },
-      {
-        "path": "line sep para.txt",
-        "size": 0,
-        "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-      },
-      {
-        "path": "plain.gpr",
-        "size": 12,
-        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-      },
-      {
-        "path": "quote\"back\\slash\ttab\u001fctl<>&'.dat",
-        "size": 1,
-        "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
-      }
-    ],
-    "filesetSha256": "96e43d25631fc238114ebaa532fb2aa82e14c48dc5995397d3a1cb3d5aa64b07",
-    "selfSha256": "1ae2fe177cdf7fceb6461156416e0383e94dfacf536e3c668e9004f4be5f12c6"
+ "about": "One fixed vector for the canonical form of a backup manifest (PROTOCOL-3.md 3.4). 'object' is a manifest without selfSha256; its canonical form is json.dumps(obj, ensure_ascii=False, separators=(',', ':'), sort_keys=True) in UTF-8; selfSha256 and filesetSha256 are the SHA-256 of the canonical form of the object and of its files array. The engine (ProjectBackup) and Hydralysis must both reproduce them. The paths hold an accented letter, a CJK name, a supplementary character (U+1F600), U+2028, U+2029, a control character, a quote, a backslash and < > & '.",
+ "object": {
+  "format": 1,
+  "kind": "ghidra-session-backup",
+  "writer": "engine",
+  "id": "20261027T143015Z-3fa9c2d1-vector",
+  "purpose": "vector",
+  "createdAt": "2026-10-27T14:30:15Z",
+  "createdBy": {
+   "client": "vector",
+   "harness": "canonical-manifest"
   },
-  "canonicalWithoutSelfSha256Utf8Hex": "7b2262617365223a7b2267656e65726174696f6e223a302c227265766973696f6e223a2233666139633264316161303162623432227d2c22636964223a22632d3030303030303031222c22656e67696e65223a7b2267686964726156657273696f6e223a2231322e33222c22687964726156657273696f6e223a2231322e332d68796472612e33227d2c2266696c6573223a5b7b2270617468223a22636166c3a92fe697a5e69cace8aa9e2ff09f98802e62696e222c22736861323536223a2262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262626262222c2273697a65223a337d2c7b2270617468223a226c696e65e280a8736570e280a9706172612e747874222c22736861323536223a2263636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363636363222c2273697a65223a307d2c7b2270617468223a22706c61696e2e677072222c22736861323536223a2261616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161222c2273697a65223a31327d2c7b2270617468223a2271756f74655c226261636b5c5c736c6173685c747461625c753030316663746c3c3e26277f2e646174222c22736861323536223a2264646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464646464222c2273697a65223a317d5d2c2266696c65736574536861323536223a2239366534336432353633316663323338313134656261613533326662326161383265313463343864633539393533393764336131636233643561613634623037222c22666f726d6174223a317d",
-  "canonicalWithoutSelfSha256Sha256": "1ae2fe177cdf7fceb6461156416e0383e94dfacf536e3c668e9004f4be5f12c6",
-  "filesetSha256": "96e43d25631fc238114ebaa532fb2aa82e14c48dc5995397d3a1cb3d5aa64b07",
-  "selfSha256": "1ae2fe177cdf7fceb6461156416e0383e94dfacf536e3c668e9004f4be5f12c6"
+  "source": {
+   "gpr": "F:\backups\\kötor\u000bec.gpr",
+   "name": "vec",
+   "revision": "3fa9c2d1aa01bb42",
+   "lineage": "L-9c1e",
+   "generation": 2
+  },
+  "engine": {
+   "hydraVersion": "12.3-hydra.4",
+   "ghidraVersion": "12.3",
+   "dbVersions": {
+    "program": 33,
+    "dataTypes": 3
+   }
+  },
+  "stored": {
+   "programDb": {
+    "min": 32,
+    "max": 32
+   },
+   "programs": 1,
+   "scanned": 1,
+   "truncated": false
+  },
+  "files": [
+   {
+    "path": "vec.gpr",
+    "size": 1234,
+    "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+   },
+   {
+    "path": "vec.rep/idata/00/café 中文 😀.bin",
+    "size": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+   },
+   {
+    "path": "vec.rep/line sep   para <&>' .txt",
+    "size": 7,
+    "sha256": "1111111111111111111111111111111111111111111111111111111111111111"
+   },
+   {
+    "path": "vec.rep/tab\there \"quoted\" back\\slash \u0001ctl.dat",
+    "size": 1099511627776,
+    "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+   }
+  ],
+  "filesetSha256": "a725a5d5e71b28d9bc32c0dfb6a741e76d4eceffad494fa6467c6853fb99a39d",
+  "copy": {
+   "method": "clone",
+   "sameVolume": true,
+   "sourceFileSystem": "ReFS",
+   "destinationFileSystem": "ReFS",
+   "independent": false,
+   "ms": 812
+  },
+  "verify": {
+   "level": "hash",
+   "ok": true,
+   "at": "2026-10-27T14:30:17Z",
+   "sourceRevisionAfter": "3fa9c2d1aa01bb42"
+  }
+ },
+ "selfSha256": "f585d077738b218563597645d2cf27d7b055d8a5f21fde5d983e7660d80ed36e",
+ "filesetSha256": "a725a5d5e71b28d9bc32c0dfb6a741e76d4eceffad494fa6467c6853fb99a39d",
+ "canonicalBytes": 1405,
+ "canonicalLengthFiles": 541
 }

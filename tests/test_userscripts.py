@@ -21,7 +21,7 @@ from unittest.mock import patch
 import fakehydra
 from hydralysis import api, hydra, query, userscripts, workcopy
 from hydralysis.hydra import EngineError
-from support import workdir
+from support import Hydra4Only, hydra4_missing, workdir
 
 
 class IsolatingEngine(fakehydra.FakeEngine):
@@ -373,7 +373,7 @@ public class Y4eDeaf extends GhidraScript {
 
 
 @unittest.skipUnless(ENGINE and CLIENT and BINARY and Path(BINARY).is_file(), "set HYDRALYSIS_INTEGRATION_ENGINE/CLIENT")
-class RealWorker(unittest.TestCase):
+class RealWorker(Hydra4Only, unittest.TestCase):
     """E7 on a real install: an edited view, the owner's one save, the worker sees the edit, a deaf script is killed."""
 
     VIEW = "y4e"
@@ -387,6 +387,9 @@ class RealWorker(unittest.TestCase):
         for name, text in (("Y4eFirst.java", FIRST % {"cls": "Y4eFirst"}), ("Y4eMutate.java", MUTATE), ("Y4eDeaf.java", DEAF)):
             (cls.scripts / name).write_text(text, encoding="utf-8")
         cls.settings["targets"] = {"fixture": dict(targets.registry(cls.settings)["fixture"], scripts=str(cls.scripts))}
+        cls.degraded = hydra4_missing(cls.runner.engine, "E7's killable script worker (scriptIsolation 2)")
+        if cls.degraded:
+            return
         level = userscripts._level(cls.runner.engine, "scriptIsolation")
         if level < userscripts.WORKER_VERSION:
             _release(cls)
