@@ -225,6 +225,45 @@ class Mechanism(Base):
 
     # --- the pool entry and its context (I1 to I3) --------------------------------------------------------------------
 
+    def slow_connect(self):
+        """connect_entry that gets no hello until released (a suspended daemon accepts the TCP connection and never answers)."""
+        gate = threading.Event()
+        self.release.append(gate)
+        made = []
+        original = self.engine.connect_entry
+
+        def connect():
+            gate.wait(20)
+            session = original()
+            made.append(session)
+            return session
+        patcher = patch.object(self.engine, "connect_entry", connect)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return gate, made, patcher
+
+    def test_a_probe_whose_connection_gets_no_hello_misses_within_its_deadline(self):
+        # gate 9.8: on hydra.3 a probe of a suspended daemon waited for hello for good (test_supervisor.RealPolicy hung)
+        gate, made, patcher = self.slow_connect()
+        started = time.monotonic()
+        with self.assertRaises(hydra.DeadlineError) as raised:
+            self.pool.probe("ping", 0.3)
+        self.assertLess(time.monotonic() - started, 3.0)
+        self.assertEqual((raised.exception.code, raised.exception.command), ("deadline_exceeded", "hello"))
+        gate.set()
+        self.assertTrue(until(lambda: made and made[0]._closed, 5.0), "the late connection is closed, never handed out")
+        patcher.stop()
+        self.assertEqual(self.pool.probe("ping", 1.0), {"pong": True}, "the next probe connects again")
+
+    def test_an_attempt_whose_connection_gets_no_hello_ends_at_its_deadline(self):
+        gate, made, _ = self.slow_connect()
+        started = time.monotonic()
+        with self.assertRaises(hydra.DeadlineError):
+            self.pool.acquire(0.3)
+        self.assertLess(time.monotonic() - started, 3.0)
+        gate.set()
+        self.assertTrue(until(lambda: made and made[0]._closed, 5.0))
+
     def test_an_entrys_first_use_sends_both_opens_and_a_replacement_has_a_new_key(self):
         self.daemon.scoped = True
         runner = self.runner()

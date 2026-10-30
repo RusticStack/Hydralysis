@@ -965,10 +965,47 @@ class Pool:
         self._probe: Entry | None = None
         self.generation = 0   # bumped by `invalidate`: an entry of an older generation is never reused
 
-    def _new(self, kind: str = "user") -> Entry:
-        entry = Entry(self.engine, self.engine.connect_entry(), kind, self.registry, self.on_retire)
+    def _new(self, kind: str = "user", deadline_s: float = DEADLINE_S) -> Entry:
+        entry = Entry(self.engine, self._connect_within(deadline_s), kind, self.registry, self.on_retire)
         entry.generation = self.generation
         return entry
+
+    def _connect_within(self, deadline_s: float):
+        """`connect_entry` bounded by DEADLINE_S. Making a connection sends `hello` and waits for its answer, and the 1.0.0
+        library (hydra.2/3) waits for it with no timeout: a suspended or wedged daemon still accepts the TCP connection
+        (the backlog), so the wait never ended and a supervisor probe hung for good instead of counting a miss (gate 9.8,
+        test_supervisor.RealPolicy on hydra.3). The connection is made in a worker thread; past the deadline the caller gets
+        `deadline_exceeded` and a connection that arrives later is closed by that thread, never handed out."""
+        lock = threading.Lock()
+        state: dict = {}
+        done = threading.Event()
+
+        def work():
+            try:
+                session, error = self.engine.connect_entry(), None
+            except BaseException as exc:   # noqa: BLE001 - handed to the caller, or dropped when it has left
+                session, error = None, exc
+            with lock:
+                late = state.get("late", False)
+                state.update(session=session, error=error)
+                done.set()
+            if late and session is not None:
+                try:
+                    session.close()
+                except Exception:   # noqa: BLE001 - nobody waits for this connection any more
+                    pass
+
+        threading.Thread(target=work, name="hydra-connect-" + str(getattr(self.engine, "key", "")), daemon=True).start()
+        done.wait(max(0.0, deadline_s))
+        with lock:
+            if not done.is_set():
+                state["late"] = True
+                raise DeadlineError("deadline_exceeded", "no answer to hello within %.1f s: the daemon accepts connections but does not "
+                                    "answer (suspended or wedged); the late connection is closed when it arrives" % deadline_s,
+                                    {"connection_abandoned": True, "command": "hello"}, "hello")
+        if state["error"] is not None:
+            raise state["error"]
+        return state["session"]
 
     def invalidate(self) -> None:
         """The daemon restarted (or the connection died): retire every idle entry, mark the checked-out ones stale (they
@@ -1029,7 +1066,7 @@ class Pool:
                         dead.append(entry)
                 if chosen is None and not dead:
                     if len(self._live) < self.size:
-                        chosen = self._new()
+                        chosen = self._new(deadline_s=max(0.0, end - time.monotonic()))
                         self._live.add(chosen)
                         chosen.begin(deadline_s)
                     else:
@@ -1088,7 +1125,7 @@ class Pool:
         with self._cond:
             entry = self._probe
             if entry is None or entry.abandoned or entry.broken or entry.finished:
-                entry = self._probe = self._new("probe")
+                entry = self._probe = self._new("probe", deadline_s)
         entry.begin(deadline_s)
         entry.grace_s = min(DEADLINE_GRACE_S, deadline_s)
         return entry.call(command, **fields)
