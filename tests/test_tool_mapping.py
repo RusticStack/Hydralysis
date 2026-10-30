@@ -97,9 +97,9 @@ def check_tool_counts(text: str, live: int) -> list[str]:
     return problems
 
 
-def check_cap_documented(readme: str, outstanding: int, workers: int) -> list[str]:
+def check_cap_documented(readme: str, floor: int, cap: int) -> list[str]:
     flat = " ".join(readme.split())
-    wanted = "%d engine workers and accepts %d outstanding calls per lane" % (workers, outstanding)
+    wanted = "at least %d and at most %d outstanding calls, each on its own thread" % (floor, cap)
     problems = [] if wanted in flat else ["README does not say %r" % wanted]
     if "Server busy" not in flat or "retryAfterMs" not in flat:
         problems.append("README does not describe the busy refusal and its retry hint")
@@ -186,7 +186,9 @@ class ToolMapping(unittest.TestCase):
         self.assertIn("{:,} bytes as the catalog test counts them".format(size), flat)
 
     def test_the_mcp_cap_is_documented_and_is_the_code_constant(self):
-        self.assertEqual(check_cap_documented(README.read_text(encoding="utf-8"), mcp.MAX_OUTSTANDING, mcp.TOOL_WORKERS), [])
+        self.assertEqual(check_cap_documented(README.read_text(encoding="utf-8"), mcp.ENGINE_SLOTS_MIN, mcp.ENGINE_SLOTS_MAX), [])
+        self.assertEqual(mcp.lane_sizes(1)["engine"].outstanding, mcp.ENGINE_SLOTS_MIN)
+        self.assertEqual(mcp.lane_sizes(1024)["engine"].outstanding, mcp.ENGINE_SLOTS_MAX)
         self.assertEqual(mcp.RETRY_AFTER_MS, 2000)
         self.assertIn("retryAfterMs=%d" % mcp.RETRY_AFTER_MS, README.read_text(encoding="utf-8"))
 
@@ -223,11 +225,11 @@ class TheChecksCanFail(unittest.TestCase):
         self.assertEqual(check_tool_counts("Hydralysis registers 20 tools. REA has 207 tools.", 20), [])
 
     def test_a_missing_or_changed_cap_sentence_is_seen(self):
-        good = "4 engine workers and accepts 8 outstanding calls per lane. Server busy retryAfterMs=2000"
-        self.assertEqual(check_cap_documented(good, 8, 4), [])
-        self.assertTrue(check_cap_documented(good.replace("8 outstanding", "16 outstanding"), 8, 4))
-        self.assertTrue(check_cap_documented("nothing", 8, 4))
-        self.assertTrue(check_cap_documented(good.replace("Server busy", "busy"), 8, 4))
+        good = "at least 8 and at most 32 outstanding calls, each on its own thread. Server busy retryAfterMs=2000"
+        self.assertEqual(check_cap_documented(good, 8, 32), [])
+        self.assertTrue(check_cap_documented(good.replace("at most 32", "at most 16"), 8, 32))
+        self.assertTrue(check_cap_documented("nothing", 8, 32))
+        self.assertTrue(check_cap_documented(good.replace("Server busy", "busy"), 8, 32))
 
     def test_an_unlabelled_or_undated_third_party_row_is_seen(self):
         good = "## Owner-reported third-party figures, 2026-10-28\n\n| Figure | By | Here | Status |\n| --- | --- | --- | --- |\n| 28 tools | owner | 30 | not reproduced |\n"
