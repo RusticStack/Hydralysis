@@ -117,6 +117,9 @@ jobs:
           "$RUNNER_TEMP/fresh/Scripts/hydralysis.exe" backend inspect | tee inspect.json
           "$RUNNER_TEMP/fresh/Scripts/python.exe" -c "import json; r = json.load(open('inspect.json')); assert r.get('ready') is True, r"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        # A dry run keeps the files as an artifact; a tag push attaches them to the draft release instead
+        # (artifact storage is a shared quota, and the release already holds the same files)
+        if: github.ref_type != 'tag'
         with:
           name: hydralysis-${{ env.VERSION }}
           path: dist/*
