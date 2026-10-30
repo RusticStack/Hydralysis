@@ -187,16 +187,19 @@ _STAMPED = (Path(), Path("Ghidra", "application.properties"), hydra.SESSION_MODU
 
 
 def _stamp(settings: dict, report: dict | None = None):
-    """(mtime_ns, size) of everything an inspection read: the saved backend record, the backends folder, the environment it
-    looked at and, with REPORT, every candidate it judged (the ones chosen and the ones that failed). None when the report
-    left failures out, so it cannot be told what to watch."""
+    """(mtime_ns, size) of everything an inspection read: the saved backend record, the backends folder, the Adoptium folder,
+    the environment it looked at and, with REPORT, every candidate it judged (the ones chosen and the ones that failed) and
+    the chosen engine's native decompilers. None when the report left failures out, so it cannot be told what to watch.
+    A javac put into a folder on PATH, with PATH itself unchanged, is seen once anything else here changes."""
     root = root_path(settings)
-    paths = [root / "backend.json", root / "backend.json.bak", root / "backends"]
+    paths = [root / "backend.json", root / "backend.json.bak", root / "backends",
+             Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Eclipse Adoptium"]
     if report is not None:
         if len(report.get("checks", [])) >= 12:
             return None
         chosen = [report[name]["path"] for name in ("engine", "client", "jdk")]
         paths += [Path(item) / part for item in chosen + [check["path"] for check in report.get("checks", [])] for part in _STAMPED]
+        paths += sorted((Path(chosen[0]) / "Ghidra" / "Features" / "Decompiler" / "os").glob("*/decompile*"))
     stamps = []
     for path in paths:
         try:

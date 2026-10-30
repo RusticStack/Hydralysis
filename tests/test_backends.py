@@ -128,6 +128,12 @@ class BackendSetupTests(unittest.TestCase):
             os.utime(client, (old + 60, old + 60))
             self.assertEqual(backends.resolved(settings), first)
             self.assertEqual(inspect.call_count, 2, "a changed client file is judged again")
+            native = next((Path(settings["hydra_dir"]) / "Ghidra/Features/Decompiler/os").glob("*/decompile*"))
+            native.write_bytes(native.read_bytes() + b"\0")
+            os.utime(native, (old + 60, old + 60))
+            os.utime(native.parent, (old, old))
+            self.assertEqual(backends.resolved(settings), first)
+            self.assertEqual(inspect.call_count, 3, "a replaced decompiler is judged again")
             (Path(settings["java_home"]) / "release").write_text('JAVA_VERSION="17.0.1"\n')
             with self.assertRaisesRegex(ValueError, "jdk missing"):
                 backends.resolved(settings)

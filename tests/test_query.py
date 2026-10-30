@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
 import threading
@@ -987,25 +986,53 @@ class ProgramsInUse(unittest.TestCase):
     def open(self, name):
         return query.open_program(self.engine, "C:/views/%s/%s.gpr" % (name, name), "/fixture.exe", "ab" * 32)
 
-    def test_a_program_a_read_is_using_is_not_closed_for_the_cap(self):
-        for name in ("a", "b", "c", "d"):
-            self.open(name)
-        with query._using(self.engine, "p-a:/fixture.exe"):   # the oldest row, but a read is running on it
-            self.assertEqual(self.open("e")["key"], "p-e:/fixture.exe")
-        self.assertIn("p-a:/fixture.exe", self.engine.open)
-        self.assertIn(("close_program", {"program": "p-b:/fixture.exe"}), self.engine.calls)
-        self.assertEqual(query._in_use, {}, "the mark ends with the read")
+    def read_elsewhere(self, *names):
+        """A read on another thread that holds NAMES until the test ends."""
+        held, done = threading.Event(), threading.Event()
 
-    def test_the_refusal_stands_when_every_read_only_program_is_in_use(self):
-        for name in ("a", "b", "c", "d"):
+        def read():
+            with query._holding():
+                for name in names:
+                    self.open(name)
+                held.set()
+                done.wait(10)
+        thread = threading.Thread(target=read)
+        thread.start()
+        self.addCleanup(thread.join, 10)
+        self.addCleanup(done.set)
+        self.assertTrue(held.wait(10))
+
+    def test_a_program_a_read_is_using_is_not_closed_for_the_cap(self):
+        self.read_elsewhere("a")
+        for name in ("b", "c", "d"):
             self.open(name)
-        with contextlib.ExitStack() as stack:
-            for name in ("a", "b", "c", "d"):
-                stack.enter_context(query._using(self.engine, "p-%s:/fixture.exe" % name))
-            with self.assertRaises(hydra.EngineError) as refused:
-                self.open("e")
-        self.assertEqual(refused.exception.details["resource"], "client_cap")
-        self.assertFalse([call for call in self.engine.calls if call[0] == "close_program"])
+        self.assertEqual(self.open("e")["key"], "p-e:/fixture.exe")
+        self.assertIn("p-a:/fixture.exe", self.engine.open, "the oldest row, but a read is running on it")
+        self.assertIn(("close_program", {"program": "p-b:/fixture.exe"}), self.engine.calls)
+
+    def test_the_marks_end_with_the_read(self):
+        with query._holding():
+            self.open("a")
+            self.open("a")
+            self.assertEqual(query._in_use, {(self.engine.key, "p-a:/fixture.exe"): 2})
+        self.assertEqual(query._in_use, {})
+
+    def test_when_every_read_only_program_is_in_use_the_least_recently_used_is_closed_as_before(self):
+        self.read_elsewhere("a", "b", "c", "d")
+        self.assertEqual(self.open("e")["key"], "p-e:/fixture.exe", "the open is served, not refused")
+        self.assertIn(("close_program", {"program": "p-a:/fixture.exe"}), self.engine.calls)
+
+    def test_a_read_holds_its_program_from_the_moment_the_open_hands_it_out(self):
+        for name in ("b", "c", "d"):
+            self.open(name)
+        self.read_elsewhere("b", "c", "d")
+        with query._holding():
+            self.open("a")   # a fresh open; another thread's open comes before this read sends its script
+            fifth = threading.Thread(target=self.open, args=("e",))
+            fifth.start()
+            fifth.join(10)
+            self.assertIn("p-a:/fixture.exe", self.engine.open, "the read's own program was closed under it")
+        self.assertIn(("close_program", {"program": "p-b:/fixture.exe"}), self.engine.calls)
 
     def test_threads_opening_one_program_send_one_open(self):
         entered, release = threading.Event(), threading.Event()
@@ -1029,6 +1056,37 @@ class ProgramsInUse(unittest.TestCase):
         self.assertEqual(len(answers), 4)
         self.assertEqual({answer["key"] for answer in answers}, {"p-a:/fixture.exe"})
         self.assertEqual(len([call for call in self.engine.calls if call[0] == "open_program"]), 1)
+
+    def test_threads_waiting_on_a_refused_open_take_its_refusal_instead_of_waiting_again(self):
+        entered, release = threading.Event(), threading.Event()
+        original = self.engine.call
+
+        def call(command, **fields):
+            if command == "open_program":
+                self.engine.calls.append((command, dict(fields)))
+                entered.set()
+                release.wait(10)   # the engine's busy wait
+                raise hydra.EngineError("busy", "held", {"reason": "capacity", "resource": "heap"}, "open_program")
+            return original(command, **fields)
+        self.engine.call = call
+        refused = []
+
+        def read():
+            try:
+                self.open("a")
+            except hydra.EngineError as error:
+                refused.append(error.details["resource"])
+        threads = [threading.Thread(target=read) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        self.assertTrue(entered.wait(10))
+        time.sleep(0.2)   # the other three join the open in flight
+        release.set()
+        for thread in threads:
+            thread.join(10)
+        self.assertEqual(refused, ["heap"] * 4)
+        self.assertEqual(len([call for call in self.engine.calls if call[0] == "open_program"]), 1)
+        self.assertEqual(query._opening, {}, "the open in flight is forgotten once it ends")
 
     def test_a_refresh_opens_again_after_the_gate(self):
         self.open("a")

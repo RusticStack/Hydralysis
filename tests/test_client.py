@@ -417,6 +417,31 @@ class EngineConnect(unittest.TestCase):
                 thread.join(10)
         self.assertEqual(sorted(connects), ["fast", "slow"], "the second slow thread took the first one's connection")
 
+    def test_connects_that_may_start_one_daemon_take_turns_in_the_process(self):
+        import threading
+        import time
+        import types
+        from unittest.mock import patch
+        hydra, lock, inside, most = self.hydra, threading.Lock(), [0], [0]
+
+        def connect(start=True, **_):
+            with lock:
+                inside[0] += 1
+                most[0] = max(most[0], inside[0])
+            time.sleep(0.2)   # the library's start: on POSIX its start lock does not hold off another thread of this process
+            with lock:
+                inside[0] -= 1
+            return types.SimpleNamespace(hello={"hydraVersion": hydra.RELEASE, "protocol": hydra.PROTOCOL})
+        module = types.SimpleNamespace(connect=connect, IncompatibleError=type("IncompatibleError", (Exception,), {}),
+                                       LaunchError=type("LaunchError", (Exception,), {}))
+        with patch("hydralysis.hydra.load_client", return_value=module), patch("hydralysis.hydra.sync_scripts"),                 patch("hydralysis.hydra.write_daemon_config"), patch.dict(hydra.Engine._starting, clear=True):
+            threads = [threading.Thread(target=hydra.Engine(self.settings, lane=lane).session) for lane in ("one", "two")]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(10)
+        self.assertEqual(most[0], 1, "two threads were in the daemon start at once")
+
     def test_an_unchanged_client_file_is_not_read_again(self):
         import os
         import sys
