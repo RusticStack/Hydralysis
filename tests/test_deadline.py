@@ -125,6 +125,18 @@ class Base(unittest.TestCase):
     def program(self, entry):
         return query.open_program(entry, str(self.gpr), "/owned.exe", self.digest)
 
+    def warm(self, open_program=True):
+        """Connect a pooled entry (and open the program on it) OUTSIDE the timed attempt that follows, which takes that
+        idle entry again. A short deadline then times the call under test, not the connect and open before it: on a
+        loaded machine those alone took longer than a 0.2-0.3 s budget, so the attempt ended before the call was sent
+        (`connection_abandoned: false`, `deadline_exceeded` instead of `cancelled`), on main as on the integration."""
+        with self.pool.attempt(30) as entry:
+            if open_program:
+                self.program(entry)
+            else:
+                entry.call("ping")
+        return entry
+
 
 
 class Mechanism(Base):
@@ -133,9 +145,11 @@ class Mechanism(Base):
     # --- the abandon helper ------------------------------------------------------------------------------------------
 
     def test_a_blocked_call_gets_cancel_then_is_abandoned_with_no_close_and_no_shutdown(self):
+        warm = self.warm()
         event = self.hold("script")
         with self.assertRaises(hydra.DeadlineError) as raised:
             with self.pool.attempt(0.3) as entry:
+                self.assertIs(entry, warm)
                 entry.grace_s = 0.2
                 program = self.program(entry)
                 entry.call("script", script="Other.java", program=program["key"], args=["{}"])
@@ -152,9 +166,11 @@ class Mechanism(Base):
         self.assertEqual(self.registry.snapshot()["closing"], [])
 
     def test_a_cooperative_request_ends_on_cancel_and_the_connection_is_kept(self):
+        warm = self.warm()
         self.hold("script", cooperative=True)
         with self.assertRaises(hydra.EngineError) as raised:
             with self.pool.attempt(0.2) as entry:
+                self.assertIs(entry, warm)
                 entry.grace_s = 2.0
                 program = self.program(entry)
                 entry.call("script", script="Other.java", program=program["key"], args=["{}"])
@@ -163,18 +179,25 @@ class Mechanism(Base):
         self.assertEqual(self.pool.live(), 1, "an answered request leaves the entry usable")
 
     def test_the_deadline_is_the_attempts_not_each_calls(self):
+        # Connected outside the clock (the open stays inside it). One clock ends at deadline + grace = 2.2 s; a deadline
+        # per call would end at open + deadline + grace = 3.2 s at the earliest. The open leaves 1.0 s for the script
+        # call to be sent (it was 0.2 s, which a loaded machine overran: the call was then never sent and the attempt
+        # ended before the grace, below the lower bound).
+        warm = self.warm(open_program=False)
         slow = self.hold("open_program")
-        started = time.monotonic()
-        threading.Timer(0.4, slow.set).start()
         script = self.hold("script")
-        with self.assertRaises(hydra.DeadlineError):
-            with self.pool.attempt(0.6) as entry:
+        started = time.monotonic()
+        threading.Timer(1.0, slow.set).start()
+        with self.assertRaises(hydra.DeadlineError) as raised:
+            with self.pool.attempt(2.0) as entry:
+                self.assertIs(entry, warm)
                 entry.grace_s = 0.2
-                program = self.program(entry)          # takes 0.4 of the 0.6 s
-                entry.call("script", script="Other.java", program=program["key"], args=["{}"])   # has 0.2 s left, not 0.6
+                program = self.program(entry)          # takes 1.0 of the 2.0 s
+                entry.call("script", script="Other.java", program=program["key"], args=["{}"])   # has 1.0 s left, not 2.0
         elapsed = time.monotonic() - started
-        self.assertLess(elapsed, 0.6 + 0.2 + 0.35, "one clock for the attempt: deadline plus grace, not one deadline per call")
-        self.assertGreaterEqual(elapsed, 0.6 + 0.2 - 0.05)
+        self.assertTrue(raised.exception.details["connection_abandoned"], "the script call was sent and then abandoned")
+        self.assertLess(elapsed, 1.0 + 2.0 + 0.2, "one clock for the attempt: deadline plus grace, not one deadline per call")
+        self.assertGreaterEqual(elapsed, 2.0 + 0.2 - 0.05)
         script.set()
 
     def test_a_second_request_on_a_checked_out_entry_raises(self):
@@ -437,9 +460,11 @@ class ProductionWiring(Base):
         self.assertEqual(query._keys, {}, "I2: the retired entry's rows left with it")
 
     def test_an_abandoned_entry_forgets_its_rows_when_the_engine_answers(self):
+        warm = self.warm()
         event = self.hold("script")
         with self.assertRaises(hydra.DeadlineError):
             with self.pool.attempt(0.2) as entry:
+                self.assertIs(entry, warm)
                 entry.grace_s = 0.1
                 program = self.program(entry)
                 entry.call("script", script="Other.java", program=program["key"], args=["{}"])
