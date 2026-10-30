@@ -183,6 +183,11 @@ class WorkflowTests(unittest.TestCase):
             if m and not m.group(1).startswith("./.github/workflows/"):   # a workflow of this repository, same commit
                 self.assertRegex(m.group(1), r"@[0-9a-f]{40}$", line)
 
+    def test_the_draft_body_is_this_versions_section_only(self):
+        self.assertNotIn("--notes-file CHANGELOG.md", self.text)
+        self.assertIn("awk -v h=\"## ${VERSION}\"", self.text)
+        self.assertIn('--notes-file "$RUNNER_TEMP/notes.md"', self.text)
+
     def test_the_release_waits_for_the_unit_and_engine_jobs(self):
         self.assertRegex(self.text, r"\n  tests:\n    uses: \./\.github/workflows/tests\.yml\n")
         self.assertRegex(self.text, r"\n  build:\n    needs: tests\n")

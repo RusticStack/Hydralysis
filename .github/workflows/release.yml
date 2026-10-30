@@ -91,4 +91,8 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" dist/* --draft --title "Hydralysis ${VERSION}" --notes-file CHANGELOG.md
+        run: |
+          # The body is this version's CHANGELOG section only, not the whole file
+          awk -v h="## ${VERSION}" '$0==h{on=1; next} on && /^## /{exit} on' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          test -s "$RUNNER_TEMP/notes.md" || { echo "::error::CHANGELOG.md has no '## ${VERSION}' section"; exit 1; }
+          gh release create "${GITHUB_REF_NAME}" dist/* --draft --title "Hydralysis ${VERSION}" --notes-file "$RUNNER_TEMP/notes.md"
