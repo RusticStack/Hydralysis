@@ -201,8 +201,11 @@ class QueryRunner:
 
         ENGINE is the pool entry of an attempt (7.6); it defaults to the shared connection."""
         engine = engine or self.engine
-        if for_overlays and not target.get("master_read") and workcopy.has_overlays(self.settings, target):
-            return workcopy.reader(self.settings, engine, target)
+        if for_overlays and not target.get("master_read"):
+            if workcopy.has_overlays(self.settings, target):
+                return workcopy.reader(self.settings, engine, target)
+            # A view without pending records is its base generation: the head unless the view is behind it (gate 9.17 H).
+            return open_program(engine, workcopy.read_gpr(self.settings, target), target["program"], target["sha256"])
         return open_program(engine, target["gpr"], target["program"], target["sha256"])
 
     def _pool(self):
