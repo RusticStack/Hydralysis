@@ -4,6 +4,20 @@ Hydralysis follows the version policy in [docs/versioning.md](docs/versioning.md
 engine, what 0.x means, and how to roll back a pin. Every release states only the claims whose tests pass.
 Nothing here is a tag: a release is tagged by the owner.
 
+## Unreleased
+
+- Publish pipeline: a leader waits for `.commit.lock` in a first-come queue instead of polling; decided changesets are
+  settled in their views after the commit lock is released. A changeset with a generation does not wait for a busy
+  view (the view's next call replays it from `CURRENT.log`); one decided without a generation (already in master,
+  converged) keeps the bounded view wait, since no log row replays it. A lineage the registry already names is found
+  without a lock. The `.bak` copy of a sealed record is no longer fsynced (the new version still is).
+- New setting `tampered_cache_s` (default `0`, off). The 4.7 tamper check re-hashes every published generation before
+  each publish. With a value above 0, a generation whose manifest hash and content files' size, modification time and
+  file id are unchanged since its last full re-hash is not re-hashed again, for up to that many seconds. The verified
+  signatures are kept in `lineages/<id>/.tamper-checks.json`, so they reach every publish worker (the setting is passed
+  to the worker). Weaker than a re-hash: a write into a generation that puts back the size, time and file id is found
+  by the next full re-hash, at most `tampered_cache_s` seconds later.
+
 ## 0.6.0
 
 This release (0.6.0, label OD11) pins Hydra Engine `12.3-hydra.4` (protocol 3), released 2026-10-30. Hydralysis

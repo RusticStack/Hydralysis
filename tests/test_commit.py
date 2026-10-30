@@ -10,6 +10,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
+import sys
 import threading
 import unittest
 from pathlib import Path
@@ -940,7 +942,7 @@ class WorkerSettings(World, unittest.TestCase):
         from hydralysis import backups, overlayjobs
         settings = {**self.settings, "backup_min_independent": 1, "backup_min_verified": 2, "backup_confirm_gb": 7,
                     "backup_root_warn_gb": 9, "generations_root": str(self.root / "gens"), "tmp_dir": str(self.root / "tmp"),
-                    "backup_roots": [{"path": str(self.root / "b1")}, {"path": str(self.root / "b2"), "independent": True}]}
+                    "tampered_cache_s": 60, "backup_roots": [{"path": str(self.root / "b1")}, {"path": str(self.root / "b2"), "independent": True}]}
         child = type("Child", (), {"pid": 4242})()
         with patch("hydralysis.overlayjobs.proc.popen", return_value=child), patch("hydralysis.overlayjobs.proc_start", return_value=1):
             record = overlayjobs.start(settings, "owned", "commit", "", {"cid": "c-fa5e0007"})
@@ -950,6 +952,7 @@ class WorkerSettings(World, unittest.TestCase):
         self.assertEqual(backups.policy(worker), backups.policy(settings))
         self.assertEqual(lineage.lineages_root(worker), lineage.lineages_root(settings))
         self.assertEqual(worker["generations_root"], settings["generations_root"])
+        self.assertEqual(worker["tampered_cache_s"], 60)  # the publish leader runs in this worker (H17)
 
 
 class Sealing(World, unittest.TestCase):
@@ -1005,6 +1008,41 @@ class Tamper(World, unittest.TestCase):
         with self.assertRaises(commits.CommitError) as raised:
             self.commit()
         self.assertEqual(raised.exception.code, "tampered")
+
+    def test_an_unchanged_generation_is_not_rehashed_and_a_changed_one_is(self):
+        self.edit("One", A)
+        self.commit()
+        cached = {**self.settings, "tampered_cache_s": 600}
+        real = lineage.verify_manifest
+        with patch.object(lineage, "verify_manifest", side_effect=real) as verify:
+            self.assertEqual(lineage.tampered(cached, self.lineage_id()), [])
+            self.assertEqual(lineage.tampered(cached, self.lineage_id()), [])
+            self.assertEqual(verify.call_count, 1)  # the second check reads the files' size, time and id only (H17)
+            self.assertEqual(lineage.tampered(self.settings, self.lineage_id()), [])
+            self.assertEqual(verify.call_count, 2)  # off by default: every check re-hashes
+            victim = next(lineage.generation_dir(self.settings, self.lineage_id(), 1).rglob("programs.json"))
+            os.chmod(victim, 0o666)
+            victim.write_text("tampered", encoding="utf-8")
+            self.assertEqual(lineage.tampered(cached, self.lineage_id())[0]["generation"], 1)
+            self.assertEqual(verify.call_count, 3)
+
+    def test_the_tamper_cache_outlives_the_process_that_checked(self):
+        """Each publish job is a new worker process: the verified signatures are kept beside CURRENT.log, not in memory."""
+        self.edit("One", A)
+        self.commit()
+        cached = {**self.settings, "tampered_cache_s": 600}
+        self.assertEqual(lineage.tampered(cached, self.lineage_id()), [])
+        self.assertTrue((lineage.lineage_dir(self.settings, self.lineage_id()) / lineage.TAMPER_CACHE_NAME).is_file())
+        code = "\n".join(["import sys, json",
+                          "from unittest.mock import patch",
+                          "from hydralysis import lineage",
+                          "settings, lineage_id = json.loads(sys.argv[1]), sys.argv[2]",
+                          "with patch.object(lineage, 'verify_manifest', side_effect=AssertionError('re-hashed')):",
+                          "    print(json.dumps(lineage.tampered(settings, lineage_id)))"])
+        env = dict(os.environ, PYTHONPATH=str(Path(lineage.__file__).resolve().parent.parent))
+        out = subprocess.run([sys.executable, "-c", code, json.dumps(cached), self.lineage_id()], env=env, capture_output=True,
+                             text=True, timeout=60)
+        self.assertEqual((out.returncode, out.stdout.strip()), (0, "[]"), out.stderr)
 
 
 class LineageLog(World, unittest.TestCase):
