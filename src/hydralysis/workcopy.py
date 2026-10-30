@@ -101,21 +101,23 @@ def release(engine: hydra.Engine, settings: dict, target: dict) -> list[str]:
     view's writer lane, which joins each fork as a writer and closes it with discard (`discard_forks`)."""
     from hydralysis import query, viewgov
     ending = viewgov.session_ending()
-    if ending and not getattr(engine, "connected", lambda: True)():
+    holders = {holder.key: holder for holder in query.readers(engine)}   # the reader lanes read views too
+    if ending and not any(getattr(holder, "connected", lambda: True)() for holder in holders.values()):
         return []   # the process is ending without a connection: there is no daemon of ours to close anything in
     folders = [folder.resolve() for folder in view_folders(settings, target)]
     with query._keys_guard:
         mine = [(key, value) for key, value in query._keys.items()
-                if key[0] == engine.key and any(Path(key[1]).resolve().is_relative_to(folder) for folder in folders)]
-    projects = {value["project"] for _, value in mine}
+                if key[0] in holders and any(Path(key[1]).resolve().is_relative_to(folder) for folder in folders)]
+    projects = sorted({(key[0], value["project"]) for key, value in mine})
     state = _state(settings, target)
     forks = [item for item in [state.get("fork_gpr"), *(state.get("retired") or [])] if item]
     forks += [str(path) for path in _forks_on_disk(settings, target) if str(path) not in forks]
     closed = []
-    for project in sorted(projects):
+    for connection, project in projects:
         try:
-            engine.call("close_project", project=project, discard=True)
-            closed.append(project)
+            holders[connection].call("close_project", project=project, discard=True)
+            if project not in closed:
+                closed.append(project)
         except hydra.EngineError as error:
             if error.code not in _GONE:
                 raise
@@ -262,17 +264,18 @@ def _reader_rows(gprs: set[str]) -> list[tuple[str, list[tuple], str]]:
 
 
 def _close_reader_rows(settings: dict, gprs: set[str]) -> None:
-    """Close this process's read-only uses of GPRS on the shared reader connection, the one `QueryRunner` reads through, so
-    that a closed copy has no reader of ours left and the per-connection view cap (`maxViewsPerClient`) is given back.
-    Best effort: a row of another connection (a pool entry, on hydra.2/3) is dropped from the cache only, as `forget` does."""
+    """Close this process's read-only uses of GPRS on the reader connections `QueryRunner` reads through (the shared one and
+    its lanes), so that a closed copy has no reader of ours left and the per-connection view cap (`maxViewsPerClient`) is
+    given back. Best effort: a row of another connection (a pool entry, on hydra.2/3) is dropped from the cache only, as
+    `forget` does."""
     from hydralysis import query
-    reader = hydra.Engine(settings)
     # A connection that is gone took its uses with it: its rows are only dropped (a call would connect, and could start a daemon).
-    live = getattr(reader, "connected", lambda: True)()
+    live = {holder.key: holder for holder in query.readers(hydra.Engine(settings))
+            if getattr(holder, "connected", lambda: True)()}
     for connection, rows, program in _reader_rows(gprs):
-        if connection == reader.key and live:
+        if connection in live:
             try:
-                reader.call("close_program", program=program)
+                live[connection].call("close_program", program=program)
             except hydra.EngineError as error:
                 if error.code not in _GONE:
                     continue   # still open: the cache keeps it, and the LRU close of the cap can still find it

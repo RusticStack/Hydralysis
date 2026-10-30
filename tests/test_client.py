@@ -379,5 +379,62 @@ class EngineRetryPolicy(unittest.TestCase):
         self.assertNotIn("token", self.writer.hello())
 
 
+class EngineConnect(unittest.TestCase):
+    """Engine.session: one connect per key at a time, and `_guard` is not held across it (H4); load_client is memoised by the
+    file's mtime and size."""
+
+    def setUp(self):
+        from unittest.mock import patch
+        from hydralysis import hydra
+        self.hydra = hydra
+        self.work = workdir("connect")
+        self.addCleanup(self.work.cleanup)
+        self.settings = {"root": str(Path(self.work.name) / "data"), "hydra_dir": "x", "hydra_client": "x"}
+        item = patch.dict(hydra.Engine._connections, clear=True)
+        item.start()
+        self.addCleanup(item.stop)
+
+    def test_a_slow_connect_holds_up_neither_its_twin_twice_nor_another_key(self):
+        import threading
+        from unittest.mock import patch
+        release, connects = threading.Event(), []
+
+        def connect(engine):
+            connects.append(engine.lane)
+            if engine.lane == "slow":
+                release.wait(10)    # a daemon start
+            return object()
+        with patch.object(self.hydra.Engine, "_connect", connect):
+            slow = [threading.Thread(target=self.hydra.Engine(self.settings, lane="slow").session) for _ in range(2)]
+            for thread in slow:
+                thread.start()
+            fast = threading.Thread(target=self.hydra.Engine(self.settings, lane="fast").session)
+            fast.start()
+            fast.join(3)
+            self.assertFalse(fast.is_alive(), "another key connected while the slow one was starting the daemon")
+            release.set()
+            for thread in slow:
+                thread.join(10)
+        self.assertEqual(sorted(connects), ["fast", "slow"], "the second slow thread took the first one's connection")
+
+    def test_an_unchanged_client_file_is_not_read_again(self):
+        import os
+        import sys
+        from unittest.mock import patch
+        client = Path(self.work.name) / "client" / "ghidra_session.py"
+        client.parent.mkdir()
+        client.write_text('PROTOCOL = %d\nCLIENT_VERSION = "%s"\nHYDRA_RELEASE = "%s"\n'
+                          % (self.hydra.PROTOCOL, self.hydra.CLIENT_VERSION, self.hydra.RELEASE), encoding="utf-8")
+        self.addCleanup(lambda: [sys.modules.pop(name) for name in list(sys.modules) if name.startswith("rusticre_hydra_client_")
+                                 and str(getattr(sys.modules[name], "__file__", "")).startswith(str(client.parent))])
+        first = self.hydra.load_client(client)
+        with patch.object(Path, "read_text", side_effect=AssertionError("read again")):
+            self.assertIs(self.hydra.load_client(client), first)
+        client.write_text('PROTOCOL = 1\n', encoding="utf-8")
+        os.utime(client, ns=(client.stat().st_atime_ns, client.stat().st_mtime_ns + 1_000_000_000))
+        with self.assertRaisesRegex(ValueError, "speaks protocol 1"):
+            self.hydra.load_client(client)
+
+
 if __name__ == "__main__":
     unittest.main()

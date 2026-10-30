@@ -115,6 +115,23 @@ class BackendSetupTests(unittest.TestCase):
                 backends.resolved(settings)
         download.assert_not_called()
 
+    def test_resolved_is_kept_while_nothing_it_was_judged_by_changes(self):
+        settings = self.installed()
+        old = os.stat(self.root).st_mtime - 3600
+        for path in [self.root, *self.root.rglob("*")]:
+            os.utime(path, (old, old))
+        with patch.dict(os.environ, {}, clear=True), patch("hydralysis.backends._children", return_value=[]),                 patch("hydralysis.backends.shutil.which", return_value=None), patch.dict(backends._RESOLVED, clear=True),                 patch("hydralysis.backends.inspect", wraps=backends.inspect) as inspect:
+            first = backends.resolved(settings)
+            self.assertEqual(backends.resolved(settings), first)
+            self.assertEqual(inspect.call_count, 1)
+            client = Path(settings["hydra_client"])
+            os.utime(client, (old + 60, old + 60))
+            self.assertEqual(backends.resolved(settings), first)
+            self.assertEqual(inspect.call_count, 2, "a changed client file is judged again")
+            (Path(settings["java_home"]) / "release").write_text('JAVA_VERSION="17.0.1"\n')
+            with self.assertRaisesRegex(ValueError, "jdk missing"):
+                backends.resolved(settings)
+
     def test_install_is_required_when_discovery_is_not_ready(self):
         report = {"ready": False, "root": str(self.root), "portable_install_supported": True}
         with patch("hydralysis.backends.inspect", return_value=report), patch("hydralysis.backends._download") as download:

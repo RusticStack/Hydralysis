@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import threading
+import time
 import unittest
+import zlib
 from pathlib import Path
 from unittest.mock import patch
 
@@ -970,3 +974,151 @@ class ClientCap(unittest.TestCase):
             query.open_program(engine, "C:/views/held/held.gpr", "/fixture.exe", "ab" * 32)
         self.assertEqual(refused.exception.details["resource"], "heap")
         self.assertEqual(engine.open, ["p-a:/fixture.exe"])
+
+
+class ProgramsInUse(unittest.TestCase):
+    """The cap's LRU close (H3) and the open of one program by several threads at once (H6)."""
+
+    def setUp(self):
+        query._keys.clear()
+        self.addCleanup(query._keys.clear)
+        self.engine = CappedEngine()
+
+    def open(self, name):
+        return query.open_program(self.engine, "C:/views/%s/%s.gpr" % (name, name), "/fixture.exe", "ab" * 32)
+
+    def test_a_program_a_read_is_using_is_not_closed_for_the_cap(self):
+        for name in ("a", "b", "c", "d"):
+            self.open(name)
+        with query._using(self.engine, "p-a:/fixture.exe"):   # the oldest row, but a read is running on it
+            self.assertEqual(self.open("e")["key"], "p-e:/fixture.exe")
+        self.assertIn("p-a:/fixture.exe", self.engine.open)
+        self.assertIn(("close_program", {"program": "p-b:/fixture.exe"}), self.engine.calls)
+        self.assertEqual(query._in_use, {}, "the mark ends with the read")
+
+    def test_the_refusal_stands_when_every_read_only_program_is_in_use(self):
+        for name in ("a", "b", "c", "d"):
+            self.open(name)
+        with contextlib.ExitStack() as stack:
+            for name in ("a", "b", "c", "d"):
+                stack.enter_context(query._using(self.engine, "p-%s:/fixture.exe" % name))
+            with self.assertRaises(hydra.EngineError) as refused:
+                self.open("e")
+        self.assertEqual(refused.exception.details["resource"], "client_cap")
+        self.assertFalse([call for call in self.engine.calls if call[0] == "close_program"])
+
+    def test_threads_opening_one_program_send_one_open(self):
+        entered, release = threading.Event(), threading.Event()
+        original = self.engine.call
+
+        def call(command, **fields):
+            if command == "open_program":
+                entered.set()
+                release.wait(10)
+            return original(command, **fields)
+        self.engine.call = call
+        answers = []
+        threads = [threading.Thread(target=lambda: answers.append(self.open("a"))) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        self.assertTrue(entered.wait(10))
+        time.sleep(0.2)   # the other three reach the gate of the open in flight
+        release.set()
+        for thread in threads:
+            thread.join(10)
+        self.assertEqual(len(answers), 4)
+        self.assertEqual({answer["key"] for answer in answers}, {"p-a:/fixture.exe"})
+        self.assertEqual(len([call for call in self.engine.calls if call[0] == "open_program"]), 1)
+
+    def test_a_refresh_opens_again_after_the_gate(self):
+        self.open("a")
+        query.open_program(self.engine, "C:/views/a/a.gpr", "/fixture.exe", "ab" * 32, refresh=True)
+        self.assertEqual(len([call for call in self.engine.calls if call[0] == "open_program"]), 2)
+
+
+class ReaderLanes(unittest.TestCase):
+    """hydra.4 reads are spread over `readerLanes` connections by view key (H1): a real hydra.Engine over the fake daemon."""
+
+    def setUp(self):
+        self.temp = workdir("lanes")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.exe = self.root / "owned.exe"
+        self.exe.write_bytes(b"MZ a small owned executable")
+        self.digest = hashlib.sha256(self.exe.read_bytes()).hexdigest()
+        self.daemon = fakehydra.reset()
+        self.gpr = self.root / "analysed" / "Owned" / "Owned.gpr"
+        self.daemon.add_project(self.gpr, {"/owned.exe": {"sha256": self.digest}})
+        self.native = True
+        test = self
+
+        class Native(fakehydra.FakeClientModule):
+            @classmethod
+            def connect(cls, client="", harness="", **_):
+                session = fakehydra.FakeSession(cls, fakehydra.DAEMON, client, harness)
+                session.supports_deadline = test.native   # library 1.1.0 (hydra.4) or 1.0.0
+                return session
+        for item in (patch("hydralysis.hydra.load_client", return_value=Native),
+                     patch.dict(hydra.Engine._connections, clear=True), patch.dict(query._lanes, clear=True)):
+            item.start()
+            self.addCleanup(item.stop)
+        query._keys.clear()
+        self.addCleanup(query._keys.clear)
+
+    def runner(self, **settings):
+        settings = {"root": str(self.root / "data"), "hydra_dir": "x", "hydra_client": "x", "hydra_supervisor": False,
+                    "targets": {"owned": {"gpr": str(self.gpr), "program": "/owned.exe", "exe": str(self.exe)}}, **settings}
+        runner = query.QueryRunner(settings, hydra.Engine(settings))
+        default_to_shared(runner)
+        return runner
+
+    def test_each_view_reads_on_one_of_the_lanes(self):
+        runner = self.runner(readerLanes=4)
+        views = [{"name": "owned", "key": "owned|view-%d" % index} for index in range(32)]
+        lanes = [runner.reader(view) for view in views]
+        self.assertEqual(len({lane.key for lane in lanes}), 4)
+        self.assertIn(runner.engine, lanes, "lane 0 is the shared connection")
+        self.assertEqual([runner.reader(view) for view in views], lanes, "a view always reads on the same lane")
+        self.assertEqual({lane.key for lane in query.readers(runner.engine)}, {lane.key for lane in lanes})
+
+    def test_the_default_and_hydra_2_keep_the_shared_connection(self):
+        views = [{"name": "owned", "key": "owned|view-%d" % index} for index in range(8)]
+        runner = self.runner()
+        self.assertEqual({runner.reader(view).key for view in views}, {runner.engine.key}, "one lane unless readerLanes says")
+        self.native = False
+        query._lanes.clear()
+        hydra.Engine._connections.clear()
+        runner = self.runner(readerLanes=4)
+        self.assertEqual({runner.reader(view).key for view in views}, {runner.engine.key}, "hydra.2/3 read through the pool")
+
+    def test_a_read_and_its_stop_use_the_lane_of_the_view(self):
+        runner = self.runner()
+        selected = workcopy.with_view(runner.target("owned"), "shared")
+        lanes = next(count for count in range(2, 65)
+                     if zlib.crc32(str(selected.get("key") or selected["name"]).encode("utf-8")) % count)
+        runner = self.runner(readerLanes=lanes)
+        json.loads(runner.query("owned", "decompile", "0x140001000"))
+        lane = runner.reader(selected)
+        self.assertNotEqual(lane.key, runner.engine.key)
+        rows = [key for key in query._keys if key[1] == str(self.gpr).lower()]
+        self.assertTrue(rows)
+        self.assertEqual({key[0] for key in rows}, {lane.key}, "the program is open on the view's lane, not the shared one")
+        stopped = runner.stop(runner.target("owned"))
+        self.assertTrue(stopped["ok"], stopped)
+        self.assertTrue(stopped["released"])
+        self.assertFalse([key for key in query._keys if key[0] == lane.key])
+
+    def test_a_superseded_copy_is_closed_on_the_lane_that_read_it(self):
+        runner = self.runner()
+        selected = workcopy.with_view(runner.target("owned"), "shared")
+        lanes = next(count for count in range(2, 65)
+                     if zlib.crc32(str(selected.get("key") or selected["name"]).encode("utf-8")) % count)
+        runner = self.runner(readerLanes=lanes)
+        json.loads(runner.query("owned", "decompile", "0x140001000"))
+        lane = runner.reader(selected)
+        program = next(value["key"] for key, value in query._keys.items() if key[0] == lane.key)
+        self.daemon.calls.clear()
+        workcopy._close_reader_rows(runner.settings, {workcopy._norm(self.gpr)})
+        self.assertIn(program, [fields.get("program") for _, command, fields in self.daemon.calls if command == "close_program"],
+                      "closed on the lane, not only dropped from the cache (the cap would stay taken)")
+        self.assertFalse([key for key in query._keys if key[0] == lane.key])

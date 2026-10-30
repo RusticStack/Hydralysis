@@ -14,6 +14,7 @@ import platform
 import re
 import shutil
 import stat
+import threading
 import time
 import urllib.request
 import uuid
@@ -175,15 +176,61 @@ def inspect(settings: dict) -> dict:
             "portable_install_supported": os.name == "nt" and platform.machine().lower() in ("amd64", "x86_64")}
 
 
+# settings (as JSON) -> (stamp, report, resolved settings) of the last ready inspection; see `_stamp`.
+_RESOLVED: dict[str, tuple] = {}
+_RESOLVED_GUARD = threading.Lock()
+RACY_NS = 2_000_000_000
+# What a candidate is judged by: an engine's properties, jar and decompiler folder, a JDK's release file and tools, a client file.
+_STAMPED = (Path(), Path("Ghidra", "application.properties"), hydra.SESSION_MODULE / "lib" / "HeadlessSession.jar",
+            Path("Ghidra", "Features", "Decompiler", "os"), Path("release"), Path("bin", "java.exe" if os.name == "nt" else "java"),
+            Path("bin", "javac.exe" if os.name == "nt" else "javac"))
+
+
+def _stamp(settings: dict, report: dict | None = None):
+    """(mtime_ns, size) of everything an inspection read: the saved backend record, the backends folder, the environment it
+    looked at and, with REPORT, every candidate it judged (the ones chosen and the ones that failed). None when the report
+    left failures out, so it cannot be told what to watch."""
+    root = root_path(settings)
+    paths = [root / "backend.json", root / "backend.json.bak", root / "backends"]
+    if report is not None:
+        if len(report.get("checks", [])) >= 12:
+            return None
+        chosen = [report[name]["path"] for name in ("engine", "client", "jdk")]
+        paths += [Path(item) / part for item in chosen + [check["path"] for check in report.get("checks", [])] for part in _STAMPED]
+    stamps = []
+    for path in paths:
+        try:
+            found = os.stat(path)
+            stamps.append((found.st_mtime_ns, found.st_size))
+        except OSError:
+            stamps.append(None)
+    names = ("HYDRALYSIS_HYDRA_DIR", "RUSTICRE_HYDRA_DIR", "JAVA_HOME", "PATH", "ProgramFiles")
+    return tuple(stamps) + tuple(os.environ.get(name) for name in names)
+
+
 def resolved(settings: dict) -> dict:
-    """Settings with verified engine paths, or a clear error. Never installs."""
+    """Settings with verified engine paths, or a clear error. Never installs.
+
+    A ready answer is kept while nothing it was judged by changed (`_stamp`); a failed one is always inspected again."""
+    memo = json.dumps(settings, sort_keys=True, default=str)
+    with _RESOLVED_GUARD:
+        known = _RESOLVED.get(memo)
+    if known is not None and _stamp(settings, known[1]) == known[0]:
+        return {**known[2]}
+    started = time.time_ns()
     report = inspect(settings)
     if not report["ready"]:
         missing = [name for name in ("engine", "client", "jdk") if not report[name]]
         raise ValueError("analysis engine unavailable (%s missing); run backend inspect, then backend install. "
                          "Queries never install or import implicitly. Details: %s" % (", ".join(missing), json.dumps(report)))
-    return {**settings, "root": report["root"], "hydra_dir": report["engine"]["path"],
-            "hydra_client": report["client"]["path"], "java_home": report["jdk"]["path"]}
+    answer = {**settings, "root": report["root"], "hydra_dir": report["engine"]["path"],
+              "hydra_client": report["client"]["path"], "java_home": report["jdk"]["path"]}
+    stamp = _stamp(settings, report)
+    # A file changed within RACY_NS of the inspection may have changed after it was read (racy git): not kept.
+    if stamp is not None and all(item[0] < started - RACY_NS for item in stamp if isinstance(item, tuple)):
+        with _RESOLVED_GUARD:
+            _RESOLVED[memo] = (stamp, report, answer)
+    return {**answer}
 
 
 def _download(asset: dict, directory: Path, cancelled=lambda: False) -> Path:
