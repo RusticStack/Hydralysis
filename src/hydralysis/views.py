@@ -43,6 +43,7 @@ import shutil
 import subprocess
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -57,8 +58,12 @@ POLL_S = 0.1
 # A waiting publish worker (a follower) used to look at the queue every POLL_S: about fifteen file operations and a sealed
 # job-record write ten times a second per waiter, for the whole time a leader builds. On Windows it now waits in the kernel's
 # queue of `publish.lock` instead (the one event that can decide its changeset is a leader finishing), for at most TURN_WAIT_S
-# so the job's progress and its deadline are still looked at.
+# so the job's progress and its deadline are still looked at. It also wakes as soon as a result is written to `done/` or
+# `declined/` (a leader that decides this changeset while it drains others), so a follower returns no later than before.
 TURN_WAIT_S = 1.0
+# A waiting worker rewrites its job record when its progress changes, and at least this often: `hydra.active_jobs` finds
+# the running jobs among the newest records by time, and the supervisor asks it whether a publish is in flight.
+PROGRESS_HEARTBEAT_S = 10.0
 MAX_ATTEMPTS = 3                 # counted candidate failures of one changeset before it ends as `candidate_failed`
 MAX_QUEUE = 1000
 RESOLUTIONS = ("take_mine", "keep")
@@ -672,9 +677,13 @@ def _ids_in(folder: Path) -> list[str]:
 
 # The queue's records (pending/, done/, declined/) are each written once, by an atomic replace, and never rewritten: an agent
 # that polls `status show=queue` read and seal-checked every one of them on every poll (two thirds of a polling agent's CPU).
-# A record whose file is the same file (id, size, time) as when it was last read is answered from that read.
-_RECORDS: dict[tuple, tuple[tuple, str]] = {}
+# A record whose file is the same file (id, size, time) as when it was last read is answered from that read. The memo is
+# bounded in bytes (least recently used first out), and a large record (a pending changeset can be ~20 MB) is not kept.
+_RECORDS: "OrderedDict[tuple, tuple[tuple, str]]" = OrderedDict()
 _RECORDS_CAP = 4096
+_RECORDS_BUDGET = 4 * 1024 * 1024    # characters of JSON text kept, in all
+_RECORD_MAX = 64 * 1024              # a record whose JSON text is longer is read from disk every time
+_records_size = 0
 _NO_DEFAULT = object()
 
 
@@ -696,6 +705,7 @@ def _read_record_once_written(path: Path, *, default=_NO_DEFAULT, max_bytes: int
     if identity is not None:
         known = _RECORDS.get(key)
         if known is not None and known[0] == identity:
+            _RECORDS.move_to_end(key)
             return json.loads(known[1])
     options = {"max_bytes": max_bytes} if max_bytes is not None else {}
     if default is not _NO_DEFAULT:
@@ -707,10 +717,30 @@ def _read_record_once_written(path: Path, *, default=_NO_DEFAULT, max_bytes: int
         except OSError:
             again = None
         if again is not None and (again.st_ino, again.st_size, again.st_mtime_ns) == identity:
-            if len(_RECORDS) >= _RECORDS_CAP:
-                _RECORDS.clear()
-            _RECORDS[key] = (identity, json.dumps(value))
+            _remember_record(key, identity, value)
     return value
+
+
+def _forget_records() -> None:
+    global _records_size
+    _RECORDS.clear()
+    _records_size = 0
+
+
+def _remember_record(key: tuple, identity: tuple, value) -> None:
+    global _records_size
+    old = _RECORDS.pop(key, None)
+    if old is not None:
+        _records_size -= len(old[1])
+    if identity[1] > _RECORD_MAX:    # the file is already too large: do not even serialize it
+        return
+    text = json.dumps(value)
+    if len(text) > _RECORD_MAX:
+        return
+    _RECORDS[key] = (identity, text)
+    _records_size += len(text)
+    while _RECORDS and (_records_size > _RECORDS_BUDGET or len(_RECORDS) > _RECORDS_CAP):
+        _records_size -= len(_RECORDS.popitem(last=False)[1][1])
 
 
 def read_changeset(settings: dict, lineage_id: str, csid: str) -> dict:
@@ -1434,8 +1464,9 @@ def run_publish_job(settings: dict, selected: dict, options: dict, engine=None, 
     csid, lineage_id = options["csid"], options["lineage"]
     engine = engine or hydra.Engine(settings)
     deadline = time.monotonic() + float(settings.get("publish_wait_s", PUBLISH_WAIT_S))
-    reported = None
+    reported, reported_at = None, 0.0
     turn = None   # `publish.lock`, when the last wait was granted it: the next drain leads with it
+    watch = _decision_watch(settings, lineage_id)   # wakes the wait when a result is written (Windows), set before the first look
     try:
         while True:
             result = read_done(settings, lineage_id, csid)
@@ -1460,27 +1491,52 @@ def run_publish_job(settings: dict, selected: dict, options: dict, engine=None, 
                 continue
             if info["state"] == "unknown":
                 raise ViewError("unknown_changeset", "changeset %s is not in the queue" % csid)
-            if progress and info != reported:
+            if progress and (info != reported or time.monotonic() - reported_at >= PROGRESS_HEARTBEAT_S):
                 progress(info)
-                reported = info
+                reported, reported_at = info, time.monotonic()
             if time.monotonic() >= deadline:
                 raise ViewError("publish_wait_expired", "the changeset was not decided within publish_wait_s; it stays queued and is "
                                 "published when a leader reaches it", csid=csid, **pending_info(settings, lineage_id, csid))
-            turn = await_turn(settings, lineage_id, min(TURN_WAIT_S, max(POLL_S, deadline - time.monotonic())))
+            turn = await_turn(settings, lineage_id, min(TURN_WAIT_S, max(POLL_S, deadline - time.monotonic())), watch)
+            if watch is not None:
+                watch.rearm()   # before the next look: a result written from here on signals the next wait at once
     finally:
         if turn is not None:
             turn.release()
+        if watch is not None:
+            watch.close()
 
 
-def await_turn(settings: dict, lineage_id: str, timeout_s: float):
+def _decision_watch(settings: dict, lineage_id: str):
+    """A `locks.FolderWatch` on the lineage's `done/` and `declined/` (Windows), else None."""
+    if os.name != "nt":
+        return None
+    from hydralysis.locks import FolderWatch
+    folders = []
+    for name in ("done", "declined"):
+        try:
+            folder = _dir(settings, lineage_id, name)
+            folder.mkdir(parents=True, exist_ok=True)
+        except (OSError, ValueError):   # no watch: the wait still ends at TURN_WAIT_S, as without one
+            continue
+        folders.append(folder)
+    watch = FolderWatch(folders)
+    if not watch.handles:
+        watch.close()
+        return None
+    return watch
+
+
+def await_turn(settings: dict, lineage_id: str, timeout_s: float, watch=None):
     """Wait until `publish.lock` is free, at most TIMEOUT_S. On Windows the wait is queued in the kernel (`locks._QueuedLock`)
-    and returns the lock held (the caller's `drain` leads with it, or the caller releases it), or None when TIMEOUT_S passed.
-    Elsewhere, and when the lock file cannot be opened for the queued wait, it sleeps POLL_S and returns None, as before."""
+    and returns the lock held (the caller's `drain` leads with it, or the caller releases it), or None when TIMEOUT_S passed
+    or WATCH (a `locks.FolderWatch`) was signalled first. Elsewhere, and when the lock file cannot be opened for the queued
+    wait, it sleeps POLL_S and returns None, as before."""
     if os.name == "nt":
         from hydralysis.locks import _QueuedLock
         lease = _QueuedLock(str(publish_lock_path(settings, lineage_id)))
         try:
-            return lease if lease.wait(timeout_s) else None
+            return lease if lease.wait(timeout_s, watch.handles if watch is not None else ()) else None
         except OSError:
             pass
     time.sleep(POLL_S)

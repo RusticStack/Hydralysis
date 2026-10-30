@@ -131,6 +131,14 @@ if _NT:
     _k32.UnlockFileEx.restype = wintypes.BOOL
     _k32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
     _k32.WaitForSingleObject.restype = wintypes.DWORD
+    _k32.WaitForMultipleObjects.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE), wintypes.BOOL, wintypes.DWORD]
+    _k32.WaitForMultipleObjects.restype = wintypes.DWORD
+    _k32.FindFirstChangeNotificationW.argtypes = [wintypes.LPCWSTR, wintypes.BOOL, wintypes.DWORD]
+    _k32.FindFirstChangeNotificationW.restype = wintypes.HANDLE
+    _k32.FindNextChangeNotification.argtypes = [wintypes.HANDLE]
+    _k32.FindNextChangeNotification.restype = wintypes.BOOL
+    _k32.FindCloseChangeNotification.argtypes = [wintypes.HANDLE]
+    _k32.FindCloseChangeNotification.restype = wintypes.BOOL
     _k32.CancelIoEx.argtypes = [wintypes.HANDLE, ctypes.POINTER(_Overlapped)]
     _k32.CancelIoEx.restype = wintypes.BOOL
     _k32.GetOverlappedResult.argtypes = [wintypes.HANDLE, ctypes.POINTER(_Overlapped),
@@ -155,8 +163,9 @@ class _QueuedLock:
         self.path = path
         self.handle = None
 
-    def wait(self, timeout_s: float) -> bool:
-        """Queue for the lock; True once held, False when TIMEOUT_S ran out (the request is withdrawn)."""
+    def wait(self, timeout_s: float, wake=()) -> bool:
+        """Queue for the lock; True once held, False when TIMEOUT_S ran out or one of the WAKE handles (waitable kernel
+        handles, such as a `FolderWatch`) was signalled first (the request is withdrawn)."""
         try:
             empty = os.stat(self.path).st_size == 0
         except FileNotFoundError:
@@ -182,7 +191,12 @@ class _QueuedLock:
                     raise ctypes.WinError(error)
                 pending = True
                 milliseconds = max(0, min(int(timeout_s * 1000), 0xFFFFFFFE))
-                if _k32.WaitForSingleObject(event, milliseconds) != _WAIT_OBJECT_0:
+                if wake:
+                    handles = (wintypes.HANDLE * (1 + len(wake)))(event, *wake)
+                    signalled = _k32.WaitForMultipleObjects(len(handles), handles, False, milliseconds)
+                else:
+                    signalled = _k32.WaitForSingleObject(event, milliseconds)
+                if signalled != _WAIT_OBJECT_0:   # timeout, a WAKE handle, or a failed wait: withdraw the request
                     cancelled = True
                     _k32.CancelIoEx(handle, ctypes.byref(overlapped))
                 # Always wait for the request to finish (OVERLAPPED must outlive it). A grant that raced the
@@ -214,6 +228,30 @@ class _QueuedLock:
             _k32.UnlockFileEx(handle, 0, 1, 0, ctypes.byref(_Overlapped()))
         finally:
             _k32.CloseHandle(handle)
+
+
+class FolderWatch:
+    """A waitable handle signalled when a file is created, renamed or removed in one of FOLDERS (Windows change
+    notification, not recursive); `rearm` after each wake. Changes between a wake and `rearm` are kept by the OS and
+    signal again at once, so none is missed. Folders that do not exist are not watched."""
+
+    def __init__(self, folders):
+        self.handles = []
+        if not _NT:
+            return
+        for folder in folders:
+            handle = _k32.FindFirstChangeNotificationW(str(folder), False, 0x1)   # FILE_NOTIFY_CHANGE_FILE_NAME
+            if handle and handle != _INVALID:
+                self.handles.append(handle)
+
+    def rearm(self) -> None:
+        for handle in self.handles:
+            _k32.FindNextChangeNotification(handle)
+
+    def close(self) -> None:
+        handles, self.handles = self.handles, []
+        for handle in handles:
+            _k32.FindCloseChangeNotification(handle)
 
 
 @contextmanager

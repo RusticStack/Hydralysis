@@ -146,7 +146,8 @@ class QueueRecords(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        getattr(views, "_RECORDS", {}).clear()
+        views._forget_records()
+        self.addCleanup(views._forget_records)
         self.settings = {"root": str(Path(self.tmp.name) / "data")}
         self.lineage_id = "l-" + "0" * 16
         from hydralysis import lineage
@@ -190,6 +191,37 @@ class QueueRecords(unittest.TestCase):
         self.assertEqual(views.read_done(self.settings, self.lineage_id, csid)["outcome"], "skipped")
         durable.backup_path(path).unlink()
         self.assertIsNone(views.read_done(self.settings, self.lineage_id, csid))
+
+    def test_a_large_pending_record_is_not_kept(self):
+        from hydralysis import durable
+        csid = views.new_csid()
+        path = views.pending_path(self.settings, self.lineage_id, csid)
+        path.parent.mkdir(parents=True)
+        durable.write_sealed(path, {"csid": csid, "format": 1, "records": ["x" * 1024] * 1024})   # ~1 MB
+        for _ in range(3):
+            self.assertEqual(len(views.read_changeset(self.settings, self.lineage_id, csid)["records"]), 1024)
+        self.assertEqual(len(views._RECORDS), 0)
+        self.assertEqual(views._records_size, 0)
+
+    def test_the_memo_is_bounded_in_bytes_least_recently_used_first(self):
+        from hydralysis import durable
+        folder = views.done_path(self.settings, self.lineage_id, views.new_csid()).parent
+        folder.mkdir(parents=True)
+        ids = []
+        for n in range(40):
+            csid = "c-%016x" % n
+            durable.write_sealed(folder / (csid + ".json"), {"csid": csid, "outcome": "applied", "generation": n, "pad": "p" * 30000})
+            ids.append(csid)
+        with patch.object(views, "_RECORDS_BUDGET", 10 * 31000):
+            for csid in ids:
+                self.assertEqual(views.read_done(self.settings, self.lineage_id, csid)["csid"], csid)
+                views.read_done(self.settings, self.lineage_id, ids[0])   # kept warm: the least recently used go first
+            self.assertLessEqual(views._records_size, 10 * 31000)
+            self.assertEqual(views._records_size, sum(len(text) for _, text in views._RECORDS.values()))
+            kept = {key[0] for key in views._RECORDS}
+            self.assertIn(os.path.normcase(str(folder / (ids[0] + ".json"))), kept)
+            self.assertIn(os.path.normcase(str(folder / (ids[-1] + ".json"))), kept)
+            self.assertNotIn(os.path.normcase(str(folder / (ids[1] + ".json"))), kept)
 
     def test_a_corrupt_changeset_is_still_refused(self):
         from hydralysis import durable
@@ -239,7 +271,13 @@ class ViewLease(unittest.TestCase):
     def test_another_process_default_view_is_still_refused(self):
         record = views.claim(self.settings, self.selected, {"agent": "agent-c", "kind": "default", "name": "agent-c",
                                                             "shared": False}, "l-1", 600)
-        record["holders"] = {"other-boot": {"pid": os.getppid(), "pid_started_ms": __import__("hydralysis.preparation").preparation.process_start_ms(os.getppid()),
+        import subprocess
+        import sys
+        from hydralysis import preparation
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])   # a process certain to be alive
+        self.addCleanup(other.wait)
+        self.addCleanup(other.kill)
+        record["holders"] = {"other-boot": {"pid": other.pid, "pid_started_ms": preparation.process_start_ms(other.pid),
                                             "lease_until": time.time() + 600, "agent_name": "x"}}
         from hydralysis import durable
         durable.write_sealed(views.record_path(self.settings, "l-1", "agent-c"), record, max_bytes=65536)
@@ -322,6 +360,53 @@ class FollowerWait(unittest.TestCase):
         self.assertLessEqual(drains.count("busy"), 3, drains)
         self.assertEqual(len(reports), 1, "progress is written when it changes, not on every look")
         self.assertFalse(locks.held(str(self.lock_path)))
+
+    def wait_for(self, decide_after: float, hold_s: float, heartbeat_s: float | None = None):
+        """A follower of a real lineage folder while a leader holds publish.lock for HOLD_S and writes the follower's result
+        after DECIDE_AFTER (None: never). Returns (seconds the job took, progress reports)."""
+        from hydralysis import lineage
+        lineage_id = "l-" + "0" * 16
+        with patch.object(lineage, "lineage_dir", lambda settings, lid: Path(self.tmp.name) / "lineages" / lid):
+            settings = {"root": str(Path(self.tmp.name) / "data")}
+            csid = views.new_csid()
+            self.lock_path = views.publish_lock_path(settings, lineage_id)
+            self.lock_path.parent.mkdir(parents=True)
+            self.hold(hold_s)
+            if decide_after is not None:
+                timer = threading.Timer(decide_after, views.write_done, (settings, lineage_id, csid, {"outcome": "applied", "generation": 1}))
+                timer.start()
+                self.addCleanup(timer.join)
+            reports = []
+            busy = {"led": False, "built": [], "failure": None}
+            info = {"state": "publish_pending", "csid": csid, "position": 2, "etaMs": None, "leader": True}
+            options = dict(publish_wait_s=hold_s + 5)
+            patches = [patch.object(views, "drain", return_value=busy), patch.object(views, "pending_info", return_value=dict(info)),
+                       patch.object(views, "_settle_own", return_value=True), patch.object(views, "_revision_of", return_value=1)]
+            if heartbeat_s is not None:
+                patches += [patch.object(views, "PROGRESS_HEARTBEAT_S", heartbeat_s), patch.object(views, "TURN_WAIT_S", 0.1)]
+            for item in patches:
+                item.start()
+                self.addCleanup(item.stop)
+            started = time.monotonic()
+            try:
+                result = views.run_publish_job(dict(settings, **options), {"name": "t"}, {"csid": csid, "lineage": lineage_id},
+                                               engine=object(), timeout_s=60, progress=reports.append)
+            except views.ViewError as error:
+                result = {"error": error.args[0]}
+            return time.monotonic() - started, reports, result
+
+    def test_a_follower_returns_as_soon_as_a_leader_decides_its_changeset(self):
+        """The leader keeps the lock (it drains others); the follower must not wait for its next TURN_WAIT_S look."""
+        took, _, result = self.wait_for(decide_after=0.3, hold_s=3.0)
+        self.assertEqual(result["outcome"], "applied")
+        self.assertLess(took, 0.3 + 0.35, "woken by the result, not by the 1 s look")
+
+    def test_a_long_waiting_follower_still_refreshes_its_job_record(self):
+        """`hydra.active_jobs` keeps the newest records by time: an unchanged wait still rewrites its record now and then."""
+        took, reports, result = self.wait_for(decide_after=1.4, hold_s=1.6, heartbeat_s=0.3)
+        self.assertEqual(result["outcome"], "applied")
+        self.assertGreaterEqual(len(reports), 3, reports)
+        self.assertLessEqual(len(reports), 8, "a heartbeat, not a rewrite on every look")
 
 
 if __name__ == "__main__":
