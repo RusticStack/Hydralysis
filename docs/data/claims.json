@@ -26,7 +26,7 @@
      "pattern": "\"id\": \"rea\",[^}]{1,20}\"count\": ([0-9]+)"},
     {"id": "mcp_engine_min", "value": 8, "source": "file_number", "path": "src/hydralysis/mcp.py",
      "pattern": "ENGINE_SLOTS_MIN = ([0-9]+)"},
-    {"id": "mcp_engine_max", "value": 32, "source": "file_number", "path": "src/hydralysis/mcp.py",
+    {"id": "mcp_engine_max", "value": 24, "source": "file_number", "path": "src/hydralysis/mcp.py",
      "pattern": "ENGINE_SLOTS_MAX = ([0-9]+)"}
   ],
   "claims": [

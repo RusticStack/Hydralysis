@@ -3,7 +3,8 @@
 The tool list is the dispatch table in api.py. Nothing else is registered.
 
 Concurrency: tools run on three lanes, each with its own threads and its own outstanding budget, sized from the CPUs
-the OS grants this process (`os.process_cpu_count()`, which honours affinity and PYTHON_CPU_COUNT):
+the OS grants this process (`granted_cpus()`: the process affinity on Windows, `os.process_cpu_count()` elsewhere, and
+PYTHON_CPU_COUNT / -X cpu_count when set):
 
 - `fast`: offline PE tools and the evidence store (CPU work in this process);
 - `engine`: the short tools that wait on the Hydra daemon (queries, job/backend control, runtime requests);
@@ -16,9 +17,17 @@ with a `Server busy` tool error that carries the retry hint twice: in the text (
 `structuredContent.retryAfterMs` (for a client that parses). Clients that predate structuredContent (MCP 2025-06-18)
 ignore the extra field and still have the text.
 
+The two engine lanes together never admit more calls than the engine runs in parallel on one connection
+(ENGINE_PARALLEL_MAX, the engine's Connection.MAX_PARALLEL): every engine call of this process shares one connection on
+hydra.4, so a call the MCP accepts is never refused by the engine as busy.
+
 Cancellation: `notifications/cancelled` for an accepted, unanswered tool call fires that call's token
-(hydralysis.cancel). A call still queued never starts; a running call's engine wait sends `cancel` to the engine and
-returns; no response is sent for a cancelled request (MCP: the receiver SHOULD NOT respond), and its lane slot is freed.
+(hydralysis.cancel). A call still queued never starts. A running call that waits on the engine in this process
+(ghidra_run, ghidra_query, job/backend engine calls, the wait for a pool connection) sends `cancel` to the engine,
+waits the grace (hydra.DEADLINE_GRACE_S) and returns, which frees its lane slot. A tool body that never reaches such a
+wait (offline tools, `prepare`, whose import runs in a subprocess, runtime requests) runs to its end and holds its slot
+until then; only its reply is dropped. No response is sent for a cancelled request (MCP: the receiver SHOULD NOT
+respond). The cancel callbacks run on the stdin reader thread and only set events: no engine I/O happens there.
 """
 
 from __future__ import annotations
@@ -44,9 +53,17 @@ RETRY_AFTER_MS = 2000
 ENGINE_TOOLS = frozenset({"ghidra_run", "ghidra_query", "backend", "prepare", "job", "runtime"})
 # The engine tools that can hold the engine for minutes: a user script, an adopt or import. They get their own lane.
 LONG_TOOLS = frozenset({"ghidra_run", "prepare"})
-# The bounds of the short engine lane (README and docs/data/claims.json quote them): 2 calls per granted CPU.
+# The engine runs at most this many parallel requests per client connection (hydra-engine Connection.MAX_PARALLEL);
+# more get BUSY. On hydra.4 every engine call of this process goes through one shared connection, so the engine and
+# long lanes together stay within it.
+ENGINE_PARALLEL_MAX = 32
+# The long lane: `ghidra_run` and `prepare` hold the engine for minutes; 8 of them at once is the 0.6.0 budget.
+LONG_SLOTS = 8
+# The bounds of the short engine lane (README and docs/data/claims.json quote them): 2 calls per granted CPU, and
+# never more than the engine's parallel limit leaves after the long lane.
 ENGINE_SLOTS_MIN = 8
-ENGINE_SLOTS_MAX = 32
+ENGINE_SLOTS_MAX = 24
+assert ENGINE_SLOTS_MAX + LONG_SLOTS <= ENGINE_PARALLEL_MAX
 
 
 class Lane:
@@ -61,9 +78,41 @@ class Lane:
         return "Lane(%r, workers=%d, outstanding=%d)" % (self.name, self.workers, self.outstanding)
 
 
+def _windows_granted_cpus() -> int | None:
+    """The CPUs in this process's affinity on Windows (os.process_cpu_count() ignores affinity there), or None."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        process_mask, system_mask = ctypes.c_size_t(0), ctypes.c_size_t(0)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.GetProcessAffinityMask.argtypes = (wintypes.HANDLE, ctypes.POINTER(ctypes.c_size_t),
+                                                    ctypes.POINTER(ctypes.c_size_t))
+        if kernel32.GetProcessAffinityMask(kernel32.GetCurrentProcess(), ctypes.byref(process_mask),
+                                           ctypes.byref(system_mask)) and process_mask.value:
+            return bin(process_mask.value).count("1")
+        # Zero masks: the process has threads in several processor groups; it may run on every active processor.
+        kernel32.GetActiveProcessorCount.restype = wintypes.DWORD
+        count = kernel32.GetActiveProcessorCount(0xFFFF)   # ALL_PROCESSOR_GROUPS
+        return int(count) or None
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
 def granted_cpus() -> int:
-    """The CPUs the OS grants this process (affinity, PYTHON_CPU_COUNT), not the machine's count."""
-    count = os.process_cpu_count() if hasattr(os, "process_cpu_count") else None
+    """The CPUs the OS grants this process, not the machine's count.
+
+    PYTHON_CPU_COUNT / -X cpu_count win when set (os.process_cpu_count() returns them). Otherwise, on Windows the
+    process affinity mask (os.process_cpu_count() ignores it there), elsewhere os.process_cpu_count(), which uses
+    sched_getaffinity."""
+    override = os.environ.get("PYTHON_CPU_COUNT") or getattr(sys, "_xoptions", {}).get("cpu_count")
+    count = None
+    if sys.platform == "win32" and not override:
+        count = _windows_granted_cpus()
+    if count is None:
+        count = os.process_cpu_count() if hasattr(os, "process_cpu_count") else None
+    if count is None and hasattr(os, "sched_getaffinity"):
+        count = len(os.sched_getaffinity(0))
     return max(1, int(count or os.cpu_count() or 1))
 
 
@@ -72,16 +121,16 @@ def lane_sizes(cpus: int | None = None) -> dict[str, Lane]:
     a small machine never gets less than before.
 
     fast: CPU work under the GIL, so workers follow the CPUs (4..16) and a short queue is fine (outstanding 2x, >= 8).
-    engine: threads that wait on a socket, not on a CPU: 2 per CPU, 8..32, each with its own thread.
-    long: one per CPU, 8..16, each with its own thread; the engine itself admits and schedules the work.
+    engine: threads that wait on a socket, not on a CPU: 2 per CPU, 8..24, each with its own thread.
+    long: 8, each with its own thread; the engine itself admits and schedules the work.
+    engine + long never pass ENGINE_PARALLEL_MAX, the engine's parallel limit for the one shared connection.
     """
     cpus = granted_cpus() if cpus is None else max(1, int(cpus))
     fast = min(16, max(4, cpus))
-    engine = min(ENGINE_SLOTS_MAX, max(ENGINE_SLOTS_MIN, 2 * cpus))
-    long = min(16, max(8, cpus))
+    engine = min(ENGINE_SLOTS_MAX, max(ENGINE_SLOTS_MIN, 2 * cpus), ENGINE_PARALLEL_MAX - LONG_SLOTS)
     return {"fast": Lane("fast", fast, max(8, 2 * fast)),
             "engine": Lane("engine", engine, engine),
-            "long": Lane("long", long, long)}
+            "long": Lane("long", LONG_SLOTS, LONG_SLOTS)}
 
 
 LANES = lane_sizes()

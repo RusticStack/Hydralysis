@@ -286,8 +286,11 @@ class RuntimeRunner:
         if not 1 <= timeout <= 60:
             raise ValueError("runtime timeout_s must be 1..60")
         # `status` reads the worker's in-memory snapshot and needs no session lock: it is answered beside a running
-        # request (the worker serves it on its own thread) instead of failing with "busy".
-        lock = LaneLock(str(directory / ".request.lock")) if action not in LOCK_FREE else _NoLock()
+        # request (the worker serves it on its own thread) instead of failing with "busy". Only a worker that says so
+        # in ready.json does that; an older worker still alive serves one connection at a time, so status to it takes
+        # the lock as before (else it would wait in the backlog, time out and retire the worker).
+        lock_free = action in LOCK_FREE and ready.get("concurrent_status") is True
+        lock = _NoLock() if lock_free else LaneLock(str(directory / ".request.lock"))
         if not lock.acquire():
             raise ValueError("runtime session is busy; retry after the current bounded request")
         try:

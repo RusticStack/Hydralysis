@@ -458,6 +458,13 @@ class RequestGate:
         self.threads: set[threading.Thread] = set()
         self.guard = threading.Lock()
         self.touched = time.monotonic()
+        self.active = 0   # connections being served; the worker is never idle while one runs
+
+    def idle(self, idle_s: float) -> bool:
+        """No connection is being served and none was answered for IDLE_S. A request that outlasts the idle time
+        keeps the worker (and its session) alive; the clock restarts when it is answered."""
+        with self.guard:
+            return self.active == 0 and time.monotonic() - self.touched >= idle_s
 
     def handler(self, action, args, budget):
         if action in self.CONCURRENT:
@@ -471,9 +478,19 @@ class RequestGate:
             if ipc_serve(connection, self.secret, self.handler):
                 self.touched = time.monotonic()
 
+    def _finished(self) -> None:
+        with self.guard:
+            self.active -= 1
+
     def submit(self, connection) -> None:
+        # Counted from the accept until the connection is served, so the loop's idle check never sees 0 in between.
+        with self.guard:
+            self.active += 1
         if not self.slots.acquire(blocking=False):
-            self.serve(connection)
+            try:
+                self.serve(connection)
+            finally:
+                self._finished()
             return
 
         def run():
@@ -483,11 +500,19 @@ class RequestGate:
                 with self.guard:
                     self.threads.discard(thread)
                 self.slots.release()
+                self._finished()
 
         thread = threading.Thread(target=run, name="runtime-ipc", daemon=True)
         with self.guard:
             self.threads.add(thread)
-        thread.start()
+        try:
+            thread.start()
+        except BaseException:
+            with self.guard:
+                self.threads.discard(thread)
+            self.slots.release()
+            self._finished()
+            raise
 
     def drain(self, timeout: float) -> None:
         end = time.monotonic() + timeout
@@ -529,7 +554,10 @@ def main() -> int:
         listener.settimeout(0.25)
         secret = secrets.token_hex(32)
         _write(directory / "ready.json", {**_ready_record(worker, observation),
-                                          "ipc": {"port": listener.getsockname()[1], "token": secret}})
+                                          "ipc": {"port": listener.getsockname()[1], "token": secret},
+                                          # This worker answers `status` beside a running request (RequestGate); a
+                                          # worker without the field serves one connection at a time.
+                                          "concurrent_status": True})
     except Exception as exc:
         cleanup_error = None
         try:
@@ -557,7 +585,7 @@ def main() -> int:
     gate = RequestGate(secret, handle_request)
     gate.touched = touched
     try:
-        while not agent.closed and (agent.tainted or time.monotonic() - gate.touched < int(initial.get("idle_s", 600))):
+        while not agent.closed and (agent.tainted or not gate.idle(int(initial.get("idle_s", 600)))):
             try:
                 connection, _ = listener.accept()
             except socket.timeout:

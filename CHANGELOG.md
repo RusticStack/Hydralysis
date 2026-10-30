@@ -6,14 +6,18 @@ Nothing here is a tag: a release is tagged by the owner.
 
 ## Unreleased
 
-- MCP request handling (H5): three lanes sized from the CPUs the OS grants the process (`os.process_cpu_count()`):
-  `fast` (offline tools, 4..16 workers), `engine` (short engine tools, 2 per CPU, 8..32, a thread per accepted call)
-  and `long` (`ghidra_run`, `prepare`, one per CPU, 8..16), so long tools no longer hold the threads queries need.
-  Every budget is at least the 0.6.0 one. `notifications/cancelled` is honoured: a queued call never starts, a running
-  engine wait sends `cancel` to the engine (pooled attempt, plain call and the wait for a pool entry), and the
-  cancelled request gets no reply (MCP). Everything else on the wire is unchanged.
+- MCP request handling (H5): three lanes sized from the CPUs the OS grants the process (the affinity mask on
+  Windows, `os.process_cpu_count()` elsewhere): `fast` (offline tools, 4..16 workers), `engine` (short engine tools,
+  2 per CPU, 8..24, a thread per accepted call) and `long` (`ghidra_run`, `prepare`, 8), so long tools no longer hold
+  the threads queries need. Engine + long never pass the engine's 32 parallel requests per connection. Every budget is
+  at least the 0.6.0 one. `notifications/cancelled` is honoured: a queued call never starts; a running engine wait in
+  this process (pooled attempt, plain hydra.4 call, the wait for a pool entry) sends `cancel` to the engine and returns
+  after the grace, freeing its slot; `prepare`, offline and runtime tools run to their end and only their reply is
+  dropped. The cancelled request gets no reply (MCP). Everything else on the wire is unchanged.
 - Runtime sessions (H9): the worker serves each IPC connection on its own thread; `status` is answered beside a running
-  request and is sent without the session request lock; every other action stays one at a time.
+  request and is sent without the session request lock when the worker's ready.json says `concurrent_status` (an older
+  worker still alive gets the lock as before); every other action stays one at a time. A request that outlasts the
+  idle time no longer lets the worker retire as idle.
 
 ## 0.6.0
 

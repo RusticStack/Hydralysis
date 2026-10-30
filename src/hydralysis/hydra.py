@@ -632,11 +632,17 @@ RETIRE_CODES = frozenset({"no_program", "no_project", "not_found", "closed"})
 WAITING_COMMANDS = frozenset({"open_project", "open_program", "script"})
 
 
-def _cancellable_call(session, command: str, labels: dict, fields: dict):
-    """`session.call`, which is `wait(send(...))`, with the client's cancel of the MCP request wired in: when the request
-    runs under a cancel token (hydralysis.cancel, set by the MCP server) a cancel sends `cancel` for the request id, the
-    engine answers the request (with `cancelled` when it stopped it) and the wait returns. Without a token, or with a
-    stand-in session that has no send/wait, it is `session.call` unchanged."""
+def _cancellable_call(session, command: str, labels: dict, fields: dict, grace_s: float | None = None):
+    """`session.call`, which is `wait(send(...))`, with the client's cancel of the MCP request wired in.
+
+    Under a cancel token (hydralysis.cancel, set by the MCP server) the wait runs on a helper thread and this thread
+    waits for the answer or the cancel. The token's callback only sets an event (it runs on the MCP stdin reader thread,
+    which must never block on engine I/O). On a cancel this thread sends `cancel` for the request id the way the
+    library's own deadline does (parallel, with the request's labels, its answer dropped), waits the grace for the
+    engine to answer the request, and returns: with the engine's answer, or EngineError("cancelled") when the engine did
+    not answer within the grace. The helper thread stays in `wait` and consumes the late answer, so nothing is left in
+    the session's pending map. Without a token, or with a stand-in session that has no send/wait, it is `session.call`
+    unchanged."""
     token = cancel.current()
     if token is None or not (hasattr(session, "send") and hasattr(session, "wait")):
         return session.call(command, **labels, **fields)
@@ -647,18 +653,53 @@ def _cancellable_call(session, command: str, labels: dict, fields: dict):
     if deadline is not None and hasattr(session, "_check_deadline"):
         session._check_deadline(deadline)
     rid = session.send(command, **labels, **fields)
+    box: dict = {}
+    done, wake = threading.Event(), threading.Event()
 
-    def stop():
+    def work():
         try:
-            session.send("cancel", target=rid)   # thread-safe; the engine answers the cancelled request
-        except Exception:   # noqa: BLE001 - the wait below reports what happened to the request
-            pass
+            box["value"] = session.wait(rid, deadline) if deadline is not None else session.wait(rid)
+        except BaseException as exc:   # noqa: BLE001 - handed to the caller, or dropped when it has left
+            box["error"] = exc
+        finally:
+            done.set()
+            wake.set()
 
-    remove = token.add(stop)
+    threading.Thread(target=work, name="hydra-call-%s" % rid, daemon=True).start()
+    remove = token.add(wake.set)
     try:
-        return session.wait(rid, deadline) if deadline is not None else session.wait(rid)
+        while not done.is_set() and not token.cancelled:
+            wake.wait(1.0)
+            wake.clear()   # both conditions are checked again at the top, so a wake set before this clear is not lost
     finally:
         remove()
+    if not done.is_set():
+        _send_cancel(session, rid, labels)
+        if not done.wait(DEADLINE_GRACE_S if grace_s is None else grace_s):
+            raise EngineError("cancelled", "the client cancelled %s; cancel sent, the engine did not answer within the "
+                              "grace; its late answer is read and dropped" % command,
+                              {"target": rid, "command": command}, command)
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
+def _send_cancel(session, rid: int, labels: dict) -> None:
+    """`cancel target=RID` as the library's deadline sends it: parallel (a plain cancel would queue behind the request it
+    is meant to end on a connection that keeps order), with the request's labels (cancel is scoped by them), and with
+    its own answer marked abandoned, so it never stays in the session's pending map."""
+    fields = {"target": rid, "parallel": True}
+    for name in ("client", "harness"):
+        if labels.get(name) is not None:
+            fields[name] = labels[name]
+    try:
+        send_request = getattr(session, "_send_request", None)
+        if callable(send_request):
+            send_request("cancel", fields, abandon=True)
+        else:
+            session.send("cancel", **fields)
+    except Exception:   # noqa: BLE001 - the connection is gone: the wait reports what happened to the request
+        pass
 
 
 class DeadlineError(EngineError):
