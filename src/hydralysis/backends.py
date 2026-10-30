@@ -173,7 +173,20 @@ def inspect(settings: dict) -> dict:
                        "reason": "full JDK missing or outside the engine's Java bounds (%s+)" % minimum})
     return {"root": str(root), "ready": bool(engine and client and java), "engine": engine, "client": client, "jdk": java,
             "checks": checks[:12], "ignored": _ignored(settings), "pinned_release": hydra.RELEASE, "protocol": hydra.PROTOCOL,
-            "portable_install_supported": os.name == "nt" and platform.machine().lower() in ("amd64", "x86_64")}
+            "portable_install_supported": os.name == "nt" and _machine().lower() in ("amd64", "x86_64")}
+
+
+def _machine() -> str:
+    """The native CPU architecture without starting a process. On Windows `platform.machine()` goes through
+    `platform.uname()`, which also reads the OS version; when the WMI query behind it fails (seen on a loaded machine),
+    the standard library falls back to running `cmd /c ver`, a child process that `backend status` promises not to start
+    (tests/test_environment.py). PROCESSOR_ARCHITEW6432 names the native architecture under WOW64, PROCESSOR_ARCHITECTURE
+    otherwise; without either, platform.machine() is the fallback."""
+    if os.name == "nt":
+        found = os.environ.get("PROCESSOR_ARCHITEW6432") or os.environ.get("PROCESSOR_ARCHITECTURE")
+        if found:
+            return found
+    return platform.machine()
 
 
 # settings (as JSON) -> (stamp, report, resolved settings) of the last ready inspection; see `_stamp`.

@@ -298,6 +298,18 @@ class StatusSpawnsNothing(unittest.TestCase):
         self.assertIn("root", status["environment"])
         self.assertIn("catalog", status)
 
+    @unittest.skipUnless(os.name == "nt", "the WMI fallback of platform.uname() is Windows-only")
+    def test_the_backend_report_starts_no_process_when_wmi_fails(self):
+        # platform.uname() falls back to `cmd /c ver` when its WMI query fails; the report must not go through it.
+        import platform
+        from hydralysis import backends
+        with workdir("env-nowmi") as name, patch.object(platform, "_uname_cache", None),                 patch.object(platform, "_wmi_query", side_effect=OSError("WMI not available")),                 patch("subprocess.Popen", side_effect=AssertionError("the backend report started a process")) as popen:
+            report = backends.inspect({"root": str(Path(name) / "data")})
+        popen.assert_not_called()
+        self.assertEqual(report["portable_install_supported"],
+                         (os.environ.get("PROCESSOR_ARCHITEW6432") or os.environ.get("PROCESSOR_ARCHITECTURE", "")).lower()
+                         in ("amd64", "x86_64"))
+
     def test_status_with_no_engine_installed_is_a_result_not_an_error(self):
         with patch("hydralysis.api._settings", side_effect=ValueError("no ready Hydra engine")), patch("hydralysis.api.load", return_value={}):
             status = json.loads(api.call("backend", {"action": "status"}))

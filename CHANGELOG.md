@@ -6,6 +6,9 @@ Nothing here is a tag: a release is tagged by the owner.
 
 ## Unreleased
 
+- `backend status` (and every backend report) reads the CPU architecture from `PROCESSOR_ARCHITEW6432` /
+  `PROCESSOR_ARCHITECTURE` on Windows instead of `platform.machine()`, which could start `cmd /c ver` when its WMI
+  query failed on a loaded machine; status now starts no process in that case either.
 - Publish pipeline: a leader waits for `.commit.lock` in a first-come queue instead of polling; decided changesets are
   settled in their views after the commit lock is released. A changeset with a generation does not wait for a busy
   view (the view's next call replays it from `CURRENT.log`); one decided without a generation (already in master,
