@@ -153,7 +153,8 @@ class WorkflowTests(unittest.TestCase):
         upload = [(i, st) for i, st in enumerate(steps) if st.get("uses", "").startswith("actions/upload-artifact@")]
         self.assertEqual(len(upload), 1)
         upload_i, upload_step = upload[0]
-        self.assertNotIn("if", upload_step)
+        # a dry run uploads the artifact; a tag push attaches the same files to the draft release instead
+        self.assertEqual(upload_step.get("if"), "github.ref_type != 'tag'")
         self.assertEqual(upload_step["with"].get("path"), "dist/*")
         self.assertEqual(upload_step["with"].get("if-no-files-found"), "error")
         verify_i, _ = self.step("Verify the wheel in a fresh environment")
