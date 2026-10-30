@@ -1158,12 +1158,13 @@ class FaultMatrix(World, unittest.TestCase):
         original = durable.AppendLog._raw_append
 
         def measure(path, data, repair_tail=False, faults=True):
-            lengths.append(len(data))
+            if Path(path).name == "CURRENT.log":  # the store's own log (storelog) appends too; only CURRENT.log counts
+                lengths.append(len(data))
             return original(path, data, repair_tail, faults)
         self.edit("One", A)
         with patch.object(durable.AppendLog, "_raw_append", staticmethod(measure)):
             self.commit(cid="c-fa0100ff")
-        total = lengths[-2]  # the CURRENT.log line is the second-last append (the FINALIZED intent line follows it)
+        total = lengths[-1]  # the CURRENT.log line of the commit
         for offset in (0, 1, 9, 40, total // 2, total - 1):
             with self.subTest(offset=offset):
                 self.setUp()

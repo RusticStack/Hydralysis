@@ -594,6 +594,37 @@ class Rebase(ViewWorld, unittest.TestCase):
         self.assertEqual(self.store("two")["base"], before["base"])
         self.assertEqual(self.name_of(B, view="two"), "FromTwo")  # the old working copy still serves reads
 
+    def test_the_rebase_builds_outside_the_view_lock(self):
+        # H12: the engine round trips of the build no longer hold `.view.lock` (with it held, this acquisition is busy).
+        self.stale_view()
+        original, seen = views._build_rebased_copy, []
+
+        def build(settings, engine, selected, *rest):
+            with patch.object(workcopy, "SYNC_LOCK_S", 0.5), workcopy.view_lock(settings, selected):
+                seen.append(True)
+            return original(settings, engine, selected, *rest)
+        with patch.object(views, "_build_rebased_copy", side_effect=build):
+            self.assertTrue(self.rebase("two")["rebased"])
+        self.assertEqual(seen, [True])
+
+    def test_an_edit_during_the_build_makes_the_switch_refuse_and_change_nothing(self):
+        self.stale_view()
+        before = self.store("two")
+        original = views._build_rebased_copy
+
+        def build(*args):
+            with workcopy.view_lock(self.settings, self.target("two")):  # another agent's mutation lands mid-build
+                store = workcopy.load_store(self.settings, self.target("two"))
+                store["revision"] += 1
+                workcopy._save_store(self.settings, self.target("two"), store)
+            return original(*args)
+        with patch.object(views, "_build_rebased_copy", side_effect=build):
+            body = self.error(lambda: self.rebase("two"))
+        self.assertEqual((body["expected_revision"], body["current_revision"]), (before["revision"], before["revision"] + 1))
+        after = self.store("two")
+        self.assertEqual((after["base"], after["revision"], after["edits"]), (before["base"], before["revision"] + 1, before["edits"]))
+        self.assertTrue(self.rebase("two")["rebased"])  # and a rebase from the new revision goes through
+
     def test_a_kill_after_the_store_write_is_healed_by_the_next_read(self):
         self.stale_view()
         with patch.dict(os.environ, {"HYDRALYSIS_TEST_MODE": "1", "HYDRALYSIS_TEST_FAULT": "publish.after_rebase_store:raise"}):

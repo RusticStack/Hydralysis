@@ -304,6 +304,9 @@ class SealedJson(Base):
         self.assertEqual(durable.read_sealed(path)["n"], 60)
 
 
+# The whole-store writer (HYDRALYSIS_STORE_LOG=0): every save is a sealed snapshot and the previous one is the `.bak`.
+# The log writer's own fallback rules (damaged main, `.bak` plus the log) are covered in test_storelog.py.
+@patch.dict(os.environ, {"HYDRALYSIS_STORE_LOG": "0"})
 class StoreIntegration(Base):
     def setUp(self):
         super().setUp()

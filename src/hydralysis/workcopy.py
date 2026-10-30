@@ -35,7 +35,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from hydralysis import durable, hydra, integrity, lineage, revisions
+from hydralysis import durable, hydra, integrity, lineage, revisions, storelog
 from hydralysis.analysis import MAX_CORPUS_BYTES, MAX_HISTORY_BYTES, MAX_OVERLAYS, _edit, _overlay_path
 from hydralysis.backends import read_json, write_json
 from hydralysis.locks import LaneLock, LockBusy, locked
@@ -567,7 +567,7 @@ def load_store(settings: dict, target: dict) -> dict:
         raise ValueError("overlay history exceeds 20 MiB; preserved for review")
     # Sealed record: the file, else its previous version (.bak). A store that exists but has no valid
     # version raises store_corrupt; only a store that was never written reads as "no edits".
-    record = _store_record(path)
+    record = storelog.read(path, _store_record(path))  # the snapshot, then its append log (storelog)
     if record is None:
         fresh = _empty_store(target["sha256"])
         binding = lineage_binding(target)
@@ -642,11 +642,19 @@ def _keep_old_format(path: Path) -> None:
             durable.atomic_write(backup, path.read_bytes(), point="v%d_backup" % old)
 
 
-def _v3(store: dict, target: dict) -> dict:
-    """The record to write: the store in its v3 form, whatever shape the caller holds (a v2 dict upgrades)."""
+def _v3(store: dict, target: dict, known: list | None = None) -> dict:
+    """The record to write: the store in its v3 form, whatever shape the caller holds (a v2 dict upgrades).
+
+    KNOWN: the records of the store on disk, already in their clean form (storelog.known_edits). A record equal to the
+    one at its position there is taken as it is (cleaning a clean record gives it back, tests/test_storelog.py checks
+    that), so a mutation re-validates only the records it added or changed instead of the whole history."""
     edits, previous = [], 0
+    known = known or []
     for position, item in enumerate(store.get("edits", [])):
-        edit = _clean_record(item, position, previous)
+        if position < len(known) and item == known[position] and known[position]["seq"] > previous:
+            edit = item
+        else:
+            edit = _clean_record(item, position, previous)
         previous = edit["seq"]
         edits.append(edit)
     base = store.get("base") if isinstance(store.get("base"), dict) else dict(DEFAULT_BASE)
@@ -658,13 +666,14 @@ def _v3(store: dict, target: dict) -> dict:
 
 
 def _save_store(settings: dict, target: dict, store: dict) -> None:
-    # Version 3, sealed, previous version kept as .bak, atomic and fsynced (durable.write_sealed); a v1 or v2
-    # file is kept once as .v1.bak or .v2.bak before it is replaced.
+    # Version 3, sealed snapshot (previous one kept as .bak) plus an append log, fsynced before return (storelog); a v1
+    # or v2 file is kept once as .v1.bak or .v2.bak before it is replaced.
     path = _store_path(settings, target)
-    record = _v3(store, target)
+    record = _v3(store, target, storelog.known_edits(path))
     _keep_old_format(path)
-    durable.write_sealed(path, record, max_bytes=MAX_HISTORY_BYTES,
-                         too_large="overlay history would exceed 20 MiB; existing history preserved")
+    # One fsynced log row per mutation, a sealed snapshot every storelog.SNAPSHOT_EVERY rows (H16).
+    storelog.save(path, record, max_bytes=MAX_HISTORY_BYTES,
+                  too_large="overlay history would exceed 20 MiB; existing history preserved")
 
 
 def committed_ids(store: dict) -> set[str]:

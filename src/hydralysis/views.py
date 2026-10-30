@@ -299,7 +299,10 @@ def rebase(settings: dict, engine, selected: dict, options: dict, timeout_s: int
     options = validate({**options, "kind": "rebase"})
     workcopy.heal(settings, selected)
     binding = workcopy.lineage_binding(selected)
-    with workcopy.view_lock(settings, selected):
+    # H12: the engine round trips (probe, build, verify) run OUTSIDE the view's `.view.lock`, so the view's edits and
+    # syncs do not wait for them; the rebase lane (the shadow directory's own lock) keeps one rebase per view at a time.
+    # The switch takes the view lock and is a compare-and-swap on the store revision the decision was made on.
+    with workcopy.view_lock(settings, _shadow(selected)):
         store = workcopy.load_store(settings, selected)
         decision = workcopy.reconcile(store, options["expect_revision"], [revisions.WILDCARD])
         base_generation = (store.get("base") or {}).get("generation", 0)
@@ -372,15 +375,25 @@ def rebase(settings: dict, engine, selected: dict, options: dict, timeout_s: int
                      "journal": revisions.append(store["journal"], revisions.journal_entry(store["revision"] + 1, "rebase", subjects, who, now))}
         # 1. the new working copy, beside the old one, verified; the old one keeps serving reads until the switch below.
         verified = _build_rebased_copy(settings, engine, selected, new_store, kept_ids, timeout_s)
-        # 2. the switch: one atomic store write.
-        try:
-            workcopy._save_store(settings, selected, new_store)
-        except Exception:
-            _abandon_copy(settings, selected, verified.get("state"))
-            raise
-        _point("after_rebase_store")
-        # 3. the cache pointer follows (a crash before it is harmless: the marker mismatch rebuilds the copy).
-        _adopt_copy(settings, selected, verified)
+        # 2. the switch, under the view lock: only if the store is still the revision the rebase was decided on (CAS),
+        #    then one store write.
+        with workcopy.view_lock(settings, selected):
+            now = workcopy.load_store(settings, selected)["revision"]
+            if now != store["revision"]:
+                _abandon_copy(settings, selected, verified.get("state"))
+                raise RuntimeError(json.dumps({
+                    "conflict": "overlay revision changed", "reason": "the view changed while the rebase was building; "
+                    "nothing was changed", "expected_revision": store["revision"], "current_revision": now,
+                    "view_revision": now, "view": selected.get("view", "shared"),
+                    "next": {"tool": "ghidra_query", "action": "type_edit", "options": {"kind": "rebase", "expect_revision": now}}}))
+            try:
+                workcopy._save_store(settings, selected, new_store)
+            except Exception:
+                _abandon_copy(settings, selected, verified.get("state"))
+                raise
+            _point("after_rebase_store")
+            # 3. the cache pointer follows (a crash before it is harmless: the marker mismatch rebuilds the copy).
+            _adopt_copy(settings, selected, verified)
     return {"ok": True, "rebased": True, "outcome": "clean" if not conflicts and not removed else
             ("resolved" if conflicts else ("dropped" if removed else "clean")),
             "view": selected.get("view", "shared"), "from_generation": base_generation, "to_generation": binding["generation"],
@@ -430,7 +443,8 @@ def _build_rebased_copy(settings: dict, engine, selected: dict, new_store: dict,
             raise ViewError("rebase_verify_failed", "the rebuilt working copy does not hold the values of the kept records; the view "
                             "was not changed", mismatches=wrong[:20])
     except BaseException:
-        _abandon_copy(settings, selected, state)
+        with workcopy.view_lock(settings, selected):  # the build runs outside the view lock; the view's writer does not
+            _abandon_copy(settings, selected, state)
         raise
     return {"verified": True, "state": state, "checked": len(pairs)}
 
