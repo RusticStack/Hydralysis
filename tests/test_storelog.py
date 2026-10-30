@@ -185,6 +185,38 @@ class CleanOnce(Base):
         self.assertEqual(cleaned.call_count, 2)  # the changed record and the new one, not all 30
 
 
+class LoadCache(Base):
+    def setUp(self):
+        super().setUp()
+        workcopy._LOADED.clear()
+        self.addCleanup(workcopy._LOADED.clear)
+
+    def test_a_warm_load_does_not_clean_the_records_again_and_gives_a_private_copy(self):
+        store = self.load()
+        for number in range(1, 6):
+            store = self.edit(store, number)
+        first = self.load()
+        with patch.object(workcopy, "_clean_record", wraps=workcopy._clean_record) as cleaned:
+            second = self.load()
+        self.assertEqual(cleaned.call_count, 0)
+        self.assertEqual(first, second)
+        second["edits"].append(record(99))
+        second["edits"][0]["options"]["name"] = "Mutated"
+        self.assertEqual(self.load(), first)
+
+    def test_every_write_and_an_in_place_rewrite_of_the_same_size_are_seen(self):
+        store = self.edit(self.load(), 1)
+        self.assertEqual(self.load()["revision"], 1)
+        self.edit(store, 2)
+        self.assertEqual(self.load()["revision"], 2)
+        with patch.dict(os.environ, {"HYDRALYSIS_STORE_LOG": "0"}):  # the whole-store writer: main and .bak replaced
+            workcopy._save_store(self.settings, TARGET, {**self.load(), "revision": 3})
+        self.assertEqual(self.load()["revision"], 3)
+        good = self.path().read_bytes()
+        self.path().write_bytes(good.replace(b'"revision": 3', b'"revision": 4'))  # same size, mis-sealed
+        self.assertEqual(self.load()["revision"], 2)  # the .bak (and its log), never the cached 3 nor the forged 4
+
+
 class Recovery(Base):
     def build(self, count: int) -> dict:
         store = self.load()

@@ -30,6 +30,7 @@ import json
 import os
 import re
 import shutil
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -559,10 +560,48 @@ def _empty_store(sha256: str) -> dict:
             "published_through": {}, "changesets": []}
 
 
+_LOADED: dict[str, tuple] = {}
+_LOADED_GUARD = threading.Lock()
+
+
+def _file_id(path: Path, tail: bool = False):
+    """Which file is at PATH: id, time, size and (TAIL) its last 256 bytes, which hold the seal of a sealed record, so
+    an in-place rewrite of the same size within one clock tick is still seen."""
+    try:
+        found = path.stat()
+        end = b""
+        if tail:
+            with path.open("rb") as handle:
+                handle.seek(max(0, found.st_size - 256))
+                end = handle.read(256)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    return found.st_ino, found.st_mtime_ns, found.st_size, end
+
+
 def load_store(settings: dict, target: dict) -> dict:
     """The store in its version-3 shape. A v1 or v2 file upgrades in memory (its `version` still says what was read)
-    and on disk at its first write, which keeps the old file once as `.v1.bak` or `.v2.bak`."""
+    and on disk at its first write, which keeps the old file once as `.v1.bak` or `.v2.bak`.
+
+    A warm query reads the store several times; the parsed, validated result is kept per store path and reused while
+    the snapshot, its `.bak` and its log are the same files with the same size and time (a write replaces or grows one
+    of them). Every call gets its own copy (callers mutate what they get)."""
     path = _store_path(settings, target)
+    key = (os.path.normcase(os.path.abspath(path)), target["sha256"], json.dumps(lineage_binding(target), sort_keys=True))
+    signature = (_file_id(path, True), _file_id(durable.backup_path(path)), _file_id(storelog.log_path(path)))
+    with _LOADED_GUARD:
+        cached = _LOADED.get(key[0])
+    if cached is not None and signature[0] is not None and cached[0] == key and cached[1] == signature:
+        return json.loads(cached[2])
+    store = _load_store_uncached(settings, target, path)
+    text = json.dumps(store)
+    if signature[0] is not None and _file_id(path, True) == signature[0] and json.loads(text) == store:
+        with _LOADED_GUARD:
+            _LOADED[key[0]] = (key, signature, text)
+    return store
+
+
+def _load_store_uncached(settings: dict, target: dict, path: Path) -> dict:
     if path.is_file() and path.stat().st_size > MAX_HISTORY_BYTES:
         raise ValueError("overlay history exceeds 20 MiB; preserved for review")
     # Sealed record: the file, else its previous version (.bak). A store that exists but has no valid
