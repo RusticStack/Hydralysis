@@ -857,6 +857,9 @@ class RealEngineBackups(unittest.TestCase):
         cls.env.start()
         cls.engine = hydra.Engine(cls.settings)
         cls.serial = 0
+        from support import require_hydra4
+        require_hydra4(cls.engine, "the engine-written backup (capability `backup`, E2) and its upgrade gate",
+                       lambda: integration._release(cls))
 
     @classmethod
     def tearDownClass(cls):
@@ -1012,6 +1015,9 @@ class RealEngineFaultMatrix(unittest.TestCase):
         integration._prepare(cls, integration.BINARY, "y4d-matrix", "fixture")
         cls.settings["backup_roots"] = [{"path": str(cls.root / "backups")}]
         default_to_shared(cls.runner)
+        from support import require_hydra4
+        require_hydra4(cls.runner.engine, "the E2 commit path (engine-written backups, generation candidates)",
+                       lambda: integration._release(cls))
 
     @classmethod
     def tearDownClass(cls):

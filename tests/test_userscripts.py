@@ -387,6 +387,8 @@ class RealWorker(unittest.TestCase):
         for name, text in (("Y4eFirst.java", FIRST % {"cls": "Y4eFirst"}), ("Y4eMutate.java", MUTATE), ("Y4eDeaf.java", DEAF)):
             (cls.scripts / name).write_text(text, encoding="utf-8")
         cls.settings["targets"] = {"fixture": dict(targets.registry(cls.settings)["fixture"], scripts=str(cls.scripts))}
+        from support import require_hydra4
+        require_hydra4(cls.runner.engine, "E7's killable script worker (scriptIsolation 2)", lambda: _release(cls))
         level = userscripts._level(cls.runner.engine, "scriptIsolation")
         if level < userscripts.WORKER_VERSION:
             _release(cls)
