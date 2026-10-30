@@ -60,13 +60,16 @@ class ConfigFile(unittest.TestCase):
 
 
 class Packaging(unittest.TestCase):
-    def test_both_console_scripts_share_one_entry_point_and_the_version_is_a_dev_version(self):
+    def test_both_console_scripts_share_one_entry_point_and_the_version_is_dev_or_released(self):
         project = tomllib.loads((REPOSITORY / "pyproject.toml").read_text(encoding="utf-8"))["project"]
         self.assertEqual(project["name"], "hydralysis")
         self.assertEqual(project["scripts"], {"hydralysis": "hydralysis.cli:main", "rusticre": "hydralysis.cli:main"})
         from hydralysis import __version__
         self.assertEqual(project["version"], __version__)
-        self.assertIn("dev", __version__)
+        # Between releases a dev version; on a release commit, a version with its own CHANGELOG section
+        if "dev" not in __version__:
+            changelog = (REPOSITORY / "CHANGELOG.md").read_text(encoding="utf-8")
+            self.assertIn("\n## %s\n" % __version__, changelog.replace("\r\n", "\n"))
 
     def test_mcp_server_name_and_attribution_prefix(self):
         from hydralysis import hydra, mcp
