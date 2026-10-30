@@ -97,11 +97,35 @@ def chain(record: dict, rows: list[dict]) -> tuple[dict, dict]:
     return record, {"anchor": current, "n": n, "start": start}
 
 
-def read(path, record: dict | None) -> dict | None:
-    """The store at PATH: RECORD (its snapshot, as workcopy read it) with the log applied."""
-    if record is None or not isinstance(record.get("log_anchor"), str):
-        return record
-    return chain(record, _rows(path))[0]
+READ_RETRIES = 8
+
+
+def _identity(path: Path):
+    try:
+        found = Path(path).stat()
+        return found.st_ino, found.st_mtime_ns, found.st_size
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+
+
+def read(path, record: dict | None, reread=None) -> dict | None:
+    """The store at PATH: RECORD (its snapshot, as workcopy read it) with the log applied.
+
+    The reader holds no lock. When the snapshot file was replaced while the snapshot and then the log were read, the log
+    may already be trimmed past the snapshot read (two compactions in between), and the chain would silently stop at that
+    snapshot. So REREAD (a call that reads the snapshot again) is used to read both again until the snapshot stayed the
+    same file across the read (bounded: READ_RETRIES; the writer compacts only every SNAPSHOT_EVERY mutations)."""
+    before = _identity(path)
+    for attempt in range(READ_RETRIES + 1):
+        if attempt:
+            before = _identity(path)
+            record = reread()
+        if record is None or not isinstance(record.get("log_anchor"), str):
+            return record
+        rows = _rows(path)
+        if reread is None or _identity(path) == before:
+            break
+    return chain(record, rows)[0]
 
 
 # --------------------------------------------------------------------------------------------------------- writing
@@ -153,14 +177,26 @@ def _current(path: Path) -> dict | None:
         return None
     if kind != "sealed" or not isinstance(snapshot.get("log_anchor"), str) or snapshot.get("version") != 3:
         return None  # no snapshot, a .bak-only read, an old format: the next write is a snapshot
-    record, position = chain(snapshot, _rows(path))
-    if position["anchor"] != snapshot["log_anchor"] and position["start"] != snapshot["log_anchor"]:
-        return None
+    rows = _rows(path)
+    record, position = chain(snapshot, rows)
+    # The log bytes of the current anchor's rows: the size trigger counts what was appended since the last snapshot, not
+    # the rows of the `.bak` snapshot that the trim keeps (else a size-triggered compaction is followed by another one).
+    since = sum(len(durable.frame(row)) for row in rows if isinstance(row, dict) and row.get("a") == position["anchor"])
     found = {"signature": signature, "record": record, "anchor": position["anchor"], "n": position["n"],
-             "prev": snapshot.get("log_prev"), "key": key, "size": path.stat().st_size}
-    with _GUARD:
-        _CACHE[key] = found
+             "prev": snapshot.get("log_prev"), "key": key, "size": path.stat().st_size, "since": since}
+    _remember(key, found)
     return found
+
+
+CACHE_ENTRIES = 32  # store paths kept per process (each entry holds a parsed store of up to MAX_HISTORY_BYTES)
+
+
+def _remember(key: str, entry: dict) -> None:
+    with _GUARD:
+        _CACHE.pop(key, None)
+        _CACHE[key] = entry
+        while len(_CACHE) > CACHE_ENTRIES:
+            _CACHE.pop(next(iter(_CACHE)))
 
 
 def _list_change(old: list, new: list):
@@ -204,16 +240,34 @@ def _snapshot(path: Path, record: dict, prev: str | None, max_bytes, too_large) 
     if prev:
         body["log_prev"] = prev
     payload = durable.write_sealed(path, body, max_bytes=max_bytes, too_large=too_large)
-    if prev is None and not durable.backup_path(path).is_file():
-        # The first snapshot is also the `.bak`: a damaged main file then still reads (from it plus the log) as the
-        # newest state, where the whole-store writer had no previous version until its second write.
-        durable.atomic_write(durable.backup_path(path), payload, point="backup")
-    durable.fault("store.after_snapshot")
-    _trim(path, prev)
+    # From here the snapshot is durable: what follows is upkeep, and a failure of it must not be reported as a failed
+    # write (the caller would undo or retry a mutation that is stored). The next write retries it.
+    key = os.path.normcase(os.path.abspath(path))
+    try:
+        if prev is None and not durable.backup_path(path).is_file():
+            # The first snapshot is also the `.bak`: a damaged main file then still reads (from it plus the log) as the
+            # newest state, where the whole-store writer had no previous version until its second write.
+            durable.atomic_write(durable.backup_path(path), payload, point="backup")
+        durable.fault("store.after_snapshot")
+        _trim(path, prev)
+    except OSError as error:
+        _upkeep_failed(path, "snapshot upkeep", error)
+        with _GUARD:
+            _CACHE.pop(key, None)
+        return
+    _remember(key, {"signature": _signature(path), "record": _owned(body), "anchor": anchor, "n": 0, "prev": prev,
+                    "key": key, "size": path.stat().st_size, "since": 0})
+
+
+# The last compaction failure per store path (an OSError after the mutation was durable): reported, never raised.
+UPKEEP_ERRORS: dict[str, str] = {}
+
+
+def _upkeep_failed(path: Path, what: str, error: BaseException) -> None:
     with _GUARD:
-        _CACHE[os.path.normcase(os.path.abspath(path))] = {
-            "signature": _signature(path), "record": _owned(body), "anchor": anchor, "n": 0, "prev": prev,
-            "key": os.path.normcase(os.path.abspath(path)), "size": path.stat().st_size}
+        UPKEEP_ERRORS[os.path.normcase(os.path.abspath(path))] = "%s: %s" % (what, error)
+        while len(UPKEEP_ERRORS) > CACHE_ENTRIES:
+            UPKEEP_ERRORS.pop(next(iter(UPKEEP_ERRORS)))
 
 
 def _trim(path: Path, keep_from: str | None) -> None:
@@ -267,8 +321,8 @@ def save(path, record: dict, *, max_bytes: int | None, too_large: str | None) ->
     if current["n"] == 0 and current.get("prev"):
         row["prev"] = current["prev"]
     line = durable.frame(row)
-    log_before = current["signature"][1][1] if current["signature"][1] else 0
-    due = after >= SNAPSHOT_EVERY or log_before + len(line) > SNAPSHOT_LOG_BYTES
+    since = current.get("since", 0)
+    due = after >= SNAPSHOT_EVERY or since + len(line) > SNAPSHOT_LOG_BYTES
     # Budget: an upper estimate (snapshot size plus four times every row since) decides when to measure exactly, so a
     # store that would pass the whole-store writer's 20 MiB limit is refused here too, before the row is appended.
     estimate = current["size"] + 4 * len(line)
@@ -277,8 +331,14 @@ def save(path, record: dict, *, max_bytes: int | None, too_large: str | None) ->
     _log(path).append(row)
     durable.fault("store.after_append")
     apply_row(current["record"], _owned(row))
-    state = {**current, "n": after, "size": estimate, "signature": _signature(path)}
-    with _GUARD:
-        _CACHE[current["key"]] = state
+    state = {**current, "n": after, "size": estimate, "signature": _signature(path), "since": since + len(line)}
+    _remember(current["key"], state)
     if due:
-        _snapshot(path, record, current["anchor"], max_bytes, too_large)
+        # The mutation is durable (the row above): compaction is best effort from here. A failure (disk full, a sharing
+        # violation that outlasts replace_file's retries) is recorded, the log stays whole, and the next write is due again.
+        try:
+            _snapshot(path, record, current["anchor"], max_bytes, too_large)
+        except (OSError, ValueError) as error:
+            _upkeep_failed(path, "compaction", error)
+            with _GUARD:
+                _CACHE.pop(current["key"], None)

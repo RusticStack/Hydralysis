@@ -209,12 +209,47 @@ def _forget_current(settings: dict, target: dict, discarded: list[str], retired:
         write_json(_directory(settings, target) / "state.json", changed)
 
 
+# The rebase folders (`views._shadow`) whose rebase lane this thread holds: a rebase sweeping its own view at the switch
+# (`views._adopt_copy`) still sees the copies in it; any other sweep skips a rebase folder whose lane is held (below).
+_REBASING = threading.local()
+
+
+@contextmanager
+def rebase_lane(settings: dict, target: dict):
+    """The rebase lane of TARGET's view: the `.view.lock` of its rebase folder, held for the whole rebase (one rebase per
+    view at a time), and marked as this thread's so the switch's own sweep still lists the copies in that folder."""
+    shadow = {**target, "key": target["key"] + "r"}
+    folder = _norm(_directory(settings, shadow))
+    with view_lock(settings, shadow):
+        owned = getattr(_REBASING, "folders", None)
+        if owned is None:
+            owned = _REBASING.folders = set()
+        owned.add(folder)
+        try:
+            yield
+        finally:
+            owned.discard(folder)
+
+
+def _rebase_building(folder: Path) -> bool:
+    """FOLDER is a rebase folder whose lane another rebase holds: the copy in it is being built (H12: outside the view
+    lock), so a sweep of the view must not close it."""
+    if _norm(folder) in (getattr(_REBASING, "folders", None) or set()):
+        return False
+    from hydralysis.locks import held
+    return held(str(folder / ".view.lock"))
+
+
 def _forks_on_disk(settings: dict, target: dict) -> list[Path]:
     """Every working copy of the view that is on disk (`w-*/<name>.gpr` in the view's folders), referenced or not: a state
-    file that was lost (K15 removes it) or never written (a sync that failed) no longer names the copies it made."""
+    file that was lost (K15 removes it) or never written (a sync that failed) no longer names the copies it made.
+
+    The rebase folder is left out while another rebase of the view holds its lane: the copy it is building there is no
+    orphan (review finding: a concurrent sync of the view swept it and the switch then adopted a discarded copy)."""
     found = []
-    for folder in view_folders(settings, target):
-        if folder.is_dir():
+    folders = view_folders(settings, target)
+    for index, folder in enumerate(folders):
+        if folder.is_dir() and not (index > 0 and _rebase_building(folder)):
             found += sorted(path for path in folder.glob("w-*/*.gpr") if path.is_file())
     return found
 
@@ -597,7 +632,10 @@ def load_store(settings: dict, target: dict) -> dict:
     text = json.dumps(store)
     if signature[0] is not None and _file_id(path, True) == signature[0] and json.loads(text) == store:
         with _LOADED_GUARD:
+            _LOADED.pop(key[0], None)
             _LOADED[key[0]] = (key, signature, text)
+            while len(_LOADED) > storelog.CACHE_ENTRIES:   # bounded: a long-lived server reads many views
+                _LOADED.pop(next(iter(_LOADED)))
     return store
 
 
@@ -606,7 +644,8 @@ def _load_store_uncached(settings: dict, target: dict, path: Path) -> dict:
         raise ValueError("overlay history exceeds 20 MiB; preserved for review")
     # Sealed record: the file, else its previous version (.bak). A store that exists but has no valid
     # version raises store_corrupt; only a store that was never written reads as "no edits".
-    record = storelog.read(path, _store_record(path))  # the snapshot, then its append log (storelog)
+    # the snapshot, then its append log (storelog); read again when a compaction replaced the snapshot meanwhile
+    record = storelog.read(path, _store_record(path), reread=lambda: _store_record(path))
     if record is None:
         fresh = _empty_store(target["sha256"])
         binding = lineage_binding(target)

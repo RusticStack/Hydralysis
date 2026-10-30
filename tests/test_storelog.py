@@ -114,6 +114,87 @@ class Appending(Base):
         self.assertEqual(self.load()["revision"], 2)
 
 
+class ReviewFixes(Base):
+    def setUp(self):
+        super().setUp()
+        workcopy._LOADED.clear()
+        self.addCleanup(workcopy._LOADED.clear)
+
+    def test_a_failed_compaction_after_the_row_is_durable_is_not_reported_as_a_failed_write(self):
+        store = self.edit(self.load(), 1)
+        with patch.object(storelog, "SNAPSHOT_EVERY", 2):
+            store = self.edit(store, 2)              # n=1: an append
+            with patch.object(durable, "write_sealed", side_effect=OSError(28, "disk full (simulated)")):
+                store = self.edit(store, 3)          # n=2: due; the snapshot fails after the row was appended
+            self.assertIn("compaction", storelog.UPKEEP_ERRORS[os.path.normcase(os.path.abspath(self.path()))])
+            self.assertEqual(self.load()["revision"], 3)
+            store = self.edit(store, 4)              # still due: this one compacts
+            self.assertEqual(self.load()["revision"], 4)
+            self.assertEqual(durable.read_sealed(self.path())["revision"], 4)
+
+    def test_a_failed_trim_after_the_snapshot_is_not_reported_either(self):
+        store = self.edit(self.load(), 1)
+        with patch.object(storelog, "SNAPSHOT_EVERY", 2):
+            store = self.edit(store, 2)
+            with patch.object(storelog, "_trim", side_effect=PermissionError(13, "sharing violation (simulated)")):
+                store = self.edit(store, 3)
+            self.assertEqual(self.load()["revision"], 3)
+            store = self.edit(store, 4)
+            self.assertEqual(self.load()["revision"], 4)
+
+    def test_a_size_triggered_compaction_is_not_followed_at_once_by_another(self):
+        store = self.edit(self.load(), 1)
+        snapshots = []
+        real = storelog._snapshot
+        with patch.object(storelog, "SNAPSHOT_LOG_BYTES", 3000), \
+                patch.object(storelog, "_snapshot", side_effect=lambda *a, **k: (snapshots.append(at[0]), real(*a, **k))[1]):
+            at = [0]
+            for number in range(2, 40):
+                at[0] = number
+                store = self.edit(store, number)
+        self.assertEqual(self.load()["revision"], store["revision"])
+        # each size-triggered snapshot covers about 3000 bytes of new rows; the old trigger (the whole log, including the
+        # rows the trim keeps for the .bak) compacted again on the very next mutation (measured: 6,7,13,14,...)
+        self.assertGreater(len(snapshots), 1)
+        self.assertEqual([b - a for a, b in zip(snapshots, snapshots[1:]) if b - a == 1], [])
+
+    def test_a_reader_whose_snapshot_was_replaced_twice_meanwhile_reads_again(self):
+        store = self.edit(self.load(), 1)
+        with patch.object(storelog, "SNAPSHOT_EVERY", 3):
+            store = self.edit(store, 2)
+            stale_snapshot = workcopy._store_record(self.path())   # the reader's snapshot read ...
+            for number in range(3, 10):                              # ... then two compactions finish
+                store = self.edit(store, number)
+            self.assertNotEqual(durable.read_sealed(self.path())["log_anchor"], stale_snapshot["log_anchor"])
+            # without a re-read, the chain stops at the old snapshot and loses acknowledged rows
+            self.assertLess(storelog.read(self.path(), json.loads(json.dumps(stale_snapshot)))["revision"], 9)
+            # the reader notices the snapshot file changed during its read and reads both again
+            calls = []
+
+            def reread():
+                calls.append(1)
+                return workcopy._store_record(self.path())
+            real = storelog._identity
+            seen = iter([("old",), ("new",)])
+            with patch.object(storelog, "_identity", side_effect=lambda p: next(seen, None) or real(p)):
+                got = storelog.read(self.path(), json.loads(json.dumps(stale_snapshot)), reread=reread)
+            self.assertEqual(got["revision"], 9)
+            self.assertEqual(calls, [1])
+
+    def test_the_per_process_caches_are_bounded(self):
+        with patch.object(storelog, "CACHE_ENTRIES", 3):
+            for index in range(6):
+                target = {**TARGET, "key": "%016x" % index}
+                store = workcopy.load_store(self.settings, target)
+                store["revision"] += 1
+                store["edits"].append(record(index + 1))
+                workcopy._save_store(self.settings, target, store)
+                workcopy._save_store(self.settings, target, {**workcopy.load_store(self.settings, target), "revision": 2})
+                workcopy.load_store(self.settings, target)
+            self.assertLessEqual(len(storelog._CACHE), 3)
+            self.assertLessEqual(len(workcopy._LOADED), 3)
+
+
 class Equivalence(Base):
     """Any sequence of mutations loads exactly as the whole-store writer's file does (HYDRALYSIS_STORE_LOG=0)."""
 

@@ -625,6 +625,93 @@ class Rebase(ViewWorld, unittest.TestCase):
         self.assertEqual((after["base"], after["revision"], after["edits"]), (before["base"], before["revision"] + 1, before["edits"]))
         self.assertTrue(self.rebase("two")["rebased"])  # and a rebase from the new revision goes through
 
+    def test_a_published_through_mark_set_during_the_build_survives_the_switch(self):
+        # review finding: merge marks the SOURCE view's published_through without a revision bump; the switch kept the
+        # decision-time copy and silently dropped the mark.
+        self.stale_view()
+        original = views._build_rebased_copy
+
+        def build(*args):
+            with workcopy.view_lock(self.settings, self.target("two")):
+                store = workcopy.load_store(self.settings, self.target("two"))
+                store["published_through"] = {**store.get("published_through", {}), "other": 7}
+                workcopy._save_store(self.settings, self.target("two"), store)
+            return original(*args)
+        with patch.object(views, "_build_rebased_copy", side_effect=build):
+            self.assertTrue(self.rebase("two")["rebased"])
+        after = self.store("two")
+        self.assertEqual(after["published_through"].get("other"), 7)
+        self.assertEqual(after["base"]["generation"], 1)
+
+    def test_a_versioned_change_without_a_revision_bump_makes_the_switch_refuse(self):
+        self.stale_view()
+        before = self.store("two")
+        original = views._build_rebased_copy
+
+        def build(*args):
+            with workcopy.view_lock(self.settings, self.target("two")):
+                store = workcopy.load_store(self.settings, self.target("two"))
+                store["stale"] = "planted"
+                workcopy._save_store(self.settings, self.target("two"), store)
+            return original(*args)
+        with patch.object(views, "_build_rebased_copy", side_effect=build):
+            body = self.error(lambda: self.rebase("two"))
+        self.assertIn("conflict", body)
+        after = self.store("two")
+        self.assertEqual((after["base"], after["stale"]), (before["base"], "planted"))
+
+    def test_a_sync_of_the_view_during_the_build_leaves_the_rebase_copy_alone(self):
+        # review finding: a concurrent sync swept the copy being built in the rebase folder, and the switch then named the
+        # discarded copy as the view's fork. The sync runs in another thread (another caller) while the build holds its lane.
+        self.stale_view()
+        original, seen = views._build_rebased_copy, {}
+
+        def build(settings, engine, selected, *rest):
+            built = original(settings, engine, selected, *rest)
+            seen["fork"] = (built.get("state") or {}).get("fork_gpr")
+            errors = []
+
+            def other():
+                try:
+                    workcopy.repair(settings, self.engine(), selected)
+                except Exception as error:  # noqa: BLE001
+                    errors.append(error)
+            thread = threading.Thread(target=other)
+            thread.start()
+            thread.join(120)
+            seen["errors"] = errors
+            seen["exists"] = bool(seen["fork"]) and Path(seen["fork"]).is_file()
+            seen["synced"] = json.loads((workcopy._directory(settings, selected) / "state.json").read_text())
+            return built
+        with patch.object(views, "_build_rebased_copy", side_effect=build):
+            self.assertTrue(self.rebase("two")["rebased"])
+        self.assertEqual(seen["errors"], [])
+        self.assertTrue(seen["exists"])
+        # the concurrent sync did not close (discard) or retire the copy being built
+        self.assertNotIn(workcopy._norm(seen["fork"]), {workcopy._norm(item) for item in seen["synced"].get("retired") or []})
+        self.assertNotIn("discarded", seen["synced"].get("last_sync") or {})
+        state = json.loads((workcopy._directory(self.settings, self.target("two")) / "state.json").read_text())
+        self.assertEqual(state["fork_gpr"], seen["fork"])
+        self.assertNotIn(seen["fork"], state.get("retired") or [])
+        self.assertEqual(self.names([A, B], "two"), {A: "FromOne", B: "FromTwo"})
+
+    def test_the_switch_refuses_a_copy_that_was_closed_while_it_was_building(self):
+        # The guard behind the sweep fix: if the built copy was discarded anyway (same thread here, so the lane does not
+        # hide it), the switch refuses instead of adopting a discarded program.
+        self.stale_view()
+        before = self.store("two")
+        original = views._build_rebased_copy
+
+        def build(settings, engine, selected, *rest):
+            built = original(settings, engine, selected, *rest)
+            workcopy.repair(settings, self.engine(), selected)
+            return built
+        with patch.object(views, "_build_rebased_copy", side_effect=build):
+            body = self.error(lambda: self.rebase("two"))
+        self.assertIn("closed", body["reason"])
+        self.assertEqual(self.store("two")["base"], before["base"])
+        self.assertTrue(self.rebase("two")["rebased"])
+
     def test_a_kill_after_the_store_write_is_healed_by_the_next_read(self):
         self.stale_view()
         with patch.dict(os.environ, {"HYDRALYSIS_TEST_MODE": "1", "HYDRALYSIS_TEST_FAULT": "publish.after_rebase_store:raise"}):
