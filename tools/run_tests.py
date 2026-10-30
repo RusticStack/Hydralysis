@@ -54,6 +54,26 @@ RAN = re.compile(r"^Ran (\d+) tests? in ", re.M)
 FAILED_LOADER = "unittest.loader._FailedTest."
 
 
+def granted_cpus() -> int:
+    """The logical processors this process may run on (its affinity mask), not the machine's count: a CI runner or a
+    run under ``start /affinity`` has fewer than ``os.cpu_count()`` reports, and on Windows ``os.cpu_count`` and
+    ``os.process_cpu_count`` both report the whole machine."""
+    if hasattr(os, "sched_getaffinity"):
+        return max(1, len(os.sched_getaffinity(0)))
+    if os.name == "nt":
+        import ctypes
+        proc, system = ctypes.c_size_t(), ctypes.c_size_t()
+        k32 = ctypes.windll.kernel32
+        k32.GetCurrentProcess.restype = ctypes.c_void_p
+        if k32.GetProcessAffinityMask(ctypes.c_void_p(k32.GetCurrentProcess()), ctypes.byref(proc), ctypes.byref(system)) and proc.value:
+            return bin(proc.value).count("1")
+    return os.cpu_count() or 1
+
+
+#: tasks at once: the granted logical processors less 2 for the runner and the OS, at least 2
+DEFAULT_JOBS = max(2, granted_cpus() - 2)
+
+
 def test_id(ident: str) -> str:
     """The id the planner uses: an import failure is named by its module."""
     return ident[len(FAILED_LOADER):] if ident.startswith(FAILED_LOADER) else ident
@@ -160,7 +180,7 @@ def run_task(task: dict, root: Path, label: str, integration: bool = False, time
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("-j", "--jobs", type=int, default=max(2, (os.cpu_count() or 4) - 2))
+    ap.add_argument("-j", "--jobs", type=int, default=DEFAULT_JOBS, help="tasks at once (default %d)" % DEFAULT_JOBS)
     ap.add_argument("--root", default="", help="parent directory for this run's work directory (default: the system temp); keep it dot-free")
     ap.add_argument("-k", default="", help="only test ids containing this text")
     ap.add_argument("--rerun-alone", type=int, default=1, help="how many times a failed task is run again alone (0: none)")

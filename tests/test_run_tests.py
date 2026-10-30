@@ -1,5 +1,7 @@
 """The parallel runner: how it plans tasks, when it trusts a task process, and that it only deletes its own directory."""
 
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,6 +15,37 @@ import run_tests  # noqa: E402
 
 def ids(cls, n):
     return ["test_mod.%s.test_%02d" % (cls, i) for i in range(n)]
+
+
+def lowest_granted_cpu() -> int:
+    """The lowest logical processor this process may run on: a child can only be granted one of its parent's."""
+    if hasattr(os, "sched_getaffinity"):
+        return min(os.sched_getaffinity(0))
+    import ctypes
+    proc, system = ctypes.c_size_t(), ctypes.c_size_t()
+    k32 = ctypes.windll.kernel32
+    k32.GetCurrentProcess.restype = ctypes.c_void_p
+    if not k32.GetProcessAffinityMask(ctypes.c_void_p(k32.GetCurrentProcess()), ctypes.byref(proc), ctypes.byref(system)):
+        raise OSError("GetProcessAffinityMask failed")
+    return (proc.value & -proc.value).bit_length() - 1
+
+
+class Workers(unittest.TestCase):
+    def test_the_default_worker_count_follows_the_affinity_mask_not_the_machine(self):
+        code = ("import sys; sys.path.insert(0, %r); import run_tests; print(run_tests.granted_cpus(), run_tests.DEFAULT_JOBS)"
+                % str(TOOLS))
+        mask = "%X" % (1 << lowest_granted_cpu())
+        if sys.platform == "win32":
+            # one logical processor granted at process creation, as a CI runner or `start /affinity` grants it; one this
+            # process has, since a child under a narrower mask (heavy.py, `start /affinity F0`) keeps its parent's otherwise
+            out = subprocess.run(["cmd", "/c", "start", "", "/affinity", mask, "/wait", "/b", sys.executable, "-c", code],
+                                 capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        else:
+            if not shutil.which("taskset"):
+                self.skipTest("no taskset to grant one processor")
+            out = subprocess.run(["taskset", mask, sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.stdout.split(), ["1", "2"], out.stderr)
+        self.assertLessEqual(run_tests.granted_cpus(), os.cpu_count())
 
 
 class Plan(unittest.TestCase):
