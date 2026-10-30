@@ -20,6 +20,7 @@ concurrency:
 #   actions/setup-python v5.6.0 -> a26af69be951a213d495a4c3e4e4022e16d87065
 #   actions/setup-java   v4.9.1 -> cf277c60eb25467037889841efdb72551f06f6c3
 #   actions/cache        v4.3.0 -> 0057852bfaa89a56745cba8c7296529d2fc39830
+#   actions/upload-artifact v4.6.2 -> ea165f8d65b6e75b540449e92b4886f43607fa02
 
 jobs:
   unit:
@@ -50,9 +51,13 @@ jobs:
         run: python -m unittest discover -s tests -v
 
   engine:
-    # The real engine: the pinned Hydra release, a JDK 25, the env-gated end-to-end tests.
+    # The real engine: the pinned Hydra release, a JDK 25, every env-gated end-to-end test file (not three of them),
+    # on the private repository's 2 vCPU / 8 GB runner. tools/run_tests.py sizes its workers from the processors
+    # the runner grants (granted_cpus: max(2, CPUs - 2), 2 here) and runs a failed task again alone; --strict
+    # makes a test that fails only under load a failure. Tests that need a helper client, a legacy project or game
+    # data still skip (their variables are not set here).
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
     env:
       GHIDRA_INSTALL_DIR: ""
     steps:
@@ -78,20 +83,22 @@ jobs:
         run: python .github/scripts/ci_engine.py install "${{ runner.temp }}\hydra-root"
       - name: Hermetic - the pinned Hydra is the only engine; a stock-Ghidra variable is ignored
         run: python .github/scripts/ci_engine.py hermetic "${{ runner.temp }}\hydra-root" --java "$env:JAVA_HOME"
-      - name: Engine integration tests
-        env:
-          HYDRALYSIS_INTEGRATION_JAVA: ${{ env.JAVA_HOME }}
-          HYDRALYSIS_TEST_ROOT: ${{ runner.temp }}\hydralysis-tests
-        run: python -m unittest discover -s tests -p test_engine_integration.py -v
-      - name: Concurrency tests on the real engine (Z1)
-        env:
-          HYDRALYSIS_INTEGRATION_JAVA: ${{ env.JAVA_HOME }}
-          HYDRALYSIS_TEST_ROOT: ${{ runner.temp }}\hydralysis-tests
-        run: python -m unittest discover -s tests -p test_concurrency.py -v
-      - name: No-stock end-to-end proof and harness audit (Z4)
-        env:
-          HYDRALYSIS_INTEGRATION_JAVA: ${{ env.JAVA_HOME }}
-          HYDRALYSIS_TEST_ROOT: ${{ runner.temp }}\hydralysis-tests
+      - name: Build the fixtures (MSVC, x64 and x86; the linker maps are the ground truth)
         run: |
-          python -m unittest discover -s tests -p test_engine_nostock.py -v
-          python tools/audit_harness.py --self --skills skills
+          python tests/fixtures/build_fixtures.py "${{ runner.temp }}\fixtures"
+          "HYDRALYSIS_INTEGRATION_FIXTURES=${{ runner.temp }}\fixtures" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: The runner's processors
+        run: python -c "import os, sys; sys.path.insert(0, 'tools'); import run_tests; print(f'granted CPUs {run_tests.granted_cpus()} of {os.cpu_count()}')"
+      - name: Every engine-gated test file, in parallel (Z1, Z4 and the rest)
+        env:
+          HYDRALYSIS_INTEGRATION_JAVA: ${{ env.JAVA_HOME }}
+        run: python tools/run_tests.py --integration --strict --root "${{ runner.temp }}\hy-run" --keep
+      - name: Harness audit (Z4)
+        run: python tools/audit_harness.py --self --skills skills
+      - name: Upload the test logs
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: engine-test-logs
+          path: ${{ runner.temp }}\hy-run
+          if-no-files-found: ignore

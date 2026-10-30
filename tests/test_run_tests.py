@@ -1,5 +1,7 @@
 """The parallel runner: how it plans tasks, when it trusts a task process, and that it only deletes its own directory."""
 
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,6 +15,21 @@ import run_tests  # noqa: E402
 
 def ids(cls, n):
     return ["test_mod.%s.test_%02d" % (cls, i) for i in range(n)]
+
+
+class Workers(unittest.TestCase):
+    def test_the_default_worker_count_follows_the_affinity_mask_not_the_machine(self):
+        code = "import sys; sys.path.insert(0, %r); import run_tests; print(run_tests.granted_cpus())" % str(TOOLS)
+        if sys.platform == "win32":
+            # one logical processor granted at process creation, as a CI runner or `start /affinity 1` grants it
+            out = subprocess.run(["cmd", "/c", "start", "", "/affinity", "1", "/wait", "/b", sys.executable, "-c", code],
+                                 capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        else:
+            if not shutil.which("taskset"):
+                self.skipTest("no taskset to grant one processor")
+            out = subprocess.run(["taskset", "1", sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.stdout.strip(), "1", out.stderr)
+        self.assertLessEqual(run_tests.granted_cpus(), os.cpu_count())
 
 
 class Plan(unittest.TestCase):
