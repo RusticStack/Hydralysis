@@ -726,6 +726,8 @@ class CallerEngine(fakehydra.FakeEngine):
             calls = "".join("  %s();\n" % view["names"].get(callee, "FUN_" + callee.removeprefix("0x"))
                             for callee in self.CALLEES[out["function"]["address"]])
             out["c"] = "void %s(void) {\n%s}\n" % (out["function"]["name"], calls)
+            # as the engine answers: the length of the whole text, which a rename of a callee changes (gate 9.17)
+            out.update(total_characters=len(out["c"]), truncated=False)
         elif "functions" in out and self.ROWS is not None:
             out["functions"] = [dict(row) for row in self.ROWS]
         return {**result, "output": json.dumps(out) + "\n"}

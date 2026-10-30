@@ -90,9 +90,29 @@ class Daemon:
         for path, info in programs.items():
             project["programs"][path] = {"sha256": info["sha256"], "analyzed": info.get("analyzed", True),
                                          "functions": info.get("functions", 2), "imageBase": "0x140000000",
-                                         "saved": {"marker": "", "names": {}}, "live": None, "writers": set()}
+                                         "saved": {"marker": "", "names": {}}, "live": None, "writers": set(), "users": set()}
         self.projects[self._norm(gpr)] = project
         return project
+
+    # --- what the real daemon reports of its programs (9.17's leak check reads the same: `status` programs) -------------
+    @staticmethod
+    def _unsaved(program: dict) -> bool:
+        return program["live"] is not None and program["live"] != program["saved"]
+
+    def program_rows(self) -> list[dict]:
+        """Every program the daemon holds: one somebody uses, or one that keeps unsaved work nobody uses (an orphan)."""
+        rows = []
+        for project in self.projects.values():
+            for path, program in project["programs"].items():
+                if program.setdefault("users", set()) or program["writers"] or self._unsaved(program):
+                    rows.append({"project": project.get("id"), "path": path, "gpr": project["gpr"], "users": sorted(program.setdefault("users", set())),
+                                 "writers": sorted(program["writers"]), "unsavedEdits": 1 if self._unsaved(program) else 0})
+        return rows
+
+    def orphans(self) -> list[dict]:
+        """Programs that hold unsaved edits and no writer (ProgramEntry.holdsOrphanedWork): the daemon keeps them for ever
+        (orphanKeepS 0), as views, whether readers still use them or not; once the readers leave nobody uses them (K7)."""
+        return [row for row in self.program_rows() if not row["writers"] and row["unsavedEdits"]]
 
     @staticmethod
     def _norm(path) -> str:
@@ -368,11 +388,17 @@ class FakeEngine:
 
     # --- connection -------------------------------------------------------------------------
     def reset(self):
-        # Like the real daemon: committed changes in shared mode stay, the writer leaves.
+        # Like the real daemon: committed changes in shared mode stay, the writer leaves (and every use of the connection ends:
+        # a program kept for its unsaved work with no user left is an orphan, `Daemon.orphans`).
         for key in self.writable:
             program = self._program(key)
             program["writers"].discard(self.conn)
         self.writable.clear()
+        with self.daemon.lock:
+            for project in self.daemon.projects.values():
+                for program in project["programs"].values():
+                    program.setdefault("users", set()).discard(self.conn)
+                    program["writers"].discard(self.conn)
 
     def hello(self):
         return {"protocol": 2, **self.daemon.release, "installId": "fake"}
@@ -454,6 +480,7 @@ class FakeEngine:
             self.writable.add(key)
             if program["live"] is None:
                 program["live"] = copy.deepcopy(program["saved"])
+        program.setdefault("users", set()).add(self.conn)
         return {"key": key, "sha256": program["sha256"], "analyzed": program["analyzed"], "functions": program["functions"],
                 "imageBase": program["imageBase"], "mode": "shared" if writable else "read_only", "revision": "r"}
 
@@ -508,17 +535,30 @@ class FakeEngine:
                               {"reason": "sealed", "project": project["gpr"]})
 
     def _close_project(self, project, discard=False, **_):
-        for key in [key for key in self.writable if key.startswith(project + ":")]:
-            self._program(key)["writers"].discard(self.conn)
-            self.writable.discard(key)
-        if discard:
-            # Closing with discard drops the unsaved changes of the project's programs and keeps its folder.
-            for program in self.daemon.project_by_id(project)["programs"].values():
+        """This connection leaves the project (ProjectCommands.leaveProject). With discard, a program it was the last writer of
+        loses its unsaved changes; a reader's discard discards nothing (a reader has nothing to discard, and the work a
+        writer left in a shared program stays, as on the real daemon). The folder is kept."""
+        for path, program in self.daemon.project_by_id(project)["programs"].items():
+            key = "%s:%s" % (project, path)
+            writer = self.conn in program["writers"] or key in self.writable
+            # as on the real daemon (gate 9.17 probe): while another connection still reads the program, it keeps the edits
+            # it shows that reader; only a discard by the last user disposes of them
+            others = (program["writers"] | program.setdefault("users", set())) - {self.conn}
+            if discard and writer and not others:
                 program["live"] = None
+            program["writers"].discard(self.conn)
+            program.setdefault("users", set()).discard(self.conn)
+            self.writable.discard(key)
         return {"closed": True}
 
     def _close_program(self, program, **_):
         self.writable.discard(program)
+        try:
+            entry = self._program(program)
+        except (EngineError, KeyError):
+            return {"closed": True}
+        entry.setdefault("users", set()).discard(self.conn)
+        entry["writers"].discard(self.conn)
         return {"closed": True}
 
     def _fork_project(self, project, path, writable=True, mode="auto", purpose=None, reason="manual", **_):
@@ -587,7 +627,9 @@ class FakeEngine:
 
     def _status(self, **_):
         return {"projects": [{"gpr": item["gpr"], "id": item.get("id")} for item in self.daemon.projects.values()
-                             if item.get("id")], "programs": [], "clients": []}
+                             if item.get("id")],
+                "programs": [{key: row[key] for key in ("project", "path", "users", "writers", "unsavedEdits")}
+                             for row in self.daemon.program_rows()], "clients": []}
 
     def _refresh(self, project, **_):
         return {"refreshed": False}

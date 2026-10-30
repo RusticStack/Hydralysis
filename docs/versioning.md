@@ -38,6 +38,7 @@ need a hydra.4-only feature: on hydra.3 each of their tests skips with a reason 
 | `test_backups.RealEngineBackups` | the engine-written backup (`backup` capability, E2) and its upgrade gate |
 | `test_backups.RealEngineFaultMatrix` | the E2 commit path: engine-written backups, `generation` candidates |
 | `test_userscripts.RealWorker` | E7's killable script worker (`scriptIsolation` 2) |
+| `test_view_leak.RealEngineViewLeak` | the governor's `health` view count and `status` program rows (`unsavedEdits`, `writers`) of gate 9.17 |
 | `test_deadline.RealNative` | client library 1.1.0 timing its own wait (already skipped without that library) |
 | `test_deadline.RealDegrade` (the hydra.4 side) | the install's library 1.1.0; on hydra.3 that side has no library and skips with its reason |
 
