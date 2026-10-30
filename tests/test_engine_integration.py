@@ -410,7 +410,12 @@ class EngineIntegration(unittest.TestCase):
         self.assertEqual(renamed["effects"][0]["before"], original)
 
     def test_a_removed_main_store_with_an_intact_backup_still_serves_the_overlays(self):
-        from hydralysis import durable, workcopy
+        # With the store log (H16, storelog.py, the default) the main file is the snapshot and `.bak` the snapshot
+        # before it; `.bak` plus the log reaches the newest ACKNOWLEDGED state, so the second rename (fsynced into the
+        # log before its call returned) is served: oracle O2, "every acknowledged store revision is present". With
+        # HYDRALYSIS_STORE_LOG=0 every edit rewrites the whole store and `.bak` is the store before the last edit, so
+        # the first rename is served (the old, weaker rule). Either way the overlays are never lost (spec 8.2, Y1).
+        from hydralysis import durable, storelog, workcopy
         view = "subject-backup"
         address = self.entry()
         self.edit_in_view(address, kind="rename", name="backup_one", view=view)
@@ -419,8 +424,11 @@ class EngineIntegration(unittest.TestCase):
         path = workcopy._store_path(self.settings, selected)
         path.unlink()
         self.assertTrue(workcopy.has_overlays(self.settings, selected))
-        self.assertEqual(self.ask("decompile", address, options={"view": view})["function"]["name"], "backup_one")
+        expected = "backup_two" if storelog.enabled() else "backup_one"
+        self.assertEqual(self.ask("decompile", address, options={"view": view})["function"]["name"], expected)
         self.assertTrue(durable.exists(path))
+        if storelog.enabled():
+            self.assertTrue(storelog.log_path(path).is_file())
 
     def test_adopt_registers_the_prepared_project_in_place(self):
         from hydralysis import hydra, targets
