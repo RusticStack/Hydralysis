@@ -70,6 +70,10 @@ def granted_cpus() -> int:
     return os.cpu_count() or 1
 
 
+#: tasks at once: the granted logical processors less 2 for the runner and the OS, at least 2
+DEFAULT_JOBS = max(2, granted_cpus() - 2)
+
+
 def test_id(ident: str) -> str:
     """The id the planner uses: an import failure is named by its module."""
     return ident[len(FAILED_LOADER):] if ident.startswith(FAILED_LOADER) else ident
@@ -176,7 +180,7 @@ def run_task(task: dict, root: Path, label: str, integration: bool = False, time
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("-j", "--jobs", type=int, default=max(2, granted_cpus() - 2))
+    ap.add_argument("-j", "--jobs", type=int, default=DEFAULT_JOBS, help="tasks at once (default %d)" % DEFAULT_JOBS)
     ap.add_argument("--root", default="", help="parent directory for this run's work directory (default: the system temp); keep it dot-free")
     ap.add_argument("-k", default="", help="only test ids containing this text")
     ap.add_argument("--rerun-alone", type=int, default=1, help="how many times a failed task is run again alone (0: none)")

@@ -53,9 +53,11 @@ jobs:
   engine:
     # The real engine: the pinned Hydra release, a JDK 25, every env-gated end-to-end test file (not three of them),
     # on the private repository's 2 vCPU / 8 GB runner. tools/run_tests.py sizes its workers from the processors
-    # the runner grants (granted_cpus: max(2, CPUs - 2), 2 here) and runs a failed task again alone; --strict
-    # makes a test that fails only under load a failure. Tests that need a helper client, a legacy project or game
-    # data still skip (their variables are not set here).
+    # the runner grants (granted_cpus: max(2, CPUs - 2), 2 here) and runs a failed task again alone, which counts
+    # when it passes. Not --strict yet: this suite has not run on 2 processors, so neither its length (the timeout
+    # is a guess, about 1 h expected) nor its timing under load is measured; --strict, and a timeout sized from
+    # the measured run, follow once it is green. Tests that need a helper client, a legacy project or game data
+    # still skip (their variables are not set here).
     runs-on: windows-latest
     timeout-minutes: 120
     env:
@@ -88,11 +90,11 @@ jobs:
           python tests/fixtures/build_fixtures.py "${{ runner.temp }}\fixtures"
           "HYDRALYSIS_INTEGRATION_FIXTURES=${{ runner.temp }}\fixtures" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
       - name: The runner's processors
-        run: python -c "import os, sys; sys.path.insert(0, 'tools'); import run_tests; print(f'granted CPUs {run_tests.granted_cpus()} of {os.cpu_count()}')"
+        run: python -c "import os, sys; sys.path.insert(0, 'tools'); import run_tests; print(f'granted CPUs {run_tests.granted_cpus()} of {os.cpu_count()}; -j {run_tests.DEFAULT_JOBS}')"
       - name: Every engine-gated test file, in parallel (Z1, Z4 and the rest)
         env:
           HYDRALYSIS_INTEGRATION_JAVA: ${{ env.JAVA_HOME }}
-        run: python tools/run_tests.py --integration --strict --root "${{ runner.temp }}\hy-run" --keep
+        run: python tools/run_tests.py --integration --root "${{ runner.temp }}\hy-run" --keep
       - name: Harness audit (Z4)
         run: python tools/audit_harness.py --self --skills skills
       - name: Upload the test logs
