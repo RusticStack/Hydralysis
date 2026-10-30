@@ -438,6 +438,65 @@ class RuntimeAgent(MemoryMixin, CaptureMixin, ActionsMixin):
                 "spawn_resumed": not self.paused_spawn, "scripts_released": not self.scripts, **self.memory_cleanup_report()}
 
 
+class RequestGate:
+    """Serves each accepted IPC connection on its own thread, so the accept loop never waits for a request.
+
+    `status` reads the in-memory snapshot under the agent's own lock and runs at once, beside a running request (the
+    client sends it without the session's request lock). Every other action keeps one-at-a-time order through
+    `serial`, as before; the client's session lock already sends at most one of them at a time. Past LIMIT connections
+    at once a connection is served on the accept thread, which is the old serial behaviour, never a refusal.
+    """
+
+    CONCURRENT = frozenset({"status"})
+    LIMIT = 8
+
+    def __init__(self, secret: str, handle_request, limit: int = LIMIT):
+        self.secret = secret
+        self.handle_request = handle_request
+        self.serial = threading.Lock()
+        self.slots = threading.BoundedSemaphore(limit)
+        self.threads: set[threading.Thread] = set()
+        self.guard = threading.Lock()
+        self.touched = time.monotonic()
+
+    def handler(self, action, args, budget):
+        if action in self.CONCURRENT:
+            return self.handle_request(action, args, budget)
+        with self.serial:
+            return self.handle_request(action, args, budget)
+
+    def serve(self, connection) -> None:
+        with connection:
+            connection.settimeout(3)
+            if ipc_serve(connection, self.secret, self.handler):
+                self.touched = time.monotonic()
+
+    def submit(self, connection) -> None:
+        if not self.slots.acquire(blocking=False):
+            self.serve(connection)
+            return
+
+        def run():
+            try:
+                self.serve(connection)
+            finally:
+                with self.guard:
+                    self.threads.discard(thread)
+                self.slots.release()
+
+        thread = threading.Thread(target=run, name="runtime-ipc", daemon=True)
+        with self.guard:
+            self.threads.add(thread)
+        thread.start()
+
+    def drain(self, timeout: float) -> None:
+        end = time.monotonic() + timeout
+        with self.guard:
+            threads = list(self.threads)
+        for thread in threads:
+            thread.join(max(0.0, end - time.monotonic()))
+
+
 def main() -> int:
     import frida
     if len(sys.argv) > 1 and sys.argv[1] == "--processes":
@@ -495,18 +554,18 @@ def main() -> int:
             return agent.handle(action, args)
         finally:
             done.set()
+    gate = RequestGate(secret, handle_request)
+    gate.touched = touched
     try:
-        while not agent.closed and (agent.tainted or time.monotonic() - touched < int(initial.get("idle_s", 600))):
+        while not agent.closed and (agent.tainted or time.monotonic() - gate.touched < int(initial.get("idle_s", 600))):
             try:
                 connection, _ = listener.accept()
             except socket.timeout:
                 continue
-            with connection:
-                connection.settimeout(3)
-                if ipc_serve(connection, secret, handle_request):
-                    touched = time.monotonic()
+            gate.submit(connection)
     finally:
         listener.close()
+        gate.drain(65.0)   # the longest request budget (60 s) plus the IPC margin
         if not agent.closed:
             agent.ended = "idle: no request for %d s (runtime_idle_s)" % int(initial.get("idle_s", 600))
             try:

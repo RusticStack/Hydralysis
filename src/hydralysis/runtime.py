@@ -30,6 +30,8 @@ ACTION_NAMES = ("setup", "processes", "spawn", "attach", "status", "modules", "t
                 "observe", "break", "continue", "unload", "resume", "detach", "writers", "capture", "snapshot", "compare",
                 "write", "watch")
 # Only the session's owner drives the target; any client may look.
+# Actions that need no session request lock (they read the worker's in-memory state under its own lock).
+LOCK_FREE = frozenset({"status"})
 MUTATING = ("observe", "break", "continue", "unload", "resume", "detach", "writers", "write", "watch")
 # capture start/stop write the session's event log: the owner's. read, verify, list, counters and snapshot only look.
 CAPTURE_OWNER_OPS = ("start", "stop")
@@ -202,6 +204,14 @@ def setup(settings: dict) -> dict:
         lock.release()
 
 
+class _NoLock:
+    def acquire(self) -> bool:
+        return True
+
+    def release(self) -> None:
+        pass
+
+
 class RuntimeRunner:
     def __init__(self, settings: dict):
         self.settings = settings
@@ -275,7 +285,9 @@ class RuntimeRunner:
         timeout = int(args.pop("timeout_s", 15))
         if not 1 <= timeout <= 60:
             raise ValueError("runtime timeout_s must be 1..60")
-        lock = LaneLock(str(directory / ".request.lock"))
+        # `status` reads the worker's in-memory snapshot and needs no session lock: it is answered beside a running
+        # request (the worker serves it on its own thread) instead of failing with "busy".
+        lock = LaneLock(str(directory / ".request.lock")) if action not in LOCK_FREE else _NoLock()
         if not lock.acquire():
             raise ValueError("runtime session is busy; retry after the current bounded request")
         try:

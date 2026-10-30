@@ -11,8 +11,10 @@ import unittest
 from unittest.mock import patch
 
 from hydralysis.api import TOOL_NAMES
-from hydralysis.mcp import (ENGINE_TOOLS, MAX_OUTSTANDING, MAX_OUTPUT_BYTES, RETRY_AFTER_MS, TOOL_WORKERS,
+from hydralysis.mcp import (ENGINE_TOOLS, LANES, LONG_TOOLS, MAX_OUTSTANDING, MAX_OUTPUT_BYTES, RETRY_AFTER_MS, TOOL_WORKERS,
                             Server, _read_message, lane_of)
+
+FAST_OUTSTANDING = LANES["fast"].outstanding
 
 
 def request(ident, method, params=None):
@@ -150,7 +152,7 @@ class TransportTests(unittest.TestCase):
             return "finished"
 
         messages = [request(index, "tools/call", {"name": "inspect", "arguments": {"number": index}})
-                    for index in range(MAX_OUTSTANDING + 1)]
+                    for index in range(FAST_OUTSTANDING + 1)]
         messages.append(request("list", "tools/list"))
         messages.append(request("ping", "ping"))
         worker = threading.Thread(target=Server().serve, args=(io.BytesIO(lines(messages)), output))
@@ -165,12 +167,12 @@ class TransportTests(unittest.TestCase):
                 worker.join(5)
         self.assertFalse(worker.is_alive())
         replies = list(map(json.loads, output.getvalue().splitlines()))
-        self.assertEqual(len(replies), MAX_OUTSTANDING + 3)
-        busy = next(reply for reply in replies if reply["id"] == MAX_OUTSTANDING)
+        self.assertEqual(len(replies), FAST_OUTSTANDING + 3)
+        busy = next(reply for reply in replies if reply["id"] == FAST_OUTSTANDING)
         self.assertTrue(busy["result"]["isError"])
         self.assertIn("Server busy", busy["result"]["content"][0]["text"])
         self.assertIn("retryAfterMs", busy["result"]["content"][0]["text"])
-        self.assertEqual(len(calls), MAX_OUTSTANDING)
+        self.assertEqual(len(calls), FAST_OUTSTANDING)
         self.assertEqual(replies[1]["id"], "list")
         self.assertEqual(replies[2]["id"], "ping")
 
@@ -216,7 +218,7 @@ class TransportTests(unittest.TestCase):
         worker, output = self.serve_in_thread(messages, self.engine_call(release, entered))
         try:
             self.assertTrue(output.wait_for({"fp", "dis"}, 3), "local tools were delayed by blocked engine calls")
-            self.assertEqual(output.ids() & {"q0", "q1", "q2", "q3"}, set())
+            self.assertEqual(output.ids() & {"q%d" % i for i in range(TOOL_WORKERS)}, set())
             self.assertEqual(output.text("fp"), "fingerprint:fp")
             self.assertEqual(output.text("dis"), "disasm:dis")
         finally:
@@ -264,14 +266,14 @@ class TransportTests(unittest.TestCase):
             return "%s:%s" % (name, arguments["tag"])
 
         messages = [request("f%d" % i, "tools/call", {"name": "disasm", "arguments": {"tag": "f%d" % i}})
-                    for i in range(MAX_OUTSTANDING + 1)]
+                    for i in range(FAST_OUTSTANDING + 1)]
         messages.append(request("job", "tools/call", {"name": "job", "arguments": {"tag": "job"}}))
         worker, output = self.serve_in_thread(messages, fake)
         try:
-            self.assertTrue(output.wait_for({"job", "f%d" % MAX_OUTSTANDING}, 3))
+            self.assertTrue(output.wait_for({"job", "f%d" % FAST_OUTSTANDING}, 3))
             self.assertEqual(output.text("job"), "job:job")
-            self.assertIn("Server busy", output.text("f%d" % MAX_OUTSTANDING))
-            self.assertEqual(output.reply("f%d" % MAX_OUTSTANDING)["result"]["structuredContent"]["lane"], "fast")
+            self.assertIn("Server busy", output.text("f%d" % FAST_OUTSTANDING))
+            self.assertEqual(output.reply("f%d" % FAST_OUTSTANDING)["result"]["structuredContent"]["lane"], "fast")
         finally:
             release.set()
             worker.join(10)
@@ -339,7 +341,7 @@ class TransportTests(unittest.TestCase):
             release.set()
             worker.join(10)
         self.assertFalse(worker.is_alive())
-        self.assertEqual(output.ids(), {"q0", "q1", "q2", "q3", "fp"})
+        self.assertEqual(output.ids(), {"q%d" % i for i in range(TOOL_WORKERS)} | {"fp"})
         leaked = [t for t in threading.enumerate() if t.name.startswith("hydralysis-")]
         self.assertEqual(leaked, [])
 
@@ -348,8 +350,11 @@ class TransportTests(unittest.TestCase):
         self.assertTrue(ENGINE_TOOLS <= set(TOOL_NAMES))
         for name in set(TOOL_NAMES) - ENGINE_TOOLS:
             self.assertEqual(lane_of(name), "fast")
-        for name in ENGINE_TOOLS:
+        self.assertEqual(LONG_TOOLS, {"ghidra_run", "prepare"})
+        for name in ENGINE_TOOLS - LONG_TOOLS:
             self.assertEqual(lane_of(name), "engine")
+        for name in LONG_TOOLS:
+            self.assertEqual(lane_of(name), "long")
         self.assertEqual(lane_of(None), "fast")
         self.assertEqual(lane_of(["x"]), "fast")
 

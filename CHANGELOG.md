@@ -4,6 +4,17 @@ Hydralysis follows the version policy in [docs/versioning.md](docs/versioning.md
 engine, what 0.x means, and how to roll back a pin. Every release states only the claims whose tests pass.
 Nothing here is a tag: a release is tagged by the owner.
 
+## Unreleased
+
+- MCP request handling (H5): three lanes sized from the CPUs the OS grants the process (`os.process_cpu_count()`):
+  `fast` (offline tools, 4..16 workers), `engine` (short engine tools, 2 per CPU, 8..32, a thread per accepted call)
+  and `long` (`ghidra_run`, `prepare`, one per CPU, 8..16), so long tools no longer hold the threads queries need.
+  Every budget is at least the 0.6.0 one. `notifications/cancelled` is honoured: a queued call never starts, a running
+  engine wait sends `cancel` to the engine (pooled attempt, plain call and the wait for a pool entry), and the
+  cancelled request gets no reply (MCP). Everything else on the wire is unchanged.
+- Runtime sessions (H9): the worker serves each IPC connection on its own thread; `status` is answered beside a running
+  request and is sent without the session request lock; every other action stays one at a time.
+
 ## 0.6.0
 
 This release (0.6.0, label OD11) pins Hydra Engine `12.3-hydra.4` (protocol 3), released 2026-10-30. Hydralysis

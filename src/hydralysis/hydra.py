@@ -26,7 +26,7 @@ import time
 import zipfile
 from pathlib import Path
 
-from hydralysis import compat, durable
+from hydralysis import cancel, compat, durable
 from hydralysis.paths import root_path
 
 RELEASE = "12.3-hydra.4"
@@ -548,7 +548,7 @@ class Engine:
             try:
                 if raw:
                     return session.call_raw(command, **labels, **fields)
-                return session.call(command, **labels, **fields)
+                return _cancellable_call(session, command, labels, fields)
             except module.SessionError as exc:
                 if exc.code != "closed":
                     raise self._error(session, exc, command) from exc
@@ -624,12 +624,41 @@ DEADLINE_GRACE_S = 5.0     # after `cancel`, before the connection is abandoned
 USER_CAP = 8               # abandoned user calls at a time (unmeasured policy, 7.6 step 5)
 PROBE_CAP = 3              # abandoned supervisor probes: the number of consecutive misses that make a wedge (7.2)
 CLOSING_CAP = 8            # the closing list of the leave gate (rule L3)
-POOL_SIZE = 4              # live entries per role (TOOL_WORKERS, mcp.py)
+POOL_SIZE = 4              # live entries per role (the engine's per-client view budget); more MCP calls wait in acquire, cancellable
 PATIENCE_S = 25.0          # the patience budget of a lock wait (7.6, Waits)
 # An error after which the entry is retired and the retry takes another one (I3).
 RETIRE_CODES = frozenset({"no_program", "no_project", "not_found", "closed"})
 # Calls whose `wait` is bound below the attempt's deadline (N2): the two opens and the script.
 WAITING_COMMANDS = frozenset({"open_project", "open_program", "script"})
+
+
+def _cancellable_call(session, command: str, labels: dict, fields: dict):
+    """`session.call`, which is `wait(send(...))`, with the client's cancel of the MCP request wired in: when the request
+    runs under a cancel token (hydralysis.cancel, set by the MCP server) a cancel sends `cancel` for the request id, the
+    engine answers the request (with `cancelled` when it stopped it) and the wait returns. Without a token, or with a
+    stand-in session that has no send/wait, it is `session.call` unchanged."""
+    token = cancel.current()
+    if token is None or not (hasattr(session, "send") and hasattr(session, "wait")):
+        return session.call(command, **labels, **fields)
+    if token.cancelled:
+        raise EngineError("cancelled", "the client cancelled the request before %s was sent" % command, {}, command)
+    fields = dict(fields)
+    deadline = fields.pop("deadline", None)
+    if deadline is not None and hasattr(session, "_check_deadline"):
+        session._check_deadline(deadline)
+    rid = session.send(command, **labels, **fields)
+
+    def stop():
+        try:
+            session.send("cancel", target=rid)   # thread-safe; the engine answers the cancelled request
+        except Exception:   # noqa: BLE001 - the wait below reports what happened to the request
+            pass
+
+    remove = token.add(stop)
+    try:
+        return session.wait(rid, deadline) if deadline is not None else session.wait(rid)
+    finally:
+        remove()
 
 
 class DeadlineError(EngineError):
@@ -850,19 +879,40 @@ class Entry:
             self.registry.read_begin(program)
         box: dict = {}
         done = threading.Event()
+        # `wake` ends the caller's wait: the answer (`done`), or the client's cancel of the MCP request (cancel.current()),
+        # which is handled like a deadline that came early: `cancel` is sent to the engine, then the grace, then abandon.
+        wake = threading.Event()
         module = self.engine.module()
+        token = cancel.current()
 
         def work():
             try:
                 rid = self.session.send(command, **labels, **fields)
                 box["rid"] = rid
+                if token is not None and token.cancelled:
+                    wake.set()   # cancelled before the request id was known: the caller can send `cancel` now
                 box["value"] = self.session.wait(rid)
             except BaseException as exc:   # noqa: BLE001 - handed to the caller, or dropped when it has left
                 box["error"] = exc
             self._worker_done(command, reading, program, box, done)
+            wake.set()
 
         threading.Thread(target=work, name="hydra-deadline-" + self.key, daemon=True).start()
-        if not done.wait(max(0.0, remaining)):
+        remove = token.add(wake.set) if token is not None else (lambda: None)
+        try:
+            end = time.monotonic() + max(0.0, remaining)
+            while not done.is_set():
+                if token is not None and token.cancelled and box.get("rid") is not None:
+                    break
+                left = end - time.monotonic()
+                if left <= 0:
+                    break
+                wake.wait(left)
+                wake.clear()   # the condition is checked again at the top, so a wake set before this clear is not lost
+        finally:
+            remove()
+        if not done.is_set():
+            cancelled = token is not None and token.cancelled
             rid = box.get("rid")
             if rid is not None:
                 try:
@@ -878,6 +928,10 @@ class Entry:
                 if abandon:
                     # Nothing more is sent: no shutdown, no close(), no FIN. The worker closes the session itself,
                     # through the gate, when the engine answers.
+                    if cancelled:
+                        raise EngineError("cancelled", "the client cancelled %s; cancel sent, the engine did not stop within "
+                                          "the grace, the connection is abandoned" % command,
+                                          {"connection_abandoned": True, "command": command}, command)
                     raise DeadlineError("deadline_exceeded", "no answer to %s within the deadline; cancel sent, the connection "
                                         "is abandoned" % command, {"connection_abandoned": True, "command": command}, command)
                 done.wait()
@@ -1084,7 +1138,16 @@ class Pool:
                         if left <= 0:
                             raise EngineError("busy", "all %d connections of this process are in use" % self.size,
                                               {"reason": "pool_full"}, retry_after_ms=2000)
-                        self._cond.wait(left)
+                        token = cancel.current()
+                        if token is not None and token.cancelled:
+                            raise EngineError("cancelled", "the client cancelled the request while it waited for one of the "
+                                              "%d connections of this process" % self.size, {"reason": "pool_full"})
+                        remove = token.add(self._wake) if token is not None else None
+                        try:
+                            self._cond.wait(left)
+                        finally:
+                            if remove is not None:
+                                remove()
                         continue
             # `retire` runs `on_retire` (which takes the query row guard) and the gate: never under `_cond` (lock order).
             try:
@@ -1096,6 +1159,11 @@ class Pool:
                 raise
             if chosen is not None:
                 return chosen
+
+    def _wake(self) -> None:
+        """A cancel of a request that waits in `acquire`: wake the waiters, the cancelled one leaves."""
+        with self._cond:
+            self._cond.notify_all()
 
     def release(self, entry: Entry, error: BaseException | None = None) -> None:
         """Return ENTRY after an attempt: a healthy one goes back; an abandoned, broken or error-retired one does not."""
