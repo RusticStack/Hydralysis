@@ -8,14 +8,43 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 
 from hydralysis import compat
 
+# `Path.resolve` on Windows opens the path twice (GetFinalPathNameByHandle): a query resolved the data root and its project
+# paths about twenty times, which was over half of the CPU a warm query spent in Hydralysis. The answer for one path text is
+# kept briefly; a junction or link retargeted under a running process is seen once the entry is older than RESOLVE_TTL_S.
+RESOLVE_TTL_S = 2.0
+_RESOLVE_CAP = 512
+_resolved_cache: dict[tuple[str, str], tuple[float, Path]] = {}
+_resolved_guard = threading.Lock()
+
+
+def resolved(path: str | Path) -> Path:
+    """`Path(path).expanduser().resolve()`, remembered for RESOLVE_TTL_S per path text (and working directory when the
+    text is relative)."""
+    expanded = Path(path).expanduser()
+    text = str(expanded)
+    key = (text, "" if expanded.is_absolute() else os.getcwd())
+    now = time.monotonic()
+    with _resolved_guard:
+        found = _resolved_cache.get(key)
+    if found is not None and now - found[0] < RESOLVE_TTL_S:
+        return found[1]
+    result = expanded.resolve()
+    with _resolved_guard:
+        if len(_resolved_cache) >= _RESOLVE_CAP:
+            _resolved_cache.clear()
+        _resolved_cache[key] = (now, result)
+    return result
+
 
 def validate_project_path(directory: str | Path) -> Path:
     """Fail before an engine launch: Ghidra rejects dot-prefixed path components."""
-    path = Path(directory).expanduser().resolve()
+    path = resolved(directory)
     if any(part.startswith(".") for part in path.parts):
         raise ValueError("Ghidra project paths cannot contain dot-prefixed directories: %s; "
                          "choose a dot-free data root/project directory" % path)
@@ -65,7 +94,7 @@ def forbidden_drives(settings: dict) -> list[str]:
 
 def root_path(settings: dict) -> Path:
     raw = settings.get("root") or compat.env("ROOT") or default_root()
-    root = Path(raw).expanduser().resolve()
+    root = resolved(raw)
     banned = forbidden_drives(settings)
     if root.drive and root.drive.upper() in banned:
         raise ValueError("Hydralysis data root %s is on %s, which this configuration forbids (forbidden_drives=%s); "

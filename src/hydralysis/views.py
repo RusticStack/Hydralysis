@@ -55,6 +55,11 @@ PUBLISH_BATCH_MAX = 1            # `publishBatchMax`: changesets per generation;
 PUBLISH_WAIT_S = 3600            # how long one publish job waits for its changeset before it gives up (it stays queued)
 COMMIT_WAIT_S = 120              # how long a leader waits for a running commit (`.commit.lock`) before it yields
 POLL_S = 0.1
+# A waiting publish worker (a follower) used to look at the queue every POLL_S: about fifteen file operations and a sealed
+# job-record write ten times a second per waiter, for the whole time a leader builds. On Windows it now waits in the kernel's
+# queue of `publish.lock` instead (the one event that can decide its changeset is a leader finishing), for at most TURN_WAIT_S
+# so the job's progress and its deadline are still looked at.
+TURN_WAIT_S = 1.0
 MAX_ATTEMPTS = 3                 # counted candidate failures of one changeset before it ends as `candidate_failed`
 MAX_QUEUE = 1000
 RESOLUTIONS = ("take_mine", "keep")
@@ -841,16 +846,22 @@ def _batch_max(settings: dict) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 1 else PUBLISH_BATCH_MAX
 
 
-def drain(settings: dict, lineage_id: str, engine=None, stop_after: str | None = None, timeout_s: int = 600) -> dict:
+def drain(settings: dict, lineage_id: str, engine=None, stop_after: str | None = None, timeout_s: int = 600, lock=None) -> dict:
     """Try to become the leader and drain the queue in id order, until it is empty or STOP_AFTER is decided.
 
     Non-blocking: when another process holds `publish.lock` this returns `{"led": False}` at once. The lock is held for the
-    drain only, and is released by the OS if the leader dies. Returns {"led", "built": [generation ...], "failure"}."""
-    lineage.lineage_dir(settings, lineage_id).mkdir(parents=True, exist_ok=True)
-    lock = LaneLock(str(publish_lock_path(settings, lineage_id)))
-    if not lock.acquire():
-        return {"led": False, "built": [], "failure": None}
-    engine = engine or hydra.Engine(settings)
+    drain only, and is released by the OS if the leader dies. LOCK is `publish.lock` already held by the caller (a granted
+    `await_turn`); the drain releases it. Returns {"led", "built": [generation ...], "failure"}."""
+    if lock is None:
+        lineage.lineage_dir(settings, lineage_id).mkdir(parents=True, exist_ok=True)
+        lock = LaneLock(str(publish_lock_path(settings, lineage_id)))
+        if not lock.acquire():
+            return {"led": False, "built": [], "failure": None}
+    try:
+        engine = engine or hydra.Engine(settings)
+    except BaseException:
+        lock.release()
+        raise
     built: list[int] = []
     failure = None
     try:
@@ -1380,31 +1391,57 @@ def run_publish_job(settings: dict, selected: dict, options: dict, engine=None, 
     csid, lineage_id = options["csid"], options["lineage"]
     engine = engine or hydra.Engine(settings)
     deadline = time.monotonic() + float(settings.get("publish_wait_s", PUBLISH_WAIT_S))
-    while True:
-        result = read_done(settings, lineage_id, csid)
-        if result is None:
-            led = drain(settings, lineage_id, engine, stop_after=csid, timeout_s=timeout_s)
+    reported = None
+    turn = None   # `publish.lock`, when the last wait was granted it: the next drain leads with it
+    try:
+        while True:
             result = read_done(settings, lineage_id, csid)
-            if result is None and led["failure"] and not led["failure"].get("counted") and led["failure"]["error"] != "commit_busy":
-                failure = led["failure"]
-                raise ViewError(failure["error"], failure["message"], csid=csid,
-                                retained="the changeset stays queued and its records stay pending; this job ends, and no job drives the "
-                                         "changeset now: it is published when any later publish on this lineage (from any view) leads "
-                                         "the queue, so publish again once the cause is gone")
-        if result is not None:
-            _settle_own(settings, lineage_id, csid, result)
-            return outcome_of(result, _revision_of(settings, selected))
-        info = pending_info(settings, lineage_id, csid)
-        if info["state"] == "done":
-            continue
-        if info["state"] == "unknown":
-            raise ViewError("unknown_changeset", "changeset %s is not in the queue" % csid)
-        if progress:
-            progress(info)
-        if time.monotonic() >= deadline:
-            raise ViewError("publish_wait_expired", "the changeset was not decided within publish_wait_s; it stays queued and is "
-                            "published when a leader reaches it", csid=csid, **pending_info(settings, lineage_id, csid))
-        time.sleep(POLL_S)
+            if result is None:
+                led = drain(settings, lineage_id, engine, stop_after=csid, timeout_s=timeout_s, lock=turn)
+                turn = None   # drain released it
+                result = read_done(settings, lineage_id, csid)
+                if result is None and led["failure"] and not led["failure"].get("counted") and led["failure"]["error"] != "commit_busy":
+                    failure = led["failure"]
+                    raise ViewError(failure["error"], failure["message"], csid=csid,
+                                    retained="the changeset stays queued and its records stay pending; this job ends, and no job drives the "
+                                             "changeset now: it is published when any later publish on this lineage (from any view) leads "
+                                             "the queue, so publish again once the cause is gone")
+            if turn is not None:
+                turn.release()
+                turn = None
+            if result is not None:
+                _settle_own(settings, lineage_id, csid, result)
+                return outcome_of(result, _revision_of(settings, selected))
+            info = pending_info(settings, lineage_id, csid)
+            if info["state"] == "done":
+                continue
+            if info["state"] == "unknown":
+                raise ViewError("unknown_changeset", "changeset %s is not in the queue" % csid)
+            if progress and info != reported:
+                progress(info)
+                reported = info
+            if time.monotonic() >= deadline:
+                raise ViewError("publish_wait_expired", "the changeset was not decided within publish_wait_s; it stays queued and is "
+                                "published when a leader reaches it", csid=csid, **pending_info(settings, lineage_id, csid))
+            turn = await_turn(settings, lineage_id, min(TURN_WAIT_S, max(POLL_S, deadline - time.monotonic())))
+    finally:
+        if turn is not None:
+            turn.release()
+
+
+def await_turn(settings: dict, lineage_id: str, timeout_s: float):
+    """Wait until `publish.lock` is free, at most TIMEOUT_S. On Windows the wait is queued in the kernel (`locks._QueuedLock`)
+    and returns the lock held (the caller's `drain` leads with it, or the caller releases it), or None when TIMEOUT_S passed.
+    Elsewhere, and when the lock file cannot be opened for the queued wait, it sleeps POLL_S and returns None, as before."""
+    if os.name == "nt":
+        from hydralysis.locks import _QueuedLock
+        lease = _QueuedLock(str(publish_lock_path(settings, lineage_id)))
+        try:
+            return lease if lease.wait(timeout_s) else None
+        except OSError:
+            pass
+    time.sleep(POLL_S)
+    return None
 
 
 def _settle_own(settings: dict, lineage_id: str, csid: str, result: dict) -> bool:

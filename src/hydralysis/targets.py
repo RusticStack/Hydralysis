@@ -16,7 +16,7 @@ from pathlib import Path
 
 from hydralysis.backends import read_json, sha256, write_json
 from hydralysis.locks import locked
-from hydralysis.paths import root_path, validate_project_path
+from hydralysis.paths import resolved, root_path, validate_project_path
 
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 _SHA = re.compile(r"[0-9a-f]{64}")
@@ -54,7 +54,7 @@ def register(settings: dict, names: list[str], record: dict) -> None:
 
 def exe_sha256(settings: dict, exe: str | Path) -> str:
     """Hash a build once per (path, size, mtime); queries do not re-read 66 MB each time."""
-    path = Path(exe).expanduser().resolve()
+    path = resolved(exe)
     stat = path.stat()
     key = "%s|%d|%d" % (str(path).lower(), stat.st_size, stat.st_mtime_ns)
     cache_path = root_path(settings) / "hash-cache.json"
@@ -119,7 +119,7 @@ def resolve(settings: dict, name: str) -> dict:
 
 def target_key(gpr: str, program: str) -> str:
     """A stable identity for one program of one project, for overlays and working copies."""
-    normal = str(Path(gpr).expanduser().resolve()).lower()
+    normal = str(resolved(gpr)).lower()
     return hashlib.sha256((normal + "\n" + program.lstrip("/")).encode()).hexdigest()[:16]
 
 
