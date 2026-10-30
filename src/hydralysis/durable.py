@@ -577,8 +577,11 @@ class AppendLog:
         line = frame(record)
         if lock_held:
             return self._append_locked(line)
+        # Outside the lock: framing and the directory. Inside stays only what must be serialised: the tail check,
+        # the write and its fsync (the record is durable before the next writer reads or builds on the log).
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         with file_lock(self.lock_path, self.lock_timeout_s, what="log " + self.path.name):
-            return self._append_locked(line)
+            return self._append_locked(line, made=True)
 
     def repair(self, *, lock_held: bool = False) -> dict | None:
         """Repair a torn tail (and refuse corruption) without appending. Returns the repair record or None."""
@@ -675,8 +678,9 @@ class AppendLog:
             _fsync_directory(path.parent)
         return offset
 
-    def _append_locked(self, line: bytes) -> int:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+    def _append_locked(self, line: bytes, made: bool = False) -> int:
+        if not made:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
         try:
             self._check_tail()
             offset = self._raw_append(self.path, line)
