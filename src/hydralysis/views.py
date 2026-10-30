@@ -988,7 +988,7 @@ def _build(settings: dict, lineage_id: str, engine, batch_ids: list[str], timeou
     A publish and a Y2 commit both append generations: they take turns on `.commit.lock`. The leader queues for it in arrival
     order (locks.locked) instead of polling, so a commit that releases and asks again cannot overtake it. The wait is bounded,
     and a wait that runs out is not a failure of the changeset. The decided changesets are settled in their views after the
-    commit lock is released, without waiting for a busy view (its owner's job, or its next call, settles it)."""
+    commit lock is released (see _settle_all for which ones wait for a busy view)."""
     started = time.monotonic()
     settles: list[tuple] = []
     try:
@@ -1009,8 +1009,10 @@ def _build(settings: dict, lineage_id: str, engine, batch_ids: list[str], timeou
 
 
 def _settle_all(settings: dict, lineage_id: str, settles: list[tuple]) -> None:
+    """A changeset with a generation does not wait for a busy view: `settle` replays it from CURRENT.log at the view's next
+    call. One decided without a generation (already in master, converged) is in no log row, so it keeps the bounded wait."""
     for cs, generation, ids in settles:
-        settle_one(settings, lineage_id, cs, generation, ids, wait_s=0)
+        settle_one(settings, lineage_id, cs, generation, ids, wait_s=0 if generation is not None else None)
 
 
 def _build_locked(settings: dict, lineage_id: str, engine, batch_ids: list[str], timeout_s: int, started: float,
@@ -1233,7 +1235,8 @@ def _publish_candidate(settings: dict, lineage_id: str, engine, head: dict, targ
 
 def settle_one(settings: dict, lineage_id: str, cs: dict, generation: int | None, ids: list[str], wait_s: float | None = None) -> bool:
     """Finalize one decided changeset in the view that sealed it (best effort: a view that is busy settles at its next call).
-    WAIT_S bounds the wait for the view's lock (default workcopy.SYNC_LOCK_S; the leader passes 0)."""
+    WAIT_S bounds the wait for the view's lock (default workcopy.SYNC_LOCK_S; the leader passes 0 for a
+    changeset with a generation)."""
     try:
         target = workcopy.with_view(targets.resolve(settings, cs["target"]["name"]), "" if cs["view"] == "shared" else cs["view"])
         return finalize_changeset(settings, target, lineage_id, cs["csid"], generation, ids, cs.get("store_revision"), wait_s=wait_s)

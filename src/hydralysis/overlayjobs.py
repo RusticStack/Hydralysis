@@ -26,10 +26,10 @@ from hydralysis.paths import root_path
 ACTIVE = ("queued", "running", "cancelling")
 TIMEOUT_S = 4 * 3600
 # What the commit worker reads from the caller's settings besides the engine ones: where generations and backups live, the
-# backup policy and the scratch folder of the verify clone. Without them the worker would publish into <root>/lineages and
-# back up to <root>/backups while the caller looks elsewhere.
+# backup policy, the tamper-check cache and the scratch folder of the verify clone. Without them the worker would publish into
+# <root>/lineages and back up to <root>/backups while the caller looks elsewhere.
 WORKER_POLICY_KEYS = ("generations_root", "tmp_dir", "backup_roots", "backup_min_verified", "backup_min_independent",
-                      "backup_confirm_gb", "backup_root_warn_gb")
+                      "backup_confirm_gb", "backup_root_warn_gb", "tampered_cache_s")
 
 
 def job_path(settings: dict, job_id: str) -> Path:

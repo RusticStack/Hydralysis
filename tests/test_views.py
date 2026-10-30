@@ -300,6 +300,51 @@ class Queue(ViewWorld, unittest.TestCase):
         store = self.store("one")
         self.assertEqual([(entry["cid"], entry["ids"]) for entry in store["commits"]], [(sealed["csid"], [record])])
 
+    def test_a_converged_changeset_waits_for_a_busy_view_since_no_log_row_replays_it(self):
+        """A result without a generation is in no CURRENT.log row, so `settle` never replays it: with no job left to settle
+        it (expired, cancelled, dead), the leader must settle it, waiting for the view as before H13."""
+        self.edit("Same", A, view="one")
+        record = self.edit("Same", A, view="two")["overlay_id"]
+        self.publish("one")
+        sealed = self.seal("two")
+        held = threading.Event()
+
+        def hold():
+            with workcopy.view_lock(self.settings, self.target("two")):
+                held.set()
+                time.sleep(0.5)
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        held.wait(5)
+        views.drain(self.settings, self.lineage_id(), self.engine(), stop_after=sealed["csid"])  # no run_job: the job is gone
+        holder.join()
+        self.assertEqual(self.done(sealed["csid"])["outcome"], "converged")
+        store = self.store("two")
+        self.assertEqual([(item["csid"], item["generation"], item["ids"]) for item in store["changesets"]],
+                         [(sealed["csid"], None, [record])])
+        self.assertEqual(self.pending_ids("two"), [])
+        self.assertEqual(views.settle(self.settings, self.target("two")), False)  # nothing left for the next call
+
+    def test_a_generation_settled_after_a_later_one_of_its_view_does_not_replace_it(self):
+        """A view's later changeset holds the records of its earlier undecided one, so settling the earlier generation last
+        finds them committed already: it adds no commit entry and the newer one stays live."""
+        first = self.edit("One", A, view="one")["overlay_id"]
+        early = self.seal("one")
+        second = self.edit("Two", B, view="one")["overlay_id"]
+        late = self.seal("one")
+        with workcopy.view_lock(self.settings, self.target("one")):
+            views.drain(self.settings, self.lineage_id(), self.engine(), stop_after=early["csid"])  # busy: not settled
+        views.drain(self.settings, self.lineage_id(), self.engine(), stop_after=late["csid"])  # generation 2 settles first
+        self.assertEqual([item["csid"] for item in self.store("one")["changesets"]], [late["csid"]])
+        views.settle(self.settings, self.target("one"))  # then generation 1, replayed from CURRENT.log
+        store = self.store("one")
+        live = [(entry["cid"], entry["generation"], entry["ids"]) for entry in store["commits"] if not entry.get("reverted")]
+        self.assertEqual(live, [(late["csid"], 2, sorted([first, second]))])
+        self.assertEqual(store.get("archived") or [], [])
+        self.assertEqual(sorted(item["csid"] for item in store["changesets"]), sorted([early["csid"], late["csid"]]))
+        self.assertEqual(store["base"]["generation"], 2)
+
     def test_an_existing_lineage_is_found_without_the_creation_lock(self):
         self.edit("Mine", A, view="one")
         self.run_job(self.seal("one"), "one")

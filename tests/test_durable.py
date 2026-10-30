@@ -1061,6 +1061,8 @@ FOLLOW_UP = {  # (file, function, kind) -> (category, note)
     ("evidence.py", "export", "open(w)"): ("artifact", "evidence export"),
     ("export_worker.py", "run", "open(a)"): ("artifact", "export output rows"),
     ("exporting.py", "_launch", "open(ab)"): ("artifact", "worker log"),
+    ("lineage.py", "_write_tamper_cache", "write_text"): ("artifact", "tamper-check cache; losing it costs a re-hash"),
+    ("lineage.py", "_write_tamper_cache", "Path.replace"): ("artifact", "tamper-check cache; losing it costs a re-hash"),
     ("locks.py", "LaneLock.acquire", "open(a+b)"): ("artifact", "lock file"),
     ("locks.py", "_QueuedLock.wait", "open(ab)"): ("artifact", "lock file (byte 0, before the queued lock)"),
     ("preparation.py", "cancel", "write_text"): ("artifact", "cancel marker"),
@@ -1159,10 +1161,10 @@ class WriteGate(unittest.TestCase):
         records = [key for key, (category, _) in FOLLOW_UP.items() if category == "record"]
         # Y0e moved hydra.write_daemon_config, runtime._write and runtime_worker._write onto durable (six rows gone);
         # Y1 deleted the legacy analysis.save_overlay (its two rows). What is left is the artifact sites that are
-        # not records: no record-bearing writer stands outside durable. GATE16 added the queued lock's byte-0 seed.
+        # not records: no record-bearing writer stands outside durable. GATE16 added the queued lock's byte-0 seed; H17 the tamper-check cache.
         self.assertEqual(len(records), 0)
-        self.assertEqual(len(FOLLOW_UP), 25)
-        self.assertEqual(sum(COUNTS.get(key, 1) for key in FOLLOW_UP), 27)
+        self.assertEqual(len(FOLLOW_UP), 27)
+        self.assertEqual(sum(COUNTS.get(key, 1) for key in FOLLOW_UP), 29)
         self.assertEqual(sorted(key[:2] for key in records), [])
 
 
