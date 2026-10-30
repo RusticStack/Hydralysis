@@ -30,12 +30,13 @@ import json
 import os
 import re
 import shutil
+import threading
 import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from hydralysis import durable, hydra, integrity, lineage, revisions
+from hydralysis import durable, hydra, integrity, lineage, revisions, storelog
 from hydralysis.analysis import MAX_CORPUS_BYTES, MAX_HISTORY_BYTES, MAX_OVERLAYS, _edit, _overlay_path
 from hydralysis.backends import read_json, write_json
 from hydralysis.locks import LaneLock, LockBusy, locked
@@ -208,12 +209,47 @@ def _forget_current(settings: dict, target: dict, discarded: list[str], retired:
         write_json(_directory(settings, target) / "state.json", changed)
 
 
+# The rebase folders (`views._shadow`) whose rebase lane this thread holds: a rebase sweeping its own view at the switch
+# (`views._adopt_copy`) still sees the copies in it; any other sweep skips a rebase folder whose lane is held (below).
+_REBASING = threading.local()
+
+
+@contextmanager
+def rebase_lane(settings: dict, target: dict):
+    """The rebase lane of TARGET's view: the `.view.lock` of its rebase folder, held for the whole rebase (one rebase per
+    view at a time), and marked as this thread's so the switch's own sweep still lists the copies in that folder."""
+    shadow = {**target, "key": target["key"] + "r"}
+    folder = _norm(_directory(settings, shadow))
+    with view_lock(settings, shadow):
+        owned = getattr(_REBASING, "folders", None)
+        if owned is None:
+            owned = _REBASING.folders = set()
+        owned.add(folder)
+        try:
+            yield
+        finally:
+            owned.discard(folder)
+
+
+def _rebase_building(folder: Path) -> bool:
+    """FOLDER is a rebase folder whose lane another rebase holds: the copy in it is being built (H12: outside the view
+    lock), so a sweep of the view must not close it."""
+    if _norm(folder) in (getattr(_REBASING, "folders", None) or set()):
+        return False
+    from hydralysis.locks import held
+    return held(str(folder / ".view.lock"))
+
+
 def _forks_on_disk(settings: dict, target: dict) -> list[Path]:
     """Every working copy of the view that is on disk (`w-*/<name>.gpr` in the view's folders), referenced or not: a state
-    file that was lost (K15 removes it) or never written (a sync that failed) no longer names the copies it made."""
+    file that was lost (K15 removes it) or never written (a sync that failed) no longer names the copies it made.
+
+    The rebase folder is left out while another rebase of the view holds its lane: the copy it is building there is no
+    orphan (review finding: a concurrent sync of the view swept it and the switch then adopted a discarded copy)."""
     found = []
-    for folder in view_folders(settings, target):
-        if folder.is_dir():
+    folders = view_folders(settings, target)
+    for index, folder in enumerate(folders):
+        if folder.is_dir() and not (index > 0 and _rebase_building(folder)):
             found += sorted(path for path in folder.glob("w-*/*.gpr") if path.is_file())
     return found
 
@@ -559,15 +595,57 @@ def _empty_store(sha256: str) -> dict:
             "published_through": {}, "changesets": []}
 
 
+_LOADED: dict[str, tuple] = {}
+_LOADED_GUARD = threading.Lock()
+
+
+def _file_id(path: Path, tail: bool = False):
+    """Which file is at PATH: id, time, size and (TAIL) its last 256 bytes, which hold the seal of a sealed record, so
+    an in-place rewrite of the same size within one clock tick is still seen."""
+    try:
+        found = path.stat()
+        end = b""
+        if tail:
+            with path.open("rb") as handle:
+                handle.seek(max(0, found.st_size - 256))
+                end = handle.read(256)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    return found.st_ino, found.st_mtime_ns, found.st_size, end
+
+
 def load_store(settings: dict, target: dict) -> dict:
     """The store in its version-3 shape. A v1 or v2 file upgrades in memory (its `version` still says what was read)
-    and on disk at its first write, which keeps the old file once as `.v1.bak` or `.v2.bak`."""
+    and on disk at its first write, which keeps the old file once as `.v1.bak` or `.v2.bak`.
+
+    A warm query reads the store several times; the parsed, validated result is kept per store path and reused while
+    the snapshot, its `.bak` and its log are the same files with the same size and time (a write replaces or grows one
+    of them). Every call gets its own copy (callers mutate what they get)."""
     path = _store_path(settings, target)
+    key = (os.path.normcase(os.path.abspath(path)), target["sha256"], json.dumps(lineage_binding(target), sort_keys=True))
+    signature = (_file_id(path, True), _file_id(durable.backup_path(path)), _file_id(storelog.log_path(path)))
+    with _LOADED_GUARD:
+        cached = _LOADED.get(key[0])
+    if cached is not None and signature[0] is not None and cached[0] == key and cached[1] == signature:
+        return json.loads(cached[2])
+    store = _load_store_uncached(settings, target, path)
+    text = json.dumps(store)
+    if signature[0] is not None and _file_id(path, True) == signature[0] and json.loads(text) == store:
+        with _LOADED_GUARD:
+            _LOADED.pop(key[0], None)
+            _LOADED[key[0]] = (key, signature, text)
+            while len(_LOADED) > storelog.CACHE_ENTRIES:   # bounded: a long-lived server reads many views
+                _LOADED.pop(next(iter(_LOADED)))
+    return store
+
+
+def _load_store_uncached(settings: dict, target: dict, path: Path) -> dict:
     if path.is_file() and path.stat().st_size > MAX_HISTORY_BYTES:
         raise ValueError("overlay history exceeds 20 MiB; preserved for review")
     # Sealed record: the file, else its previous version (.bak). A store that exists but has no valid
     # version raises store_corrupt; only a store that was never written reads as "no edits".
-    record = _store_record(path)
+    # the snapshot, then its append log (storelog); read again when a compaction replaced the snapshot meanwhile
+    record = storelog.read(path, _store_record(path), reread=lambda: _store_record(path))
     if record is None:
         fresh = _empty_store(target["sha256"])
         binding = lineage_binding(target)
@@ -642,11 +720,19 @@ def _keep_old_format(path: Path) -> None:
             durable.atomic_write(backup, path.read_bytes(), point="v%d_backup" % old)
 
 
-def _v3(store: dict, target: dict) -> dict:
-    """The record to write: the store in its v3 form, whatever shape the caller holds (a v2 dict upgrades)."""
+def _v3(store: dict, target: dict, known: list | None = None) -> dict:
+    """The record to write: the store in its v3 form, whatever shape the caller holds (a v2 dict upgrades).
+
+    KNOWN: the records of the store on disk, already in their clean form (storelog.known_edits). A record equal to the
+    one at its position there is taken as it is (cleaning a clean record gives it back, tests/test_storelog.py checks
+    that), so a mutation re-validates only the records it added or changed instead of the whole history."""
     edits, previous = [], 0
+    known = known or []
     for position, item in enumerate(store.get("edits", [])):
-        edit = _clean_record(item, position, previous)
+        if position < len(known) and item == known[position] and known[position]["seq"] > previous:
+            edit = item
+        else:
+            edit = _clean_record(item, position, previous)
         previous = edit["seq"]
         edits.append(edit)
     base = store.get("base") if isinstance(store.get("base"), dict) else dict(DEFAULT_BASE)
@@ -658,13 +744,14 @@ def _v3(store: dict, target: dict) -> dict:
 
 
 def _save_store(settings: dict, target: dict, store: dict) -> None:
-    # Version 3, sealed, previous version kept as .bak, atomic and fsynced (durable.write_sealed); a v1 or v2
-    # file is kept once as .v1.bak or .v2.bak before it is replaced.
+    # Version 3, sealed snapshot (previous one kept as .bak) plus an append log, fsynced before return (storelog); a v1
+    # or v2 file is kept once as .v1.bak or .v2.bak before it is replaced.
     path = _store_path(settings, target)
-    record = _v3(store, target)
+    record = _v3(store, target, storelog.known_edits(path))
     _keep_old_format(path)
-    durable.write_sealed(path, record, max_bytes=MAX_HISTORY_BYTES,
-                         too_large="overlay history would exceed 20 MiB; existing history preserved")
+    # One fsynced log row per mutation, a sealed snapshot every storelog.SNAPSHOT_EVERY rows (H16).
+    storelog.save(path, record, max_bytes=MAX_HISTORY_BYTES,
+                  too_large="overlay history would exceed 20 MiB; existing history preserved")
 
 
 def committed_ids(store: dict) -> set[str]:

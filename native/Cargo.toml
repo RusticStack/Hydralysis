@@ -1,0 +1,19 @@
+[package]
+name = "hydralysis-native"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Optional native helpers for Hydralysis (CRC-framed log scanning); pure-Python fallback in hydralysis.durable"
+
+[lib]
+name = "hydralysis_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.27", features = ["extension-module", "abi3-py313"] }
+crc32fast = "1.4"
+memchr = "2.7"
+
+[profile.release]
+lto = true
+codegen-units = 1

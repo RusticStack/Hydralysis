@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "hydralysis-native"
+version = "0.1.0"
+requires-python = ">=3.13"
+description = "Optional native helpers for Hydralysis; Hydralysis works without it (pure-Python fallback, identical results)."
+
+[tool.maturin]
+module-name = "hydralysis_native"
+features = ["pyo3/extension-module"]

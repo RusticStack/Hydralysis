@@ -411,6 +411,41 @@ class Scan:
                 "torn_tail": self.torn_tail, "corrupt": self.corrupt}
 
 
+try:  # optional Rust helper (native/, PyO3 abi3); HYDRALYSIS_NATIVE=0 or a missing wheel uses the Python twin below
+    import hydralysis_native as _native  # type: ignore[import-not-found]
+except ImportError:
+    _native = None
+
+
+def _frame_lines_py(data: bytes) -> list[tuple[int, int, bool]]:
+    """Every complete line of DATA as (start, end, crc_ok), END the offset of its LF: the frame check of `_parse`
+    without the JSON decode. The Python twin of hydralysis_native.frame_lines (tests/test_native.py: they agree)."""
+    out = []
+    cursor = 0
+    while True:
+        end = data.find(b"\n", cursor)
+        if end < 0:
+            return out
+        line = data[cursor:end]
+        ok = (len(line) >= 10 and line[8:9] == b" " and all(byte in _HEX for byte in line[:8])
+              and zlib.crc32(line[9:]) & 0xFFFFFFFF == int(line[:8], 16))
+        out.append((cursor, end, ok))
+        cursor = end + 1
+
+
+def frame_lines(data: bytes) -> list[tuple[int, int, bool]]:
+    if _native is not None and os.environ.get("HYDRALYSIS_NATIVE", "1") != "0":
+        return _native.frame_lines(data, 0)
+    return _frame_lines_py(data)
+
+
+def _decode(body: bytes):
+    try:
+        return (json.loads(body.decode("utf-8")),)
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+
 def scan_chunks(chunks, base: int = 0, collect: bool = True, size: int | None = None) -> Scan:
     """Scan consecutive chunks that start at byte `base` of a log (`base` must be a line start).
 
@@ -424,15 +459,12 @@ def scan_chunks(chunks, base: int = 0, collect: bool = True, size: int | None = 
         seen += len(chunk)
         pending += chunk
         cursor = 0
-        while True:
-            end = pending.find(b"\n", cursor)
-            if end < 0:
-                break
+        for start, end, framed in frame_lines(pending):
             line_no += 1
-            parsed = _parse(pending[cursor:end])
+            parsed = _decode(pending[start + 9:end]) if framed else None
             if parsed is None:
                 if bad_from is None:
-                    bad_from, bad_line = pending_start + cursor, line_no
+                    bad_from, bad_line = pending_start + start, line_no
             elif bad_from is not None:
                 return Scan(records, bad_from, seen if size is None else size, None,
                             {"offset": bad_from, "line": bad_line, "error": "lineage_corrupt"})
