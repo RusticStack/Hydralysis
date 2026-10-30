@@ -31,7 +31,7 @@ library protocols 2 to 3.
 Gate 9.8 of the engine's `PROTOCOL-3.md` runs the whole test suite with the real-engine classes against hydra.4 and
 against the released hydra.3 ("degraded set"). On hydra.3 the client runs in the degraded mode of 7.5: protocol 2, no
 `capabilities`, the 1.0.0 helper library for deadlines. The degraded set is every test except the classes below, which
-need a hydra.4-only feature and skip on hydra.3 with a reason that starts `hydra.3 degraded set:`.
+need a hydra.4-only feature: on hydra.3 each of their tests skips with a reason that starts `hydra.3 degraded set:`.
 
 | Class | hydra.4 feature it needs |
 |---|---|
@@ -41,7 +41,8 @@ need a hydra.4-only feature and skip on hydra.3 with a reason that starts `hydra
 | `test_deadline.RealNative` | client library 1.1.0 timing its own wait (already skipped without that library) |
 
 The decision is the protocol the connection negotiated (`Engine.protocol()`, read from `hello`), made by
-`tests/support.py` `require_hydra4`, never a release name. An engine that serves protocol 3 never skips these classes: on
+`tests/support.py` (`hydra4_missing` in `setUpClass`, the `Hydra4Only` mixin skips each test, so the runner still counts
+every planned test), never a release name. An engine that serves protocol 3 never skips these classes: on
 hydra.4 a missing capability still fails them. The hydra.3 run sets `HYDRALYSIS_INTEGRATION_UNPINNED=1`, names the
 hydra.3 install and its own `ghidra_session.py` (library 1.0.0) as `HYDRALYSIS_INTEGRATION_ENGINE` and `_CLIENT`, and
 must otherwise end green.

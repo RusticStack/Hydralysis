@@ -812,6 +812,7 @@ class CommitHygiene(World, unittest.TestCase):
 # project of /flow_fixture.exe). Each class has its own data root and daemon, stopped at the end.
 
 import test_engine_integration as integration   # noqa: E402  (its _prepare/_release and gates; no test class is imported)
+from support import Hydra4Only, hydra4_missing   # noqa: E402  (the hydra.3 degraded set, docs/versioning.md)
 
 LEGACY = os.environ.get("HYDRALYSIS_INTEGRATION_LEGACY_PROJECT") or os.environ.get("RUSTICRE_INTEGRATION_LEGACY_PROJECT")
 LEGACY_PROGRAM = "/flow_fixture.exe"
@@ -839,7 +840,7 @@ def _legacy_copy(source: str, destination: Path) -> Path:
 @unittest.skipUnless(HAVE_ENGINE, "set HYDRALYSIS_INTEGRATION_ENGINE/CLIENT")
 @unittest.skipUnless(LEGACY and Path(LEGACY).exists(), "set HYDRALYSIS_INTEGRATION_LEGACY_PROJECT (an older-format project, e.g. the "
                      "engine's examples/fixtures/legacy-12.1.4) for the upgrade-gate cases")
-class RealEngineBackups(unittest.TestCase):
+class RealEngineBackups(Hydra4Only, unittest.TestCase):
     """One schema, two writers, on the real engine (4.5, 3.4): the engine's `fork_project purpose:"backup"` is re-verified by
     Hydralysis and accepted by the engine's upgrade gate; a Python-written backup (writer "hydralysis") is accepted by the same gate;
     without a backup, or with a tampered one, the gate refuses; a flipped byte passes the gate (it checks sizes) but not Hydralysis."""
@@ -857,9 +858,7 @@ class RealEngineBackups(unittest.TestCase):
         cls.env.start()
         cls.engine = hydra.Engine(cls.settings)
         cls.serial = 0
-        from support import require_hydra4
-        require_hydra4(cls.engine, "the engine-written backup (capability `backup`, E2) and its upgrade gate",
-                       lambda: integration._release(cls))
+        cls.degraded = hydra4_missing(cls.engine, "the engine-written backup (capability `backup`, E2) and its upgrade gate")
 
     @classmethod
     def tearDownClass(cls):
@@ -1001,7 +1000,7 @@ class RealEngineBackups(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_ENGINE and integration.BINARY and Path(integration.BINARY).is_file(), "set HYDRALYSIS_INTEGRATION_ENGINE/CLIENT")
-class RealEngineFaultMatrix(unittest.TestCase):
+class RealEngineFaultMatrix(Hydra4Only, unittest.TestCase):
     """Y4d's "fault matrix re-run" on the real E2 path: test_commit's fault points injected into commits.run_commit against the real
     hydra.4 engine (engine-written backups, candidates forked with purpose "generation"). After each fault the master is
     byte-identical and the head names the old generation or (published points) the new one; a resubmission with the same cid ends
@@ -1015,9 +1014,7 @@ class RealEngineFaultMatrix(unittest.TestCase):
         integration._prepare(cls, integration.BINARY, "y4d-matrix", "fixture")
         cls.settings["backup_roots"] = [{"path": str(cls.root / "backups")}]
         default_to_shared(cls.runner)
-        from support import require_hydra4
-        require_hydra4(cls.runner.engine, "the E2 commit path (engine-written backups, generation candidates)",
-                       lambda: integration._release(cls))
+        cls.degraded = hydra4_missing(cls.runner.engine, "the E2 commit path (engine-written backups, generation candidates)")
 
     @classmethod
     def tearDownClass(cls):
