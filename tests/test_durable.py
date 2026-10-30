@@ -1045,6 +1045,7 @@ FOLLOW_UP = {  # (file, function, kind) -> (category, note)
     ("export_worker.py", "run", "open(a)"): ("artifact", "export output rows"),
     ("exporting.py", "_launch", "open(ab)"): ("artifact", "worker log"),
     ("locks.py", "LaneLock.acquire", "open(a+b)"): ("artifact", "lock file"),
+    ("locks.py", "_QueuedLock.wait", "open(ab)"): ("artifact", "lock file (byte 0, before the queued lock)"),
     ("preparation.py", "cancel", "write_text"): ("artifact", "cancel marker"),
     ("preparation.py", "_launch", "open(wb)"): ("artifact", "worker log"),
     ("preparation_worker.py", "_log", "open(a)"): ("artifact", "worker log"),
@@ -1141,10 +1142,10 @@ class WriteGate(unittest.TestCase):
         records = [key for key, (category, _) in FOLLOW_UP.items() if category == "record"]
         # Y0e moved hydra.write_daemon_config, runtime._write and runtime_worker._write onto durable (six rows gone);
         # Y1 deleted the legacy analysis.save_overlay (its two rows). What is left is the artifact sites that are
-        # not records: no record-bearing writer stands outside durable.
+        # not records: no record-bearing writer stands outside durable. GATE16 added the queued lock's byte-0 seed.
         self.assertEqual(len(records), 0)
-        self.assertEqual(len(FOLLOW_UP), 24)
-        self.assertEqual(sum(COUNTS.get(key, 1) for key in FOLLOW_UP), 26)
+        self.assertEqual(len(FOLLOW_UP), 25)
+        self.assertEqual(sum(COUNTS.get(key, 1) for key in FOLLOW_UP), 27)
         self.assertEqual(sorted(key[:2] for key in records), [])
 
 

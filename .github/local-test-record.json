@@ -1,0 +1,12 @@
+{
+  "release": "0.6.0",
+  "testedCommit": "399412fcef4cdc8e7f5678b2f1a6af4e6c3929bd",
+  "date": "2026-10-30",
+  "machine": "Windows 11 Pro 10.0.26300, 22 cores, NTFS, Python 3.15, JDK 25.0.4.1 Temurin",
+  "engine": "the published Hydra Engine 12.3-hydra.4 zip (SHA-256 f0f2844ca32b702c3fe711adbf6c7d4743ddac5097073691965faaabf7a8cef0), unzipped",
+  "suites": {
+    "unit (tools/run_tests.py)": "1512/1512 OK (D:/Projects/Hydra/_logs/final/rel-unit2.log)",
+    "unit + real engine (tools/run_tests.py --integration)": "1512/1512 OK, 0 failed alone, 0 under load, NoStockEndToEnd ran (D:/Projects/Hydra/_logs/final/rel-integ2.log)",
+    "bump_hydra.py --check": "exit 0 against the published SHA256SUMS"
+  }
+}

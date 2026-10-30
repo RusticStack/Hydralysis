@@ -12,8 +12,10 @@ that speaks another protocol, or needs a newer client, is refused by name.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.util
+import itertools
 import json
 import os
 import re
@@ -27,9 +29,12 @@ from pathlib import Path
 from hydralysis import compat, durable
 from hydralysis.paths import root_path
 
-RELEASE = "12.3-hydra.2"
-PROTOCOL = 2
-CLIENT_VERSION = "1.0.0"
+RELEASE = "12.3-hydra.4"
+PROTOCOL = 3
+# The oldest engine protocol this client still speaks: a protocol-3 client library connects to a released protocol-2
+# engine (hydra.2, hydra.3) and negotiates down; the features of 3 are used only when hello advertises them (7.5).
+PROTOCOL_MIN = 2
+CLIENT_VERSION = "1.1.0"
 # The daemon instance id and the client attribution prefix are deliberately still
 # "rusticre" for this release (0.5.0.dev0). A running daemon is found and locked by its
 # instance id, and its state directory, log and job-owner records carry that name.
@@ -39,12 +44,17 @@ CLIENT_VERSION = "1.0.0"
 INSTANCE = "rusticre"
 ATTRIBUTION = "rusticre"
 _BASE = "https://github.com/RusticStack/hydra-engine/releases/download/v" + RELEASE + "/"
-# SHA256SUMS of the release, observed 2026-10-26 and checked after download.
+# PENDING PUBLICATION: the release v12.3-hydra.4 is not tagged yet. The sizes and digests below were taken from a hand-built
+# stand-in dist (engine 338,530 bytes, not the real archive), so `backend install` cannot succeed until the coordinator
+# publishes the release and re-runs `tools/bump_hydra.py --release 12.3-hydra.4 --dist <published files> --write`.
+# Until then the next line (the one `bump_hydra.py` rewrites) is NOT true: the digests and sizes are those of the stand-in
+# dist, not a published SHA256SUMS, and nothing was checked after a download.
+# SHA256SUMS of the release, observed 2026-10-30 and checked after download.
 ASSETS = {
     "engine": {"url": _BASE + "hydra-engine-" + RELEASE + "-win_x86_64.zip",
-               "sha256": "f5cc0d721d401660556e28af6c104ee75a23fdc62803a419789d799a00ee6218", "size": 378876631},
+               "sha256": "f0f2844ca32b702c3fe711adbf6c7d4743ddac5097073691965faaabf7a8cef0", "size": 379241326},
     "client": {"url": _BASE + "hydra-client-" + RELEASE + ".zip",
-               "sha256": "f26e9ebc3d242d1f8ad4872acd2c5219addfc7a615c4e4334d7189c81792c773", "size": 22901},
+               "sha256": "6f086aa2a5a91b043f856d33ee851da6d485cc45ba17925fe5709536dfac7406", "size": 45187},
 }
 SESSION_MODULE = Path("Ghidra", "Features", "HeadlessSession")
 
@@ -229,8 +239,10 @@ def load_client(path: str | Path, allow_unpinned: bool = False):
     text = path.read_text(encoding="utf-8", errors="replace")
     stamps = {name: (re.search(r'^%s\s*=\s*"?([^"\n]+)"?' % name, text, re.M) or [None, None])[1]
               for name in ("PROTOCOL", "CLIENT_VERSION", "HYDRA_RELEASE")}
-    if stamps["PROTOCOL"] != str(PROTOCOL):
-        raise ValueError("Hydra client %s speaks protocol %s; Hydralysis needs %s" % (path, stamps["PROTOCOL"], PROTOCOL))
+    wanted = range(PROTOCOL_MIN, PROTOCOL + 1) if allow_unpinned else (PROTOCOL,)
+    if not (stamps["PROTOCOL"] or "").isdigit() or int(stamps["PROTOCOL"]) not in wanted:
+        raise ValueError("Hydra client %s speaks protocol %s; Hydralysis needs %s" % (
+            path, stamps["PROTOCOL"], PROTOCOL if not allow_unpinned else "%d to %d" % (PROTOCOL_MIN, PROTOCOL)))
     if not allow_unpinned and (stamps["HYDRA_RELEASE"] != RELEASE or stamps["CLIENT_VERSION"] != CLIENT_VERSION):
         raise ValueError("Hydra client %s is release %s / client %s; this Hydralysis pins %s / %s"
                          % (path, stamps["HYDRA_RELEASE"], stamps["CLIENT_VERSION"], RELEASE, CLIENT_VERSION))
@@ -383,7 +395,55 @@ class Engine:
             session.close()
             raise RuntimeError("the running Hydralysis daemon is Hydra %s, not the pinned %s; stop it (backend action=stop)"
                                % (hello.get("hydraVersion"), RELEASE))
+        found = hello.get("protocol")
+        if isinstance(found, int) and not PROTOCOL_MIN <= found <= PROTOCOL:
+            session.close()
+            raise RuntimeError("the running Hydralysis daemon speaks protocol %s; this Hydralysis speaks %d to %d"
+                               % (found, PROTOCOL_MIN, PROTOCOL))
         return session
+
+    def connect_entry(self):
+        """A new connection for the pool (7.6): `connect` and the identity check, and not `sync_scripts` or `write_daemon_config`
+        (they run once per process when the shared connection is made; a replacement must not fsync a config per abandon)."""
+        module = self.module()
+        try:
+            session = module.connect(client=_IDENTITY["client"], harness=_IDENTITY["harness"], ghidra=str(self.engine_dir),
+                                     state=str(state_dir(self.settings)), instance=INSTANCE, start=False)
+        except (module.IncompatibleError, module.LaunchError) as exc:
+            raise RuntimeError("Hydra engine refused a pool connection: %s" % exc) from exc
+        hello = getattr(session, "hello", {}) or {}
+        if hello.get("hydraVersion") != RELEASE and not self.allow_unpinned:
+            session.close()
+            raise RuntimeError("the running Hydralysis daemon is Hydra %s, not the pinned %s" % (hello.get("hydraVersion"), RELEASE))
+        return session
+
+    _pools: dict[str, "Pool"] = {}
+
+    def pool(self) -> "Pool":
+        """The entries of deadline-bound attempts for this root and role (one pool per process, 7.6)."""
+        with self._guard:
+            found = self._pools.get(self.key)
+            if found is None:
+                found = self._pools[self.key] = Pool(self, on_retire=_forget_rows)
+                fresh = True
+            else:
+                fresh = False
+        if fresh:
+            supervise(self)
+        return found
+
+    def protocol(self) -> int:
+        """The protocol this connection negotiated: what hello reports; an engine that reports nothing speaks 2."""
+        found = self.hello().get("protocol")
+        return found if isinstance(found, int) and not isinstance(found, bool) else PROTOCOL_MIN
+
+    def deadline_mode(self) -> str:
+        """"native" when the loaded client library times its own `wait` (library 1.1.0, P1b; the connection survives),
+        else "helper" (the worker-thread abandon helper of 7.6 on hydra.2/3)."""
+        return "native" if getattr(self.session(), "supports_deadline", False) else "helper"
+
+    def supports(self, name: str) -> bool:
+        return name in self.capabilities()
 
     def session(self):
         with self._guard:
@@ -392,10 +452,21 @@ class Engine:
                 session = self._connections[self.key] = self._connect()
             return session
 
+    def connected(self) -> bool:
+        """Whether this process holds a live connection of this key now (asking never connects, so it never starts a daemon)."""
+        with self._guard:
+            session = self._connections.get(self.key)
+        return session is not None and not getattr(session, "_closed", False)
+
     def reset(self) -> None:
+        """Drop the shared connection, and with it every pool entry of the role: a daemon restart (or a connection that
+        died) takes the context of all of them (7.6, I2; 7.2 lists the restart as a retire event)."""
         with self._guard:
             session = self._connections.pop(self.key, None)
             self._used.pop(self.key, None)
+            pool = self._pools.get(self.key)
+        if pool is not None:
+            pool.invalidate()
         if session is not None:
             try:
                 session.close()
@@ -464,6 +535,8 @@ class Engine:
         """
         module = self.module()
         labels = {"client": _IDENTITY["client"], "harness": _IDENTITY["harness"], "parallel": True}
+        if fields.get("deadline") is None:
+            fields.pop("deadline", None)   # `deadline` reaches the library only when set (library 1.1.0)
         retry = idempotent(command, fields)
         for attempt in (0, 1):
             session = self.session()
@@ -533,9 +606,891 @@ class Engine:
 
     def stop(self, force: bool = False) -> dict:
         module = self.module()
+        unsupervise(self)   # a stopped daemon is not restarted behind the caller's back
+        with self._guard:
+            pool = self._pools.pop(self.key, None)
+        if pool is not None:
+            pool.close_all(0.0)
         self.reset()
         daemon = module.Daemon(str(self.engine_dir), str(state_dir(self.settings)), INSTANCE)
         return {"stopped": daemon.stop(force=force)}
+
+
+# ---- deadlines on hydra.2/3: the abandon helper, the pool of entries, the leave gate (PROTOCOL-3.md 7.6) ----------
+
+DEADLINE_S = 60.0          # the deadline of one attempt (7.6), not of each call
+CONNECT_FLOOR_S = 5.0      # the least time a new pool connection gets for its hello (Pool._connect_within)
+DEADLINE_GRACE_S = 5.0     # after `cancel`, before the connection is abandoned
+USER_CAP = 8               # abandoned user calls at a time (unmeasured policy, 7.6 step 5)
+PROBE_CAP = 3              # abandoned supervisor probes: the number of consecutive misses that make a wedge (7.2)
+CLOSING_CAP = 8            # the closing list of the leave gate (rule L3)
+POOL_SIZE = 4              # live entries per role (TOOL_WORKERS, mcp.py)
+PATIENCE_S = 25.0          # the patience budget of a lock wait (7.6, Waits)
+# An error after which the entry is retired and the retry takes another one (I3).
+RETIRE_CODES = frozenset({"no_program", "no_project", "not_found", "closed"})
+# Calls whose `wait` is bound below the attempt's deadline (N2): the two opens and the script.
+WAITING_COMMANDS = frozenset({"open_project", "open_program", "script"})
+
+
+class DeadlineError(EngineError):
+    """`deadline_exceeded` and `abandoned_cap`: errors of the client-side deadline, not of the engine."""
+
+
+def _forget_rows(entry) -> None:
+    """The pool's `on_retire` in production: the retired entry's rows of `query._keys` go with it (I2). `query` imports this
+    module, so it is imported here, when an entry retires."""
+    from hydralysis import query
+    query.forget(entry)
+
+
+def _forget_role_rows(engine) -> None:
+    from hydralysis import query
+    query.forget_role(engine)
+
+
+def supports(engine, name: str) -> bool:
+    """Whether the engine advertises capability NAME. A stand-in without `capabilities` supports nothing."""
+    found = getattr(engine, "capabilities", None)
+    if not callable(found):
+        return False
+    try:
+        return name in found()
+    except Exception:
+        return False
+
+
+def patience_ms(engine, default_ms: int) -> int:
+    """The wait a read sends: DEFAULT_MS (the old 180 s budget), or the 25 s patience budget once the engine reports queue information."""
+    return min(default_ms, int(PATIENCE_S * 1000)) if supports(engine, "queueInfo") else default_ms
+
+
+class Registry:
+    """The process-wide state of abandoned requests, reads in flight and the closing list (7.6, step 5, rules L2 and L3).
+
+    Two budgets: at most USER_CAP abandoned user calls and PROBE_CAP abandoned probes; a probe is exempt from the user
+    budget. `reads` counts the scripts in flight (answered or not by the engine) per daemon program key; the leave gate
+    closes an entry that joined a program only when no read is in flight on any program it joined.
+    """
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.abandoned: dict[int, dict] = {}
+        self.reads: dict[str, int] = {}
+        self.closing: list = []
+        self.closed: list[str] = []   # entry keys closed by the gate, in order (diagnostics and tests)
+        self._ids = 0
+
+    def abandon(self, entry, command: str, program: str | None) -> int:
+        with self.lock:
+            self._ids += 1
+            self.abandoned[self._ids] = {"id": self._ids, "kind": entry.kind, "cmd": command, "program": program,
+                                         "label": "%s/%s" % (_IDENTITY["client"], _IDENTITY["harness"]),
+                                         "entry": entry.key, "since": time.monotonic()}
+            return self._ids
+
+    def answered(self, token: int) -> None:
+        with self.lock:
+            self.abandoned.pop(token, None)
+
+    def count(self, kind: str) -> int:
+        with self.lock:
+            return sum(1 for item in self.abandoned.values() if item["kind"] == kind)
+
+    def check_cap(self, kind: str) -> None:
+        """Fail fast, before anything is sent, when the budget of KIND is full."""
+        cap = PROBE_CAP if kind == "probe" else USER_CAP
+        with self.lock:
+            if self.count(kind) < cap:
+                return
+            listing = [{"cmd": item["cmd"], "label": item["label"], "program": item["program"],
+                        "ageS": round(time.monotonic() - item["since"], 1)}
+                       for item in self.abandoned.values() if item["kind"] == kind]
+        raise DeadlineError("abandoned_cap", "%d requests that ignore cancel are still running on the engine; "
+                            "no further call is sent until some end" % cap, {"cap": cap, "abandoned": listing},
+                            next={"cmd": "doctor"})
+
+    # --- the leave gate ------------------------------------------------------------------------------------------
+
+    def read_begin(self, program: str | None) -> None:
+        if program:
+            with self.lock:
+                self.reads[program] = self.reads.get(program, 0) + 1
+
+    def read_end(self, program: str | None) -> None:
+        if not program:
+            return
+        with self.lock:
+            left = self.reads.get(program, 0) - 1
+            if left > 0:
+                self.reads[program] = left
+            else:
+                self.reads.pop(program, None)
+            ready = [entry for entry in self.closing if not self._busy(entry)]
+            for entry in ready:
+                self.closing.remove(entry)
+        for entry in ready:
+            self._close(entry)
+
+    def _busy(self, entry) -> bool:
+        return any(self.reads.get(program) for program in entry.joined)
+
+    def leave(self, entry) -> str:
+        """Close ENTRY when this process has no read in flight on a program it joined; otherwise queue it.
+
+        Returns "dropped" (its connection had failed: nothing to leave), "closed" or "deferred". A ninth entry in the
+        list closes the oldest regardless (L3)."""
+        if entry.broken:
+            entry.close_now()   # its connection failed: no request is in flight and it holds no lock; free the socket
+            return "dropped"
+        with self.lock:
+            if entry.joined and self._busy(entry):
+                self.closing.append(entry)
+                oldest = self.closing.pop(0) if len(self.closing) > CLOSING_CAP else None
+                state = "deferred"
+            else:
+                oldest, state = entry, "closed"
+        if oldest is not None:
+            self._close(oldest)
+        return state
+
+    def _close(self, entry) -> None:
+        with self.lock:
+            self.closed.append(entry.key)
+        entry.close_now()
+
+    def drain(self, grace_s: float) -> None:
+        """Wait for the gate (at most GRACE_S), then close everything still waiting: `stop` and the exit of the process."""
+        end = time.monotonic() + grace_s
+        while time.monotonic() < end:
+            with self.lock:
+                if not self.closing:
+                    return
+            time.sleep(0.02)
+        with self.lock:
+            left, self.closing = self.closing, []
+        for entry in left:
+            self._close(entry)
+
+    def snapshot(self) -> dict:
+        """What the doctor lists: both budgets, the reads in flight, the closing list."""
+        with self.lock:
+            now = time.monotonic()
+            items = [{**{k: v for k, v in item.items() if k != "since"}, "ageS": round(now - item["since"], 1)}
+                     for item in self.abandoned.values()]
+            return {"abandoned": {"user": self.count("user"), "probe": self.count("probe"), "userCap": USER_CAP,
+                                  "probeCap": PROBE_CAP, "items": items},
+                    "reads": dict(self.reads), "closing": [entry.key for entry in self.closing]}
+
+
+REGISTRY = Registry()
+_SERIALS = itertools.count(1)   # never reused in the process (I1)
+
+
+class Entry:
+    """A connection plus the context it holds: the unit of the pool (7.6). One attempt owns it; one request is ever in flight."""
+
+    def __init__(self, engine, session, kind: str = "user", registry: Registry | None = None, on_retire=None):
+        self.engine = engine
+        self.session = session
+        self.kind = kind
+        self.registry = registry or REGISTRY
+        self.serial = next(_SERIALS)
+        self.key = "%s|%d" % (engine.key, self.serial)   # "<root>|<role>|<serial>": the rows of `_keys` it owns start with it
+        self.joined: set[str] = set()                    # daemon program keys this entry opened
+        self.abandoned = False
+        self.broken = False
+        self.finished = False                            # closed or dropped
+        self.on_retire = on_retire
+        self.deadline_at = 0.0
+        self.grace_s = DEADLINE_GRACE_S
+        self._guard = threading.Lock()
+        self._inflight = False
+        self._ended = False
+        self._retired = False
+        self._token = None
+        self.pending_close: set[str] = set()
+        self.generation = 0
+
+    def begin(self, deadline_s: float) -> "Entry":
+        """Start the attempt's clock (when the entry is acquired)."""
+        self.deadline_at = time.monotonic() + deadline_s
+        return self
+
+    def remaining(self) -> float:
+        return self.deadline_at - time.monotonic()
+
+    @staticmethod
+    def _program_of(command: str, fields: dict) -> str | None:
+        if command == "script":
+            return fields.get("program")
+        if command == "open_program" and fields.get("project") and fields.get("path"):
+            return "%s:%s" % (fields["project"], fields["path"])
+        return None
+
+    def call(self, command: str, raw: bool = False, **fields):
+        """One engine call of the attempt, in a worker thread the caller never enters (steps 2 to 5)."""
+        labels = {"client": _IDENTITY["client"], "harness": _IDENTITY["harness"], "parallel": True}
+        with self._guard:
+            if self.abandoned or self.broken or self.finished:
+                raise RuntimeError("entry %s is retired; it is never used again" % self.key)
+            if self._inflight:
+                raise RuntimeError("entry %s has a request in flight; one request at a time (7.6 step 1)" % self.key)
+            self.registry.check_cap(self.kind)
+            remaining = self.remaining()
+            if remaining <= 0:
+                raise DeadlineError("deadline_exceeded", "the deadline of the attempt passed before %s was sent" % command,
+                                    {"connection_abandoned": False}, command)
+            self._inflight = True
+            self._ended = False
+        if command in WAITING_COMMANDS and "wait" in fields:
+            fields["wait"] = max(1, int(min(PATIENCE_S, remaining / 2) * 1000))
+        reading = command == "script"
+        program = self._program_of(command, fields)
+        if reading:
+            self.registry.read_begin(program)
+        box: dict = {}
+        done = threading.Event()
+        module = self.engine.module()
+
+        def work():
+            try:
+                rid = self.session.send(command, **labels, **fields)
+                box["rid"] = rid
+                box["value"] = self.session.wait(rid)
+            except BaseException as exc:   # noqa: BLE001 - handed to the caller, or dropped when it has left
+                box["error"] = exc
+            self._worker_done(command, reading, program, box, done)
+
+        threading.Thread(target=work, name="hydra-deadline-" + self.key, daemon=True).start()
+        if not done.wait(max(0.0, remaining)):
+            rid = box.get("rid")
+            if rid is not None:
+                try:
+                    self.session.send("cancel", target=rid)   # thread-safe; the only thing sent (rule L1)
+                except Exception:
+                    pass
+            if not done.wait(self.grace_s):
+                with self._guard:
+                    abandon = not self._ended
+                    if abandon:
+                        self.abandoned = True
+                        self._token = self.registry.abandon(self, command, program)
+                if abandon:
+                    # Nothing more is sent: no shutdown, no close(), no FIN. The worker closes the session itself,
+                    # through the gate, when the engine answers.
+                    raise DeadlineError("deadline_exceeded", "no answer to %s within the deadline; cancel sent, the connection "
+                                        "is abandoned" % command, {"connection_abandoned": True, "command": command}, command)
+                done.wait()
+        return self._outcome(box, module, command)
+
+    def _worker_done(self, command: str, reading: bool, program, box: dict, done: threading.Event) -> None:
+        value = box.get("value")
+        error = box.get("error")
+        if command == "open_program" and isinstance(value, dict) and value.get("key"):
+            self.joined.add(str(value["key"]))
+        if error is not None and (isinstance(error, OSError) or getattr(error, "code", None) == "closed"):
+            self.broken = True
+        if reading:
+            self.registry.read_end(program)
+        with self._guard:
+            self._inflight = False
+            self._ended = True
+            was_abandoned = self.abandoned
+        done.set()
+        if was_abandoned:
+            self._after_answer()
+
+    def _after_answer(self) -> None:
+        """The abandoned request ended: the count drops, the rows leave `_keys`, the session goes to the leave gate (step 5)."""
+        with self._guard:
+            if self._retired:
+                return
+            self._retired = True
+        if self._token is not None:
+            self.registry.answered(self._token)
+        if self.on_retire is not None:
+            self.on_retire(self)
+        self.registry.leave(self)
+
+    def _outcome(self, box: dict, module, command: str):
+        error = box.get("error")
+        if error is None:
+            return box["value"]
+        if isinstance(error, module.SessionError):
+            raise self.engine._error(self.session, error, command) from error
+        if isinstance(error, OSError):
+            raise EngineError("closed", "the connection to the engine failed while %s was in flight (%s)" % (command, error),
+                              {"cause": type(error).__name__}, command) from error
+        raise error
+
+    def capabilities(self) -> dict:
+        return self.engine.capabilities()
+
+    def module(self):
+        return self.engine.module()
+
+    def close_program(self, program: str, grace_s: float = DEADLINE_GRACE_S) -> bool:
+        """Leave one program this idle entry joined (`QueryRunner.stop`). A close is a leave, so it passes the gate: while a
+        read is in flight on the program it is only noted (`pending_close`, sent when the entry is returned): False."""
+        if self.registry.reads.get(program):
+            self.pending_close.add(program)
+            return False
+        self.begin(grace_s + 5.0)
+        self.call("close_program", program=program)
+        self.joined.discard(program)
+        return True
+
+    def close_now(self) -> None:
+        self.finished = True
+        try:
+            self.session.close()
+        except Exception:
+            pass
+
+    def retire(self) -> None:
+        """Drop the entry from use: forget its rows (I2) and leave its programs through the gate (I3)."""
+        with self._guard:
+            if self._retired:
+                return
+            self._retired = True
+        if self.on_retire is not None:
+            self.on_retire(self)
+        self.registry.leave(self)
+
+
+class Pool:
+    """At most POOL_SIZE live entries per engine role; an entry is created lazily by the next acquire (7.6, Pool size)."""
+
+    def __init__(self, engine, size: int = POOL_SIZE, registry: Registry | None = None, on_retire=None):
+        self.engine = engine
+        self.size = size
+        self.registry = registry or REGISTRY
+        self.on_retire = on_retire
+        self._cond = threading.Condition()
+        self._idle: list[Entry] = []
+        self._live: set[Entry] = set()
+        self._probe: Entry | None = None
+        self.generation = 0   # bumped by `invalidate`: an entry of an older generation is never reused
+
+    def _new(self, kind: str = "user", deadline_s: float = DEADLINE_S) -> Entry:
+        entry = Entry(self.engine, self._connect_within(deadline_s), kind, self.registry, self.on_retire)
+        entry.generation = self.generation
+        return entry
+
+    def _connect_within(self, deadline_s: float):
+        """`connect_entry` bounded by DEADLINE_S. Making a connection sends `hello` and waits for its answer, and the 1.0.0
+        library (hydra.2/3) waits for it with no timeout: a suspended or wedged daemon still accepts the TCP connection
+        (the backlog), so the wait never ended and a supervisor probe hung for good instead of counting a miss (gate 9.8,
+        test_supervisor.RealPolicy on hydra.3). The connection is made in a worker thread; past the deadline the caller gets
+        `deadline_exceeded` and a connection that arrives later is closed by that thread, never handed out. The bound is at
+        least CONNECT_FLOOR_S: the attempt's own clock starts after the connection (`Entry.begin`), as before, and a short
+        attempt deadline must not turn a slow but healthy hello under load into a failure."""
+        deadline_s = max(deadline_s, CONNECT_FLOOR_S)
+        lock = threading.Lock()
+        state: dict = {}
+        done = threading.Event()
+
+        def work():
+            try:
+                session, error = self.engine.connect_entry(), None
+            except BaseException as exc:   # noqa: BLE001 - handed to the caller, or dropped when it has left
+                session, error = None, exc
+            with lock:
+                late = state.get("late", False)
+                state.update(session=session, error=error)
+                done.set()
+            if late and session is not None:
+                try:
+                    session.close()
+                except Exception:   # noqa: BLE001 - nobody waits for this connection any more
+                    pass
+
+        threading.Thread(target=work, name="hydra-connect-" + str(getattr(self.engine, "key", "")), daemon=True).start()
+        done.wait(max(0.0, deadline_s))
+        with lock:
+            if not done.is_set():
+                state["late"] = True
+                raise DeadlineError("deadline_exceeded", "no answer to hello within %.1f s: the daemon accepts connections but does not "
+                                    "answer (suspended or wedged); the late connection is closed when it arrives" % deadline_s,
+                                    {"connection_abandoned": True, "command": "hello"}, "hello")
+        if state["error"] is not None:
+            raise state["error"]
+        return state["session"]
+
+    def invalidate(self) -> None:
+        """The daemon restarted (or the connection died): retire every idle entry, mark the checked-out ones stale (they
+        retire when returned) and drop every row of the role (`forget_role`). The pool makes new entries on demand."""
+        with self._cond:
+            self.generation += 1
+            idle, self._idle = self._idle, []
+            probe, self._probe = self._probe, None
+            for entry in idle:
+                self._live.discard(entry)
+            self._cond.notify_all()
+        for entry in idle:
+            if not entry.abandoned:
+                entry.broken = True
+                entry.retire()
+        if probe is not None:
+            probe.broken = True   # a probe in flight is not closed under its request; the next probe opens a new connection
+            if not probe._inflight and not probe.abandoned:
+                probe.retire()
+        if self.on_retire is not None:
+            _forget_role_rows(self.engine)
+
+    def live(self) -> int:
+        with self._cond:
+            return len(self._live)
+
+    def owns(self, key: str) -> bool:
+        """Whether KEY (a `_keys` row's first element) is a live entry of this pool."""
+        with self._cond:
+            return any(entry.key == key for entry in self._live)
+
+    def entry_for(self, key: str) -> "Entry | None":
+        """The idle entry named KEY, or None (a checked-out entry is never touched from outside its attempt)."""
+        with self._cond:
+            return next((entry for entry in self._idle if entry.key == key), None)
+
+    def owned_keys(self) -> set:
+        """The keys of the live entries, taken under `_cond` alone (a caller that holds another lock reads this first)."""
+        with self._cond:
+            return {entry.key for entry in self._live}
+
+    def acquire(self, deadline_s: float = DEADLINE_S) -> Entry:
+        end = time.monotonic() + deadline_s
+        while True:
+            dead: list[Entry] = []
+            chosen: Entry | None = None
+            with self._cond:
+                while self._idle:
+                    entry = self._idle.pop()
+                    if getattr(entry.session, "_closed", False) and not entry.abandoned:
+                        entry.broken = True   # the library closed it (the daemon went away): never handed out
+                    if not (entry.abandoned or entry.broken or entry.finished) and entry.generation == self.generation:
+                        chosen = entry.begin(deadline_s)
+                        break
+                    self._live.discard(entry)
+                    if not entry.abandoned:
+                        entry.broken = True
+                        dead.append(entry)
+                if chosen is None and not dead:
+                    if len(self._live) < self.size:
+                        chosen = self._new(deadline_s=deadline_s)
+                        self._live.add(chosen)
+                        chosen.begin(deadline_s)
+                    else:
+                        left = end - time.monotonic()
+                        if left <= 0:
+                            raise EngineError("busy", "all %d connections of this process are in use" % self.size,
+                                              {"reason": "pool_full"}, retry_after_ms=2000)
+                        self._cond.wait(left)
+                        continue
+            # `retire` runs `on_retire` (which takes the query row guard) and the gate: never under `_cond` (lock order).
+            try:
+                for entry in dead:
+                    entry.retire()
+            except BaseException:
+                if chosen is not None:
+                    self.release(chosen)   # it was begun and counted live: give the slot back instead of holding it for good
+                raise
+            if chosen is not None:
+                return chosen
+
+    def release(self, entry: Entry, error: BaseException | None = None) -> None:
+        """Return ENTRY after an attempt: a healthy one goes back; an abandoned, broken or error-retired one does not."""
+        stale = entry.generation != self.generation
+        if stale and not entry.abandoned:
+            entry.broken = True
+        retire = entry.abandoned or entry.broken or (isinstance(error, EngineError) and error.code in RETIRE_CODES)
+        if retire and not entry.abandoned:
+            entry.retire()
+        elif entry.pending_close and not retire:
+            for program in sorted(entry.pending_close):
+                try:
+                    if entry.close_program(program):
+                        entry.pending_close.discard(program)
+                except EngineError:
+                    entry.pending_close.discard(program)
+        with self._cond:
+            if retire:
+                self._live.discard(entry)
+            else:
+                self._idle.append(entry)
+            self._cond.notify()
+
+    @contextlib.contextmanager
+    def attempt(self, deadline_s: float = DEADLINE_S):
+        entry = self.acquire(deadline_s)
+        try:
+            yield entry
+        except BaseException as exc:
+            self.release(entry, exc)
+            raise
+        else:
+            self.release(entry)
+
+    def probe(self, command: str = "ping", deadline_s: float = 5.0, **fields):
+        """A supervisor probe on its own connection (no context, outside the pool); an expired one is abandoned (budget 3)."""
+        with self._cond:
+            entry = self._probe
+            if entry is None or entry.abandoned or entry.broken or entry.finished:
+                entry = self._probe = self._new("probe", deadline_s)
+        entry.begin(deadline_s)
+        entry.grace_s = min(DEADLINE_GRACE_S, deadline_s)
+        return entry.call(command, **fields)
+
+    def close_all(self, grace_s: float = DEADLINE_GRACE_S) -> None:
+        """At exit: the gate waits at most the grace, then everything is closed."""
+        self.registry.drain(grace_s)
+        with self._cond:
+            entries = list(self._idle) + ([self._probe] if self._probe else [])
+            self._idle.clear()
+            self._live.clear()
+            self._probe = None
+        for entry in entries:
+            if not entry.finished and not entry.abandoned:
+                self.registry._close(entry)
+
+
+# ---- the supervisor (PROTOCOL-3.md 7.2, D55) ----------------------------------------------------------------------
+
+PROBE_PERIOD_S = 5.0       # a probe every 5 s while the engine is in use
+WEDGE_MISSES = 3           # consecutive probes that make a wedge
+RESTART_BUDGET = 3         # restarts ...
+RESTART_WINDOW_S = 600.0   # ... per 10 minutes, then `daemon_unhealthy`
+EXIT_WAIT_S = 45.0         # the wait for the process object to exit (maximum seen 39 s under load)
+
+
+def wedge_signal(health: dict | None, stall_ms: int = 30_000) -> str | None:
+    """Why one probe counts as a miss, or None. NONE is `no answer to ping`; the others read the `health` reply."""
+    if health is None:
+        return "no_answer"
+    if health.get("state") == "suspect":
+        return "suspect"
+    tick = health.get("tick") or {}
+    stall = health.get("watchdogStallMs", stall_ms)
+    if isinstance(tick, dict) and isinstance(tick.get("ageMs"), (int, float)) and tick["ageMs"] > stall:
+        return "tick_stalled"
+    if health.get("schedulerLockOk") is False:
+        return "scheduler_lock"
+    return None
+
+
+class Supervisor:
+    """Probe, decide, restart within a budget, and record every event in `supervisor.json` through `durable`.
+
+    Everything that touches the world is injected, so the policy is tested against a fake and the same code drives the
+    real daemon (`for_engine`):
+
+    * `probe()` returns the `health` reply (or the `ping` reply on an engine without `health`) and raises on no answer;
+    * `pid_alive()` and `lock_free()` say whether the daemon process exists and whether its instance lock is free;
+    * `status()` returns the engine `status` (programs with `unsavedEdits`, running jobs), kept at each probe;
+    * `restart(force)` stops the daemon, waits for the process to exit and starts it again;
+    * `recoverable(program)` says whether a program's edits are in the store or the intent log (`working/`, a commit candidate);
+    * `durable_journal()` is `journal.durable` (D55); `publish_in_flight()` is true while a publish has no recorded intent;
+    * `mark_lost(entries)` marks the in-flight Hydralysis jobs `lost_on_restart`.
+    """
+
+    def __init__(self, path, *, probe, pid_alive, lock_free, restart, status=lambda: {}, recoverable=lambda program: False,
+                 durable_journal=lambda: False, publish_in_flight=lambda: False, mark_lost=lambda entries: None,
+                 abandoned=lambda: {}, clock=time.monotonic, stall_ms: int = 30_000):
+        self.path = Path(path)
+        self.probe, self.pid_alive, self.lock_free, self.restart_daemon = probe, pid_alive, lock_free, restart
+        self.status, self.recoverable, self.durable_journal = status, recoverable, durable_journal
+        self.publish_in_flight, self.mark_lost, self.abandoned = publish_in_flight, mark_lost, abandoned
+        self.clock = clock
+        self.stall_ms = stall_ms
+        self.misses = 0
+        self.last_status: dict = {}
+        self.restarts: list[float] = []
+        self.unhealthy = False
+        self._thread: threading.Thread | None = None
+        self._stop = threading.Event()
+        self._guard = threading.Lock()
+
+    # --- the record ------------------------------------------------------------------------------------------------
+
+    def record(self, event: dict) -> dict:
+        """Append EVENT to supervisor.json (sealed, under the cross-process lock)."""
+        event = {"at": time.time(), **event}
+
+        def add(current):
+            events = list(current.get("events", []))[-199:] + [event]
+            return {"events": events}
+
+        durable.update_sealed(self.path, add, default={"events": []})
+        return event
+
+    def events(self) -> list[dict]:
+        return list(durable.read_sealed(self.path, default={"events": []}).get("events", []))
+
+    # --- what dies with a restart ----------------------------------------------------------------------------------
+
+    def lost_on_restart(self) -> list[dict]:
+        """Programs with non-recoverable unsaved edits and in-flight imports or exports, from the last `status`."""
+        lost = []
+        for program in self.last_status.get("programs") or []:
+            edits = program.get("unsavedEdits") or 0
+            name = program.get("key") or program.get("path") or program.get("program")
+            if edits and not self.recoverable(name):
+                lost.append({"program": name, "unsavedEdits": edits, "by": program.get("lastEditor") or program.get("by")})
+        for job in self.last_status.get("jobs") or []:
+            if job.get("kind") in ("import", "export") and job.get("state", "running") == "running":
+                lost.append({"program": job.get("program") or job.get("id"), "unsavedEdits": 0, "by": job.get("kind")})
+        return lost
+
+    # --- one cycle -------------------------------------------------------------------------------------------------
+
+    def tick(self, force: bool = False) -> dict:
+        """One probe cycle. Returns the event it decided (also recorded when it is a restart decision)."""
+        with self._guard:
+            return self._tick(force)
+
+    def _tick(self, force: bool) -> dict:
+        if self.unhealthy:
+            return {"event": "daemon_unhealthy"}   # the budget is spent: no further attempt, whatever the window says (7.2)
+        alive = self.pid_alive()
+        if not alive and self.lock_free():
+            self.misses = 0
+            return self._restart("dead", force, answers=False)
+        if not alive:
+            return {"event": "no_process"}
+        answers, reply = True, None
+        try:
+            reply = self.probe()
+        except Exception:   # an expired probe is abandoned by the helper; a miss is a miss
+            answers = False
+        signal = wedge_signal(reply if answers else None, self.stall_ms)
+        if signal is None:
+            self.misses = 0
+            try:
+                found = self.status()
+                if isinstance(found, dict):
+                    self.last_status = found
+            except Exception:
+                pass
+            return {"event": "ok"}
+        self.misses += 1
+        if self.misses < WEDGE_MISSES:
+            return {"event": "miss", "signal": signal, "misses": self.misses}
+        return self._restart("wedged:" + signal, force, answers=answers)
+
+    def _budget_left(self) -> int:
+        now = self.clock()
+        self.restarts = [moment for moment in self.restarts if now - moment < RESTART_WINDOW_S]
+        return RESTART_BUDGET - len(self.restarts)
+
+    def _restart(self, why: str, force: bool, answers: bool) -> dict:
+        if not self.durable_journal():
+            return self.record({"event": "restart_refused", "reason": "journal_not_durable", "why": why})
+        if self.publish_in_flight():
+            return self.record({"event": "restart_refused", "reason": "publish_in_flight", "why": why})
+        if self._budget_left() <= 0:
+            self.unhealthy = True
+            return self.record({"event": "daemon_unhealthy", "why": why, "restarts": len(self.restarts),
+                                "window_s": RESTART_WINDOW_S, "doctor": self.summary()})
+        lost = [] if why == "dead" else self.lost_on_restart()
+        if lost and answers and not force:
+            # A daemon that is merely slow keeps running while a restart would lose work.
+            return self.record({"event": "restart_refused", "reason": "unsaved_edits", "why": why, "lost_on_restart": lost})
+        self.restarts.append(self.clock())
+        if lost:
+            self.mark_lost(lost)
+        try:
+            self.restart_daemon(force)
+        except Exception as exc:   # noqa: BLE001 - recorded, never raised into the probe loop
+            return self.record({"event": "restart_failed", "why": why, "error": "%s: %s" % (type(exc).__name__, exc),
+                                "lost_on_restart": lost})
+        self.misses = 0
+        self.last_status = {}
+        return self.record({"event": "restarted", "why": why, "lost_on_restart": lost})
+
+    def reset_budget(self) -> None:
+        """An operator's decision (after the doctor's report): forget the restarts and the verdict, and probe again."""
+        with self._guard:
+            self.restarts.clear()
+            self.unhealthy = False
+            self.misses = 0
+        self.record({"event": "budget_reset"})
+
+    def summary(self) -> dict:
+        """The doctor summary: both abandoned budgets are reported as a finding of their own (7.2)."""
+        return {"misses": self.misses, "restarts_in_window": len(self.restarts), "unhealthy": self.unhealthy,
+                "abandoned": self.abandoned()}
+
+    # --- the loop --------------------------------------------------------------------------------------------------
+
+    def start(self, period_s: float = PROBE_PERIOD_S) -> None:
+        if self._thread is not None:
+            return
+
+        def loop():
+            while not self._stop.wait(period_s):
+                try:
+                    self.tick()
+                except Exception:   # noqa: BLE001 - the loop never dies; the next tick looks again
+                    continue
+
+        self._thread = threading.Thread(target=loop, name="hydra-supervisor", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+            self._thread = None
+
+    @classmethod
+    def for_engine(cls, engine: "Engine", settings: dict, **overrides) -> "Supervisor":
+        """A supervisor over the real daemon of ENGINE, fed by real sources:
+
+        * `pid_alive`: the pid in the daemon's endpoint file exists as a process; `lock_free`: the instance lock
+          (`<instance>.lock`, held by the JVM for its whole life) is free: two different facts, as 7.2 needs them;
+        * `probe`: `health` (or `ping` on hydra.2/3) on the pool's own probe connection, with a deadline;
+        * `status`: the engine `status`, kept for `lost_on_restart`; a program is recoverable when it lives under
+          `working/` or `lineages/` of the root (the store or the intent log is its record);
+        * `publish_in_flight` and `mark_lost`: the job records of the root (`overlay-jobs/*/job.json`): an active publish or
+          commit job refuses the restart (stricter than 7.2, which allows it once an intent is recorded), and every active
+          job of the root is marked `lost_on_restart` when the restart goes ahead;
+        * `durable_journal`: `journal_durable` (see there)."""
+        module = engine.module()
+        daemon = module.Daemon(str(engine.engine_dir), str(state_dir(settings)), INSTANCE)
+        root = root_path(settings)
+        keep: set[str] = set()   # program keys found recoverable in the last `status`
+
+        def pid_alive() -> bool:
+            from hydralysis.preparation import process_start_ms
+            found = (daemon.read_endpoint() or {}).get("pid")
+            return isinstance(found, int) and not isinstance(found, bool) and process_start_ms(found) > 0
+
+        def probe():
+            if "health" in engine.capabilities():
+                return engine.pool().probe("health", 5.0)
+            engine.pool().probe("ping", 5.0)
+            return {}
+
+        def restart(force):
+            engine.reset()
+            daemon.kill()
+            end = time.monotonic() + EXIT_WAIT_S
+            while daemon.jvm_alive() and time.monotonic() < end:
+                time.sleep(0.2)
+            if daemon.jvm_alive():
+                raise RuntimeError("the daemon process did not exit within %d s" % EXIT_WAIT_S)
+            engine.session()
+
+        def status():
+            found = engine.call("status")
+            places = [root / "working", root / "lineages"]
+            keep.clear()
+            for program in (found.get("programs") or []) if isinstance(found, dict) else []:
+                name = program.get("key") or program.get("path") or program.get("program")
+                texts = [value for value in program.values() if isinstance(value, str)]
+                if name and any(_under(text, places) for text in texts):
+                    keep.add(name)
+            return found
+
+        def publish_in_flight() -> bool:
+            return any(job.get("kind") in ("publish", "commit") for job in active_jobs(settings))
+
+        def mark_lost(entries):
+            from hydralysis import overlayjobs
+            for job in active_jobs(settings):
+                overlayjobs._update(overlayjobs.job_path(settings, job["id"]), lost_on_restart=True,
+                                    lost_on_restart_at=time.time(), lost_on_restart_programs=[item.get("program") for item in entries])
+
+        found = dict(probe=probe, pid_alive=pid_alive, lock_free=lambda: not daemon.jvm_alive(), restart=restart, status=status,
+                     recoverable=lambda program: program in keep, abandoned=REGISTRY.snapshot,
+                     durable_journal=lambda: journal_durable(settings), publish_in_flight=publish_in_flight, mark_lost=mark_lost)
+        found.update(overrides)
+        return cls(state_dir(settings) / "supervisor.json", **found)
+
+
+def _under(text: str, places: list[Path]) -> bool:
+    try:
+        path = Path(text).resolve()
+    except (OSError, ValueError):
+        return False
+    return any(path.is_relative_to(place.resolve()) for place in places)
+
+
+def active_jobs(settings: dict, limit: int = 50) -> list[dict]:
+    """The Hydralysis jobs of the root that are queued, running or cancelling (the 50 newest records)."""
+    from hydralysis import overlayjobs
+    folder = root_path(settings) / "overlay-jobs"
+    if not folder.is_dir():
+        return []
+    found = []
+    paths = sorted(folder.glob("overlay-*/job.json"), key=lambda item: item.stat().st_mtime_ns, reverse=True)[:limit]
+    for path in paths:
+        try:
+            record = overlayjobs.status(settings, path.parent.name)
+        except Exception:   # noqa: BLE001 - a record that cannot be read is not an active job
+            continue
+        if record.get("state") in overlayjobs.ACTIVE:
+            found.append(record)
+    return found
+
+
+_SUPERVISORS: dict[str, Supervisor] = {}
+
+
+def _root_key(engine) -> str:
+    return str(engine.root).lower() if os.name == "nt" else str(engine.root)
+
+
+def supervise(engine, settings: dict | None = None) -> "Supervisor | None":
+    """Start the supervisor of ENGINE's root, once per process (7.2: probes while the engine is in use). It is called when the
+    first pool of a root is made, which is the first deadline-bound read of a long-lived process. Anything that keeps a
+    supervisor from being built (a client without `Daemon`, `hydra_supervisor: false`) leaves the engine unsupervised and
+    never fails the read. `Engine.stop` stops it."""
+    settings = settings if settings is not None else getattr(engine, "settings", {})
+    if settings.get("hydra_supervisor") is False or not isinstance(engine, Engine):
+        return None
+    key = _root_key(engine)
+    with Engine._guard:
+        found = _SUPERVISORS.get(key)
+        if found is not None:
+            return found
+        try:
+            found = _SUPERVISORS[key] = Supervisor.for_engine(engine, settings)
+        except Exception:   # noqa: BLE001 - see above
+            return None
+    found.start()
+    return found
+
+
+def unsupervise(engine) -> None:
+    if not isinstance(engine, Engine):
+        return
+    with Engine._guard:
+        found = _SUPERVISORS.pop(_root_key(engine), None)
+    if found is not None:
+        found.stop()
+
+
+def journal_durable(settings: dict) -> bool:
+    """`journal.durable` (D55): the overlay store is version 3 (its edits are sealed and flushed before they are applied, 4.10
+    W1 to W4) and a start-up self-test (write, read back) passes.
+
+    The "kill the writer" step of D55 is the crash tests' (`durable.fault`) and is not done here: this checks that a record
+    appended to a log under the state directory reads back exactly through the sealed, fsynced path the intent logs use,
+    and that the store this Hydralysis writes is v3. It does not prove the write-ahead record against a killed writer."""
+    path = state_dir(settings) / "journal-selftest.log"
+    try:
+        from hydralysis import workcopy
+        if workcopy.STORE_VERSION < 3:
+            return False
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.unlink(missing_ok=True)
+        log = durable.AppendLog(path)
+        token = hashlib.sha256(os.urandom(16)).hexdigest()
+        log.append({"selftest": token})
+        last = log.last(strict=True)
+        return bool(last and last.get("selftest") == token)
+    except Exception:   # noqa: BLE001 - a journal that cannot prove itself is not durable
+        return False
 
 
 # ---- install ---------------------------------------------------------------------------------

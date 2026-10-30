@@ -10,23 +10,29 @@ with small canned results; apply_overlays records renames so reads can see them.
 from __future__ import annotations
 
 import copy
+import hashlib
+import itertools
 import json
 import shutil
 import threading
+import time
 from pathlib import Path
 
+from hydralysis import hydra as _hydra
 from hydralysis.hydra import EngineError
+
+_RealEngine = _hydra.Engine   # captured here: tests patch `hydralysis.hydra.Engine` with the fake
 
 
 class Daemon:
-    def __init__(self):
+    def __init__(self, connection_scoped: bool = False):
         self.projects: dict[str, dict] = {}   # normalized gpr -> project
         self.ids = 0
         self.calls: list[tuple[str, str, dict]] = []
         self.lock = threading.RLock()
         self.fail_next: dict[str, EngineError] = {}
         # What hello reports; tests change it to model an engine upgrade between syncs.
-        self.release = {"hydraVersion": "12.3-hydra.2", "ghidraVersion": "12.3"}
+        self.release = {"hydraVersion": "12.3-hydra.4", "ghidraVersion": "12.3"}
         self.fork_copy_ms = 7
         # What a real hydra.Engine sees through FakeClientModule (see FakeSession):
         # drops: connection losses to inject, {"command", "when": "before"|"after", "action": a script
@@ -50,6 +56,32 @@ class Daemon:
         # Type names that a signature may only use once a struct record defined them (fail closed otherwise): models the
         # engine refusing a prototype with an undefined type, so a subset commit that leaves the struct behind aborts.
         self.typed_names: set[str] = set()
+        # Y4a (deadlines, pool, supervisor). All of it is opt-in and off by default, so that no frozen test changes.
+        # scoped: a connection-scoped context like the engine's (a call on a connection that has not seen open_project and
+        #   open_program answers no_project / no_program). holds: command -> {"event", "cooperative", "times"}: a request of
+        #   that command blocks in `wait` until the event is set (a cooperative one also ends on `cancel`). The log lists
+        #   what reached a connection: cancels, closes (time, session id, reads in flight) and violations (a close or a
+        #   shutdown while a request of the session is in flight: the mechanism of 7.6 must never do either).
+        self.scoped = connection_scoped
+        self.holds: dict[str, dict] = {}
+        self.cancels: list[tuple[int, int]] = []
+        self.close_log: list[tuple[float, int, int]] = []
+        self.violations: list[str] = []
+        self.reads_in_flight = 0
+        self.session_ids = itertools.count(1)
+        self.sessions_open: set[int] = set()
+        self.queue_info = False   # models a v3 engine that reports queue information and the lane hint
+        # E2 surface for Y4d's tests: `format` in project info, `backup_required` on the upgrade gate and a backup written by
+        # the engine (`fork_project purpose:"backup"`, manifest with writer "engine").
+        # format_info: what `open_project` and `info` report as `format` (3.4, v3); None = a hydra.2/3 engine, no `format`.
+        # backup_required: a writable `upgrade` open of a non-disposable project without a `backup` is refused (the upgrade
+        #   gate, D12): code `backup_required` on a protocol-3 connection, `conflict` with details.reason on protocol 2.
+        # health_extra: merged into the `health` reply (only an engine that has queue_info, i.e. hydra.4, answers `health`).
+        self.format_info: dict | None = None
+        self.backup_required = False
+        self.health_extra: dict = {}
+        self.refused_closed = 0   # requests that reached a session whose connection had ended (answered `closed`)
+        self.backup_seq = itertools.count(1)
 
     def add_project(self, gpr: Path, programs: dict[str, dict]) -> dict:
         gpr.parent.mkdir(parents=True, exist_ok=True)
@@ -59,9 +91,29 @@ class Daemon:
         for path, info in programs.items():
             project["programs"][path] = {"sha256": info["sha256"], "analyzed": info.get("analyzed", True),
                                          "functions": info.get("functions", 2), "imageBase": "0x140000000",
-                                         "saved": {"marker": "", "names": {}}, "live": None, "writers": set()}
+                                         "saved": {"marker": "", "names": {}}, "live": None, "writers": set(), "users": set()}
         self.projects[self._norm(gpr)] = project
         return project
+
+    # --- what the real daemon reports of its programs (9.17's leak check reads the same: `status` programs) -------------
+    @staticmethod
+    def _unsaved(program: dict) -> bool:
+        return program["live"] is not None and program["live"] != program["saved"]
+
+    def program_rows(self) -> list[dict]:
+        """Every program the daemon holds: one somebody uses, or one that keeps unsaved work nobody uses (an orphan)."""
+        rows = []
+        for project in self.projects.values():
+            for path, program in project["programs"].items():
+                if program.setdefault("users", set()) or program["writers"] or self._unsaved(program):
+                    rows.append({"project": project.get("id"), "path": path, "gpr": project["gpr"], "users": sorted(program.setdefault("users", set())),
+                                 "writers": sorted(program["writers"]), "unsavedEdits": 1 if self._unsaved(program) else 0})
+        return rows
+
+    def orphans(self) -> list[dict]:
+        """Programs that hold unsaved edits and no writer (ProgramEntry.holdsOrphanedWork): the daemon keeps them for ever
+        (orphanKeepS 0), as views, whether readers still use them or not; once the readers leave nobody uses them (K7)."""
+        return [row for row in self.program_rows() if not row["writers"] and row["unsavedEdits"]]
 
     @staticmethod
     def _norm(path) -> str:
@@ -117,6 +169,58 @@ class FakeSession:
         self.last_response = None
         self.on_event = None
         self.hello = {"protocol": 2, **daemon.release, "installId": "fake", **daemon.hello_extra}
+        self.id = next(daemon.session_ids)
+        daemon.sessions_open.add(self.id)
+        self.supports_deadline = False
+        self._rids = itertools.count(1)
+        self._pending: dict[int, tuple[str, dict]] = {}
+        self._cancel_events: dict[int, threading.Event] = {}
+        self._blocked = 0
+        self.joined_projects: set[str] = set()
+        self.opened_programs: set[str] = set()
+        self.closes = 0
+
+    # --- send / wait: what the abandon helper of 7.6 uses (library 1.0.0) --------------------------------------------
+    def send(self, command, **fields):
+        rid = next(self._rids)
+        if command == "cancel":
+            self.daemon.cancels.append((self.id, fields.get("target")))
+            event = self._cancel_events.get(fields.get("target"))
+            if event is not None:
+                event.set()
+            return rid
+        self._pending[rid] = (command, fields)
+        self._cancel_events[rid] = threading.Event()
+        return rid
+
+    def wait(self, rid):
+        command, fields = self._pending.pop(rid)
+        cancelled = self._cancel_events[rid]
+        hold = self.daemon.holds.get(command)
+        if hold is not None and hold.get("times", 1) > 0:
+            hold["times"] = hold.get("times", 1) - 1
+            self._blocked += 1
+            if command == "script":
+                with self.daemon.lock:
+                    self.daemon.reads_in_flight += 1
+            try:
+                end = time.monotonic() + hold.get("timeout", 30)
+                while not hold["event"].is_set() and time.monotonic() < end:
+                    if hold.get("cooperative") and cancelled.is_set():
+                        break
+                    hold["event"].wait(0.01)
+            finally:
+                self._blocked -= 1
+                if command == "script":
+                    with self.daemon.lock:
+                        self.daemon.reads_in_flight -= 1
+            if cancelled.is_set() and hold.get("cooperative"):
+                raise self.module.SessionError("cancelled", "the request was cancelled")
+        return self.call(command, **fields)
+
+    def shutdown(self, *_):
+        if self._blocked:
+            self.daemon.violations.append("shutdown while a request is in flight")
 
     @staticmethod
     def _action(fields):
@@ -135,9 +239,29 @@ class FakeSession:
             raise ConnectionResetError("the connection was reset")
         raise self.module.SessionError("closed", "the session connection ended")
 
+    def _check_scope(self, command, fields):
+        """The engine's rule (opt-in): a project or a program a connection has not opened is refused."""
+        if not self.daemon.scoped:
+            return
+        if command == "open_program" and fields.get("project") not in self.joined_projects:
+            raise self.module.SessionError("no_project", "this client has not joined project %s; send open_project" % fields.get("project"))
+        if command == "script" and fields.get("program") and fields["program"] not in self.opened_programs:
+            raise self.module.SessionError("no_program", "%s is not open for this client; send open_program first" % fields["program"])
+
     def call(self, command, **fields):
         if self._closed:
+            self.daemon.refused_closed += 1
             raise self.module.SessionError("closed", "the session connection ended")
+        self._check_scope(command, fields)
+        result = self._call(command, **fields)
+        if self.daemon.scoped and isinstance(result, dict):
+            if command == "open_project" and result.get("id"):
+                self.joined_projects.add(result["id"])
+            if command == "open_program" and result.get("key"):
+                self.opened_programs.add(result["key"])
+        return result
+
+    def _call(self, command, **fields):
         labels = {key: fields.pop(key) for key in ("client", "harness", "parallel") if key in fields}
         drop = next((item for item in self.daemon.drops if item["command"] == command and
                      item.get("action") in (None, self._action(fields))), None)
@@ -160,13 +284,22 @@ class FakeSession:
         try:
             return self.engine.call(command, **labels, **fields)
         except EngineError as exc:
-            self.last_response = {"id": 1, "ok": False, "error": {"code": exc.code, "message": exc.message,
-                                                                 "details": exc.details}}
+            error = {"code": exc.code, "message": exc.message, "details": exc.details}
+            if exc.next is not None:
+                error["next"] = exc.next
+            if exc.retry_after_ms is not None:
+                error["retryAfterMs"] = exc.retry_after_ms
+            self.last_response = {"id": 1, "ok": False, "error": error}
             raise self.module.SessionError(exc.code, exc.message, exc.details) from exc
 
     call_raw = call
 
     def close(self):
+        if self._blocked:
+            self.daemon.violations.append("close while a request is in flight")
+        self.closes += 1
+        self.daemon.close_log.append((time.monotonic(), self.id, self.daemon.reads_in_flight))
+        self.daemon.sessions_open.discard(self.id)
         self._closed = True
         self.engine.reset()
 
@@ -190,6 +323,57 @@ class FakeClientModule:
         return FakeSession(cls, DAEMON, client, harness)
 
 
+class FakePooledEngine:
+    """What the abandon helper, the pool and `QueryRunner` need from a real hydra.Engine, over the fake daemon (Y4a, opt-in).
+
+    The shared connection is a FakeEngine; entries are FakeSessions with send/wait (library 1.0.0). `pool` and `reset` are
+    hydra.Engine's own functions (not a copy): the production wiring of retired entries (I2) and of a daemon restart is
+    what the tests run."""
+
+    _guard = threading.Lock()
+
+    def __init__(self, settings: dict | None = None, role: str = "reader"):
+        self.shared = FakeEngine(settings or {}, role)
+        self.role = role
+        self.key = "fake|" + role
+        self.settings = settings or {}
+        self._pools: dict = {}
+        self._connections: dict = {}
+        self._used: dict = {}
+        self.pool = lambda: _RealEngine.pool(self)
+
+    def module(self):
+        return FakeClientModule
+
+    def connect_entry(self):
+        return FakeSession(FakeClientModule, DAEMON)
+
+    def _error(self, session, exc, command):
+        reply = getattr(session, "last_response", None)
+        envelope = reply.get("error") if isinstance(reply, dict) and reply.get("ok") is False else None
+        envelope = envelope if isinstance(envelope, dict) and envelope.get("code") == exc.code else {}
+        return EngineError(exc.code, exc.message, dict(exc.details or {}), command, retry_after_ms=envelope.get("retryAfterMs"),
+                           next=envelope.get("next"))
+
+    def capabilities(self):
+        if not DAEMON.queue_info:
+            return {}
+        return {"laneHint": 1, "queueInfo": 1, "health": 1}
+
+    def deadline_mode(self):
+        return "helper"
+
+    def reset(self):
+        """A daemon restart as the Engine sees it: the shared connection is dropped and so is every pool entry."""
+        self.shared.reset()
+        _RealEngine.reset(self)
+
+    def __getattr__(self, name):   # call, hello, stop ... on the shared connection
+        if name in ("shared", "_pools", "_connections", "_used"):
+            raise AttributeError(name)
+        return getattr(self.shared, name)
+
+
 class FakeEngine:
     """The interface Hydralysis uses from hydra.Engine."""
 
@@ -205,11 +389,17 @@ class FakeEngine:
 
     # --- connection -------------------------------------------------------------------------
     def reset(self):
-        # Like the real daemon: committed changes in shared mode stay, the writer leaves.
+        # Like the real daemon: committed changes in shared mode stay, the writer leaves (and every use of the connection ends:
+        # a program kept for its unsaved work with no user left is an orphan, `Daemon.orphans`).
         for key in self.writable:
             program = self._program(key)
             program["writers"].discard(self.conn)
         self.writable.clear()
+        with self.daemon.lock:
+            for project in self.daemon.projects.values():
+                for program in project["programs"].values():
+                    program.setdefault("users", set()).discard(self.conn)
+                    program["writers"].discard(self.conn)
 
     def hello(self):
         return {"protocol": 2, **self.daemon.release, "installId": "fake"}
@@ -248,7 +438,10 @@ class FakeEngine:
         if "id" not in project:
             self.daemon.ids += 1
             project["id"] = "p%d" % self.daemon.ids
-        return {"id": project["id"], "gpr": project["gpr"], "revision": project["revision"], "writable": writable}
+        reply = {"id": project["id"], "gpr": project["gpr"], "revision": project["revision"], "writable": writable}
+        if self.daemon.format_info is not None:
+            reply["format"] = copy.deepcopy(self.daemon.format_info)
+        return reply
 
     def _list(self, project, sha256=None, **_):
         entries = []
@@ -259,25 +452,46 @@ class FakeEngine:
                             "format": "Portable Executable (PE)", "language": "x86:LE:64:default"})
         return {"entries": entries}
 
-    def _open_program(self, path, project, writable=False, share=False, upgrade=False, **_):
+    def _upgrade_gate(self, project, key, upgrade, backup):
+        """D12: a writable upgrading open of a non-disposable project needs a backup (E2 surface, opt-in: `backup_required`)."""
+        if not (self.daemon.backup_required and upgrade) or backup:
+            return
+        sidecar = self._sidecar(project)
+        if sidecar is not None and sidecar.get("disposable", True) is not False:
+            return   # a disposable fork is upgraded without a backup
+        details = {"project": project["id"], "program": key, "format": copy.deepcopy(self.daemon.format_info or {}),
+                   "suggest": "fork_project purpose backup"}
+        reply_next = {"cmd": "fork_project", "project": project["id"], "purpose": "backup", "open": False, "verify": "hash"}
+        if self.daemon.hello_extra.get("protocol", 2) >= 3:
+            raise EngineError("backup_required", "upgrading %s is one-way and the project is not a disposable fork" % key, details,
+                              next=reply_next)
+        raise EngineError("conflict", "upgrading %s is one-way and the project is not a disposable fork" % key,
+                          {**details, "reason": "backup_required"})
+
+    def _open_program(self, path, project, writable=False, share=False, upgrade=False, backup=None, **_):
         programs = self.daemon.project_by_id(project)["programs"]
         program = programs.get(path) or programs.get("/" + path.lstrip("/"))
         if program is None:
             raise EngineError("not_found", "no program " + path)
         key = "%s:%s" % (project, "/" + path.lstrip("/"))
         if writable:
+            self._upgrade_gate(self.daemon.project_by_id(project), key, upgrade, backup)
             self._refuse_if_sealed(self.daemon.project_by_id(project), "a writable open")
             program["writers"].add(self.conn)
             self.writable.add(key)
             if program["live"] is None:
                 program["live"] = copy.deepcopy(program["saved"])
+        program.setdefault("users", set()).add(self.conn)
         return {"key": key, "sha256": program["sha256"], "analyzed": program["analyzed"], "functions": program["functions"],
                 "imageBase": program["imageBase"], "mode": "shared" if writable else "read_only", "revision": "r"}
 
     def _info(self, program, **_):
         entry = self._program(program)
-        return {"key": program, "sha256": entry["sha256"], "analyzed": entry["analyzed"],
-                "changed": entry["live"] is not None and entry["live"] != entry["saved"]}
+        reply = {"key": program, "sha256": entry["sha256"], "analyzed": entry["analyzed"],
+                 "changed": entry["live"] is not None and entry["live"] != entry["saved"]}
+        if self.daemon.format_info is not None:
+            reply["format"] = copy.deepcopy(self.daemon.format_info)
+        return reply
 
     def _save(self, program, **_):
         entry = self._program(program)
@@ -286,7 +500,10 @@ class FakeEngine:
         if entry["live"] is not None:
             entry["saved"] = copy.deepcopy(entry["live"])
             self._persist(project)
-        return {"revision": "saved"}
+            # As the real engine: the revision names the saved content, so two generations never share one (gate 9.17 H).
+            saved = {path: item["saved"] for path, item in project["programs"].items()}
+            project["revision"] = "rev-" + hashlib.sha256(json.dumps(saved, sort_keys=True).encode()).hexdigest()[:12]
+        return {"revision": project["revision"]}
 
     @staticmethod
     def _persist(project):
@@ -322,20 +539,33 @@ class FakeEngine:
                               {"reason": "sealed", "project": project["gpr"]})
 
     def _close_project(self, project, discard=False, **_):
-        for key in [key for key in self.writable if key.startswith(project + ":")]:
-            self._program(key)["writers"].discard(self.conn)
-            self.writable.discard(key)
-        if discard:
-            # Closing with discard drops the unsaved changes of the project's programs and keeps its folder.
-            for program in self.daemon.project_by_id(project)["programs"].values():
+        """This connection leaves the project (ProjectCommands.leaveProject). With discard, a program it was the last writer of
+        loses its unsaved changes; a reader's discard discards nothing (a reader has nothing to discard, and the work a
+        writer left in a shared program stays, as on the real daemon). The folder is kept."""
+        for path, program in self.daemon.project_by_id(project)["programs"].items():
+            key = "%s:%s" % (project, path)
+            writer = self.conn in program["writers"] or key in self.writable
+            # as on the real daemon (gate 9.17 probe): while another connection still reads the program, it keeps the edits
+            # it shows that reader; only a discard by the last user disposes of them
+            others = (program["writers"] | program.setdefault("users", set())) - {self.conn}
+            if discard and writer and not others:
                 program["live"] = None
+            program["writers"].discard(self.conn)
+            program.setdefault("users", set()).discard(self.conn)
+            self.writable.discard(key)
         return {"closed": True}
 
     def _close_program(self, program, **_):
         self.writable.discard(program)
+        try:
+            entry = self._program(program)
+        except (EngineError, KeyError):
+            return {"closed": True}
+        entry.setdefault("users", set()).discard(self.conn)
+        entry["writers"].discard(self.conn)
         return {"closed": True}
 
-    def _fork_project(self, project, path, writable=True, mode="auto", purpose=None, **_):
+    def _fork_project(self, project, path, writable=True, mode="auto", purpose=None, reason="manual", **_):
         source = (self.daemon.project_by_id(project) if not Path(project).suffix and not Path(project).exists()
                   else self.daemon.projects[self.daemon._norm(project)])
         destination = Path(path)
@@ -361,14 +591,49 @@ class FakeEngine:
                    "source": source["gpr"]}
         if purpose == "generation":
             sidecar["state"] = "candidate"
+        if purpose == "backup":
+            sidecar["state"] = "complete"
         (destination / (name + ".fork.json")).write_text(json.dumps(sidecar), encoding="utf-8")
         opened = self._open_project(str(gpr), writable=True)
-        return {"project": opened["id"], "gpr": str(gpr), "method": "clone", "cloned": True, "bytes": 1,
-                "copyMs": self.daemon.fork_copy_ms}
+        reply = {"project": opened["id"], "gpr": str(gpr), "method": "clone", "cloned": True, "bytes": 1,
+                 "copyMs": self.daemon.fork_copy_ms, "purpose": purpose or "fork"}
+        if purpose == "backup":
+            reply["manifest"] = self._write_backup(source, destination, name, reason)
+        return reply
+
+    def _write_backup(self, source, destination: Path, name: str, reason: str) -> dict:
+        """The manifest an engine writes for `fork_project purpose:"backup"` (3.4): `writer:"engine"`, the one schema of
+        Hydralysis's own backups, written last and never changed (so `backups.verify` accepts it)."""
+        from hydralysis import lineage
+        files = lineage.tree_files(destination)
+        number = next(self.daemon.backup_seq)
+        manifest = {"format": 1, "kind": "ghidra-session-backup", "writer": "engine",
+                    "id": "20261029T000000Z-%08x-%s" % (number, reason), "purpose": reason,
+                    "createdAt": "2026-10-29T00:00:00Z", "createdBy": {"client": "hydralysis", "harness": "fake"},
+                    "source": {"gpr": source["gpr"], "name": name, "revision": source["revision"]},
+                    "engine": {**self.daemon.release, "dbVersions": {"program": 33, "dataTypes": 3}},
+                    "stored": {"programDb": {"min": 32, "max": 32}, "programs": len(source["programs"]),
+                               "scanned": len(source["programs"]), "truncated": False},
+                    "files": files, "filesetSha256": lineage.fileset_sha256(files),
+                    "copy": {"method": "clone", "sameVolume": True, "independent": False, "ms": self.daemon.fork_copy_ms},
+                    "verify": {"level": "hash", "ok": True, "at": "2026-10-29T00:00:01Z", "sourceRevisionAfter": source["revision"]}}
+        manifest["selfSha256"] = lineage.self_hash(manifest)
+        (destination / "backup.json").write_bytes(lineage.canonical(manifest))
+        return manifest
+
+    def _health(self, **_):
+        """The v3 `health` command (hydra.4): an engine without queue information answers like hydra.2/3 (no such command)."""
+        if not self.daemon.queue_info:
+            raise EngineError("bad_request", "unknown command: health", {"command": "health"})
+        return {"state": "ok", "tick": {"ageMs": 10}, "watchdogStallMs": 30000, "schedulerLockOk": True,
+                "queue": {"lanes": {"quick": {"running": 0, "waiting": 0}, "long": {"running": 0, "waiting": 0}}},
+                **self.daemon.health_extra}
 
     def _status(self, **_):
         return {"projects": [{"gpr": item["gpr"], "id": item.get("id")} for item in self.daemon.projects.values()
-                             if item.get("id")], "programs": [], "clients": []}
+                             if item.get("id")],
+                "programs": [{key: row[key] for key in ("project", "path", "users", "writers", "unsavedEdits")}
+                             for row in self.daemon.program_rows()], "clients": []}
 
     def _refresh(self, project, **_):
         return {"refreshed": False}

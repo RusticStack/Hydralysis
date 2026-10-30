@@ -42,6 +42,31 @@ def workdir(prefix: str = "t") -> WorkDir:
     return WorkDir(prefix)
 
 
+def hydra4_missing(engine, what: str) -> str | None:
+    """The hydra.3 degraded set (docs/versioning.md, gate 9.8): the skip reason of a real-engine class that needs a hydra.4-only
+    feature, or None. The reason is given when the connection negotiated protocol 2 (`Engine.protocol()`, from hello; hydra.2
+    and hydra.3 serve nothing else), never from a name. An engine that serves protocol 3 never gets one: on hydra.4 a missing
+    feature still fails the class."""
+    served = engine.protocol()
+    if served >= 3:
+        return None
+    return ("hydra.3 degraded set: engine %s serves protocol %d; %s needs hydra.4 (protocol 3)"
+            % (engine.hello().get("hydraVersion", "unknown"), served, what))
+
+
+class Hydra4Only:
+    """Mixin (first base) of a hydra.4-only real-engine class: setUpClass sets `degraded` from `hydra4_missing` and returns
+    early; every test then skips with that reason. The skip is per test, so a run counts each test (tools/run_tests.py checks
+    "Ran N" against the plan), and tearDownClass still releases the daemon."""
+
+    degraded: str | None = None
+
+    def setUp(self):
+        if self.degraded:
+            self.skipTest(self.degraded)
+        super().setUp()
+
+
 def default_to_shared(runner) -> None:
     """Make a QueryRunner name the `shared` view for every call that names neither a `view` nor an agent (`as`).
 

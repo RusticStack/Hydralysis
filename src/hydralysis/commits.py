@@ -275,6 +275,41 @@ def _decompile(engine, program: dict, address: str, sha256: str) -> str:
     return lineage.canonical({key: value for key, value in response.items() if key not in VOLATILE}).decode("utf-8")
 
 
+def _rows(engine) -> dict[tuple, dict]:
+    """The rows of the query cache (`query._keys`) that belong to ENGINE's own connection: the programs it has open."""
+    from hydralysis import query
+    with query._keys_guard:
+        return {key: value for key, value in query._keys.items() if key[0] == engine.key}
+
+
+_GONE = ("no_program", "no_project", "not_found", "closed")
+
+
+def _release(engine, rows: dict[tuple, dict]) -> list[dict]:
+    """Close the programs of ROWS on ENGINE's connection (one `close_program` per daemon program) and drop their cache rows.
+
+    hydra.4 caps a connection at maxViewsPerClient, so a program the commit leaves open there costs every later open of the
+    process. A program the engine no longer has counts as closed; every other failure is returned (never swallowed): the
+    caller raises it or reports it."""
+    from hydralysis import query
+    failed: list[dict] = []
+    by_program: dict[str, list[tuple]] = {}
+    for key, value in rows.items():
+        by_program.setdefault(value["key"], []).append(key)
+    for program, keys in by_program.items():
+        try:
+            engine.call("close_program", program=program)
+        except hydra.EngineError as error:
+            if error.code not in _GONE:
+                failed.append({"program": program, "gpr": keys[0][1], "error": error.code, "message": str(error)[:300]})
+                continue
+        with query._keys_guard:
+            for key in keys:
+                if query._keys.get(key) is rows[key]:
+                    query._keys.pop(key, None)
+    return failed
+
+
 def _touched(records: list[dict]) -> dict[str, set[str]]:
     """field kind -> function addresses that the records touched (subjects `address:0x...`)."""
     found: dict[str, set[str]] = {}
@@ -295,6 +330,151 @@ def _sample(records: list[dict]) -> list[str]:
     for kind, addresses in sorted(_touched(records).items()):
         chosen.extend(sorted(addresses)[:SAMPLE_PER_KIND])
     return sorted(set(chosen))
+
+
+# Effect kinds that change how OTHER functions decompile: a caller prints the callee's name and prototype, a user of a global
+# prints its label and type, a user of a structure prints its fields. A comment or a local variable shows only in its own
+# function, which the spot check skips anyway.
+_SHOWN_ELSEWHERE = ("name", "label", "signature", "type", "existence", "body", "definition")
+
+
+def _effects_of(record: dict) -> list[dict]:
+    """The record's effects, or (a record without a subject record) its fields with the value it sets as `after`."""
+    return record.get("effects") or [{"subject": subject, "field": field, "before": None, "after": record["options"].get("name")}
+                                     for subject, field in revisions.fields_of(record["address"], record["options"])]
+
+
+def _listing_names(listing: list[dict]) -> dict[int, str]:
+    found = {}
+    for row in listing:
+        try:
+            found[int(str(row.get("address", "")).removeprefix("0x"), 16)] = row.get("name")
+        except ValueError:
+            continue
+    return found
+
+
+def renames(records: list[dict], listing: list[dict]) -> dict[str, str]:
+    """{old name: new name} of every symbol the records rename or relabel: per subject its first `before` (the name in the
+    parent; the parent's listing for a record that did not report one) and its last `after`. The `::`-less form of a
+    namespaced name is mapped too, since a decompile may print either."""
+    by_address = _listing_names(listing)
+    first: dict[str, str | None] = {}
+    last: dict[str, str | None] = {}
+    for record in records:
+        for effect in _effects_of(record):
+            if revisions.field_kind(effect["field"]) not in ("name", "label"):
+                continue
+            first.setdefault(effect["subject"], effect.get("before"))
+            last[effect["subject"]] = effect.get("after")
+    mapping: dict[str, str] = {}
+    for subject, after in last.items():
+        before = first[subject]
+        if before in (None, "", revisions.ABSENT) and subject.startswith("address:"):
+            before = by_address.get(int(subject.removeprefix("address:").removeprefix("0x"), 16))
+        if not before or not after or revisions.ABSENT in (before, after) or before == after:
+            continue
+        mapping[before] = after
+        short_before, short_after = before.rsplit("::", 1)[-1], after.rsplit("::", 1)[-1]
+        if short_before != short_after:
+            mapping.setdefault(short_before, short_after)
+    return mapping
+
+
+def with_renames(text: str, mapping: dict[str, str]) -> str:
+    """TEXT with every whole-word occurrence of an old name of MAPPING replaced by its new name, all at once (a swap of two
+    names is a swap, not a double replacement)."""
+    if not mapping:
+        return text
+    pattern = re.compile(r"(?<![A-Za-z0-9_])(%s)(?![A-Za-z0-9_])" % "|".join(re.escape(name) for name in sorted(mapping, key=len, reverse=True)))
+    return pattern.sub(lambda match: mapping[match.group(1)], text)
+
+
+def explained_by(before: str, after: str, mapping: dict[str, str]) -> bool:
+    """Whether the decompile answer AFTER (canonical JSON, `_decompile`) is BEFORE with the renames of MAPPING: every field
+    equal once the old names are rewritten, except the text's length, which the rewrite itself changes. `total_characters`
+    counts the whole text and `c` may be its truncated head; for a complete text the count must have moved by exactly what
+    the rewrite added, and for a truncated one the rest of the function is not shown, so the count is not compared."""
+    rewritten = with_renames(before, mapping)
+    if rewritten == after:
+        return True
+    try:
+        old, new, out = json.loads(before), json.loads(rewritten), json.loads(after)
+    except ValueError:
+        return False
+    if not all(isinstance(item, dict) and isinstance(item.get("c"), str) for item in (old, new, out)):
+        return False
+    if not new.get("truncated") and not out.get("truncated") and isinstance(old.get("total_characters"), int):
+        new["total_characters"] = old["total_characters"] + len(new["c"]) - len(old["c"])
+    else:
+        new.pop("total_characters", None)
+        out = {key: value for key, value in out.items() if key != "total_characters"}
+    return new == out
+
+
+def spot_check(engine, parent: dict, candidate: dict, sha256: str, records: list[dict], listing: list[dict],
+               touched: set[str]) -> dict:
+    """Compare the decompiles of up to SPOT_CHECK functions the records did not touch, parent against candidate.
+
+    A difference fully explained by the records passes: the parent's text with every renamed or relabelled symbol's old name
+    replaced by its new one (`renames`, `with_renames`) equals the candidate's (a caller of a renamed function prints the new
+    name). A function whose parent text mentions a symbol whose prototype, type or body the records changed is set aside
+    (that difference cannot be rewritten textually; reported, and the next function takes its place). Any other difference
+    is a divergence: `diverged` names the first one and the check stops there."""
+    mapping = renames(records, listing)
+    others = _shown_names(records, listing, kinds=tuple(kind for kind in _SHOWN_ELSEWHERE if kind not in ("name", "label")))
+    compared: list[str] = []
+    explained: list[str] = []
+    affected: list[str] = []
+    for row in listing:
+        address = row.get("address")
+        if not address or address in touched or len(compared) >= SPOT_CHECK:
+            continue
+        before = _decompile(engine, parent, address, sha256)
+        after = _decompile(engine, candidate, address, sha256)
+        if before != after:
+            if mapping and explained_by(before, after, mapping):
+                explained.append(address)
+            elif any(pattern.search(before) for pattern in others):
+                affected.append(address)
+                continue
+            else:
+                return {"compared": len(compared), "explained_by_renames": explained, "users_of_changed_symbols": affected,
+                        "diverged": address}
+        compared.append(address)
+    return {"compared": len(compared), "explained_by_renames": explained, "users_of_changed_symbols": affected, "diverged": None}
+
+
+def _shown_names(committing: list[dict], listing: list[dict], kinds: tuple[str, ...] | None = None) -> list[re.Pattern]:
+    """What the decompile of an untouched function would print differently because of the commit: the names (before and
+    after) of the renamed or relabelled symbols, the current name and the default name (`FUN_<hex>`, `DAT_<hex>`, ...) of
+    every symbol whose prototype, type or body changed, and the name of every changed structure. A function of the previous
+    generation whose decompile mentions one is a user of a changed symbol and differs from the candidate by design.
+
+    KINDS narrows the effect kinds considered (default: every kind shown elsewhere)."""
+    names: set[str] = set()
+    addresses: set[int] = set()
+    by_address = _listing_names(listing)
+    for record in committing:
+        for effect in _effects_of(record):
+            kind = revisions.field_kind(effect["field"])
+            if kind not in (kinds if kinds is not None else _SHOWN_ELSEWHERE):
+                continue
+            subject = effect["subject"]
+            if subject.startswith("address:"):
+                where = int(subject.removeprefix("address:").removeprefix("0x"), 16)
+                addresses.add(where)
+                if by_address.get(where):
+                    names.add(by_address[where])
+            elif subject.startswith("type:"):
+                names.add(subject.removeprefix("type:").rstrip("/").rsplit("/", 1)[-1])
+            if kind in ("name", "label"):
+                names.update(value for value in (effect["before"], effect["after"]) if value and value != revisions.ABSENT)
+    for name in list(names):
+        names.add(name.rsplit("::", 1)[-1])
+    patterns = [re.compile(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(name)) for name in sorted(names) if name]
+    patterns += [re.compile(r"_0*%x(?![0-9A-Fa-f])" % where, re.IGNORECASE) for where in sorted(addresses)]
+    return patterns
 
 
 def _excluded(pending_outside: list[dict]) -> set[str]:
@@ -328,10 +508,22 @@ def _force_files(folder: Path) -> dict:
 
 # ---- the commit ------------------------------------------------------------------------------------------------
 
-def _plan_confirmation(options: dict) -> None:
-    if not options.get("confirm_one_way_upgrade"):
-        # `open_project.format.upgradeRequired` is unknown on hydra.2/3 (no `format`), and unknown needs the confirmation (4.6).
-        raise CommitError("confirmation_required", CONFIRMATION, confirm="confirm_one_way_upgrade")
+def _plan_confirmation(options: dict, engine=None, source_gpr: str | None = None) -> None:
+    if options.get("confirm_one_way_upgrade"):
+        return
+    # `open_project.format.upgradeRequired` is unknown on hydra.2/3 (no `format`), and unknown needs the confirmation (4.6).
+    # An engine with the `format` capability says it: the confirmation is skipped only for an explicit `false`, and the
+    # refusal carries what the engine reported.
+    info = None
+    if engine is not None and source_gpr and "format" in _capabilities(engine):
+        try:
+            info = (engine.call("open_project", path=source_gpr) or {}).get("format")
+        except hydra.EngineError:
+            info = None
+    if isinstance(info, dict) and info.get("upgradeRequired") is False:
+        return
+    detail = {"format": info} if isinstance(info, dict) else {}
+    raise CommitError("confirmation_required", CONFIRMATION, confirm="confirm_one_way_upgrade", **detail)
 
 
 def _head_for(settings: dict, selected: dict) -> tuple[str | None, dict]:
@@ -407,7 +599,7 @@ def run_commit(settings: dict, selected: dict, options: dict, engine=None, timeo
             if prior is not None:
                 return prior
     facts = preconditions(settings, selected, options, engine)
-    _plan_confirmation(options)
+    _plan_confirmation(options, engine, facts["head"]["gpr"])
     # A commit is a lineage: create it now, at the first commit, recording the current key (4.4).
     link = lineage.ensure(settings, {**selected, "origin_key": selected.get("origin_key") or selected["key"]})
     lineage_id = link["id"]
@@ -450,6 +642,18 @@ def _commit(settings: dict, selected: dict, options: dict, engine, lineage_id: s
     job = hydra.Engine(settings, role="commit", lane=cid)
     candidate_folder: Path | None = None
     clone_folder: Path | None = None
+    # What the caller's connection had open before the commit: anything the commit opens there beside it is closed again on
+    # every exit path (finally), and on success the programs of the superseded head and working copy too.
+    held_before = set(_rows(engine))
+    superseded = {str(Path(source_gpr)).lower()}
+
+    def let_go() -> list[dict]:
+        """Published: the old head and the old working copy are superseded (the next read opens the new generation), so the
+        caller's connection lets go of them and of what the commit opened. A failure is reported, not raised."""
+        unreleased = _release(engine, {key: value for key, value in _rows(engine).items()
+                                       if key[1] in superseded or key not in held_before})
+        held_before.update(_rows(engine))   # reported here, so the cleanup in `finally` does not raise it again
+        return unreleased
 
     def note(step: str) -> None:
         if progress:
@@ -469,6 +673,8 @@ def _commit(settings: dict, selected: dict, options: dict, engine, lineage_id: s
             up_to = store["revision"]
             ids_sha = workcopy._digest_of(sorted(record["id"] for record in chosen))
             sync = workcopy._sync(settings, selected, store, timeout_s)
+            if sync.get("fork_gpr"):
+                superseded.add(str(Path(sync["fork_gpr"])).lower())
             reference, marker = _capture_reference(settings, engine, selected, sync, chosen, store, float(options.get("snapshot_budget_s", SNAPSHOT_BUDGET_S)))
             excluded_all = _excluded([record for record in workcopy.pending_of(store) if record["id"] not in {r["id"] for r in chosen}])
             # Written while the view lock is held: from this line on, a revert of a selected record is refused (in_flight_ids),
@@ -491,7 +697,8 @@ def _commit(settings: dict, selected: dict, options: dict, engine, lineage_id: s
             finalized = _publish(settings, selected, lineage_id, cid, reuse["generation"], reuse["gpr"], reuse["manifest_sha"],
                                  reuse["manifest"].get("engine") or {}, intent)
             facts = reuse["manifest"]["store"]
-            return {"ok": True, "cid": cid, "attempt": attempt, "generation": reuse["generation"], "gpr": reuse["gpr"],
+            unreleased = let_go()
+            return {"ok": True, **({"unreleased": unreleased} if unreleased else {}), "cid": cid, "attempt": attempt, "generation": reuse["generation"], "gpr": reuse["gpr"],
                     "ids": facts["ids"], "skipped": [{"id": ident, "reason": "left_pending"} for ident in facts.get("skipped", [])],
                     "closure_added": added, "resumed": True, "manifestSha256": reuse["manifest_sha"], "revision": finalized["revision"],
                     "seconds": round(time.monotonic() - started, 3)}
@@ -516,15 +723,17 @@ def _commit(settings: dict, selected: dict, options: dict, engine, lineage_id: s
         candidate_folder.parent.mkdir(parents=True, exist_ok=True)
         forked = job.call("fork_project", project=source_gpr, path=str(candidate_folder), writable=True,
                           mode=str(settings.get("fork_mode", "auto")), maxCopyMb=int(settings.get("fork_max_copy_mb", 8192)),
-                          **({"purpose": "generation"} if "forkPurposes" in _capabilities(engine) else {}))
+                          **({"purpose": "generation"} if backups.ENGINE_BACKUP_CAPABILITY in _capabilities(engine) else {}))
         candidate_gpr = forked["gpr"]
         # hydra.2/3 has no purpose: the job rewrites the sidecar so that a later engine does not take the generation for a
         # disposable fork (D12) nor for a sealed one (D38). It happens before step 7 hashes the folder.
         backups._rewrite_sidecar(candidate_folder, disposable=False, purpose="generation", state="candidate")
         integrity.check_fork(candidate_gpr, disposable=True)
-        gate = {"backup": str(Path(made["backup"]["folder"]) / "backup.json")} if "upgradeGate" in _capabilities(engine) else {}
-        program = _program_of(job, candidate_gpr, selected, writable=True, upgrade=True, refresh=True, share=False, **gate)
-        intent.write("FORKED", gen=generation, gpr=candidate_gpr)
+        program, gate_backup = _open_candidate(settings, engine, job, selected, lineage_id, candidate_gpr, forked, made, generation,
+                                               options, (master.get("format") or {}).get("upgradeRequired"))
+        intent.write("FORKED", gen=generation, gpr=candidate_gpr,
+                     **({"gate_backup": gate_backup["id"], "gate_backup_manifest_sha256": gate_backup["manifestSha256"]}
+                        if gate_backup else {}))
         _point("after_fork")
 
         # 5. APPLIED: drift pre-pass (read-only), then one transaction with verify_before.
@@ -575,7 +784,7 @@ def _commit(settings: dict, selected: dict, options: dict, engine, lineage_id: s
         body = {"cid": cid, "base": {"generation": facts["head"]["gen"], "revision": master.get("revision")},
                 "engine": {key: hello.get(key) for key in ("hydraVersion", "ghidraVersion") if hello.get(key)},
                 "dbVersions": hello.get("dbVersions") or (hello.get("analysisIdentity") or {}).get("dbVersions"),
-                "backups": [made["backup"]["manifestSha256"]],
+                "backups": [made["backup"]["manifestSha256"]] + ([gate_backup["manifestSha256"]] if gate_backup else []),
                 "store": {"view": selected.get("view", "shared"), "revision": up_to, "snapshot": up_to, "ids": final_ids,
                           "skipped": [item["id"] for item in skipped], "ids_sha256": workcopy._digest_of(sorted(final_ids)),
                           "bundle_sha256": bundle_sha},
@@ -586,7 +795,8 @@ def _commit(settings: dict, selected: dict, options: dict, engine, lineage_id: s
         intent.write("MANIFEST", manifest_sha256=manifest_sha, filesetSha256=manifest["filesetSha256"])
         _point("after_manifest")
         clone_folder = Path(settings.get("tmp_dir") or workcopy.root_path(settings)) / "commit-verify" / (cid + "-" + uuid.uuid4().hex[:6])
-        _verify_candidate(settings, engine, job, selected, candidate_gpr, clone_folder, source_gpr, committing, reference, excluded_all)
+        spot = _verify_candidate(settings, engine, job, selected, candidate_gpr, clone_folder, source_gpr, committing, reference,
+                                 excluded_all)
         intent.write("VERIFIED", manifest_sha256=manifest_sha)
         _point("after_verify")
 
@@ -600,9 +810,11 @@ def _commit(settings: dict, selected: dict, options: dict, engine, lineage_id: s
 
         note("PUBLISHED")
         finalized = _publish(settings, selected, lineage_id, cid, generation, candidate_gpr, manifest_sha, body["engine"], intent)
-        return {"ok": True, "cid": cid, "attempt": attempt, "generation": generation, "gpr": candidate_gpr, "ids": final_ids,
+        unreleased = let_go()
+        return {"ok": True, **({"unreleased": unreleased} if unreleased else {}), "cid": cid, "attempt": attempt,
+                "generation": generation, "gpr": candidate_gpr, "ids": final_ids,
                 "skipped": skipped, "closure_added": added, "backup": made["backup"]["id"], "manifestSha256": manifest_sha,
-                "excluded_functions": sorted(set(reference) & excluded_all), "revision": finalized["revision"],
+                "excluded_functions": sorted(set(reference) & excluded_all), "spot_check": spot, "revision": finalized["revision"],
                 "stale_views": "other views of this target are behind the new generation; each must rebase before it edits",
                 "seconds": round(time.monotonic() - started, 3)}
     except durable.FaultInjected:
@@ -635,6 +847,20 @@ def _commit(settings: dict, selected: dict, options: dict, engine, lineage_id: s
             pass
         if clone_folder is not None:
             shutil.rmtree(clone_folder, ignore_errors=True)
+        leftover = _release(engine, {key: value for key, value in _rows(engine).items() if key not in held_before})
+        if leftover:
+            _left_open(leftover)
+
+
+def _left_open(failed: list[dict]) -> None:
+    """Programs the commit opened on the caller's connection and could not close: added to the error under way, or raised."""
+    import sys
+    current = sys.exc_info()[1]
+    if isinstance(current, CommitError):
+        current.detail.setdefault("left_open", failed)
+    elif current is None:
+        raise CommitError("release_failed", "%d program(s) the commit opened could not be closed on the caller's connection"
+                          % len(failed), left_open=failed)
 
 
 def _publish(settings: dict, selected: dict, lineage_id: str, cid: str, generation: int, candidate_gpr: str, manifest_sha: str,
@@ -728,6 +954,55 @@ def _backup(settings: dict, engine, selected: dict, lineage_id: str, source_gpr:
         raise CommitError(error.code, str(error), **error.detail) from error
 
 
+def _open_candidate(settings: dict, engine, job, selected: dict, lineage_id: str, candidate_gpr: str, forked: dict, made: dict,
+                    generation: int, options: dict, upgrade_required) -> tuple[dict, dict | None]:
+    """Step 4's open: the candidate writable, upgrading, owned by the job alone, past the engine's upgrade gate (D12).
+
+    The gate accepts a backup whose `source.revision` is the revision of the project being opened, and the engine's revision
+    is a hash of every project file's path, size and modification time (`Revision.of`). A fork that copies the files
+    (NTFS, the baseline) gives the candidate new modification times, so it is another revision than the generation that step
+    2 backed up, and the gate refuses that backup (`backupCheck.reason: "revision"`). So when the format needs the one-way
+    upgrade (or does not say), the job lets go of the candidate and the candidate itself, still byte-identical to the
+    generation it was forked from, is backed up (`pre-upgrade`, re-hashed as every backup) and named to the gate; that is
+    a backup of exactly the revision the upgrade changes. A project already at this engine's format is not gated: the
+    backup of step 2 is passed as before. Returns the opened program and the extra backup (None when none was needed)."""
+    if "upgradeGate" not in _capabilities(engine):
+        return _program_of(job, candidate_gpr, selected, writable=True, upgrade=True, refresh=True, share=False), None
+    backup_json = str(Path(made["backup"]["folder"]) / "backup.json")
+    gate_backup = None
+    if upgrade_required is not False:
+        if forked.get("project"):
+            job.call("close_project", project=forked["project"])   # the backup reads a project nobody holds writable
+        revision = (engine.call("open_project", path=candidate_gpr) or {}).get("revision") or ""
+        try:
+            gate_backup = backups.make(settings, engine, lineage_id, candidate_gpr, "pre-upgrade", revision, generation,
+                                       confirm_large=bool(options.get("confirm_large")))["backup"]
+        except backups.BackupError as error:
+            raise CommitError(error.code, str(error), **error.detail) from error
+        finally:
+            failed = _close_project(engine, candidate_gpr)
+            if failed:
+                _left_open(failed)
+        backup_json = str(Path(gate_backup["folder"]) / "backup.json")
+    program = _program_of(job, candidate_gpr, selected, writable=True, upgrade=True, refresh=True, share=False, backup=backup_json)
+    return program, gate_backup
+
+
+def _close_project(engine, gpr: str) -> list[dict]:
+    """Close every registration of the project at GPR that ENGINE's connection can close; returns the failures."""
+    failed: list[dict] = []
+    wanted = Path(gpr).resolve()
+    for project in engine.call("status").get("projects") or []:
+        if not project.get("gpr") or Path(project["gpr"]).resolve() != wanted:
+            continue
+        try:
+            engine.call("close_project", project=project["id"])
+        except hydra.EngineError as error:
+            if error.code not in _GONE:
+                failed.append({"project": project["id"], "gpr": gpr, "error": error.code, "message": str(error)[:300]})
+    return failed
+
+
 def _capture_reference(settings: dict, engine, selected: dict, sync: dict, chosen: list[dict], store: dict, budget_s: float) -> tuple[dict, dict | None]:
     """The decompile text of the sampled functions, from the working copy at `upTo`, and its marker as the proof (step 1)."""
     deadline = time.monotonic() + budget_s
@@ -754,7 +1029,8 @@ def _verify_candidate(settings: dict, engine, job, selected: dict, candidate_gpr
     clone_folder.parent.mkdir(parents=True, exist_ok=True)
     clone = job.call("fork_project", project=candidate_gpr, path=str(clone_folder), writable=True,
                      mode=str(settings.get("fork_mode", "auto")), maxCopyMb=int(settings.get("fork_max_copy_mb", 8192)),
-                     **({"purpose": "fork"} if "forkPurposes" in _capabilities(engine) else {}))
+                     **({"purpose": "fork"} if backups.ENGINE_BACKUP_CAPABILITY in _capabilities(engine) else {}))
+    read_only: dict | None = None
     try:
         master = _program_of(engine, source_gpr, selected)
         read_only = _program_of(engine, clone["gpr"], selected, refresh=True)
@@ -787,19 +1063,42 @@ def _verify_candidate(settings: dict, engine, job, selected: dict, candidate_gpr
         from hydralysis.query import run_script
         listing, _ = run_script(engine, master, {"id": uuid.uuid4().hex, "action": "functions", "address": "", "limit": 200,
                                                  "cursor": "", "contains": "", "timeout_s": 60, "options": {}}, 60)
-        spot = [row["address"] for row in listing.get("functions", []) if row.get("address") not in touched][:SPOT_CHECK]
-        for address in spot:
-            if _decompile(engine, master, address, selected["sha256"]) != _decompile(engine, read_only, address, selected["sha256"]):
+        # A user of a symbol the commit renamed or retyped prints it differently by design (a caller of a renamed function
+        # shows the new name): it is not an untouched function in the sense of this guard, so it is set aside (reported)
+        # and the next function takes its place.
+        shown = _shown_names(committing, listing.get("functions", []))
+        compared: list[str] = []
+        affected: list[str] = []
+        for row in listing.get("functions", []):
+            address = row.get("address")
+            if address in touched or len(compared) >= SPOT_CHECK:
+                continue
+            before = _decompile(engine, master, address, selected["sha256"])
+            if any(pattern.search(before) for pattern in shown):
+                affected.append(address)
+                continue
+            if before != _decompile(engine, read_only, address, selected["sha256"]):
                 raise CommitError("verify_failed", "untouched function %s decompiles differently in the candidate" % address, address=address)
+            compared.append(address)
         # K3: a disposable clone of a candidate opens writable too (discarded; the clone is deleted below).
         writable = _program_of(job, clone["gpr"], selected, writable=True, upgrade=False, refresh=True)
         job.call("close_project", project=writable["project"], discard=True)
         job.reset()
+        return {"compared": len(compared), "users_of_changed_symbols": affected[:SPOT_CHECK]}
     finally:
-        try:
-            engine.call("close_project", project=clone.get("project"), discard=True)
-        except Exception:
-            pass
+        # The clone is closed on the connection that opened it, by the id that connection got for it (`read_only`; the
+        # fork's `project` is the job's), and a failure is not swallowed: it joins the error under way or is raised.
+        failed = _release(engine, {key: value for key, value in _rows(engine).items()
+                                   if key[1] == str(Path(clone["gpr"])).lower()})
+        if read_only is not None:
+            try:
+                engine.call("close_project", project=read_only["project"], discard=True)
+            except hydra.EngineError as error:
+                if error.code not in _GONE:
+                    failed.append({"project": read_only["project"], "gpr": clone["gpr"], "error": error.code,
+                                   "message": str(error)[:300]})
+        if failed:
+            _left_open(failed)
 
 
 # ---- step 9 ----------------------------------------------------------------------------------------------------
