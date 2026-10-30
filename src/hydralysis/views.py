@@ -373,7 +373,11 @@ def rebase(settings: dict, engine, selected: dict, options: dict, timeout_s: int
         # 1. the new working copy, beside the old one, verified; the old one keeps serving reads until the switch below.
         verified = _build_rebased_copy(settings, engine, selected, new_store, kept_ids, timeout_s)
         # 2. the switch: one atomic store write.
-        workcopy._save_store(settings, selected, new_store)
+        try:
+            workcopy._save_store(settings, selected, new_store)
+        except Exception:
+            _abandon_copy(settings, selected, verified.get("state"))
+            raise
         _point("after_rebase_store")
         # 3. the cache pointer follows (a crash before it is harmless: the marker mismatch rebuilds the copy).
         _adopt_copy(settings, selected, verified)
@@ -407,39 +411,72 @@ def _build_rebased_copy(settings: dict, engine, selected: dict, new_store: dict,
     shadow = _shadow(selected)
     folder = workcopy._directory(settings, shadow)
     (folder / "state.json").unlink(missing_ok=True)
-    state = workcopy._sync(settings, shadow, new_store, timeout_s)
-    from hydralysis.query import open_program
-    program = open_program(engine, state["fork_gpr"], selected["program"], selected["sha256"], refresh=True)
-    expected: dict[tuple[str, str], str] = {}
-    for record in workcopy.pending_of(new_store):
-        for effect in record.get("effects") or []:
-            if effect["subject"] != revisions.WILDCARD:
-                expected[(effect["subject"], effect["field"])] = _text(effect["after"])
-    pairs = list(expected)[:commits.SAMPLE_PER_KIND * 4]
-    live = workcopy.probe(engine, program, pairs) if pairs else {}
-    wrong = [{"subject": pair[0], "field": pair[1], "expected": expected[pair], "found": live.get(pair)}
-             for pair in pairs if live.get(pair) is not None and live.get(pair) != expected[pair]]
-    if wrong:
-        raise ViewError("rebase_verify_failed", "the rebuilt working copy does not hold the values of the kept records; the view "
-                        "was not changed", mismatches=wrong[:20])
+    # sweep=False: the view's current copy may live in this folder (an earlier rebase built it here) and serves reads until
+    # the switch; `_adopt_copy` closes it once the store names the new one.
+    state = workcopy._sync(settings, shadow, new_store, timeout_s, sweep=False)
+    try:
+        from hydralysis.query import open_program
+        program = open_program(engine, state["fork_gpr"], selected["program"], selected["sha256"], refresh=True)
+        expected: dict[tuple[str, str], str] = {}
+        for record in workcopy.pending_of(new_store):
+            for effect in record.get("effects") or []:
+                if effect["subject"] != revisions.WILDCARD:
+                    expected[(effect["subject"], effect["field"])] = _text(effect["after"])
+        pairs = list(expected)[:commits.SAMPLE_PER_KIND * 4]
+        live = workcopy.probe(engine, program, pairs) if pairs else {}
+        wrong = [{"subject": pair[0], "field": pair[1], "expected": expected[pair], "found": live.get(pair)}
+                 for pair in pairs if live.get(pair) is not None and live.get(pair) != expected[pair]]
+        if wrong:
+            raise ViewError("rebase_verify_failed", "the rebuilt working copy does not hold the values of the kept records; the view "
+                            "was not changed", mismatches=wrong[:20])
+    except BaseException:
+        _abandon_copy(settings, selected, state)
+        raise
     return {"verified": True, "state": state, "checked": len(pairs)}
 
 
+def _abandon_copy(settings: dict, selected: dict, state: dict | None) -> None:
+    """A rebase that does not switch (its copy failed verification, or the store write failed): the copy it built is named by
+    no store and is closed with discard, so it does not stay in the daemon as an orphan. Best effort: a later sync of the view
+    finds it on disk and closes it then."""
+    if not state or not state.get("fork_gpr"):
+        return
+    try:
+        writer = workcopy.writer_for(settings, selected)
+        try:
+            workcopy.discard_forks(settings, selected, [state["fork_gpr"]], writer)
+            workcopy._retire(writer, [state["fork_gpr"]])
+        finally:
+            writer.reset()
+            from hydralysis.query import forget
+            forget(writer)
+    except Exception:  # noqa: BLE001 - the error under way is the one the caller gets
+        pass
+
+
 def _adopt_copy(settings: dict, selected: dict, built: dict) -> None:
+    """The switch to the rebased copy: the state file names it, and every other copy of the view (the one it replaces, the
+    earlier retired ones) is closed with discard (`workcopy.discard_forks`) and its folder removed once the daemon let go."""
     state = built.get("state")
     if not state:
+        # Nothing to replay (every record was in the head) or a bulk replay the reader starts: the old copy holds records the
+        # store no longer has pending on this base, so nothing reads it again.
+        try:
+            workcopy.retire_copies(settings, selected)
+        except Exception:  # noqa: BLE001 - the store already switched; the next sync of the view sweeps what is left
+            pass
         return
     from hydralysis.backends import write_json
-    old = workcopy._state(settings, selected)
-    retired = [item for item in state.get("retired", []) if item != state["fork_gpr"]]
-    for gpr in [old.get("fork_gpr")] + list(old.get("retired", [])):
-        if gpr and gpr != state["fork_gpr"] and gpr not in retired:
-            retired.append(gpr)
     writer = workcopy.writer_for(settings, selected)
     try:
+        retired = workcopy.superseded_forks(settings, selected, keep=[state["fork_gpr"]], also=list(state.get("retired", [])))
+        if retired:
+            workcopy.discard_forks(settings, selected, retired, writer)
         retired = workcopy._retire(writer, retired)
     finally:
         writer.reset()
+        from hydralysis.query import forget
+        forget(writer)
     write_json(workcopy._directory(settings, selected) / "state.json", {**state, "retired": retired})
 
 
@@ -892,11 +929,13 @@ def _verify_candidate(settings: dict, engine, job, target: dict, candidate_gpr: 
         from hydralysis.query import run_script
         listing, _ = run_script(engine, parent, {"id": uuid.uuid4().hex, "action": "functions", "address": "", "limit": 200, "cursor": "",
                                                  "contains": "", "timeout_s": 60, "options": {}}, 60)
-        spot = [row["address"] for row in listing.get("functions", []) if row.get("address") not in touched][:commits.SPOT_CHECK]
-        for address in spot:
-            if commits._decompile(engine, parent, address, target["sha256"]) != commits._decompile(engine, read_only, address, target["sha256"]):
-                raise PublishFailure("candidate_failed", "untouched function %s decompiles differently in the candidate" % address,
-                                     counted=True, address=address)
+        # A caller of a function the changeset renamed prints the new name: that difference is explained by the records and
+        # passes; any other difference fails the candidate (commits.spot_check).
+        spot = commits.spot_check(engine, parent, read_only, target["sha256"], applied, listing.get("functions", []), touched)
+        if spot["diverged"]:
+            raise PublishFailure("candidate_failed", "untouched function %s decompiles differently in the candidate, and the "
+                                 "changeset's renames do not explain the difference" % spot["diverged"], counted=True,
+                                 address=spot["diverged"], spot_check={key: value for key, value in spot.items() if key != "diverged"})
         try:
             writable = commits._program_of(job, clone["gpr"], target, writable=True, upgrade=False, refresh=True)
         except hydra.EngineError as error:
@@ -906,7 +945,15 @@ def _verify_candidate(settings: dict, engine, job, target: dict, candidate_gpr: 
                                  engine_error=error.code) from error
         job.call("close_project", project=writable["project"], discard=True)
         job.reset()
+        return {key: value for key, value in spot.items() if key != "diverged"}
     finally:
+        # The clone's programs on the caller's connection are closed by the keys that connection got, and their rows dropped,
+        # so they neither count against maxViewsPerClient nor stay in the cache (as in commits._verify_candidate).
+        try:
+            commits._release(engine, {key: value for key, value in commits._rows(engine).items()
+                                      if key[1] == str(Path(clone["gpr"])).lower()})
+        except Exception:
+            pass
         try:
             engine.call("close_project", project=clone.get("project"), discard=True)
         except Exception:
@@ -1119,7 +1166,7 @@ def _publish_candidate(settings: dict, lineage_id: str, engine, head: dict, targ
         _point("after_manifest")
         clone_folder = Path(settings.get("tmp_dir") or workcopy.root_path(settings)) / "publish-verify" / (first + "-" + uuid.uuid4().hex[:6])
         try:
-            _verify_candidate(settings, engine, job, target, candidate_gpr, clone_folder, head["gpr"], applied)
+            spot = _verify_candidate(settings, engine, job, target, candidate_gpr, clone_folder, head["gpr"], applied) or {}
         except PublishFailure as error:
             error.csid = error.csid or first
             error.detail.setdefault("candidate", str(candidate_folder))
@@ -1142,7 +1189,8 @@ def _publish_candidate(settings: dict, lineage_id: str, engine, head: dict, targ
             write_done(settings, lineage_id, item["cs"]["csid"],
                        {"outcome": item["outcome"], "generation": generation, "gpr": candidate_gpr, "manifestSha256": manifest_sha,
                         "record_outcomes": item["records"], "seq": line["seq"], "base_generation": head["gen"], "build_ms": build_ms,
-                        "unverified": item["unverified"], "converged": item["converged"], "in_master": item["in_master"]})
+                        "unverified": item["unverified"], "converged": item["converged"], "in_master": item["in_master"],
+                        "spot_check": spot})
             _point("after_done")
         for item in accepted:
             settle_one(settings, lineage_id, item["cs"], generation, by_changeset[item["cs"]["csid"]]["ids"])
@@ -1165,6 +1213,7 @@ def _publish_candidate(settings: dict, lineage_id: str, engine, head: dict, targ
 
 
 # ---- settling a view ---------------------------------------------------------------------------------------------
+
 
 def settle_one(settings: dict, lineage_id: str, cs: dict, generation: int | None, ids: list[str]) -> bool:
     """Finalize one decided changeset in the view that sealed it (best effort: a view that is busy settles at its next call)."""
@@ -1194,6 +1243,7 @@ def finalize_changeset(settings: dict, selected: dict, lineage_id: str, csid: st
         committed = workcopy.committed_ids(store)
         present = [ident for ident in present if ident not in committed]
         remaining = [record["id"] for record in workcopy.pending_of(store) if record["id"] not in set(present)]
+        base_before = (store.get("base") or {}).get("generation", 0)
         who, now = workcopy._attribution(), time.time()
         if generation is not None:
             live = [entry for entry in store["commits"] if not entry.get("reverted")]
@@ -1215,10 +1265,19 @@ def finalize_changeset(settings: dict, selected: dict, lineage_id: str, csid: st
             store["reverted"] = (store.get("reverted") or []) + ([{"ids": present, "by": who, "at": now, "reason": "published:already_in_master"}]
                                                                 if present else [])
             op = "publish"
+        moved = (store.get("base") or {}).get("generation", 0) != base_before
         store["changesets"] = store["changesets"] + [{"csid": csid, "generation": generation, "ids": sorted(present), "at": now}]
         store["revision"] += 1
         store["journal"] = revisions.append(store["journal"], revisions.journal_entry(store["revision"], op, [revisions.WILDCARD], who, now))
         workcopy._save_store(settings, selected, store)
+        if moved or not workcopy.pending_of(store):
+            # The view's working copy holds the published records unsaved on the old base: with nothing pending the view reads
+            # the head, and with its base moved its next use rebuilds the copy, so nothing reads it again. Closed now (9.17)
+            # rather than left in the daemon as an orphan until that next use, which may never come.
+            try:
+                workcopy.retire_copies(settings, selected)
+            except Exception:  # noqa: BLE001 - the changeset is final; the next sync of the view sweeps what is left
+                pass
         return True
 
 

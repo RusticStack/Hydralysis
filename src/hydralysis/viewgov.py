@@ -59,12 +59,13 @@ class Capacity(RuntimeError):
 
 
 class Entry:
-    __slots__ = ("key", "name", "target", "last_used", "running", "pending", "state", "opened", "closed", "error")
+    __slots__ = ("key", "name", "target", "last_used", "running", "pending", "state", "opened", "closed", "error", "release")
 
     def __init__(self, key: str, name: str, target: dict, now: float):
         self.key, self.name, self.target = key, name, target
         self.last_used, self.running, self.pending, self.state = now, 0, 0, "open"
         self.opened, self.closed, self.error = now, 0, ""
+        self.release = None   # the callback of the last request that pinned it: what closes it at the end of the session
 
     def row(self, now: float) -> dict:
         return {"view": self.name, "key": self.key, "state": self.state, "running": self.running, "pending": self.pending,
@@ -116,6 +117,8 @@ class Governor:
                 rebuilt, entry.state = True, "open"
             entry.running += 1                      # pin first: from here on this view cannot be chosen as a victim
             entry.last_used = self.clock()
+            if release is not None:
+                entry.release = release
             if pending is not None:
                 entry.pending = pending
             while self._open_count() > limit["max_views"]:
@@ -218,6 +221,24 @@ class Governor:
             victim.state = "evicting"
         return victim.name if self._close([victim], release) else None
 
+    def end_session(self, settings: dict | None = None) -> list[str]:
+        """The process is ending: close every view it still holds open, as an eviction does (discard, keep the folder), each with
+        the callback of the request that last pinned it. A view with a running request, or one kept warm (pending >=
+        `viewKeepWarmRecords`, D61), is left open. Without this, the working copy of each view the process used stays in the
+        daemon as an orphan with unsaved work for ever (`orphanKeepS` 0) and counts against `maxViews` (9.17, K7)."""
+        limit = limits(settings)
+        victims = []
+        with self._cond:
+            for entry in self._entries.values():
+                if entry.state == "open" and entry.running == 0 and entry.release is not None \
+                        and entry.pending < limit["keep_warm_records"]:
+                    entry.state = "evicting"
+                    victims.append(entry)
+        closed = []
+        for entry in victims:
+            closed += self._close([entry], entry.release)
+        return closed
+
     def forget(self, key: str) -> None:
         with self._cond:
             self._entries.pop(key, None)
@@ -244,6 +265,44 @@ class Governor:
 
 GOVERNOR = Governor()
 
+SESSION_END_S = 30.0   # the most a process's exit waits for its views to be closed (a suspended daemon must not hold it up)
+_session_hook = {"armed": False, "settings": None}
+_session_guard = threading.Lock()
+_ending = threading.local()
+
+
+def session_ending() -> bool:
+    """True on the thread that closes the views at the end of the session: it uses the connections it has, and starts no daemon."""
+    return bool(getattr(_ending, "active", False))
+
+
+def arm_session_end(settings: dict | None) -> None:
+    """Close this process's views when it exits (`Governor.end_session`), once per process. The close runs on a daemon thread
+    joined for at most SESSION_END_S, so an engine that does not answer delays the exit by that much and no more."""
+    with _session_guard:
+        _session_hook["settings"] = settings
+        if _session_hook["armed"]:
+            return
+        _session_hook["armed"] = True
+    import atexit
+    atexit.register(end_session)
+
+
+def end_session(timeout_s: float | None = None) -> list[str]:
+    """Close the views of this process now (the MCP server calls it when its input ends; atexit calls it at exit)."""
+    out: list[str] = []
+
+    def run():
+        _ending.active = True   # the release callbacks never start a daemon now (`session_ending`)
+        try:
+            out.extend(GOVERNOR.end_session(_session_hook["settings"]))
+        except Exception:  # noqa: BLE001 - an exit must not fail because a view could not be closed
+            pass
+    worker = threading.Thread(target=run, name="hydralysis-session-end", daemon=True)
+    worker.start()
+    worker.join(SESSION_END_S if timeout_s is None else timeout_s)
+    return out
+
 
 def delete_idle_folders(settings: dict, template: dict, lineage_id: str, engine, now: float | None = None) -> list[str]:
     """Delete the fork folder of every view of the lineage that nobody holds and that was idle for `viewIdleDeleteS`.
@@ -262,6 +321,16 @@ def delete_idle_folders(settings: dict, template: dict, lineage_id: str, engine,
         target = {**template, "key": record["key"], "view": record["view"]}
         state = workcopy._state(settings, target)
         forks = [item for item in [state.get("fork_gpr"), *state.get("retired", [])] if item]
+        forks += [str(path) for path in workcopy._forks_on_disk(settings, target) if str(path) not in forks]
+        if forks:
+            # A copy its process left in the daemon holds unsaved work as an orphan, which the daemon keeps for ever: it is
+            # discarded first (its records are in the store), or the folder could never be deleted.
+            from hydralysis.locks import LockBusy, locked
+            try:
+                with locked(workcopy._directory(settings, target) / ".view.lock", workcopy.DISCARD_LOCK_S, "working copy"):
+                    workcopy.discard_forks(settings, target, forks)
+            except LockBusy:
+                continue
         if forks and workcopy._retire(engine, forks):
             continue  # the engine still has one open: try again later
         shutil.rmtree(workcopy._directory(settings, target), ignore_errors=True)

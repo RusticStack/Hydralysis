@@ -483,10 +483,15 @@ class ViewLifecycle(EngineCase):
         folder = Path(state["fork_gpr"]).parent
         project = self.daemon.projects[self.daemon._norm(state["fork_gpr"])]
         forks = len(self.sync_calls("fork_project"))
-        engine = fakehydra.FakeEngine(self.settings, role="writer", lane="evict")
-        engine.call("close_project", project=project["id"], discard=True)  # what an eviction does
+        # A connection that is not the copy's writer discards nothing by closing it: the sync's work stays as an orphan (9.17).
+        stranger = fakehydra.FakeEngine(self.settings, role="writer", lane="evict")
+        stranger.call("open_project", path=state["fork_gpr"])
+        stranger.call("close_project", project=project["id"], discard=True)
+        self.assertEqual([row["gpr"] for row in self.daemon.orphans()], [project["gpr"]])
+        workcopy.release(self.runner.engine, self.settings, target)  # what an eviction does: the view's writer lane discards
         self.assertTrue(folder.is_dir())
         self.assertIsNone(project["programs"]["/owned.exe"]["live"])  # the daemon lost the unsaved change
+        self.assertEqual(self.daemon.orphans(), [])
         query._keys.clear()
         self.assertEqual(self.ask(options={"view": "alice"})["function"]["name"], "Kept")  # replayed from the store
         self.assertEqual(len(self.sync_calls("fork_project")), forks)  # the same folder was reused, nothing re-forked
@@ -833,6 +838,10 @@ class ViewsThroughQuery(unittest.TestCase):
         self.assertEqual(body["error"], "stale_view")
         self.assertEqual(body["next"], {"tool": "ghidra_query", "action": "type_edit",
                                         "options": {"kind": "rebase", "expect_revision": 1}})
+        # The contract (gate 9.17, E): the client rebases; Hydralysis names the rebase call and never retries the edit itself.
+        self.assertIs(body["retried"], False)
+        self.assertIn("options.kind=rebase", body["suggest"])
+        self.assertIn("does not retry", body["suggest"])
         conflict = self.ask("type_edit", view="two", **body["next"]["options"])
         self.assertEqual((conflict["rebased"], conflict["outcome"]), (False, "conflict"))
         done = self.ask("type_edit", view="two", **{**body["next"]["options"], "resolve": {conflict["conflicts"][0]["subject"]: "take_mine"}})

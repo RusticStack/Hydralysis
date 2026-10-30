@@ -338,26 +338,127 @@ def _sample(records: list[dict]) -> list[str]:
 _SHOWN_ELSEWHERE = ("name", "label", "signature", "type", "existence", "body", "definition")
 
 
-def _shown_names(committing: list[dict], listing: list[dict]) -> list[re.Pattern]:
+def _effects_of(record: dict) -> list[dict]:
+    """The record's effects, or (a record without a subject record) its fields with the value it sets as `after`."""
+    return record.get("effects") or [{"subject": subject, "field": field, "before": None, "after": record["options"].get("name")}
+                                     for subject, field in revisions.fields_of(record["address"], record["options"])]
+
+
+def _listing_names(listing: list[dict]) -> dict[int, str]:
+    found = {}
+    for row in listing:
+        try:
+            found[int(str(row.get("address", "")).removeprefix("0x"), 16)] = row.get("name")
+        except ValueError:
+            continue
+    return found
+
+
+def renames(records: list[dict], listing: list[dict]) -> dict[str, str]:
+    """{old name: new name} of every symbol the records rename or relabel: per subject its first `before` (the name in the
+    parent; the parent's listing for a record that did not report one) and its last `after`. The `::`-less form of a
+    namespaced name is mapped too, since a decompile may print either."""
+    by_address = _listing_names(listing)
+    first: dict[str, str | None] = {}
+    last: dict[str, str | None] = {}
+    for record in records:
+        for effect in _effects_of(record):
+            if revisions.field_kind(effect["field"]) not in ("name", "label"):
+                continue
+            first.setdefault(effect["subject"], effect.get("before"))
+            last[effect["subject"]] = effect.get("after")
+    mapping: dict[str, str] = {}
+    for subject, after in last.items():
+        before = first[subject]
+        if before in (None, "", revisions.ABSENT) and subject.startswith("address:"):
+            before = by_address.get(int(subject.removeprefix("address:").removeprefix("0x"), 16))
+        if not before or not after or revisions.ABSENT in (before, after) or before == after:
+            continue
+        mapping[before] = after
+        short_before, short_after = before.rsplit("::", 1)[-1], after.rsplit("::", 1)[-1]
+        if short_before != short_after:
+            mapping.setdefault(short_before, short_after)
+    return mapping
+
+
+def with_renames(text: str, mapping: dict[str, str]) -> str:
+    """TEXT with every whole-word occurrence of an old name of MAPPING replaced by its new name, all at once (a swap of two
+    names is a swap, not a double replacement)."""
+    if not mapping:
+        return text
+    pattern = re.compile(r"(?<![A-Za-z0-9_])(%s)(?![A-Za-z0-9_])" % "|".join(re.escape(name) for name in sorted(mapping, key=len, reverse=True)))
+    return pattern.sub(lambda match: mapping[match.group(1)], text)
+
+
+def explained_by(before: str, after: str, mapping: dict[str, str]) -> bool:
+    """Whether the decompile answer AFTER (canonical JSON, `_decompile`) is BEFORE with the renames of MAPPING: every field
+    equal once the old names are rewritten, except the text's length, which the rewrite itself changes. `total_characters`
+    counts the whole text and `c` may be its truncated head; for a complete text the count must have moved by exactly what
+    the rewrite added, and for a truncated one the rest of the function is not shown, so the count is not compared."""
+    rewritten = with_renames(before, mapping)
+    if rewritten == after:
+        return True
+    try:
+        old, new, out = json.loads(before), json.loads(rewritten), json.loads(after)
+    except ValueError:
+        return False
+    if not all(isinstance(item, dict) and isinstance(item.get("c"), str) for item in (old, new, out)):
+        return False
+    if not new.get("truncated") and not out.get("truncated") and isinstance(old.get("total_characters"), int):
+        new["total_characters"] = old["total_characters"] + len(new["c"]) - len(old["c"])
+    else:
+        new.pop("total_characters", None)
+        out = {key: value for key, value in out.items() if key != "total_characters"}
+    return new == out
+
+
+def spot_check(engine, parent: dict, candidate: dict, sha256: str, records: list[dict], listing: list[dict],
+               touched: set[str]) -> dict:
+    """Compare the decompiles of up to SPOT_CHECK functions the records did not touch, parent against candidate.
+
+    A difference fully explained by the records passes: the parent's text with every renamed or relabelled symbol's old name
+    replaced by its new one (`renames`, `with_renames`) equals the candidate's (a caller of a renamed function prints the new
+    name). A function whose parent text mentions a symbol whose prototype, type or body the records changed is set aside
+    (that difference cannot be rewritten textually; reported, and the next function takes its place). Any other difference
+    is a divergence: `diverged` names the first one and the check stops there."""
+    mapping = renames(records, listing)
+    others = _shown_names(records, listing, kinds=tuple(kind for kind in _SHOWN_ELSEWHERE if kind not in ("name", "label")))
+    compared: list[str] = []
+    explained: list[str] = []
+    affected: list[str] = []
+    for row in listing:
+        address = row.get("address")
+        if not address or address in touched or len(compared) >= SPOT_CHECK:
+            continue
+        before = _decompile(engine, parent, address, sha256)
+        after = _decompile(engine, candidate, address, sha256)
+        if before != after:
+            if mapping and explained_by(before, after, mapping):
+                explained.append(address)
+            elif any(pattern.search(before) for pattern in others):
+                affected.append(address)
+                continue
+            else:
+                return {"compared": len(compared), "explained_by_renames": explained, "users_of_changed_symbols": affected,
+                        "diverged": address}
+        compared.append(address)
+    return {"compared": len(compared), "explained_by_renames": explained, "users_of_changed_symbols": affected, "diverged": None}
+
+
+def _shown_names(committing: list[dict], listing: list[dict], kinds: tuple[str, ...] | None = None) -> list[re.Pattern]:
     """What the decompile of an untouched function would print differently because of the commit: the names (before and
     after) of the renamed or relabelled symbols, the current name and the default name (`FUN_<hex>`, `DAT_<hex>`, ...) of
     every symbol whose prototype, type or body changed, and the name of every changed structure. A function of the previous
-    generation whose decompile mentions one is a user of a changed symbol and differs from the candidate by design."""
+    generation whose decompile mentions one is a user of a changed symbol and differs from the candidate by design.
+
+    KINDS narrows the effect kinds considered (default: every kind shown elsewhere)."""
     names: set[str] = set()
     addresses: set[int] = set()
-    by_address = {}
-    for row in listing:
-        try:
-            by_address[int(str(row.get("address", "")).removeprefix("0x"), 16)] = row.get("name")
-        except ValueError:
-            continue
+    by_address = _listing_names(listing)
     for record in committing:
-        effects = record.get("effects") or [{"subject": subject, "field": field, "before": None,
-                                             "after": record["options"].get("name")}
-                                            for subject, field in revisions.fields_of(record["address"], record["options"])]
-        for effect in effects:
+        for effect in _effects_of(record):
             kind = revisions.field_kind(effect["field"])
-            if kind not in _SHOWN_ELSEWHERE:
+            if kind not in (kinds if kinds is not None else _SHOWN_ELSEWHERE):
                 continue
             subject = effect["subject"]
             if subject.startswith("address:"):

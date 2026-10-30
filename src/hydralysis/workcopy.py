@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import time
@@ -93,35 +94,289 @@ def release(engine: hydra.Engine, settings: dict, target: dict) -> list[str]:
     the folder (eviction, 3.11, D61): every record is in the store, so the next use replays what the program lost.
 
     Only the view's own forks are closed (the ones a reader of this process opened and the one its writer connection left
-    open in the daemon): never the master, a generation or the shared base. Returns the project ids closed."""
-    from hydralysis import query
-    folder = _directory(settings, target).resolve()
+    open in the daemon): never the master, a generation or the shared base. Returns the project ids closed.
+
+    A reader's `close_project` only makes that reader leave: the edits a sync left in a shared-mode program stay in the
+    daemon as orphaned work, kept for ever (`orphanKeepS` 0) and counted as a view. The discard is therefore done by the
+    view's writer lane, which joins each fork as a writer and closes it with discard (`discard_forks`)."""
+    from hydralysis import query, viewgov
+    ending = viewgov.session_ending()
+    if ending and not getattr(engine, "connected", lambda: True)():
+        return []   # the process is ending without a connection: there is no daemon of ours to close anything in
+    folders = [folder.resolve() for folder in view_folders(settings, target)]
     with query._keys_guard:
         mine = [(key, value) for key, value in query._keys.items()
-                if key[0] == engine.key and Path(key[1]).resolve().is_relative_to(folder)]
+                if key[0] == engine.key and any(Path(key[1]).resolve().is_relative_to(folder) for folder in folders)]
     projects = {value["project"] for _, value in mine}
     state = _state(settings, target)
-    forks = {str(Path(item).resolve()).lower() for item in [state.get("fork_gpr"), *(state.get("retired") or [])] if item}
-    if forks:
-        try:
-            for item in engine.call("status").get("projects", []):
-                if item.get("id") and str(Path(item.get("gpr", "")).resolve()).lower() in forks:
-                    projects.add(item["id"])
-        except (hydra.EngineError, OSError):
-            pass
+    forks = [item for item in [state.get("fork_gpr"), *(state.get("retired") or [])] if item]
+    forks += [str(path) for path in _forks_on_disk(settings, target) if str(path) not in forks]
     closed = []
     for project in sorted(projects):
         try:
             engine.call("close_project", project=project, discard=True)
             closed.append(project)
         except hydra.EngineError as error:
-            if error.code not in ("not_found", "no_project", "closed", "no_program"):
+            if error.code not in _GONE:
                 raise
     with query._keys_guard:
         for key, value in mine:
             if query._keys.get(key) is value:
                 query._keys.pop(key, None)
+    if forks:
+        try:
+            with locked(_directory(settings, target) / ".view.lock", DISCARD_LOCK_S, "working copy"):
+                writer = writer_for(settings, target, start=not ending)
+                try:
+                    done = discard_forks(settings, target, forks, writer)
+                    # a copy the daemon let go of is the saved fork again, and the next use replays into it (D61); one it
+                    # still holds for another reader is not reused
+                    _forget_current(settings, target, _still_open(writer, done["closed"]))
+                finally:
+                    writer.reset()
+                    query.forget(writer)
+        except LockBusy:
+            # A sync of the view is running (in this process or another): it owns the working copy now, and whatever
+            # it supersedes it discards itself.
+            return closed
+        if done["failed"]:
+            raise RuntimeError(json.dumps({"error": "release_failed", "failed": done["failed"]}))
+        closed += [item for item in done["projects"] if item not in closed]
     return closed
+
+
+# ---- closing working copies nothing will read again (9.17: the view leak) --------------------------------------
+#
+# A sync leaves its working copy open in the daemon in shared mode with the replayed records unsaved (D61): the
+# writer connection leaves, the daemon keeps the work as an orphan (`orphanKeepS` 0: for ever) and counts the program
+# as a view against `maxViews`. That is the working copy's warm cache while the view uses it. A copy the view no
+# longer uses (superseded by a rebuild after a publish or a revert, rebased away, built by a failed operation, or
+# left behind by a process that ended) would stay an orphan for ever, so every such copy is closed here with discard:
+# its records are in the store, and nothing reads the copy again.
+
+_GONE = ("not_found", "no_project", "closed", "no_program")
+DISCARD_WAIT_MS = 30_000   # the engine's wait for the program while a running request finishes with it
+DISCARD_LOCK_S = 5         # an eviction or a session end waits this long for the view lock, then leaves it to the sync
+
+
+def _norm(gpr) -> str:
+    return str(Path(gpr).resolve()).lower()
+
+
+def view_folders(settings: dict, target: dict) -> list[Path]:
+    """The folders that hold the view's working copies: its own and the one its rebases build in (`views._shadow`)."""
+    own = _directory(settings, target)
+    return [own, own.with_name(own.name + "r")]
+
+
+def _still_open(engine: hydra.Engine, gprs: list[str]) -> list[str]:
+    """The GPRS whose program the daemon still holds after a discard: used by a connection (another process's reader) or
+    with unsaved work. A program nobody holds is the saved fork again. Unknown counts as held."""
+    if not gprs:
+        return []
+    try:
+        status = engine.call("status")
+    except (hydra.EngineError, OSError, RuntimeError):
+        return list(gprs)
+    if not isinstance(status.get("programs"), list):
+        return list(gprs)
+    by_id = {item.get("id"): _norm(item["gpr"]) for item in status.get("projects", []) if item.get("gpr")}
+    held = {by_id.get(row.get("project")) for row in status["programs"]
+            if row.get("users") or row.get("writers") or (row.get("unsavedEdits") or 0) > 0}
+    return [gpr for gpr in gprs if _norm(gpr) in held]
+
+
+def _forget_current(settings: dict, target: dict, discarded: list[str], retired: list[str] | None = None) -> None:
+    """After a discard: the state file stops naming a copy that was discarded as the view's current one, so the next use
+    forks a new copy instead of reusing it. A discarded program is not a clean fork: while another connection still reads
+    it the daemon keeps the edits it shows that reader, and its overlay marker no longer says what it holds (gate 9.17
+    soak: K8 and "overlay state ''"). RETIRED, when given, replaces the state's retired list. The caller holds the view lock."""
+    state = _state(settings, target)
+    if not state:
+        return
+    gone = {_norm(gpr) for gpr in discarded if gpr}
+    current = state.get("fork_gpr")
+    changed = dict(state)
+    if retired is not None:
+        changed["retired"] = list(retired)
+    if current and _norm(current) in gone:
+        changed.pop("fork_gpr", None)
+        changed.pop("state", None)
+        if current not in changed.get("retired", []) and Path(current).exists():
+            changed["retired"] = [*changed.get("retired", []), current]
+    if changed != state:
+        write_json(_directory(settings, target) / "state.json", changed)
+
+
+def _forks_on_disk(settings: dict, target: dict) -> list[Path]:
+    """Every working copy of the view that is on disk (`w-*/<name>.gpr` in the view's folders), referenced or not: a state
+    file that was lost (K15 removes it) or never written (a sync that failed) no longer names the copies it made."""
+    found = []
+    for folder in view_folders(settings, target):
+        if folder.is_dir():
+            found += sorted(path for path in folder.glob("w-*/*.gpr") if path.is_file())
+    return found
+
+
+def superseded_forks(settings: dict, target: dict, keep: list[str], also: list[str] = ()) -> list[str]:
+    """The view's working copies other than KEEP: the ones its state names (current and retired), ALSO, and every other
+    copy on disk in the view's folders. The view lock must be held (no other sync of the view is making one)."""
+    kept = {_norm(item) for item in keep if item}
+    state = _state(settings, target)
+    seen, out = set(), []
+    for gpr in [state.get("fork_gpr"), *(state.get("retired") or []), *also, *map(str, _forks_on_disk(settings, target))]:
+        if gpr and _norm(gpr) not in kept and _norm(gpr) not in seen:
+            seen.add(_norm(gpr))
+            out.append(gpr)
+    return out
+
+
+def retire_copies(settings: dict, target: dict, keep: list[str] = ()) -> dict:
+    """Close every working copy of the view except KEEP with discard, remove the folders the daemon let go of, and record
+    the rest as retired in the state file (a later sync tries again). For a view whose copy nothing will read again: its
+    records were all published, or its base moved and the next use rebuilds it. The caller holds the view lock."""
+    gone = superseded_forks(settings, target, keep=list(keep))
+    if not gone:
+        return {"closed": [], "projects": [], "failed": []}
+    writer = writer_for(settings, target)
+    try:
+        done = discard_forks(settings, target, gone, writer)
+        retired = _retire(writer, gone)
+    finally:
+        from hydralysis.query import forget
+        writer.reset()
+        forget(writer)
+    _forget_current(settings, target, gone, retired)
+    return done
+
+
+def _reader_rows(gprs: set[str]) -> list[tuple[str, list[tuple], str]]:
+    """This process's cached read-only rows of the programs in GPRS: (connection key, rows, daemon program key)."""
+    from hydralysis import query
+    groups: dict[tuple[str, str], list[tuple]] = {}
+    with query._keys_guard:
+        for key, value in query._keys.items():
+            if not key[3] and _norm(key[1]) in gprs:
+                groups.setdefault((key[0], value["key"]), []).append(key)
+    return [(connection, rows, program) for (connection, program), rows in groups.items()]
+
+
+def _close_reader_rows(settings: dict, gprs: set[str]) -> None:
+    """Close this process's read-only uses of GPRS on the shared reader connection, the one `QueryRunner` reads through, so
+    that a closed copy has no reader of ours left and the per-connection view cap (`maxViewsPerClient`) is given back.
+    Best effort: a row of another connection (a pool entry, on hydra.2/3) is dropped from the cache only, as `forget` does."""
+    from hydralysis import query
+    reader = hydra.Engine(settings)
+    # A connection that is gone took its uses with it: its rows are only dropped (a call would connect, and could start a daemon).
+    live = getattr(reader, "connected", lambda: True)()
+    for connection, rows, program in _reader_rows(gprs):
+        if connection == reader.key and live:
+            try:
+                reader.call("close_program", program=program)
+            except hydra.EngineError as error:
+                if error.code not in _GONE:
+                    continue   # still open: the cache keeps it, and the LRU close of the cap can still find it
+            except OSError:
+                continue
+        with query._keys_guard:
+            for key in rows:
+                query._keys.pop(key, None)
+
+
+def close_superseded_readers(settings: dict, target: dict) -> dict:
+    """Close this process's read-only uses of the view's working copies that are not its current one, and discard what the
+    daemon still holds of them. Called before each use of the view.
+
+    A copy is retired by whichever process finalizes the view's publish: usually the publish worker, which can discard the
+    copy's work but not end another connection's reading of it. While this process's reader still uses the copy the daemon
+    keeps the edits; once the reader leaves, the copy stays read-only with the edits and no user (K7). So the process that
+    reads the copy closes its rows and repeats the writer's discard, which then disposes of the program. Cheap when there is
+    nothing to do: a look at this process's row cache and the state file. Best effort (a busy view is left to its next use)."""
+    from hydralysis import query
+    folders = [_norm(folder) for folder in view_folders(settings, target)]
+    with query._keys_guard:
+        cached = {_norm(key[1]) for key in query._keys if not key[3]}
+    cached = {gpr for gpr in cached if any(gpr.startswith(folder + os.sep) for folder in folders)}
+    if not cached:
+        return {"closed": [], "projects": [], "failed": []}
+    state = _state(settings, target)
+    retired = {_norm(gpr) for gpr in state.get("retired") or [] if gpr}
+    current = _norm(state["fork_gpr"]) if state.get("fork_gpr") and Path(state["fork_gpr"]).is_file() else None
+    stale = sorted(gpr for gpr in cached if gpr != current or gpr in retired)
+    if not stale:
+        return {"closed": [], "projects": [], "failed": []}
+    try:
+        with locked(_directory(settings, target) / ".view.lock", DISCARD_LOCK_S, "working copy"):
+            done = discard_forks(settings, target, stale)
+            _forget_current(settings, target, _still_open(hydra.Engine(settings), done["closed"]))
+            return done
+    except LockBusy:
+        return {"closed": [], "projects": [], "failed": []}   # a sync of the view owns its copies now; it sweeps them
+
+
+def discard_forks(settings: dict, target: dict, gprs: list[str], writer: hydra.Engine | None = None) -> dict:
+    """Close each working copy in GPRS in the daemon and discard the edits it holds unsaved (they are in the store).
+
+    A reader's close only makes it leave: the work a sync left in a shared-mode program stays as an orphan. So the view's
+    writer lane joins the copy as a shared writer (which adopts the orphaned work) and closes its project with discard:
+    the program goes back to the saved fork for any other user, and is disposed when nobody uses it. A copy the daemon
+    does not have open needs nothing. The caller holds the view lock. Returns {"closed": [gpr], "projects": [id],
+    "failed": [{"gpr", "error", "message"}]}; nothing is raised for a copy that is already gone."""
+    wanted = {_norm(gpr): gpr for gpr in gprs if gpr}
+    result: dict = {"closed": [], "projects": [], "failed": []}
+    if not wanted:
+        return result
+    _close_reader_rows(settings, set(wanted))
+    own = writer is None
+    writer = writer if writer is not None else writer_for(settings, target)
+    try:
+        try:
+            status = writer.call("status")
+            listed = status.get("projects", [])
+        except (hydra.EngineError, OSError, RuntimeError) as error:
+            result["failed"] = [{"gpr": gpr, "error": getattr(error, "code", type(error).__name__), "message": str(error)[:300]}
+                                for gpr in wanted.values()]
+            return result
+        open_now = {_norm(item["gpr"]): item["id"] for item in listed if item.get("gpr") and item.get("id")}
+        # An engine that lists its programs (every hydra release does) says which projects hold unsaved work; one that holds
+        # none has nothing to discard, and joining it as a writer would only make the daemon reopen it for its readers.
+        unsaved = None
+        if isinstance(status.get("programs"), list):
+            unsaved = {item.get("project") for item in status["programs"] if (item.get("unsavedEdits") or 0) > 0}
+        for norm, gpr in wanted.items():
+            if norm not in open_now or (unsaved is not None and open_now[norm] not in unsaved):
+                continue
+            try:
+                opened = writer.call("open_project", path=gpr, writable=True, wait=DISCARD_WAIT_MS)
+            except hydra.EngineError as error:
+                if error.code not in _GONE:
+                    result["failed"].append({"gpr": gpr, "error": error.code, "message": str(error)[:300]})
+                continue
+            joined = None
+            try:
+                writer.call("open_program", project=opened["id"], path=target["program"], writable=True, share=True,
+                            upgrade=True, wait=DISCARD_WAIT_MS)
+                joined = True
+            except hydra.EngineError as error:
+                joined = error.code in _GONE   # the program is not in it any more: leaving the project is all there is
+                if not joined:
+                    result["failed"].append({"gpr": gpr, "error": error.code, "message": str(error)[:300]})
+            try:
+                writer.call("close_project", project=opened["id"], discard=True, wait=DISCARD_WAIT_MS)
+            except hydra.EngineError as error:
+                if error.code not in _GONE:
+                    if joined:
+                        result["failed"].append({"gpr": gpr, "error": error.code, "message": str(error)[:300]})
+                    continue
+            if joined:
+                result["closed"].append(gpr)
+                result["projects"].append(opened["id"])
+    finally:
+        if own:
+            from hydralysis.query import forget
+            writer.reset()
+            forget(writer)
+    return result
 
 
 def _store_path(settings: dict, target: dict) -> Path:
@@ -219,7 +474,11 @@ def refuse_stale(store: dict, target: dict, what: str, settings: dict | None = N
                    "view": target.get("view", "shared"), "base": store.get("base"), "head": lineage_binding(target),
                    "next": {"tool": "ghidra_query", "action": "type_edit",
                             "options": {"kind": "rebase", "expect_revision": store["revision"]}},
-                   "suggest": "another view published a new generation; rebase this view before it edits"}
+                   "retried": False,
+                   "suggest": "another view published a new generation, and this view holds records on the older one; nothing was "
+                              "recorded and Hydralysis does not retry the %s. Rebase the view with ghidra_query action=type_edit "
+                              "options.kind=rebase (the call in `next`; resolve any conflicts it lists with take_mine or keep), "
+                              "then send the %s again with the view_revision the rebase answers" % (what, what)}
         if settings is not None:
             from hydralysis import views
             payload["editors"] = views.editors_since(settings, target["lineage"]["id"], (store.get("base") or {}).get("generation", 0))
@@ -780,17 +1039,32 @@ def _prefix_matches(records: list[dict], marker: dict | None, wanted: dict | Non
     return count if _digest_of(ids) == marker.get("ids_sha256") else None
 
 
-def writer_for(settings: dict, target: dict) -> hydra.Engine:
-    """The writer connection of one view: private to it, so closing it never touches another view's programs."""
-    return hydra.Engine(settings, role="writer", lane=target["key"])
+def _same_base(record: dict | None, wanted: dict) -> bool:
+    """Was the base record of a state file (`_base`) built on the (lineage, generation) WANTED names?"""
+    record = record or {}
+    return (record.get("lineage") or "", record.get("generation") or 0) == (wanted.get("lineage") or "", wanted.get("generation") or 0)
 
 
-def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list[dict] | None = None) -> dict:
+def writer_for(settings: dict, target: dict, start: bool = True) -> hydra.Engine:
+    """The writer connection of one view: private to it, so closing it never touches another view's programs.
+    `start=False` joins a running daemon only (the end of a session must not launch one)."""
+    if start:
+        return hydra.Engine(settings, role="writer", lane=target["key"])
+    return hydra.Engine(settings, role="writer", lane=target["key"], start=False)
+
+
+def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list[dict] | None = None,
+          sweep: bool = True) -> dict:
     """Bring the working copy to the store (plus `extra`, the record being added). Lock held by caller.
 
     Changes are committed in the engine's shared-write mode and stay in the daemon after this
     connection leaves. Nothing saves them (D61): a working copy is a cache, the store is the record, and if the
     daemon stops first the program's marker shows what it lost and the next sync replays it from the store.
+
+    Every other working copy of the view (the one this sync replaced, earlier retired ones, copies on disk that no state
+    file names) is closed in the daemon with discard (`discard_forks`), so it does not stay there as an orphan for ever.
+    A rebase builds its copy with `sweep=False` (the view's current copy keeps serving reads until the switch) and the
+    switch sweeps (`views._adopt_copy`). A copy this sync made and could not finish is discarded too.
     """
     from hydralysis.query import forget, open_program
     writer = writer_for(settings, target)
@@ -800,6 +1074,7 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
     current = _state(settings, target)
     started = time.monotonic()
     phases = _Phases()
+    created = None
     try:
         opening = time.monotonic()
         master = writer.call("open_project", path=target["gpr"])
@@ -825,7 +1100,12 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
                                    writable=True, upgrade=True, refresh=True)
             phases.add("open", opening)
             opening = time.monotonic()
-            held = _prefix_matches(records, _marker(writer, program), wanted)
+            marker = _marker(writer, program)
+            held = _prefix_matches(records, marker, wanted)
+            if held is not None and not marker and not _same_base(current.get("base"), wanted["base"]):
+                # A program without a marker holds the fork as it was made (a fresh fork, or one whose unsaved replay was
+                # discarded): it is reused only on the base it was forked from.
+                held = None
             phases.add("replay", opening)
             if held is None:
                 program = None
@@ -836,7 +1116,7 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
         if program is None:
             base = _base(settings, writer, target, master, store, phases)
             forked = _fork(settings, writer, target, base["gpr"], "w-", phases)
-            gpr = forked["gpr"]
+            gpr = created = forked["gpr"]
             how = {**how, "rebuilt": True, "fork": {key: forked.get(key) for key in ("method", "cloned", "bytes", "copyMs")}}
             opening = time.monotonic()
             program = open_program(writer, gpr, target["program"], target["sha256"], writable=True, upgrade=True, refresh=True)
@@ -850,6 +1130,13 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
         # Only this view's own forks are retired; the shared base belongs to every view.
         if current.get("fork_gpr") and current["fork_gpr"] != gpr and current["fork_gpr"] not in retired:
             retired.append(current["fork_gpr"])
+        if sweep:
+            retired = superseded_forks(settings, target, keep=[gpr], also=retired)
+        if retired:
+            discarded = discard_forks(settings, target, retired, writer)
+            if discarded["closed"] or discarded["failed"]:
+                how["discarded"] = {"closed": len(discarded["closed"]), **({"failed": discarded["failed"][:5]}
+                                                                           if discarded["failed"] else {})}
         report = (applied or {}).get("import_report") if pending else None
         state = {"fork_gpr": gpr, "master_revision": master.get("revision"), "state": state_text(wanted),
                  "base": base, "edits": len(records), "updated_at": time.time(),
@@ -858,6 +1145,7 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
                                "phases_ms": phases.report(time.monotonic() - started),
                                **({"import_report": report} if report else {})}}
         write_json(_directory(settings, target) / "state.json", state)
+        created = None
         if extra:
             # What each record changed and what was there before, as the engine saw it (store v3 `effects`).
             # Only the added records': a replay of up to MAX_OVERLAYS pending ones must not inflate the response.
@@ -866,6 +1154,15 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
                                          if item.get("effects") is not None else None
                                          for item in (applied or {}).get("effects") or [] if item.get("id") in added}}
         return state
+    except BaseException:
+        if created is not None:
+            # The copy this sync forked is named by no state file and holds a partial replay: nothing will read it.
+            try:
+                discard_forks(settings, target, [created], writer)
+                _retire(writer, [created])
+            except Exception:  # noqa: BLE001 - the error under way is the one the caller gets; a later sweep finds the copy
+                pass
+        raise
     finally:
         # Disconnecting keeps the committed changes in the daemon (shared mode); readers keep (or refresh) their
         # views. This connection is this view's own, so only this view's programs are released.

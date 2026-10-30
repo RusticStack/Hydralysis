@@ -130,6 +130,22 @@ def forget(engine: hydra.Engine) -> None:
             _keys.pop(key, None)
 
 
+def _drop_program(engine: hydra.Engine, program: str) -> None:
+    """Drop the rows of one daemon program on ENGINE's connection (the program is gone there)."""
+    with _keys_guard:
+        for key in [key for key, value in _keys.items() if key[0] == engine.key and value.get("key") == program]:
+            _keys.pop(key, None)
+
+
+def _drop_rows_under(engine: hydra.Engine, folders) -> None:
+    """Drop ENGINE's rows of programs whose project lies under one of FOLDERS (a reopen joins the same program again)."""
+    roots = [Path(folder).resolve() for folder in folders]
+    with _keys_guard:
+        for key in [key for key in _keys if key[0] == engine.key
+                    and any(Path(key[1]).resolve().is_relative_to(root) for root in roots)]:
+            _keys.pop(key, None)
+
+
 def forget_role(engine: hydra.Engine) -> None:
     """Drop every row of the role: the shared connection's and every pool entry's (`<root>|<role>|`)."""
     prefix = engine.key + "|"
@@ -411,6 +427,7 @@ class QueryRunner:
                 self._touch(selected, who, mode)
         except guarded as error:
             raise RuntimeError(json.dumps(error.payload())) from error
+        viewgov.arm_session_end(self.settings)   # the process's exit closes the views it used (9.17: no orphaned copies)
         with viewgov.GOVERNOR.hold(selected, self.settings, self._release) as pin:
             ctx = {"selected": selected, "mode": mode, "who": who, "pin": pin, "trace": {}}
             try:
@@ -478,6 +495,7 @@ class QueryRunner:
             raise ValueError("use a numeric VA or hexadecimal row cursor, not a symbol name")
         if mode != "master" and action != "stop":
             workcopy.heal(self.settings, selected)  # settle a commit that died between its CURRENT.log line and its store write
+            workcopy.close_superseded_readers(self.settings, selected)  # 9.17: a copy another process retired, still read here
             if follow == "head" and action != "type_edit":
                 followed = self._auto_rebase(selected, None, timeout_s)[0]
                 ctx["followed"] = bool(followed) or not workcopy.stale_reason(workcopy.load_store(self.settings, selected), selected)
@@ -611,7 +629,13 @@ class QueryRunner:
                 if attempt == 0 and error.code in ("no_program", "not_found", "no_project", "closed"):
                     if pool is not None and error.code == "closed":
                         pool.invalidate()   # the daemon went away: the idle entries are as dead as the one that failed
-                    forget(self.engine)   # the entry that failed was retired by the pool and its rows dropped with it
+                    if pool is None and error.code != "closed":
+                        # One program is gone (the LRU close of the view cap closed it, or its project was closed): only its
+                        # rows go. Forgetting every row would hide programs the connection still has open from that LRU close,
+                        # and the cap (maxViewsPerClient) would then refuse every open with nothing left to close.
+                        _drop_program(self.engine, program["key"])
+                    else:
+                        forget(self.engine)   # the entry that failed was retired by the pool and its rows dropped with it
                     continue
                 raise
             state = response.get("overlay_state") or ""
@@ -625,7 +649,10 @@ class QueryRunner:
                     if trace is not None:
                         trace["replayed"] = len(workcopy.pending_of(stored))
                     workcopy.repair(self.settings, self.engine, selected)
-                    forget(self.engine)
+                    # The copies the repair replaced were closed by it (`workcopy.discard_forks`); the rows of the view's copies
+                    # are dropped so the next open reads the repaired one afresh. The connection's other rows stay: they are
+                    # programs it still has open, and the LRU close of the view cap must still see them.
+                    _drop_rows_under(self.engine, workcopy.view_folders(self.settings, selected))
                     continue
                 raise RuntimeError("working copy answers with overlay state %r, expected %r; refused rather than "
                                    "answer from the wrong overlay version" % (state, expected_state))
@@ -724,7 +751,15 @@ class QueryRunner:
                             _keys.pop(key, None)
             if done:
                 released.append(program)
-        result = {"ok": not failed, "released": released, "failed": failed,
+        # The view's working copies: a reader's close only leaves them, and the edits a sync left there unsaved would stay in
+        # the daemon as an orphan for ever. They are closed with discard (the records are in the store; the next use replays).
+        discarded = []
+        if workcopy.view_exists(self.settings, selected) or workcopy._forks_on_disk(self.settings, selected):
+            try:
+                discarded = workcopy.release(self.engine, self.settings, selected)
+            except (RuntimeError, hydra.EngineError) as exc:
+                failed.append({"view": selected.get("view", "shared"), "error": str(exc)[:300]})
+        result = {"ok": not failed, "released": released, "failed": failed, "discarded": discarded,
                   "note": "the shared engine keeps warm programs for keepWarm seconds"}
         if pool is not None:
             result["entries"] = {"closed": closed, "deferred": deferred}

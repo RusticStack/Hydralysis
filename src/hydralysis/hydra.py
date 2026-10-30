@@ -452,6 +452,12 @@ class Engine:
                 session = self._connections[self.key] = self._connect()
             return session
 
+    def connected(self) -> bool:
+        """Whether this process holds a live connection of this key now (asking never connects, so it never starts a daemon)."""
+        with self._guard:
+            session = self._connections.get(self.key)
+        return session is not None and not getattr(session, "_closed", False)
+
     def reset(self) -> None:
         """Drop the shared connection, and with it every pool entry of the role: a daemon restart (or a connection that
         died) takes the context of all of them (7.6, I2; 7.2 lists the restart as a retire event)."""
