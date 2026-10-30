@@ -40,7 +40,6 @@ import random
 import re
 import secrets
 import shutil
-import statistics
 import subprocess
 import time
 import uuid
@@ -719,6 +718,7 @@ def _eta_ms(settings: dict, lineage_id: str, position: int) -> int | None:
             continue
         if record and isinstance(record.get("build_ms"), (int, float)):
             samples.append(record["build_ms"])
+    import statistics   # lazy: statistics pulls in decimal and fractions
     return int(statistics.median(samples) * position) if samples else None
 
 

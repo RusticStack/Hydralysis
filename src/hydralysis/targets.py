@@ -52,14 +52,23 @@ def register(settings: dict, names: list[str], record: dict) -> None:
         write_json(registry_path(settings), data)
 
 
+# (path, size, mtime) -> sha256 already known to this process: every query of a target checks its build, and reading
+# hash-cache.json for it each time was a third of what resolving a target cost.
+_HASHED: dict[str, str] = {}
+
+
 def exe_sha256(settings: dict, exe: str | Path) -> str:
     """Hash a build once per (path, size, mtime); queries do not re-read 66 MB each time."""
     path = resolved(exe)
     stat = path.stat()
     key = "%s|%d|%d" % (str(path).lower(), stat.st_size, stat.st_mtime_ns)
+    known = _HASHED.get(key)
+    if known:
+        return known
     cache_path = root_path(settings) / "hash-cache.json"
     cache = read_json(cache_path)
     if cache.get(key):
+        _HASHED[key] = cache[key]
         return cache[key]
     digest = sha256(path)
     after = path.stat()
@@ -74,6 +83,7 @@ def exe_sha256(settings: dict, exe: str | Path) -> str:
             write_json(cache_path, cache)
     except ValueError:
         pass
+    _HASHED[key] = digest
     return digest
 
 

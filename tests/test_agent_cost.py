@@ -78,6 +78,59 @@ class ResolvedPaths(unittest.TestCase):
             paths.validate_project_path(Path(self.tmp.name) / ".hidden" / "p.gpr")
 
 
+class ImportCost(unittest.TestCase):
+    """What a query process imports: a download (urllib, ssl, http.client, email), an archive (zipfile with bz2, lzma and
+    zstd) and statistics (decimal, fractions) are imported where they are used, not by every agent process."""
+
+    def test_a_query_process_does_not_import_download_archive_or_statistics_modules(self):
+        import json
+        import subprocess
+        import sys
+        import hydralysis
+        src = str(Path(hydralysis.__file__).resolve().parent.parent)
+        code = ("import json, sys; from hydralysis import query, views, hydra, backends, lineage, workcopy; "
+                "print(json.dumps(sorted(m for m in ('urllib.request', 'ssl', 'http.client', 'zipfile', 'statistics', 'decimal') "
+                "if m in sys.modules)))")
+        env = dict(os.environ, PYTHONPATH=src)
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=120, check=True)
+        self.assertEqual(json.loads(out.stdout.strip().splitlines()[-1]), [])
+
+    def test_backends_urllib_is_still_reachable_for_a_download(self):
+        from hydralysis import backends
+        self.assertTrue(callable(backends.urllib.request.urlopen))
+
+
+class ProcessMemo(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_a_known_build_hash_is_not_read_from_the_cache_file_again(self):
+        exe = Path(self.tmp.name) / "a.exe"
+        exe.write_bytes(b"MZ" + bytes(64))
+        settings = {"root": str(Path(self.tmp.name) / "data")}
+        first = targets.exe_sha256(settings, exe)
+        real = targets.read_json
+        with patch.object(targets, "read_json", side_effect=real) as reads:
+            for _ in range(5):
+                self.assertEqual(targets.exe_sha256(settings, exe), first)
+        self.assertEqual(reads.call_count, 0)
+        exe.write_bytes(b"MZ" + bytes([1]) * 80)   # a rebuilt binary is hashed again
+        self.assertNotEqual(targets.exe_sha256(settings, exe), first)
+
+    @unittest.skipUnless(os.name == "nt", "Windows process identity")
+    def test_process_identity_loads_kernel32_once(self):
+        import ctypes
+        from hydralysis import proc, views
+        started = views.process_started_ms()
+        real = ctypes.WinDLL
+        with patch.object(ctypes, "WinDLL", side_effect=real) as loads:
+            for _ in range(5):
+                self.assertTrue(proc.identity(os.getpid(), started))
+            self.assertFalse(proc.identity(os.getpid(), started + 10_000))
+        self.assertLessEqual(loads.call_count, 1)
+
+
 @unittest.skipUnless(os.name == "nt", "the queued wait is the Windows kernel lock queue")
 class FollowerWait(unittest.TestCase):
     def setUp(self):

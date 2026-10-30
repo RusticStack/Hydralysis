@@ -23,7 +23,6 @@ import shutil
 import sys
 import threading
 import time
-import zipfile
 from pathlib import Path
 
 from hydralysis import cancel, compat, durable
@@ -192,6 +191,7 @@ def engine_release(directory: Path) -> str | None:
     if not jar.is_file():
         return None
     try:
+        import zipfile   # lazy: zipfile pulls in bz2, lzma and zstd, which a query never needs
         with zipfile.ZipFile(jar) as archive:
             text = archive.read("hydra.properties").decode("utf-8", "replace")
     except (KeyError, OSError, zipfile.BadZipFile):

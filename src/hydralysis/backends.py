@@ -16,14 +16,20 @@ import shutil
 import stat
 import threading
 import time
-import urllib.request
 import uuid
-import zipfile
 from pathlib import Path
 
 from hydralysis import compat, durable, hydra
 from hydralysis.locks import LaneLock
 from hydralysis.paths import root_path
+
+
+def __getattr__(name: str):
+    """`backends.urllib`, imported on first use (tests patch `hydralysis.backends.urllib.request.urlopen`)."""
+    if name == "urllib":
+        import urllib.request
+        return urllib
+    raise AttributeError("module %r has no attribute %r" % (__name__, name))
 
 # Official release-asset digests. No executable installer, PATH edits,
 # administrator operation, upstream bridge or upstream MCP package.
@@ -261,6 +267,7 @@ def _download(asset: dict, directory: Path, cancelled=lambda: False) -> Path:
     started = time.monotonic()
     digest = hashlib.sha256()
     total = 0
+    import urllib.request   # only a download needs it (http.client, email and ssl cost every process ~20 ms to import)
     request = urllib.request.Request(asset["url"], headers={"User-Agent": "Hydralysis backend setup"})
     with urllib.request.urlopen(request, timeout=30) as response, partial.open("xb") as output:
         while True:
@@ -285,6 +292,7 @@ def _download(asset: dict, directory: Path, cancelled=lambda: False) -> Path:
 def _extract(archive: Path, directory: Path, cancelled=lambda: False) -> Path:
     temporary = directory / ("unpack-" + uuid.uuid4().hex)
     temporary.mkdir(parents=True)
+    import zipfile
     with zipfile.ZipFile(archive) as package:
         members = package.infolist()
         if sum(item.file_size for item in members) > 8 * 1024**3:

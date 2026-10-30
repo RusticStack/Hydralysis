@@ -74,11 +74,12 @@ def popen(command, **kwargs) -> subprocess.Popen:
     return child
 
 
-def identity(pid: int, started_ms: int) -> bool:
-    """Do not adopt or kill a recycled PID. Compare OS process creation time."""
-    if pid <= 0 or not started_ms:
-        return False
-    if os.name == "nt":
+_KERNEL: list = []
+
+
+def _kernel():
+    """kernel32 with the prototypes `identity` uses, made once per process: a view's lease check runs it on every query."""
+    if not _KERNEL:
         import ctypes
         from ctypes import wintypes
 
@@ -88,6 +89,19 @@ def identity(pid: int, started_ms: int) -> bool:
         kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
         kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
         kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        _KERNEL.append(kernel)
+    return _KERNEL[0]
+
+
+def identity(pid: int, started_ms: int) -> bool:
+    """Do not adopt or kill a recycled PID. Compare OS process creation time."""
+    if pid <= 0 or not started_ms:
+        return False
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = _kernel()
         handle = kernel.OpenProcess(0x1000, False, pid)
         if not handle:
             return False
