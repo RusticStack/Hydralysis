@@ -34,10 +34,13 @@ BUSY_WAIT_MS = 180_000
 # restart; a stale key is reopened once.
 _keys: dict[tuple, dict] = {}
 _keys_guard = threading.Lock()
-# One open per program key at a time: the threads that want the same program wait for the first open and take its row.
-_opening: dict[tuple, threading.Lock] = {}
-# (connection key, daemon program) -> how many reads of this process use it now: the cap's LRU close leaves them open.
+# Program key -> the open of it in flight: the threads that want the same program meanwhile wait for that open and take its
+# outcome, the row or the refusal (they do not each wait out a busy program again in turn).
+_opening: dict[tuple, "_Flight"] = {}
+# (connection key, daemon program) -> how many reads of this process use it now: the cap's LRU close takes them last.
 _in_use: dict[tuple, int] = {}
+# The marks of the read this thread runs (`_holding`): a program is marked in use as its row is handed out.
+_held = threading.local()
 # Reads on hydra.4 are spread over this many reader connections by view key (`readerLanes`); lane 0 is the shared one.
 # One by default: a lane keeps the generations its views read before a publish open until its own cap closes them, so the
 # daemon would hold up to `maxViewsPerClient` programs per lane (gate 9.17's view-leak test counts them as held).
@@ -70,20 +73,43 @@ def open_program(engine: hydra.Engine, gpr: str, program: str, sha256: str, *, w
     `share=False` opens a writable program for its caller alone (a commit's candidate); `backup` is the verified
     backup an upgrading writable open names on an engine with the upgrade gate."""
     cache_key = (engine.key, str(Path(gpr)).lower(), program, writable)
-    with _keys_guard:
-        known = _keys.get(cache_key)
-        if known and not refresh:
-            _keys[cache_key] = _keys.pop(cache_key)   # most recently used last: eviction takes the oldest first
-            return known
-        gate = _opening.setdefault(cache_key, threading.Lock())
-    with gate:
+    while True:
+        with _keys_guard:
+            known = _keys.get(cache_key)
+            if known and not refresh:
+                _keys[cache_key] = _keys.pop(cache_key)   # most recently used last: eviction takes the oldest first
+                return _hold(engine, known)
+            flight = _opening.get(cache_key)
+            if flight is None:
+                flight = _opening[cache_key] = _Flight()
+                break
+        flight.done.wait()
         if not refresh:
-            with _keys_guard:
-                known = _keys.get(cache_key)
-                if known:
-                    _keys[cache_key] = _keys.pop(cache_key)
-                    return known
-        return _open(engine, cache_key, gpr, program, sha256, writable, upgrade, share, backup)
+            if flight.error is not None:
+                raise flight.error
+            if flight.row is not None:
+                with _keys_guard:
+                    return _hold(engine, flight.row)
+        # A refresh opens again itself after the open in flight, and so does a waiter whose opener was interrupted.
+    try:
+        flight.row = _open(engine, cache_key, gpr, program, sha256, writable, upgrade, share, backup)
+        return flight.row
+    except Exception as error:
+        flight.error = error
+        raise
+    finally:
+        with _keys_guard:
+            del _opening[cache_key]
+        flight.done.set()
+
+
+class _Flight:
+    """One open in progress (`open_program`): the threads that join it wait for `done` and take `row` or `error`."""
+
+    def __init__(self):
+        self.done = threading.Event()
+        self.row: dict | None = None
+        self.error: BaseException | None = None
 
 
 def _open(engine: hydra.Engine, cache_key: tuple, gpr: str, program: str, sha256: str, writable: bool, upgrade: bool,
@@ -109,7 +135,7 @@ def _open(engine: hydra.Engine, cache_key: tuple, gpr: str, program: str, sha256
               "functions": info.get("functions"), "analyzed": info.get("analyzed"), "mode": info.get("mode")}
     with _keys_guard:
         _keys[cache_key] = result
-    return result
+        return _hold(engine, result)
 
 
 def at_client_cap(error: hydra.EngineError) -> bool:
@@ -126,12 +152,13 @@ def _open_after_eviction(engine: hydra.Engine, cache_key: tuple, fields: dict, w
     The cache keeps every program it opened on a connection, so a process that reads several views (each a working copy)
     reaches hydra.4's cap of `maxViewsPerClient` (4) programs per connection and every later open was refused `busy`. Only
     read-only rows are closed (a writable program may hold unsaved edits); a read that still uses a closed key gets
-    `no_program` and reopens once (`QueryRunner._ask`). A program a read of this process is using is not closed. When
-    nothing is left to close, the engine's refusal stands."""
+    `no_program` and reopens once (`QueryRunner._ask`). A program no read of this process is using goes first; when every
+    one is in use, the least recently used of them is closed all the same. When nothing is left to close, the engine's
+    refusal stands."""
     while True:
         with _keys_guard:
-            rows = [(key, value) for key, value in _keys.items() if key[0] == engine.key and key != cache_key and not key[3]
-                    and not _in_use.get((engine.key, value["key"]))]
+            rows = [(key, value) for key, value in _keys.items() if key[0] == engine.key and key != cache_key and not key[3]]
+            rows = [row for row in rows if not _in_use.get((engine.key, row[1]["key"]))] or rows
         if not rows:
             raise error
         program = rows[0][1]["key"]
@@ -178,20 +205,33 @@ def _drop_rows_under(engine: hydra.Engine, folders) -> None:
                 _keys.pop(key, None)
 
 
-@contextmanager
-def _using(engine: hydra.Engine, program: str):
-    """Mark PROGRAM on ENGINE's connection as used by a read for the block: `_open_after_eviction` does not close it."""
-    mark = (engine.key, program)
-    with _keys_guard:
+def _hold(engine: hydra.Engine, row: dict) -> dict:
+    """ROW, marked in use when this thread runs a read (`_holding`). Called under `_keys_guard` where the row is handed out,
+    so no cap close of another thread comes between the open and the mark."""
+    marks = getattr(_held, "marks", None)
+    if marks is not None:
+        mark = (engine.key, row["key"])
         _in_use[mark] = _in_use.get(mark, 0) + 1
+        marks.append(mark)
+    return row
+
+
+@contextmanager
+def _holding():
+    """Mark every program this thread's opens hand out in the block as used by its read: `_open_after_eviction` closes
+    them last."""
+    previous, marks = getattr(_held, "marks", None), []
+    _held.marks = marks
     try:
         yield
     finally:
+        _held.marks = previous
         with _keys_guard:
-            if _in_use[mark] > 1:
-                _in_use[mark] -= 1
-            else:
-                del _in_use[mark]
+            for mark in marks:
+                if _in_use[mark] > 1:
+                    _in_use[mark] -= 1
+                else:
+                    del _in_use[mark]
 
 
 def reader_lanes(settings: dict) -> int:
@@ -698,31 +738,31 @@ class QueryRunner:
         for attempt in (0, 1):
             pool = self._pool()
             reader = self.engine if pool is not None else self.reader(selected)
-            if pool is None:
-                program = self.program_for(selected, engine=reader)
-            try:
+            with _holding():   # the programs this read opens are closed last for the view cap while it runs
                 if pool is None:
-                    with _using(reader, program["key"]):
+                    program = self.program_for(selected, engine=reader)
+                try:
+                    if pool is None:
                         response, raw = run_script(reader, program, request, timeout_s, self.requests,
                                                    deadline_s=self._native_deadline(timeout_s))
-                else:
-                    # One attempt, one entry: the opens and the script run on it with one clock (7.6). A retry takes another.
-                    with pool.attempt(self._deadline(timeout_s)) as entry:
-                        program = self.program_for(selected, engine=entry)
-                        response, raw = run_script(entry, program, request, timeout_s, self.requests)
-            except hydra.EngineError as error:
-                if attempt == 0 and error.code in ("no_program", "not_found", "no_project", "closed"):
-                    if pool is not None and error.code == "closed":
-                        pool.invalidate()   # the daemon went away: the idle entries are as dead as the one that failed
-                    if pool is None and error.code != "closed":
-                        # One program is gone (the LRU close of the view cap closed it, or its project was closed): only its
-                        # rows go. Forgetting every row would hide programs the connection still has open from that LRU close,
-                        # and the cap (maxViewsPerClient) would then refuse every open with nothing left to close.
-                        _drop_program(reader, program["key"])
                     else:
-                        forget(reader)   # the entry that failed was retired by the pool and its rows dropped with it
-                    continue
-                raise
+                        # One attempt, one entry: the opens and the script run on it with one clock (7.6). A retry takes another.
+                        with pool.attempt(self._deadline(timeout_s)) as entry:
+                            program = self.program_for(selected, engine=entry)
+                            response, raw = run_script(entry, program, request, timeout_s, self.requests)
+                except hydra.EngineError as error:
+                    if attempt == 0 and error.code in ("no_program", "not_found", "no_project", "closed"):
+                        if pool is not None and error.code == "closed":
+                            pool.invalidate()   # the daemon went away: the idle entries are as dead as the one that failed
+                        if pool is None and error.code != "closed":
+                            # One program is gone (the LRU close of the view cap closed it, or its project was closed): only its
+                            # rows go. Forgetting every row would hide programs the connection still has open from that LRU close,
+                            # and the cap (maxViewsPerClient) would then refuse every open with nothing left to close.
+                            _drop_program(reader, program["key"])
+                        else:
+                            forget(reader)   # the entry that failed was retired by the pool and its rows dropped with it
+                        continue
+                    raise
             state = response.get("overlay_state") or ""
             if expected_state is not None and state != expected_state:
                 if attempt == 0:

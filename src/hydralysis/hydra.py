@@ -373,10 +373,13 @@ class Engine:
     _used: dict[str, float] = {}  # connection key -> time.monotonic() when it last carried a call
     _guard = threading.Lock()
     # One connect at a time per key (the first may start the daemon). `_guard` is never held across a connect, so a thread
-    # of another key, or one whose connection is up, does not wait for a daemon start.
+    # whose connection is up does not wait for a daemon start, and neither does a connect to another root's daemon.
     _connecting: dict[str, threading.Lock] = {}
     # `sync_scripts` and `write_daemon_config` write fixed paths: connects of different keys take turns at them.
     _preparing = threading.Lock()
+    # state folder -> the lock of this process's connects that may start its daemon. The library's start lock orders starts
+    # between processes; on POSIX it is a record lock (fcntl) that a second thread of the same process also gets.
+    _starting: dict[str, threading.Lock] = {}
 
     def __init__(self, settings: dict, role: str = "reader", start: bool = True, lane: str = ""):
         # Reads use one long-lived connection and run contained (in parallel, rolled back).
@@ -401,10 +404,13 @@ class Engine:
         with self._preparing:
             sync_scripts(self.settings)
             write_daemon_config(self.settings)
+        state = str(state_dir(self.settings))
+        with self._guard:
+            starting = self._starting.setdefault(state, threading.Lock()) if self.start else contextlib.nullcontext()
         try:
-            session = module.connect(client=_IDENTITY["client"], harness=_IDENTITY["harness"],
-                                     ghidra=str(self.engine_dir), state=str(state_dir(self.settings)), instance=INSTANCE,
-                                     start=self.start)
+            with starting:
+                session = module.connect(client=_IDENTITY["client"], harness=_IDENTITY["harness"],
+                                         ghidra=str(self.engine_dir), state=state, instance=INSTANCE, start=self.start)
         except module.IncompatibleError as exc:
             raise RuntimeError("Hydra engine refused: %s. Stop the old daemon (backend action=stop) or install the "
                                "pinned release %s" % (exc, RELEASE)) from exc
@@ -475,7 +481,7 @@ class Engine:
             with self._guard:
                 session = self._connections.get(self.key)
             if session is None or getattr(session, "_closed", False):
-                session = self._connect()   # the library's start lock orders daemon starts between keys and processes
+                session = self._connect()
                 with self._guard:
                     self._connections[self.key] = session
             return session
