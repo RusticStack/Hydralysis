@@ -36,7 +36,8 @@ heavy parallel use is something to measure, not something this release promises.
 ### Limits of this release
 
 - Windows x64 only.
-- Copy-on-write cloning of a project exists only on a ReFS volume; on NTFS a full copy is made. Both work.
+- Copy-on-write cloning of a project exists only on a ReFS volume; on NTFS a full copy is made. Nothing about ReFS is
+  tested for the hydra.4 line (no ReFS volume on the release machine); NTFS is the release file system.
 - The one-way upgrade: a commit may write a generation that older engines cannot open.
 - A harness restart is needed once, for the catalog epoch.
 
@@ -46,3 +47,9 @@ Pins the Hydra Engine `12.3-hydra.4` (protocol 3). Hydralysis still speaks proto
 when `hydra_allow_unpinned` is set. Adoption of the engine's capabilities: protocol negotiation, the deadline helper
 for hydra.2/3 with its abandoned-call budget, and the supervisor. The release notes are completed when the owner tags
 it, and claim only what the gates against hydra.4 showed.
+
+Limits: every limit of PROTOCOL-3.md 6.2 is stated in the engine module README ("Limits of 12.3-hydra.4 and
+protocol 3"); the ones this client owns or sees first (the history cap of 4096 records or 20 MiB, no rotation of the
+append logs, abandoned calls on hydra.2/3, the leave stall, the trusted quick hint, no semantic dependency tracking in
+subset commits, backups verified through the OS cache, the upgrade gate is not a security boundary) are in
+`README.md`, "Limits of this client with hydra.4".
