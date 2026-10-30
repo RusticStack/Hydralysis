@@ -39,6 +39,7 @@ need a hydra.4-only feature: on hydra.3 each of their tests skips with a reason 
 | `test_backups.RealEngineFaultMatrix` | the E2 commit path: engine-written backups, `generation` candidates |
 | `test_userscripts.RealWorker` | E7's killable script worker (`scriptIsolation` 2) |
 | `test_deadline.RealNative` | client library 1.1.0 timing its own wait (already skipped without that library) |
+| `test_deadline.RealDegrade` (the hydra.4 side) | the install's library 1.1.0; on hydra.3 that side has no library and skips with its reason |
 
 The decision is the protocol the connection negotiated (`Engine.protocol()`, read from `hello`), made by
 `tests/support.py` (`hydra4_missing` in `setUpClass`, the `Hydra4Only` mixin skips each test, so the runner still counts
