@@ -35,7 +35,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from hydralysis import durable, hydra, integrity, revisions
+from hydralysis import durable, hydra, integrity, lineage, revisions
 from hydralysis.analysis import MAX_CORPUS_BYTES, MAX_HISTORY_BYTES, MAX_OVERLAYS, _edit, _overlay_path
 from hydralysis.backends import read_json, write_json
 from hydralysis.locks import LaneLock, LockBusy, locked
@@ -459,7 +459,8 @@ def lineage_binding(target: dict) -> dict | None:
 def stale_reason(store: dict, target: dict) -> str | None:
     """`master_generation_changed` when the view holds records on a generation that is no longer the head (4.7).
 
-    Reads keep answering from the view's working copy; a mutation is refused with `stale_view` until the view is rebased."""
+    Reads keep answering from the view's working copy, built from the view's own base generation (`base_master_gpr`); a
+    mutation is refused with `stale_view` until the view is rebased."""
     binding = lineage_binding(target)
     if binding and (store["edits"] or store["commits"]) and (store.get("base") or {}).get("generation", 0) != binding["generation"]:
         return "master_generation_changed"
@@ -472,9 +473,7 @@ def refuse_stale(store: dict, target: dict, what: str, settings: dict | None = N
     if stale_reason(store, target):
         payload = {"error": "stale_view", "stale": "master_generation_changed", "what": what,
                    "view": target.get("view", "shared"), "base": store.get("base"), "head": lineage_binding(target),
-                   "next": {"tool": "ghidra_query", "action": "type_edit",
-                            "options": {"kind": "rebase", "expect_revision": store["revision"]}},
-                   "retried": False,
+                   "next": _rebase_next(store), "retried": False,
                    "suggest": "another view published a new generation, and this view holds records on the older one; nothing was "
                               "recorded and Hydralysis does not retry the %s. Rebase the view with ghidra_query action=type_edit "
                               "options.kind=rebase (the call in `next`; resolve any conflicts it lists with take_mine or keep), "
@@ -483,6 +482,66 @@ def refuse_stale(store: dict, target: dict, what: str, settings: dict | None = N
             from hydralysis import views
             payload["editors"] = views.editors_since(settings, target["lineage"]["id"], (store.get("base") or {}).get("generation", 0))
         raise RuntimeError(json.dumps(payload))
+
+
+def _rebase_next(store: dict) -> dict:
+    return {"tool": "ghidra_query", "action": "type_edit", "options": {"kind": "rebase", "expect_revision": store["revision"]}}
+
+
+def base_master_gpr(settings: dict, target: dict, store: dict) -> str:
+    """The project of the generation STORE is based on: the content a working copy of the view is built from and a view
+    without pending records is read from (gate 9.17 H).
+
+    The head (`target["gpr"]`) only for a view on the head generation. A view behind it is built from its own generation's
+    sealed project (the CURRENT.log line of that generation), so it never moves without a rebase. A generation whose
+    project is gone (removed, or no longer the sealed folder its log line names) is refused with `base_unavailable`, naming
+    the rebase: the head is never substituted."""
+    binding = lineage_binding(target)
+    base = store.get("base") or DEFAULT_BASE
+    generation = base.get("generation") or 0
+    if binding is None or generation == binding["generation"]:
+        return target["gpr"]
+    lineage_id = base.get("lineage") or binding["lineage"]
+    problem = None
+    try:
+        rows = [row for row in lineage.history(settings, lineage_id) if row.get("gen") == generation and row.get("gpr")]
+    except (OSError, ValueError) as error:
+        rows, problem = [], "the lineage log could not be read: %s" % error
+    gpr = rows[-1]["gpr"] if rows else None
+    if generation == 0 and gpr is None and problem is None:
+        try:
+            gpr = lineage.load(settings, lineage_id).get("origin_gpr")
+        except (OSError, ValueError):
+            gpr = None
+    if problem is None and not gpr:
+        problem = "the lineage log names no project for generation %d" % generation
+    elif problem is None and not Path(gpr).is_file():
+        problem = "the project of generation %d is gone (%s)" % (generation, gpr)
+    elif problem is None and generation > 0:
+        # A published generation is a sealed folder: its manifest must still be the one its log line names.
+        named = next((row.get("manifestSha256") for row in rows if row.get("manifestSha256")), None)
+        folder = lineage.project_folder_of(gpr)
+        if lineage.read_manifest(folder) is None:
+            problem = "the folder of generation %d has no manifest" % generation
+        elif named and lineage.manifest_file_sha256(folder) != named:
+            problem = "the folder of generation %d is not the sealed one its log line names" % generation
+    if problem is None:
+        return gpr
+    raise RuntimeError(json.dumps({
+        "error": "base_unavailable", "view": target.get("view", "shared"), "base": base, "head": binding, "detail": problem,
+        "next": _rebase_next(store),
+        "suggest": "the generation this view is based on is no longer available, so its working copy cannot be rebuilt and "
+                   "Hydralysis does not answer from the head instead. Rebase the view onto the head with ghidra_query "
+                   "action=type_edit options.kind=rebase (the call in `next`); its records are kept in the store"}))
+
+
+def read_gpr(settings: dict, target: dict) -> str:
+    """The project a read of a view without pending records opens: its base generation (`base_master_gpr`). A view that has
+    no store, or none behind the head, reads the head."""
+    if not target.get("lineage") or not durable.exists(_store_path(settings, target)):
+        return target["gpr"]
+    store = load_store(settings, target)
+    return base_master_gpr(settings, target, store) if stale_reason(store, target) else target["gpr"]
 
 
 def heal(settings: dict, target: dict) -> None:
@@ -1077,7 +1136,9 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
     created = None
     try:
         opening = time.monotonic()
-        master = writer.call("open_project", path=target["gpr"])
+        # The generation the store is based on, not the head: a view behind the head is rebuilt on its own base and moves only
+        # by a rebase, whose store is based on the head (gate 9.17 H).
+        master = writer.call("open_project", path=base_master_gpr(settings, target, store))
         phases.add("master_open", opening)
         how = {"rebuilt": False}
         program = None
@@ -1188,17 +1249,16 @@ def _retire(engine: hydra.Engine, gprs: list[str]) -> list[str]:
 
 
 def reader(settings: dict, engine: hydra.Engine, target: dict) -> dict:
-    """The working copy, synchronized with the store, opened read-only for queries."""
+    """The working copy, synchronized with the store, opened read-only for queries.
+
+    A view behind the head is read like any other (gate 9.17 G): a copy that is gone or out of step is rebuilt from the view's
+    own base generation (`_sync`, `base_master_gpr`), never from the head, and a read is never refused with `stale_view`
+    (only a mutation is). A base generation that is no longer available is refused with `base_unavailable`, naming the rebase."""
     from hydralysis.query import open_program
     heal(settings, target)
     store = load_store(settings, target)
     wanted = state_text(state_of(store))
     state = _state(settings, target)
-    if stale_reason(store, target):
-        # A view behind the head keeps answering from the working copy it has, labelled with the generation it came from.
-        if Path(state.get("fork_gpr", "")).is_file():
-            return open_program(engine, state["fork_gpr"], target["program"], target["sha256"])
-        refuse_stale(store, target, "read", settings)
     if state.get("state") != wanted or not Path(state.get("fork_gpr", "")).is_file():
         if heavy(store):
             rebuilding(settings, target)

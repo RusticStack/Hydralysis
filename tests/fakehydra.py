@@ -10,6 +10,7 @@ with small canned results; apply_overlays records renames so reads can see them.
 from __future__ import annotations
 
 import copy
+import hashlib
 import itertools
 import json
 import shutil
@@ -499,7 +500,10 @@ class FakeEngine:
         if entry["live"] is not None:
             entry["saved"] = copy.deepcopy(entry["live"])
             self._persist(project)
-        return {"revision": "saved"}
+            # As the real engine: the revision names the saved content, so two generations never share one (gate 9.17 H).
+            saved = {path: item["saved"] for path, item in project["programs"].items()}
+            project["revision"] = "rev-" + hashlib.sha256(json.dumps(saved, sort_keys=True).encode()).hexdigest()[:12]
+        return {"revision": project["revision"]}
 
     @staticmethod
     def _persist(project):
