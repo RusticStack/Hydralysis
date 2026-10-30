@@ -88,6 +88,29 @@ class FakeViewLeak(LeakChecks, ViewWorld, unittest.TestCase):
         self.assertEqual(answer["function"]["name"], "One")
         self.assertEqual(self.daemon.orphans(), [])
 
+    def test_a_discarded_copy_another_reader_still_holds_is_not_reused(self):
+        """The daemon keeps a discarded program's edits for a reader of another connection, and its marker no longer says
+        what it holds (soak: K8, "overlay state ''"): the view forks a new copy instead of replaying into it."""
+        self.edit("One", A, view="one")
+        target = self.target("one")
+        old = workcopy._state(self.settings, target)["fork_gpr"]
+        other = fakehydra.FakeEngine(self.settings, role="reader", lane="another-process")
+        project = other.call("open_project", path=old)
+        other.call("open_program", project=project["id"], path="/owned.exe")
+        workcopy.release(self.runner.engine, self.settings, target)
+        self.assertNotIn("fork_gpr", workcopy._state(self.settings, target), "the held copy is not the view's any more")
+        self.assertEqual(self.name_of(A, view="one"), "One")
+        self.assertNotEqual(_norm(workcopy._state(self.settings, target)["fork_gpr"]), _norm(old))
+        other.call("close_project", project=project["id"])
+
+    def test_a_discarded_copy_nobody_holds_is_reused(self):
+        self.edit("One", A, view="one")
+        target = self.target("one")
+        old = workcopy._state(self.settings, target)["fork_gpr"]
+        workcopy.release(self.runner.engine, self.settings, target)
+        self.assertEqual(self.name_of(A, view="one"), "One")
+        self.assertEqual(_norm(workcopy._state(self.settings, target)["fork_gpr"]), _norm(old), "replayed into the same fork (D61)")
+
     def test_rebase_cycles_leave_no_superseded_copy_in_the_daemon(self):
         self.edit("Two", B, view="two")
         for cycle in range(4):

@@ -129,6 +129,9 @@ def release(engine: hydra.Engine, settings: dict, target: dict) -> list[str]:
                 writer = writer_for(settings, target, start=not ending)
                 try:
                     done = discard_forks(settings, target, forks, writer)
+                    # a copy the daemon let go of is the saved fork again, and the next use replays into it (D61); one it
+                    # still holds for another reader is not reused
+                    _forget_current(settings, target, _still_open(writer, done["closed"]))
                 finally:
                     writer.reset()
                     query.forget(writer)
@@ -164,6 +167,45 @@ def view_folders(settings: dict, target: dict) -> list[Path]:
     """The folders that hold the view's working copies: its own and the one its rebases build in (`views._shadow`)."""
     own = _directory(settings, target)
     return [own, own.with_name(own.name + "r")]
+
+
+def _still_open(engine: hydra.Engine, gprs: list[str]) -> list[str]:
+    """The GPRS whose program the daemon still holds after a discard: used by a connection (another process's reader) or
+    with unsaved work. A program nobody holds is the saved fork again. Unknown counts as held."""
+    if not gprs:
+        return []
+    try:
+        status = engine.call("status")
+    except (hydra.EngineError, OSError, RuntimeError):
+        return list(gprs)
+    if not isinstance(status.get("programs"), list):
+        return list(gprs)
+    by_id = {item.get("id"): _norm(item["gpr"]) for item in status.get("projects", []) if item.get("gpr")}
+    held = {by_id.get(row.get("project")) for row in status["programs"]
+            if row.get("users") or row.get("writers") or (row.get("unsavedEdits") or 0) > 0}
+    return [gpr for gpr in gprs if _norm(gpr) in held]
+
+
+def _forget_current(settings: dict, target: dict, discarded: list[str], retired: list[str] | None = None) -> None:
+    """After a discard: the state file stops naming a copy that was discarded as the view's current one, so the next use
+    forks a new copy instead of reusing it. A discarded program is not a clean fork: while another connection still reads
+    it the daemon keeps the edits it shows that reader, and its overlay marker no longer says what it holds (gate 9.17
+    soak: K8 and "overlay state ''"). RETIRED, when given, replaces the state's retired list. The caller holds the view lock."""
+    state = _state(settings, target)
+    if not state:
+        return
+    gone = {_norm(gpr) for gpr in discarded if gpr}
+    current = state.get("fork_gpr")
+    changed = dict(state)
+    if retired is not None:
+        changed["retired"] = list(retired)
+    if current and _norm(current) in gone:
+        changed.pop("fork_gpr", None)
+        changed.pop("state", None)
+        if current not in changed.get("retired", []) and Path(current).exists():
+            changed["retired"] = [*changed.get("retired", []), current]
+    if changed != state:
+        write_json(_directory(settings, target) / "state.json", changed)
 
 
 def _forks_on_disk(settings: dict, target: dict) -> list[Path]:
@@ -204,9 +246,7 @@ def retire_copies(settings: dict, target: dict, keep: list[str] = ()) -> dict:
         from hydralysis.query import forget
         writer.reset()
         forget(writer)
-    state = _state(settings, target)
-    if state:
-        write_json(_directory(settings, target) / "state.json", {**state, "retired": retired})
+    _forget_current(settings, target, gone, retired)
     return done
 
 
@@ -267,7 +307,9 @@ def close_superseded_readers(settings: dict, target: dict) -> dict:
         return {"closed": [], "projects": [], "failed": []}
     try:
         with locked(_directory(settings, target) / ".view.lock", DISCARD_LOCK_S, "working copy"):
-            return discard_forks(settings, target, stale)
+            done = discard_forks(settings, target, stale)
+            _forget_current(settings, target, _still_open(hydra.Engine(settings), done["closed"]))
+            return done
     except LockBusy:
         return {"closed": [], "projects": [], "failed": []}   # a sync of the view owns its copies now; it sweeps them
 
