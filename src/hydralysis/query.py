@@ -15,6 +15,8 @@ import re
 import threading
 import time
 import uuid
+import zlib
+from contextlib import contextmanager
 from pathlib import Path
 
 from hydralysis import hydra, lineage, targets, viewgov, views, workcopy
@@ -32,6 +34,17 @@ BUSY_WAIT_MS = 180_000
 # restart; a stale key is reopened once.
 _keys: dict[tuple, dict] = {}
 _keys_guard = threading.Lock()
+# One open per program key at a time: the threads that want the same program wait for the first open and take its row.
+_opening: dict[tuple, threading.Lock] = {}
+# (connection key, daemon program) -> how many reads of this process use it now: the cap's LRU close leaves them open.
+_in_use: dict[tuple, int] = {}
+# Reads on hydra.4 are spread over this many reader connections by view key (`readerLanes`); lane 0 is the shared one.
+# One by default: a lane keeps the generations its views read before a publish open until its own cap closes them, so the
+# daemon would hold up to `maxViewsPerClient` programs per lane (gate 9.17's view-leak test counts them as held).
+READER_LANES = 1
+# shared reader key -> {lane: Engine} of this process (`QueryRunner.reader`).
+_lanes: dict[str, dict[int, object]] = {}
+_ENGINE = hydra.Engine   # the real class, taken at import: a stand-in (a test patches hydra.Engine) keeps one reader
 # Lineages whose orphaned views this process has already listed in a reply (`adoptable`, once per lineage, 4.10).
 _announced: set[str] = set()
 # origin key -> (lineage id or None, when it was looked up): a lineage found stays found, "none" is asked again after a few seconds.
@@ -62,6 +75,19 @@ def open_program(engine: hydra.Engine, gpr: str, program: str, sha256: str, *, w
         if known and not refresh:
             _keys[cache_key] = _keys.pop(cache_key)   # most recently used last: eviction takes the oldest first
             return known
+        gate = _opening.setdefault(cache_key, threading.Lock())
+    with gate:
+        if not refresh:
+            with _keys_guard:
+                known = _keys.get(cache_key)
+                if known:
+                    _keys[cache_key] = _keys.pop(cache_key)
+                    return known
+        return _open(engine, cache_key, gpr, program, sha256, writable, upgrade, share, backup)
+
+
+def _open(engine: hydra.Engine, cache_key: tuple, gpr: str, program: str, sha256: str, writable: bool, upgrade: bool,
+          share: bool, backup: str | None) -> dict:
     wait = hydra.patience_ms(engine, BUSY_WAIT_MS)
     opened = engine.call("open_project", path=gpr, writable=writable, wait=wait)
     fields = {"path": program, "project": opened["id"]}
@@ -100,10 +126,12 @@ def _open_after_eviction(engine: hydra.Engine, cache_key: tuple, fields: dict, w
     The cache keeps every program it opened on a connection, so a process that reads several views (each a working copy)
     reaches hydra.4's cap of `maxViewsPerClient` (4) programs per connection and every later open was refused `busy`. Only
     read-only rows are closed (a writable program may hold unsaved edits); a read that still uses a closed key gets
-    `no_program` and reopens once (`QueryRunner._ask`). When nothing is left to close, the engine's refusal stands."""
+    `no_program` and reopens once (`QueryRunner._ask`). A program a read of this process is using is not closed. When
+    nothing is left to close, the engine's refusal stands."""
     while True:
         with _keys_guard:
-            rows = [(key, value) for key, value in _keys.items() if key[0] == engine.key and key != cache_key and not key[3]]
+            rows = [(key, value) for key, value in _keys.items() if key[0] == engine.key and key != cache_key and not key[3]
+                    and not _in_use.get((engine.key, value["key"]))]
         if not rows:
             raise error
         program = rows[0][1]["key"]
@@ -141,9 +169,42 @@ def _drop_rows_under(engine: hydra.Engine, folders) -> None:
     """Drop ENGINE's rows of programs whose project lies under one of FOLDERS (a reopen joins the same program again)."""
     roots = [Path(folder).resolve() for folder in folders]
     with _keys_guard:
-        for key in [key for key in _keys if key[0] == engine.key
-                    and any(Path(key[1]).resolve().is_relative_to(root) for root in roots)]:
-            _keys.pop(key, None)
+        rows = [(key, value) for key, value in _keys.items() if key[0] == engine.key]
+    # `resolve` asks the file system: outside the guard, and a row replaced meanwhile stays.
+    gone = [(key, value) for key, value in rows if any(Path(key[1]).resolve().is_relative_to(root) for root in roots)]
+    with _keys_guard:
+        for key, value in gone:
+            if _keys.get(key) is value:
+                _keys.pop(key, None)
+
+
+@contextmanager
+def _using(engine: hydra.Engine, program: str):
+    """Mark PROGRAM on ENGINE's connection as used by a read for the block: `_open_after_eviction` does not close it."""
+    mark = (engine.key, program)
+    with _keys_guard:
+        _in_use[mark] = _in_use.get(mark, 0) + 1
+    try:
+        yield
+    finally:
+        with _keys_guard:
+            if _in_use[mark] > 1:
+                _in_use[mark] -= 1
+            else:
+                del _in_use[mark]
+
+
+def reader_lanes(settings: dict) -> int:
+    """How many reader connections a hydra.4 process spreads its reads over (`readerLanes`, 1..64, default READER_LANES)."""
+    value = settings.get("readerLanes", settings.get("reader_lanes"))
+    return value if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 64 else READER_LANES
+
+
+def readers(engine: hydra.Engine) -> list:
+    """ENGINE and the reader lanes this process made beside it (`QueryRunner.reader`): every connection whose rows a view's
+    release or a stop must look at."""
+    with _keys_guard:
+        return [engine, *(lane for lane in _lanes.get(engine.key, {}).values() if lane.key != engine.key)]
 
 
 def forget_role(engine: hydra.Engine) -> None:
@@ -195,6 +256,25 @@ class QueryRunner:
 
     def target(self, name: str) -> dict:
         return targets.resolve(self.settings, name)
+
+    def reader(self, target: dict):
+        """The connection that reads TARGET. On hydra.4 a connection holds at most `maxViewsPerClient` programs and one
+        reader is shared by every thread, so reads are spread over `readerLanes` connections by view key: a view always reads
+        on the same one, and lane 0 is the shared connection. hydra.2/3 (the pool of 7.6) and a stand-in keep the one."""
+        lanes = reader_lanes(self.settings)
+        engine = self.engine
+        if lanes < 2 or type(engine) is not _ENGINE or engine.role != "reader" or engine.lane \
+                or self._native_deadline(0) is None:
+            return engine
+        lane = zlib.crc32(str(target.get("key") or target["name"]).encode("utf-8")) % lanes
+        if lane == 0:
+            return engine
+        with _keys_guard:
+            known = _lanes.setdefault(engine.key, {}).get(lane)
+            if known is None or known.settings is not self.settings:
+                known = _lanes[engine.key][lane] = type(engine)(self.settings, role=engine.role, start=engine.start,
+                                                                lane="shard-%d" % lane)
+            return known
 
     def program_for(self, target: dict, *, for_overlays: bool = True, engine=None) -> dict:
         """The master's read-only view, or the working copy that holds the view's overlays (never for a master read).
@@ -617,12 +697,14 @@ class QueryRunner:
         expected_state = None if selected.get("master_read") else workcopy.expected_state(self.settings, selected)
         for attempt in (0, 1):
             pool = self._pool()
+            reader = self.engine if pool is not None else self.reader(selected)
             if pool is None:
-                program = self.program_for(selected)
+                program = self.program_for(selected, engine=reader)
             try:
                 if pool is None:
-                    response, raw = run_script(self.engine, program, request, timeout_s, self.requests,
-                                               deadline_s=self._native_deadline(timeout_s))
+                    with _using(reader, program["key"]):
+                        response, raw = run_script(reader, program, request, timeout_s, self.requests,
+                                                   deadline_s=self._native_deadline(timeout_s))
                 else:
                     # One attempt, one entry: the opens and the script run on it with one clock (7.6). A retry takes another.
                     with pool.attempt(self._deadline(timeout_s)) as entry:
@@ -636,9 +718,9 @@ class QueryRunner:
                         # One program is gone (the LRU close of the view cap closed it, or its project was closed): only its
                         # rows go. Forgetting every row would hide programs the connection still has open from that LRU close,
                         # and the cap (maxViewsPerClient) would then refuse every open with nothing left to close.
-                        _drop_program(self.engine, program["key"])
+                        _drop_program(reader, program["key"])
                     else:
-                        forget(self.engine)   # the entry that failed was retired by the pool and its rows dropped with it
+                        forget(reader)   # the entry that failed was retired by the pool and its rows dropped with it
                     continue
                 raise
             state = response.get("overlay_state") or ""
@@ -655,7 +737,8 @@ class QueryRunner:
                     # The copies the repair replaced were closed by it (`workcopy.discard_forks`); the rows of the view's copies
                     # are dropped so the next open reads the repaired one afresh. The connection's other rows stay: they are
                     # programs it still has open, and the LRU close of the view cap must still see them.
-                    _drop_rows_under(self.engine, workcopy.view_folders(self.settings, selected))
+                    for holder in readers(self.engine):
+                        _drop_rows_under(holder, workcopy.view_folders(self.settings, selected))
                     continue
                 raise RuntimeError("working copy answers with overlay state %r, expected %r; refused rather than "
                                    "answer from the wrong overlay version" % (state, expected_state))
@@ -707,9 +790,10 @@ class QueryRunner:
         # Read the pool's entries before taking `_keys_guard`: the pool takes its own lock first and then (through
         # `on_retire`) the row guard, so the other order would be a lock-order inversion.
         owned = pool.owned_keys() if pool is not None else set()
+        holders = {holder.key: holder for holder in readers(self.engine)}
 
         def belongs(key):
-            if (key[0] != self.engine.key and key[0] not in owned) \
+            if (key[0] not in holders and key[0] not in owned) \
                     or key[2].lstrip("/") != selected["program"].lstrip("/"):
                 return False
             if key[1] in (master, adopted) and selected.get("view", "shared") == "shared":
@@ -731,11 +815,11 @@ class QueryRunner:
                 by_connection.setdefault(key[0], []).append((key, value))
             done = False
             for connection, rows in by_connection.items():
-                holder = self.engine if connection == self.engine.key else (pool.entry_for(connection) if pool is not None else None)
+                holder = holders.get(connection) or (pool.entry_for(connection) if pool is not None else None)
                 try:
                     if holder is None:
                         deferred += 1   # a checked-out or retired entry closes it on its return or through the gate
-                    elif holder is self.engine:
+                    elif connection in holders:
                         holder.call("close_program", program=program)
                         closed += 1
                         done = True

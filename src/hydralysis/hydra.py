@@ -231,8 +231,20 @@ def inspect_engine(directory: str | Path, allow_unpinned: bool = False) -> dict:
     return {**report, "ready": True, "pinned": release == RELEASE}
 
 
+# (path as given, allow_unpinned) -> (mtime_ns, size, module): the stamps of a file that has not changed are not read again.
+_CLIENTS: dict[tuple, tuple] = {}
+
+
 def load_client(path: str | Path, allow_unpinned: bool = False):
     """Import the release's ghidra_session.py from its install, after checking its stamps."""
+    memo = (str(path), bool(allow_unpinned))
+    try:
+        found = os.stat(path)
+    except OSError:
+        found = None
+    known = _CLIENTS.get(memo)
+    if found is not None and known is not None and known[:2] == (found.st_mtime_ns, found.st_size):
+        return known[2]
     path = Path(path).resolve()
     if not path.is_file():
         raise ValueError("Hydra client missing: %s; run backend install" % path)
@@ -247,12 +259,14 @@ def load_client(path: str | Path, allow_unpinned: bool = False):
         raise ValueError("Hydra client %s is release %s / client %s; this Hydralysis pins %s / %s"
                          % (path, stamps["HYDRA_RELEASE"], stamps["CLIENT_VERSION"], RELEASE, CLIENT_VERSION))
     name = "rusticre_hydra_client_" + hashlib.sha256(str(path).encode()).hexdigest()[:12]
-    if name in sys.modules:
-        return sys.modules[name]
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
+    module = sys.modules.get(name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    if found is not None:
+        _CLIENTS[memo] = (found.st_mtime_ns, found.st_size, module)
     return module
 
 
@@ -358,6 +372,11 @@ class Engine:
     _connections: dict[str, object] = {}
     _used: dict[str, float] = {}  # connection key -> time.monotonic() when it last carried a call
     _guard = threading.Lock()
+    # One connect at a time per key (the first may start the daemon). `_guard` is never held across a connect, so a thread
+    # of another key, or one whose connection is up, does not wait for a daemon start.
+    _connecting: dict[str, threading.Lock] = {}
+    # `sync_scripts` and `write_daemon_config` write fixed paths: connects of different keys take turns at them.
+    _preparing = threading.Lock()
 
     def __init__(self, settings: dict, role: str = "reader", start: bool = True, lane: str = ""):
         # Reads use one long-lived connection and run contained (in parallel, rolled back).
@@ -379,8 +398,9 @@ class Engine:
 
     def _connect(self):
         module = self.module()
-        sync_scripts(self.settings)
-        write_daemon_config(self.settings)
+        with self._preparing:
+            sync_scripts(self.settings)
+            write_daemon_config(self.settings)
         try:
             session = module.connect(client=_IDENTITY["client"], harness=_IDENTITY["harness"],
                                      ghidra=str(self.engine_dir), state=str(state_dir(self.settings)), instance=INSTANCE,
@@ -448,8 +468,16 @@ class Engine:
     def session(self):
         with self._guard:
             session = self._connections.get(self.key)
+            if session is not None and not getattr(session, "_closed", False):
+                return session
+            gate = self._connecting.setdefault(self.key, threading.Lock())
+        with gate:
+            with self._guard:
+                session = self._connections.get(self.key)
             if session is None or getattr(session, "_closed", False):
-                session = self._connections[self.key] = self._connect()
+                session = self._connect()   # the library's start lock orders daemon starts between keys and processes
+                with self._guard:
+                    self._connections[self.key] = session
             return session
 
     def connected(self) -> bool:
