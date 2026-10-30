@@ -613,6 +613,7 @@ class Engine:
 # ---- deadlines on hydra.2/3: the abandon helper, the pool of entries, the leave gate (PROTOCOL-3.md 7.6) ----------
 
 DEADLINE_S = 60.0          # the deadline of one attempt (7.6), not of each call
+CONNECT_FLOOR_S = 5.0      # the least time a new pool connection gets for its hello (Pool._connect_within)
 DEADLINE_GRACE_S = 5.0     # after `cancel`, before the connection is abandoned
 USER_CAP = 8               # abandoned user calls at a time (unmeasured policy, 7.6 step 5)
 PROBE_CAP = 3              # abandoned supervisor probes: the number of consecutive misses that make a wedge (7.2)
@@ -975,7 +976,10 @@ class Pool:
         library (hydra.2/3) waits for it with no timeout: a suspended or wedged daemon still accepts the TCP connection
         (the backlog), so the wait never ended and a supervisor probe hung for good instead of counting a miss (gate 9.8,
         test_supervisor.RealPolicy on hydra.3). The connection is made in a worker thread; past the deadline the caller gets
-        `deadline_exceeded` and a connection that arrives later is closed by that thread, never handed out."""
+        `deadline_exceeded` and a connection that arrives later is closed by that thread, never handed out. The bound is at
+        least CONNECT_FLOOR_S: the attempt's own clock starts after the connection (`Entry.begin`), as before, and a short
+        attempt deadline must not turn a slow but healthy hello under load into a failure."""
+        deadline_s = max(deadline_s, CONNECT_FLOOR_S)
         lock = threading.Lock()
         state: dict = {}
         done = threading.Event()
@@ -1066,7 +1070,7 @@ class Pool:
                         dead.append(entry)
                 if chosen is None and not dead:
                     if len(self._live) < self.size:
-                        chosen = self._new(deadline_s=max(0.0, end - time.monotonic()))
+                        chosen = self._new(deadline_s=deadline_s)
                         self._live.add(chosen)
                         chosen.begin(deadline_s)
                     else:

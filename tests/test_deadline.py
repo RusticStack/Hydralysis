@@ -240,6 +240,9 @@ class Mechanism(Base):
         patcher = patch.object(self.engine, "connect_entry", connect)
         patcher.start()
         self.addCleanup(patcher.stop)
+        floor = patch.object(hydra, "CONNECT_FLOOR_S", 0.3)   # the production floor is 5 s
+        floor.start()
+        self.addCleanup(floor.stop)
         return gate, made, patcher
 
     def test_a_probe_whose_connection_gets_no_hello_misses_within_its_deadline(self):
@@ -263,6 +266,19 @@ class Mechanism(Base):
         self.assertLess(time.monotonic() - started, 3.0)
         gate.set()
         self.assertTrue(until(lambda: made and made[0]._closed, 5.0))
+
+    def test_a_short_attempt_deadline_does_not_cut_a_slow_but_healthy_hello(self):
+        # the attempt's clock starts after the connection; the connection gets at least CONNECT_FLOOR_S (an attempt of
+        # 0.2 s under load failed in its connect: test_deadline.ProductionWiring, gate 9.8 final run)
+        original = self.engine.connect_entry
+
+        def slow():
+            time.sleep(0.5)
+            return original()
+        with patch.object(self.engine, "connect_entry", slow):
+            entry = self.pool.acquire(0.2)
+        self.assertGreater(entry.remaining(), 0.0, "the attempt's 0.2 s start after the connection")
+        self.pool.release(entry)
 
     def test_an_entrys_first_use_sends_both_opens_and_a_replacement_has_a_new_key(self):
         self.daemon.scoped = True
