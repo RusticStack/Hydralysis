@@ -8,7 +8,7 @@ Nothing here is a tag: a release is tagged by the owner.
 
 This release (0.6.0, label OD11) pins Hydra Engine `12.3-hydra.4` (protocol 3), released 2026-10-30. Hydralysis
 still speaks protocol 2 to a released hydra.3 engine when `hydra_allow_unpinned` is set (the hydra.3 degraded set
-below). Not tagged yet: the pin needs the SHA-256 of the published engine zip, written by `tools/bump_hydra.py`.
+below). The pin is the published engine zip, SHA-256 `f0f2844c…`, written by `tools/bump_hydra.py`.
 
 ### Changes in 0.6.0
 

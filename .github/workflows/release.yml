@@ -23,12 +23,46 @@ concurrency:
 # All four SHAs checked against their tags with `gh api repos/<action>/git/ref/tags/<tag>` on 2026-10-30.
 
 jobs:
-  # The unit and engine jobs of tests.yml, the same as on main; the release build waits for both.
+  # The unit and engine suites ran locally (unit + real-engine against the pinned engine) on the commit named in
+  # .github/local-test-record.json. They are skipped here when every change from that commit to this one is a
+  # document (*.md), a workflow file (.github/) or the record itself; any other change runs tests.yml as before.
+  local:
+    runs-on: ubuntu-latest
+    outputs:
+      tested: ${{ steps.rec.outputs.tested }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - name: Check the local test record
+        id: rec
+        shell: bash
+        run: |
+          rec=.github/local-test-record.json
+          tested=false
+          if [ -f "$rec" ]; then
+            commit=$(python3 -c "import json; print(json.load(open('$rec'))['testedCommit'])")
+            if git merge-base --is-ancestor "$commit" HEAD; then
+              other=$(git diff --name-only "$commit" HEAD | grep -v -E '\.md$|^\.github/' || true)
+              if [ -z "$other" ]; then tested=true; else echo "changed since $commit, beyond documents:"; echo "$other"; fi
+            else
+              echo "::warning::$commit in $rec is not an ancestor of this commit"
+            fi
+            cat "$rec" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "tested=$tested" >> "$GITHUB_OUTPUT"
+          echo "Suites covered by the local record: $tested" >> "$GITHUB_STEP_SUMMARY"
+
+  # The unit and engine jobs of tests.yml, the same as on main; the release build waits for both unless the local
+  # record covers this commit.
   tests:
+    needs: local
+    if: needs.local.outputs.tested != 'true'
     uses: ./.github/workflows/tests.yml
 
   build:
-    needs: tests
+    needs: [local, tests]
+    if: always() && needs.local.result == 'success' && (needs.tests.result == 'success' || needs.tests.result == 'skipped')
     runs-on: windows-latest
     timeout-minutes: 45
     # The draft release needs write access; a dry run never uses it.
@@ -57,6 +91,7 @@ jobs:
           fi
           echo "VERSION=$version" >> "$GITHUB_ENV"
       - name: Unit tests
+        if: needs.local.outputs.tested != 'true'
         env:
           HYDRALYSIS_TEST_ROOT: ${{ runner.temp }}\hydralysis-tests
         run: python -m unittest discover -s tests

@@ -1,6 +1,6 @@
 [project]
 name = "hydralysis"
-version = "0.6.0.dev0"
+version = "0.6.0"
 description = "Small reverse-engineering server: PE evidence, analysis setup, reusable saved-project queries and verified runtime sessions."
 readme = "README.md"
 requires-python = ">=3.13"

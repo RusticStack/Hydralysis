@@ -22,12 +22,13 @@ def read(rel: str) -> str:
 
 
 def workflow_steps(text: str) -> list[dict]:
-    """The steps of release.yml's single job: name, uses, if, shell, continue-on-error, with, and run lines.
+    """The steps of release.yml's build job: name, uses, if, shell, continue-on-error, with, and run lines.
 
     Enough YAML for this file: a step starts with `- ` at the steps' indent; `run: |` collects the deeper lines.
     """
     lines = text.splitlines()
-    start = next(i for i, line in enumerate(lines) if line.strip() == "steps:")
+    build = next(i for i, line in enumerate(lines) if line == "  build:")
+    start = next(i for i, line in enumerate(lines) if i > build and line.strip() == "steps:")
     steps: list[dict] = []
     item_indent = None
     i = start + 1
@@ -162,7 +163,8 @@ class WorkflowTests(unittest.TestCase):
 
     def test_runs_unit_tests_and_installs_the_wheel(self):
         unit_i, unit = self.step("Unit tests")
-        self.assert_unconditional(unit)
+        # skipped only when .github/local-test-record.json covers this commit (the local job)
+        self.assertEqual(unit.get("if"), "needs.local.outputs.tested != 'true'")
         self.assertEqual(live(unit["run"]), ["python -m unittest discover -s tests"])
         build_i, _ = self.step("Build sdist and wheel")
         self.assertLess(unit_i, build_i)
@@ -189,8 +191,12 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('--notes-file "$RUNNER_TEMP/notes.md"', self.text)
 
     def test_the_release_waits_for_the_unit_and_engine_jobs(self):
-        self.assertRegex(self.text, r"\n  tests:\n    uses: \./\.github/workflows/tests\.yml\n")
-        self.assertRegex(self.text, r"\n  build:\n    needs: tests\n")
+        # tests.yml runs unless .github/local-test-record.json covers this commit (only documents or workflows changed)
+        self.assertRegex(self.text, r"\n  tests:\n    needs: local\n    if: needs\.local\.outputs\.tested != 'true'\n"
+                                    r"    uses: \./\.github/workflows/tests\.yml\n")
+        self.assertRegex(self.text, r"\n  build:\n    needs: \[local, tests\]\n")
+        self.assertIn("needs.tests.result == 'success' || needs.tests.result == 'skipped'", self.text)
+        self.assertIn(r"grep -v -E '\.md$|^\.github/'", self.text)
         tests = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
         self.assertIn("\n  workflow_call:\n", tests)
         self.assertRegex(tests, r"\n  unit:\n")

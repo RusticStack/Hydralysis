@@ -49,12 +49,12 @@ _BASE = "https://github.com/RusticStack/hydra-engine/releases/download/v" + RELE
 # publishes the release and re-runs `tools/bump_hydra.py --release 12.3-hydra.4 --dist <published files> --write`.
 # Until then the next line (the one `bump_hydra.py` rewrites) is NOT true: the digests and sizes are those of the stand-in
 # dist, not a published SHA256SUMS, and nothing was checked after a download.
-# SHA256SUMS of the release, observed 2026-10-29 and checked after download.
+# SHA256SUMS of the release, observed 2026-10-30 and checked after download.
 ASSETS = {
     "engine": {"url": _BASE + "hydra-engine-" + RELEASE + "-win_x86_64.zip",
-               "sha256": "7b5a0bfe98449d3397e8804fe0e8b38112527be94286356152db34e46b9e2ea8", "size": 338530},
+               "sha256": "f0f2844ca32b702c3fe711adbf6c7d4743ddac5097073691965faaabf7a8cef0", "size": 379241326},
     "client": {"url": _BASE + "hydra-client-" + RELEASE + ".zip",
-               "sha256": "5a8bc6d708f6f8e3d3f5f3bc15a419afb090ef15baf38fadb240d723f03bb268", "size": 34137},
+               "sha256": "6f086aa2a5a91b043f856d33ee851da6d485cc45ba17925fe5709536dfac7406", "size": 45187},
 }
 SESSION_MODULE = Path("Ghidra", "Features", "HeadlessSession")
 
