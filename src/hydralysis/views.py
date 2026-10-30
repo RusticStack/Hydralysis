@@ -722,11 +722,18 @@ def queue_status(settings: dict, lineage_id: str, csid: str | None = None) -> di
 # ---- sealing a changeset (the caller's half) ---------------------------------------------------------------------
 
 def ensure_lineage(settings: dict, selected: dict) -> dict:
-    """The lineage of SELECTED, created at the first publish. Creation is serialised: 24 first publishers make one lineage."""
-    from hydralysis.locks import locked
-    lineages = lineage.lineages_root(settings)
-    with locked(lineages / ".ensure.lock", 60, what="lineage creation"):
-        return lineage.ensure(settings, {**selected, "origin_key": selected.get("origin_key") or selected["key"]})
+    """The lineage of SELECTED, created at the first publish. Creation is serialised per origin key by `lineage.ensure` (24 first
+    publishers make one lineage); a lineage that already exists, with its generation 0 registered, is read without any lock."""
+    origin = selected.get("origin_key") or selected["key"]
+    link = selected.get("lineage") or {}
+    if link.get("id") and link.get("origin_key", origin) == origin:
+        try:
+            record = lineage.load(settings, link["id"])
+            if record.get("origin_key") == origin and lineage.current_log(settings, link["id"]).last() is not None:
+                return record
+        except (lineage.LineageError, ValueError, OSError):
+            pass  # a stale or damaged registry row: the locked path below decides
+    return lineage.ensure(settings, {**selected, "origin_key": origin})
 
 
 def seal_changeset(settings: dict, selected: dict, options: dict) -> dict:
@@ -975,30 +982,39 @@ def _append_line(settings: dict, lineage_id: str, line: dict) -> dict:
     durable._die()
 
 
-def _acquire_commit_lock(settings: dict, lineage_id: str) -> LaneLock:
-    """A publish and a Y2 commit both append generations: they take turns on `.commit.lock`. The wait is bounded, and a
-    wait that runs out is not a failure of the changeset."""
-    lock = LaneLock(str(lineage.commit_lock_path(settings, lineage_id)))
-    deadline = time.monotonic() + COMMIT_WAIT_S
-    while not lock.acquire():
-        if time.monotonic() >= deadline:
-            raise PublishFailure("commit_busy", "a commit holds this lineage's commit lock; the changesets stay queued")
-        time.sleep(0.05)
-    return lock
-
-
 def _build(settings: dict, lineage_id: str, engine, batch_ids: list[str], timeout_s: int) -> dict:
-    """Steps 3 to 5 of 4.10 for one batch. Returns {"generation": n|None, "csids": [...]}."""
+    """Steps 3 to 5 of 4.10 for one batch. Returns {"generation": n|None, "csids": [...]}.
+
+    A publish and a Y2 commit both append generations: they take turns on `.commit.lock`. The leader queues for it in arrival
+    order (locks.locked) instead of polling, so a commit that releases and asks again cannot overtake it. The wait is bounded,
+    and a wait that runs out is not a failure of the changeset. The decided changesets are settled in their views after the
+    commit lock is released, without waiting for a busy view (its owner's job, or its next call, settles it)."""
     started = time.monotonic()
-    commit_lock = _acquire_commit_lock(settings, lineage_id)
+    settles: list[tuple] = []
     try:
-        # A commit that ran while this leader waited may have moved the head: everything below reads it afresh.
-        return _build_locked(settings, lineage_id, engine, batch_ids, timeout_s, started)
-    finally:
-        commit_lock.release()
+        with ExitStack() as stack:
+            try:
+                stack.enter_context(locked(lineage.commit_lock_path(settings, lineage_id), COMMIT_WAIT_S, what="commit lock"))
+            except LockBusy as busy:
+                raise PublishFailure("commit_busy", "a commit holds this lineage's commit lock; the changesets stay queued") from busy
+            # A commit that ran while this leader waited may have moved the head: everything below reads it afresh.
+            result = _build_locked(settings, lineage_id, engine, batch_ids, timeout_s, started, settles)
+    except (durable.FaultInjected, commits.Crash):
+        raise  # a simulated kill: nothing more is written, the next leader or the view's next call settles
+    except Exception:
+        _settle_all(settings, lineage_id, settles)  # the changesets decided before the failure (their results are written)
+        raise
+    _settle_all(settings, lineage_id, settles)
+    return result
 
 
-def _build_locked(settings: dict, lineage_id: str, engine, batch_ids: list[str], timeout_s: int, started: float) -> dict:
+def _settle_all(settings: dict, lineage_id: str, settles: list[tuple]) -> None:
+    for cs, generation, ids in settles:
+        settle_one(settings, lineage_id, cs, generation, ids, wait_s=0)
+
+
+def _build_locked(settings: dict, lineage_id: str, engine, batch_ids: list[str], timeout_s: int, started: float,
+                  settles: list[tuple]) -> dict:
     head = lineage.head(settings, lineage_id)
     if head["corrupt"]:
         raise PublishFailure("lineage_corrupt", "CURRENT.log has a damaged line in the middle (offset %s); publishes are refused until "
@@ -1063,10 +1079,10 @@ def _build_locked(settings: dict, lineage_id: str, engine, batch_ids: list[str],
                     "converged": item["converged"], "in_master": item["in_master"], "unverified": item["unverified"],
                     "build_ms": int((time.monotonic() - started) * 1000)})
         if item["outcome"] != "conflict":
-            settle_one(settings, lineage_id, item["cs"], None, sorted(item["converged"] + item["in_master"]))
+            settles.append((item["cs"], None, sorted(item["converged"] + item["in_master"])))
     if not accepted:
         return {"generation": None, "csids": [item["cs"]["csid"] for item in results]}
-    return _publish_candidate(settings, lineage_id, engine, head, target, accepted, timeout_s, started)
+    return _publish_candidate(settings, lineage_id, engine, head, target, accepted, timeout_s, started, settles)
 
 
 def reserve_generation(settings: dict, lineage_id: str) -> int:
@@ -1088,7 +1104,7 @@ def reserve_generation(settings: dict, lineage_id: str) -> int:
 
 
 def _publish_candidate(settings: dict, lineage_id: str, engine, head: dict, target: dict, accepted: list[dict], timeout_s: int,
-                       started: float) -> dict:
+                       started: float, settles: list[tuple]) -> dict:
     first = accepted[0]["cs"]["csid"]
     generation = reserve_generation(settings, lineage_id)
     candidate_folder = lineage.generation_dir(settings, lineage_id, generation)
@@ -1193,7 +1209,7 @@ def _publish_candidate(settings: dict, lineage_id: str, engine, head: dict, targ
                         "spot_check": spot})
             _point("after_done")
         for item in accepted:
-            settle_one(settings, lineage_id, item["cs"], generation, by_changeset[item["cs"]["csid"]]["ids"])
+            settles.append((item["cs"], generation, by_changeset[item["cs"]["csid"]]["ids"]))
         return {"generation": generation, "csids": [item["cs"]["csid"] for item in accepted], "manifestSha256": manifest_sha}
     except (durable.FaultInjected, commits.Crash):
         raise  # a simulated kill: nothing more is written, the next leader decides from the files
@@ -1215,17 +1231,18 @@ def _publish_candidate(settings: dict, lineage_id: str, engine, head: dict, targ
 # ---- settling a view ---------------------------------------------------------------------------------------------
 
 
-def settle_one(settings: dict, lineage_id: str, cs: dict, generation: int | None, ids: list[str]) -> bool:
-    """Finalize one decided changeset in the view that sealed it (best effort: a view that is busy settles at its next call)."""
+def settle_one(settings: dict, lineage_id: str, cs: dict, generation: int | None, ids: list[str], wait_s: float | None = None) -> bool:
+    """Finalize one decided changeset in the view that sealed it (best effort: a view that is busy settles at its next call).
+    WAIT_S bounds the wait for the view's lock (default workcopy.SYNC_LOCK_S; the leader passes 0)."""
     try:
         target = workcopy.with_view(targets.resolve(settings, cs["target"]["name"]), "" if cs["view"] == "shared" else cs["view"])
-        return finalize_changeset(settings, target, lineage_id, cs["csid"], generation, ids, cs.get("store_revision"))
+        return finalize_changeset(settings, target, lineage_id, cs["csid"], generation, ids, cs.get("store_revision"), wait_s=wait_s)
     except (RuntimeError, LockBusy, OSError, ValueError, durable.StoreCorrupt):
         return False
 
 
 def finalize_changeset(settings: dict, selected: dict, lineage_id: str, csid: str, generation: int | None, ids: list[str],
-                       snapshot: int | None) -> bool:
+                       snapshot: int | None, wait_s: float | None = None) -> bool:
     """In one atomic store write of the sealing view: the decided records become a commit entry of the new generation (the
     previous live entry is archived, as in 4.2) and the base moves to it; with no generation (the values were already there)
     they are dropped. Idempotent by `csid`. Returns whether anything was written.
@@ -1235,7 +1252,7 @@ def finalize_changeset(settings: dict, selected: dict, lineage_id: str, csid: st
     views' publishes the leader decided first) were never classified against them. When such records remain and the jump crosses
     another generation, the base stays: the view is then stale, `rebase` classifies the remainder against the head (a conflict is
     listed and resolvable), and until then it answers from the working copy it has."""
-    with workcopy.view_lock(settings, selected):
+    with workcopy.view_lock(settings, selected, wait_s):
         store = workcopy.load_store(settings, selected)
         if any(item.get("csid") == csid for item in store["changesets"]):
             return False
@@ -1326,6 +1343,7 @@ def run_publish_job(settings: dict, selected: dict, options: dict, engine=None, 
                                          "changeset now: it is published when any later publish on this lineage (from any view) leads "
                                          "the queue, so publish again once the cause is gone")
         if result is not None:
+            _settle_own(settings, lineage_id, csid, result)
             return outcome_of(result, _revision_of(settings, selected))
         info = pending_info(settings, lineage_id, csid)
         if info["state"] == "done":
@@ -1338,6 +1356,24 @@ def run_publish_job(settings: dict, selected: dict, options: dict, engine=None, 
             raise ViewError("publish_wait_expired", "the changeset was not decided within publish_wait_s; it stays queued and is "
                             "published when a leader reaches it", csid=csid, **pending_info(settings, lineage_id, csid))
         time.sleep(POLL_S)
+
+
+def _settle_own(settings: dict, lineage_id: str, csid: str, result: dict) -> bool:
+    """The job of a decided changeset settles it in its own view before it reports the view's revision: the leader settles
+    without waiting for a busy view, and the job's caller expects the revision after the settle. Idempotent by csid."""
+    if result.get("outcome") in ("conflict", "candidate_failed", "corrupt_changeset"):
+        return False
+    if result.get("generation") is not None:
+        ids = sorted(ident for ident, kind in (result.get("record_outcomes") or {}).items() if kind != "conflict")
+    elif "settled" in result:
+        ids = sorted(result["settled"])
+    else:
+        return False
+    try:
+        cs = read_changeset(settings, lineage_id, csid)
+    except (durable.StoreCorrupt, OSError, ValueError):
+        return False
+    return settle_one(settings, lineage_id, cs, result.get("generation"), ids)
 
 
 def _revision_of(settings: dict, selected: dict) -> int | None:

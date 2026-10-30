@@ -180,15 +180,17 @@ def replace_file(source, destination) -> None:
             delay = min(delay * 2, RETRY_MAX_DELAY_S)
 
 
-def _write_file(path: Path, data: bytes) -> None:
+def _write_file(path: Path, data: bytes, sync: bool = True) -> None:
     with open(path, "xb") as handle:
         handle.write(data)
         handle.flush()
-        os.fsync(handle.fileno())
+        if sync:
+            os.fsync(handle.fileno())
 
 
-def atomic_write(path, data: bytes, *, point: str = "atomic") -> None:
-    """Write bytes so that a reader sees the old file or the new one, never a mixture."""
+def atomic_write(path, data: bytes, *, point: str = "atomic", sync: bool = True) -> None:
+    """Write bytes so that a reader sees the old file or the new one, never a mixture. SYNC=False skips the fsync of the new
+    bytes: only for a copy that is never the sole valid version (the `.bak` of write_sealed)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
@@ -201,7 +203,7 @@ def atomic_write(path, data: bytes, *, point: str = "atomic") -> None:
                 handle.flush()
                 os.fsync(handle.fileno())
             _die()
-        _write_file(temporary, data)
+        _write_file(temporary, data, sync)
         fault(point + ".before_replace")
         replace_file(temporary, path)
         fault(point + ".after_replace")
@@ -324,7 +326,9 @@ def _keep_previous(path: Path) -> None:
     if kind in ("sealed", "unsealed"):
         backup = backup_path(path)
         if _read(backup, None) != raw:
-            atomic_write(backup, raw, point="backup")
+            # Not fsynced (H16): the file it copies is valid and stays on disk until the new version, which is fsynced
+            # before its replace (O2), takes its place. A power loss can leave this copy torn, never the record.
+            atomic_write(backup, raw, point="backup", sync=False)
         fault("sealed.after_backup")
     elif kind == "invalid" and raw:
         # Never let a bad file replace the good previous version; keep it for review.

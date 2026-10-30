@@ -4,6 +4,7 @@ import ast
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import threading
@@ -184,6 +185,22 @@ class SealedJson(Base):
             json.dumps(body, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")).hexdigest()})
         self.assertEqual(durable.read_sealed(path), {"gen": 2, "text": "café", "n": 1.5})
         self.assertEqual(durable.read_sealed(durable.backup_path(path))["gen"], 1)
+
+    def test_a_write_over_a_valid_record_fsyncs_the_record_only_not_its_backup(self):
+        path = self.root / "r.json"
+        durable.write_sealed(path, {"gen": 1})
+        synced = []
+        real_fsync = os.fsync
+
+        def fsync(fd):
+            if stat.S_ISREG(os.fstat(fd).st_mode):  # a directory fsync (POSIX replace) is not a file's
+                synced.append(fd)
+            return real_fsync(fd)
+
+        with patch("hydralysis.durable.os.fsync", side_effect=fsync):
+            durable.write_sealed(path, {"gen": 2})
+        self.assertEqual(len(synced), 1)  # the new version, before its replace (O2); the .bak copy is not forced (H16)
+        self.assertEqual((durable.read_sealed(path)["gen"], durable.read_sealed(durable.backup_path(path))["gen"]), (2, 1))
 
     def test_zero_length_returns_the_previous_version_not_empty(self):
         path = self.write_two()

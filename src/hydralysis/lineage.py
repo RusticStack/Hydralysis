@@ -20,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -352,6 +353,49 @@ def verify_head(settings: dict, lineage_id: str) -> dict:
     return {"ok": result["ok"], "generation": top["gen"], "problems": result["problems"]}
 
 
+TAMPERED_CACHE_S = 600
+# folder -> (signature, checked_at, problems) of its last full verify_manifest (see _verified_problems).
+_TAMPER_CHECKS: dict[str, tuple] = {}
+_TAMPER_GUARD = threading.Lock()
+
+
+def _tree_signature(folder: Path) -> tuple | None:
+    """What a re-hash of FOLDER depends on, without reading the files: the manifest file's hash and, for every content file
+    (the set tree_files hashes), its path, size, modification time and file id. None when the folder cannot be listed."""
+    try:
+        rows = []
+        for path in Path(folder).rglob("*"):
+            if path.is_file() and not _excluded(path):
+                info = path.stat()
+                rows.append((path.relative_to(folder).as_posix(), info.st_size, info.st_mtime_ns, info.st_ino))
+    except OSError:
+        return None
+    return manifest_file_sha256(folder), tuple(sorted(rows))
+
+
+def _verified_problems(settings: dict, folder: Path) -> list[str]:
+    """verify_manifest(FOLDER)["problems"], re-hashed only when the folder changed (H17). The leader checks every published
+    generation before each publish: a sealed generation is read-only, so its files keep their size, time and id, and the
+    signature stands in for the re-hash. A full re-hash still runs at least every `tampered_cache_s` seconds (0: every call)."""
+    limit = settings.get("tampered_cache_s", TAMPERED_CACHE_S)
+    limit = limit if isinstance(limit, (int, float)) and not isinstance(limit, bool) and limit >= 0 else TAMPERED_CACHE_S
+    key = str(Path(folder).resolve()).lower()
+    signature = _tree_signature(folder) if limit else None
+    if signature is not None:
+        with _TAMPER_GUARD:
+            cached = _TAMPER_CHECKS.get(key)
+        if cached and cached[0] == signature and time.monotonic() - cached[1] < limit:
+            return cached[2]
+    checked_at = time.monotonic()
+    check = verify_manifest(folder)
+    problems = [] if check["ok"] else check["problems"]
+    # The signature is taken again after the hash: a file that changed while it was hashed does not leave a stale entry.
+    if signature is not None and _tree_signature(folder) == signature:
+        with _TAMPER_GUARD:
+            _TAMPER_CHECKS[key] = (signature, checked_at, problems)
+    return problems
+
+
 def tampered(settings: dict, lineage_id: str) -> list[dict]:
     """Published generations whose folder no longer matches its manifest (4.7: a process wrote into one)."""
     found = []
@@ -361,9 +405,9 @@ def tampered(settings: dict, lineage_id: str) -> list[dict]:
             seen.add(record["gen"])
             folder = project_folder_of(record["gpr"])
             if folder.is_dir():
-                check = verify_manifest(folder)
-                if not check["ok"]:
-                    found.append({"generation": record["gen"], "problems": check["problems"]})
+                problems = _verified_problems(settings, folder)
+                if problems:
+                    found.append({"generation": record["gen"], "problems": problems})
     return found
 
 

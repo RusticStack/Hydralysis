@@ -48,13 +48,13 @@ BASE_WAIT_S = 30
 
 
 @contextmanager
-def view_lock(settings: dict, target: dict):
+def view_lock(settings: dict, target: dict, wait_s: float | None = None):
     """The per-view lock (replaces the per-target `.sync.lock`): bounded, OS-held, so a killed holder frees it.
 
-    A wait that runs out is a `LockBusy`; here it reaches the caller as the structured `busy` error
-    (a RuntimeError carrying the JSON payload, like the conflict payloads of `revisions`)."""
+    A wait that runs out (WAIT_S, default SYNC_LOCK_S) is a `LockBusy`; here it reaches the caller as the structured `busy`
+    error (a RuntimeError carrying the JSON payload, like the conflict payloads of `revisions`)."""
     try:
-        with locked(_directory(settings, target) / ".view.lock", SYNC_LOCK_S, "working copy"):
+        with locked(_directory(settings, target) / ".view.lock", SYNC_LOCK_S if wait_s is None else wait_s, "working copy"):
             yield
     except LockBusy as busy:
         raise RuntimeError(json.dumps(busy.payload())) from busy

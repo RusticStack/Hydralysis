@@ -285,6 +285,37 @@ class Queue(ViewWorld, unittest.TestCase):
         self.assertFalse(views.failure_path(self.settings, self.lineage_id(), sealed["csid"]).exists())
         self.assertEqual(self.run_job(sealed, "one")["generation"], 1)
 
+    def test_the_leader_does_not_wait_for_a_busy_view_and_the_job_settles_it(self):
+        record = self.edit("Mine", A, view="one")["overlay_id"]
+        sealed = self.seal("one")
+        with patch.object(workcopy, "SYNC_LOCK_S", 5), workcopy.view_lock(self.settings, self.target("one")):
+            started = time.monotonic()
+            led = views.drain(self.settings, self.lineage_id(), self.engine(), stop_after=sealed["csid"])
+            waited = time.monotonic() - started
+        self.assertEqual(led["built"], [1])
+        self.assertLess(waited, 5)  # the settle is tried after the commit lock is released, without a wait (H13)
+        self.assertEqual(self.store("one")["changesets"], [])  # the view was busy: not settled yet
+        result = self.run_job(sealed, "one")  # the job of the changeset settles its own view before it answers
+        self.assertEqual((result["outcome"], result["generation"]), ("applied", 1))
+        store = self.store("one")
+        self.assertEqual([(entry["cid"], entry["ids"]) for entry in store["commits"]], [(sealed["csid"], [record])])
+
+    def test_an_existing_lineage_is_found_without_the_creation_lock(self):
+        self.edit("Mine", A, view="one")
+        self.run_job(self.seal("one"), "one")
+        selected = self.target("one")
+        origin = selected.get("origin_key") or selected["key"]
+        root = lineage.lineages_root(self.settings)
+        held = locks.LaneLock(str(root / (".create.%s.lock" % lineage.sha256_hex(origin.encode("utf-8"))[:24])))
+        self.assertTrue(held.acquire())
+        try:
+            with patch.object(durable, "LOCK_TIMEOUT_S", 0.3):
+                self.assertEqual(views.ensure_lineage(self.settings, selected)["id"], self.lineage_id())  # H14: no lock taken
+                with self.assertRaises(locks.LockBusy):
+                    views.ensure_lineage(self.settings, {**selected, "lineage": None})  # no registry row: the locked path
+        finally:
+            held.release()
+
     def test_a_corrupt_changeset_does_not_hold_the_queue(self):
         self.edit("One", A, view="one")
         self.edit("Two", B, view="two")

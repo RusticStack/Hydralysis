@@ -1006,6 +1006,22 @@ class Tamper(World, unittest.TestCase):
             self.commit()
         self.assertEqual(raised.exception.code, "tampered")
 
+    def test_an_unchanged_generation_is_not_rehashed_and_a_changed_one_is(self):
+        self.edit("One", A)
+        self.commit()
+        real = lineage.verify_manifest
+        with patch.object(lineage, "verify_manifest", side_effect=real) as verify:
+            self.assertEqual(lineage.tampered(self.settings, self.lineage_id()), [])
+            self.assertEqual(lineage.tampered(self.settings, self.lineage_id()), [])
+            self.assertEqual(verify.call_count, 1)  # the second check reads the files' size, time and id only (H17)
+            self.assertEqual(lineage.tampered({**self.settings, "tampered_cache_s": 0}, self.lineage_id()), [])
+            self.assertEqual(verify.call_count, 2)  # 0: every check re-hashes
+            victim = next(lineage.generation_dir(self.settings, self.lineage_id(), 1).rglob("programs.json"))
+            os.chmod(victim, 0o666)
+            victim.write_text("tampered", encoding="utf-8")
+            self.assertEqual(lineage.tampered(self.settings, self.lineage_id())[0]["generation"], 1)
+            self.assertEqual(verify.call_count, 3)
+
 
 class LineageLog(World, unittest.TestCase):
     def test_a_torn_tail_is_ignored_by_readers_and_repaired_by_the_next_writer(self):
