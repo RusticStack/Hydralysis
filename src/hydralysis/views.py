@@ -40,10 +40,10 @@ import random
 import re
 import secrets
 import shutil
-import statistics
 import subprocess
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import ExitStack
 from pathlib import Path
 
@@ -55,6 +55,15 @@ PUBLISH_BATCH_MAX = 1            # `publishBatchMax`: changesets per generation;
 PUBLISH_WAIT_S = 3600            # how long one publish job waits for its changeset before it gives up (it stays queued)
 COMMIT_WAIT_S = 120              # how long a leader waits for a running commit (`.commit.lock`) before it yields
 POLL_S = 0.1
+# A waiting publish worker (a follower) used to look at the queue every POLL_S: about fifteen file operations and a sealed
+# job-record write ten times a second per waiter, for the whole time a leader builds. On Windows it now waits in the kernel's
+# queue of `publish.lock` instead (the one event that can decide its changeset is a leader finishing), for at most TURN_WAIT_S
+# so the job's progress and its deadline are still looked at. It also wakes as soon as a result is written to `done/` or
+# `declined/` (a leader that decides this changeset while it drains others), so a follower returns no later than before.
+TURN_WAIT_S = 1.0
+# A waiting worker rewrites its job record when its progress changes, and at least this often: `hydra.active_jobs` finds
+# the running jobs among the newest records by time, and the supervisor asks it whether a publish is in flight.
+PROGRESS_HEARTBEAT_S = 10.0
 MAX_ATTEMPTS = 3                 # counted candidate failures of one changeset before it ends as `candidate_failed`
 MAX_QUEUE = 1000
 RESOLUTIONS = ("take_mine", "keep")
@@ -666,8 +675,76 @@ def _ids_in(folder: Path) -> list[str]:
     return sorted(item.name[:-5] for item in folder.iterdir() if item.name.endswith(".json") and _CSID.fullmatch(item.name[:-5]))
 
 
+# The queue's records (pending/, done/, declined/) are each written once, by an atomic replace, and never rewritten: an agent
+# that polls `status show=queue` read and seal-checked every one of them on every poll (two thirds of a polling agent's CPU).
+# A record whose file is the same file (id, size, time) as when it was last read is answered from that read. The memo is
+# bounded in bytes (least recently used first out), and a large record (a pending changeset can be ~20 MB) is not kept.
+_RECORDS: "OrderedDict[tuple, tuple[tuple, str]]" = OrderedDict()
+_RECORDS_CAP = 4096
+_RECORDS_BUDGET = 4 * 1024 * 1024    # characters of JSON text kept, in all
+_RECORD_MAX = 64 * 1024              # a record whose JSON text is longer is read from disk every time
+_records_size = 0
+_NO_DEFAULT = object()
+
+
+def _read_record_once_written(path: Path, *, default=_NO_DEFAULT, max_bytes: int | None = None):
+    """`durable.read_sealed` for a write-once queue record, with the same answers: the file, else its `.bak`, else DEFAULT
+    (FileNotFoundError without one); a corrupt pair raises StoreCorrupt."""
+    try:
+        found = os.stat(path)
+    except FileNotFoundError:
+        found = None
+    except OSError:
+        found = False
+    if found is None and not os.path.exists(durable.backup_path(path)):
+        if default is _NO_DEFAULT:
+            raise FileNotFoundError(str(path))
+        return default
+    key = (os.path.normcase(str(path)), max_bytes)
+    identity = (found.st_ino, found.st_size, found.st_mtime_ns) if found else None
+    if identity is not None:
+        known = _RECORDS.get(key)
+        if known is not None and known[0] == identity:
+            _RECORDS.move_to_end(key)
+            return json.loads(known[1])
+    options = {"max_bytes": max_bytes} if max_bytes is not None else {}
+    if default is not _NO_DEFAULT:
+        options["default"] = default
+    value, source = durable.read_sealed_info(path, **options)
+    if identity is not None and source == "file":
+        try:
+            again = os.stat(path)
+        except OSError:
+            again = None
+        if again is not None and (again.st_ino, again.st_size, again.st_mtime_ns) == identity:
+            _remember_record(key, identity, value)
+    return value
+
+
+def _forget_records() -> None:
+    global _records_size
+    _RECORDS.clear()
+    _records_size = 0
+
+
+def _remember_record(key: tuple, identity: tuple, value) -> None:
+    global _records_size
+    old = _RECORDS.pop(key, None)
+    if old is not None:
+        _records_size -= len(old[1])
+    if identity[1] > _RECORD_MAX:    # the file is already too large: do not even serialize it
+        return
+    text = json.dumps(value)
+    if len(text) > _RECORD_MAX:
+        return
+    _RECORDS[key] = (identity, text)
+    _records_size += len(text)
+    while _RECORDS and (_records_size > _RECORDS_BUDGET or len(_RECORDS) > _RECORDS_CAP):
+        _records_size -= len(_RECORDS.popitem(last=False)[1][1])
+
+
 def read_changeset(settings: dict, lineage_id: str, csid: str) -> dict:
-    record = durable.read_sealed(pending_path(settings, lineage_id, csid), max_bytes=workcopy.MAX_HISTORY_BYTES + 4096)
+    record = _read_record_once_written(pending_path(settings, lineage_id, csid), max_bytes=workcopy.MAX_HISTORY_BYTES + 4096)
     if record.get("csid") != csid or record.get("format", FORMAT) > FORMAT:
         raise durable.StoreCorrupt(pending_path(settings, lineage_id, csid), pending_path(settings, lineage_id, csid), {"csid": "mismatch"})
     return record
@@ -675,8 +752,8 @@ def read_changeset(settings: dict, lineage_id: str, csid: str) -> dict:
 
 def read_done(settings: dict, lineage_id: str, csid: str) -> dict | None:
     """The result of a decided changeset: `done/` (published) or `declined/` (no generation was made), else None."""
-    found = durable.read_sealed(done_path(settings, lineage_id, csid), default=None)
-    return found if found is not None else durable.read_sealed(declined_path(settings, lineage_id, csid), default=None)
+    found = _read_record_once_written(done_path(settings, lineage_id, csid), default=None)
+    return found if found is not None else _read_record_once_written(declined_path(settings, lineage_id, csid), default=None)
 
 
 def write_done(settings: dict, lineage_id: str, csid: str, record: dict) -> dict:
@@ -709,11 +786,12 @@ def _eta_ms(settings: dict, lineage_id: str, position: int) -> int | None:
     samples = []
     for path in files:
         try:
-            record = durable.read_sealed(path, default=None)
+            record = _read_record_once_written(path, default=None)
         except (durable.StoreCorrupt, OSError):
             continue
         if record and isinstance(record.get("build_ms"), (int, float)):
             samples.append(record["build_ms"])
+    import statistics   # lazy: statistics pulls in decimal and fractions
     return int(statistics.median(samples) * position) if samples else None
 
 
@@ -841,16 +919,22 @@ def _batch_max(settings: dict) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 1 else PUBLISH_BATCH_MAX
 
 
-def drain(settings: dict, lineage_id: str, engine=None, stop_after: str | None = None, timeout_s: int = 600) -> dict:
+def drain(settings: dict, lineage_id: str, engine=None, stop_after: str | None = None, timeout_s: int = 600, lock=None) -> dict:
     """Try to become the leader and drain the queue in id order, until it is empty or STOP_AFTER is decided.
 
     Non-blocking: when another process holds `publish.lock` this returns `{"led": False}` at once. The lock is held for the
-    drain only, and is released by the OS if the leader dies. Returns {"led", "built": [generation ...], "failure"}."""
-    lineage.lineage_dir(settings, lineage_id).mkdir(parents=True, exist_ok=True)
-    lock = LaneLock(str(publish_lock_path(settings, lineage_id)))
-    if not lock.acquire():
-        return {"led": False, "built": [], "failure": None}
-    engine = engine or hydra.Engine(settings)
+    drain only, and is released by the OS if the leader dies. LOCK is `publish.lock` already held by the caller (a granted
+    `await_turn`); the drain releases it. Returns {"led", "built": [generation ...], "failure"}."""
+    if lock is None:
+        lineage.lineage_dir(settings, lineage_id).mkdir(parents=True, exist_ok=True)
+        lock = LaneLock(str(publish_lock_path(settings, lineage_id)))
+        if not lock.acquire():
+            return {"led": False, "built": [], "failure": None}
+    try:
+        engine = engine or hydra.Engine(settings)
+    except BaseException:
+        lock.release()
+        raise
     built: list[int] = []
     failure = None
     try:
@@ -1380,31 +1464,83 @@ def run_publish_job(settings: dict, selected: dict, options: dict, engine=None, 
     csid, lineage_id = options["csid"], options["lineage"]
     engine = engine or hydra.Engine(settings)
     deadline = time.monotonic() + float(settings.get("publish_wait_s", PUBLISH_WAIT_S))
-    while True:
-        result = read_done(settings, lineage_id, csid)
-        if result is None:
-            led = drain(settings, lineage_id, engine, stop_after=csid, timeout_s=timeout_s)
+    reported, reported_at = None, 0.0
+    turn = None   # `publish.lock`, when the last wait was granted it: the next drain leads with it
+    watch = _decision_watch(settings, lineage_id)   # wakes the wait when a result is written (Windows), set before the first look
+    try:
+        while True:
             result = read_done(settings, lineage_id, csid)
-            if result is None and led["failure"] and not led["failure"].get("counted") and led["failure"]["error"] != "commit_busy":
-                failure = led["failure"]
-                raise ViewError(failure["error"], failure["message"], csid=csid,
-                                retained="the changeset stays queued and its records stay pending; this job ends, and no job drives the "
-                                         "changeset now: it is published when any later publish on this lineage (from any view) leads "
-                                         "the queue, so publish again once the cause is gone")
-        if result is not None:
-            _settle_own(settings, lineage_id, csid, result)
-            return outcome_of(result, _revision_of(settings, selected))
-        info = pending_info(settings, lineage_id, csid)
-        if info["state"] == "done":
+            if result is None:
+                led = drain(settings, lineage_id, engine, stop_after=csid, timeout_s=timeout_s, lock=turn)
+                turn = None   # drain released it
+                result = read_done(settings, lineage_id, csid)
+                if result is None and led["failure"] and not led["failure"].get("counted") and led["failure"]["error"] != "commit_busy":
+                    failure = led["failure"]
+                    raise ViewError(failure["error"], failure["message"], csid=csid,
+                                    retained="the changeset stays queued and its records stay pending; this job ends, and no job drives the "
+                                             "changeset now: it is published when any later publish on this lineage (from any view) leads "
+                                             "the queue, so publish again once the cause is gone")
+            if turn is not None:
+                turn.release()
+                turn = None
+            if result is not None:
+                _settle_own(settings, lineage_id, csid, result)
+                return outcome_of(result, _revision_of(settings, selected))
+            info = pending_info(settings, lineage_id, csid)
+            if info["state"] == "done":
+                continue
+            if info["state"] == "unknown":
+                raise ViewError("unknown_changeset", "changeset %s is not in the queue" % csid)
+            if progress and (info != reported or time.monotonic() - reported_at >= PROGRESS_HEARTBEAT_S):
+                progress(info)
+                reported, reported_at = info, time.monotonic()
+            if time.monotonic() >= deadline:
+                raise ViewError("publish_wait_expired", "the changeset was not decided within publish_wait_s; it stays queued and is "
+                                "published when a leader reaches it", csid=csid, **pending_info(settings, lineage_id, csid))
+            turn = await_turn(settings, lineage_id, min(TURN_WAIT_S, max(POLL_S, deadline - time.monotonic())), watch)
+            if watch is not None:
+                watch.rearm()   # before the next look: a result written from here on signals the next wait at once
+    finally:
+        if turn is not None:
+            turn.release()
+        if watch is not None:
+            watch.close()
+
+
+def _decision_watch(settings: dict, lineage_id: str):
+    """A `locks.FolderWatch` on the lineage's `done/` and `declined/` (Windows), else None."""
+    if os.name != "nt":
+        return None
+    from hydralysis.locks import FolderWatch
+    folders = []
+    for name in ("done", "declined"):
+        try:
+            folder = _dir(settings, lineage_id, name)
+            folder.mkdir(parents=True, exist_ok=True)
+        except (OSError, ValueError):   # no watch: the wait still ends at TURN_WAIT_S, as without one
             continue
-        if info["state"] == "unknown":
-            raise ViewError("unknown_changeset", "changeset %s is not in the queue" % csid)
-        if progress:
-            progress(info)
-        if time.monotonic() >= deadline:
-            raise ViewError("publish_wait_expired", "the changeset was not decided within publish_wait_s; it stays queued and is "
-                            "published when a leader reaches it", csid=csid, **pending_info(settings, lineage_id, csid))
-        time.sleep(POLL_S)
+        folders.append(folder)
+    watch = FolderWatch(folders)
+    if not watch.handles:
+        watch.close()
+        return None
+    return watch
+
+
+def await_turn(settings: dict, lineage_id: str, timeout_s: float, watch=None):
+    """Wait until `publish.lock` is free, at most TIMEOUT_S. On Windows the wait is queued in the kernel (`locks._QueuedLock`)
+    and returns the lock held (the caller's `drain` leads with it, or the caller releases it), or None when TIMEOUT_S passed
+    or WATCH (a `locks.FolderWatch`) was signalled first. Elsewhere, and when the lock file cannot be opened for the queued
+    wait, it sleeps POLL_S and returns None, as before."""
+    if os.name == "nt":
+        from hydralysis.locks import _QueuedLock
+        lease = _QueuedLock(str(publish_lock_path(settings, lineage_id)))
+        try:
+            return lease if lease.wait(timeout_s, watch.handles if watch is not None else ()) else None
+        except OSError:
+            pass
+    time.sleep(POLL_S)
+    return None
 
 
 def _settle_own(settings: dict, lineage_id: str, csid: str, result: dict) -> bool:
@@ -1594,8 +1730,16 @@ def claim(settings: dict, selected: dict, who: dict, lineage_id: str, lease_s: f
     With CREATE False a missing record is not made."""
     name = who["name"]
     path = record_path(settings, lineage_id, name)
-    path.parent.mkdir(parents=True, exist_ok=True)
     now = time.time()
+    # Most calls find this process's own fresh lease: the answer the locked path below would give is the record as it is, so it
+    # is given without the record lock (a lock wait, a mkdir and a liveness check of every holder per query).
+    current = read_record(settings, lineage_id, name)
+    if current and (who["kind"] == "default" or current.get("id_kind") != "default"):
+        mine = (current.get("holders") or {}).get(BOOT_ID)
+        if (isinstance(mine, dict) and mine.get("pid") == os.getpid() and mine.get("pid_started_ms") == process_started_ms()
+                and isinstance(mine.get("lease_until"), (int, float)) and mine["lease_until"] - now > lease_s - LEASE_REFRESH_S):
+            return current
+    path.parent.mkdir(parents=True, exist_ok=True)
     with _record_lock(settings, lineage_id, name):
         record = read_record(settings, lineage_id, name)
         if record is None and not create:

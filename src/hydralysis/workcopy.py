@@ -40,7 +40,7 @@ from hydralysis import durable, hydra, integrity, lineage, revisions, storelog
 from hydralysis.analysis import MAX_CORPUS_BYTES, MAX_HISTORY_BYTES, MAX_OVERLAYS, _edit, _overlay_path
 from hydralysis.backends import read_json, write_json
 from hydralysis.locks import LaneLock, LockBusy, locked
-from hydralysis.paths import root_path
+from hydralysis.paths import resolved, root_path
 
 # The per-view lock bound (D44) and the bound on waiting for another caller's build of the shared base (4.10).
 # Both are unmeasured starting values; past them the caller gets the structured `busy`, never a silent wait.
@@ -163,7 +163,7 @@ DISCARD_LOCK_S = 5         # an eviction or a session end waits this long for th
 
 
 def _norm(gpr) -> str:
-    return str(Path(gpr).resolve()).lower()
+    return str(resolved(gpr)).lower()
 
 
 def view_folders(settings: dict, target: dict) -> list[Path]:
