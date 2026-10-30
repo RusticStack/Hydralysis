@@ -670,8 +670,51 @@ def _ids_in(folder: Path) -> list[str]:
     return sorted(item.name[:-5] for item in folder.iterdir() if item.name.endswith(".json") and _CSID.fullmatch(item.name[:-5]))
 
 
+# The queue's records (pending/, done/, declined/) are each written once, by an atomic replace, and never rewritten: an agent
+# that polls `status show=queue` read and seal-checked every one of them on every poll (two thirds of a polling agent's CPU).
+# A record whose file is the same file (id, size, time) as when it was last read is answered from that read.
+_RECORDS: dict[tuple, tuple[tuple, str]] = {}
+_RECORDS_CAP = 4096
+_NO_DEFAULT = object()
+
+
+def _read_record_once_written(path: Path, *, default=_NO_DEFAULT, max_bytes: int | None = None):
+    """`durable.read_sealed` for a write-once queue record, with the same answers: the file, else its `.bak`, else DEFAULT
+    (FileNotFoundError without one); a corrupt pair raises StoreCorrupt."""
+    try:
+        found = os.stat(path)
+    except FileNotFoundError:
+        found = None
+    except OSError:
+        found = False
+    if found is None and not os.path.exists(durable.backup_path(path)):
+        if default is _NO_DEFAULT:
+            raise FileNotFoundError(str(path))
+        return default
+    key = (os.path.normcase(str(path)), max_bytes)
+    identity = (found.st_ino, found.st_size, found.st_mtime_ns) if found else None
+    if identity is not None:
+        known = _RECORDS.get(key)
+        if known is not None and known[0] == identity:
+            return json.loads(known[1])
+    options = {"max_bytes": max_bytes} if max_bytes is not None else {}
+    if default is not _NO_DEFAULT:
+        options["default"] = default
+    value, source = durable.read_sealed_info(path, **options)
+    if identity is not None and source == "file":
+        try:
+            again = os.stat(path)
+        except OSError:
+            again = None
+        if again is not None and (again.st_ino, again.st_size, again.st_mtime_ns) == identity:
+            if len(_RECORDS) >= _RECORDS_CAP:
+                _RECORDS.clear()
+            _RECORDS[key] = (identity, json.dumps(value))
+    return value
+
+
 def read_changeset(settings: dict, lineage_id: str, csid: str) -> dict:
-    record = durable.read_sealed(pending_path(settings, lineage_id, csid), max_bytes=workcopy.MAX_HISTORY_BYTES + 4096)
+    record = _read_record_once_written(pending_path(settings, lineage_id, csid), max_bytes=workcopy.MAX_HISTORY_BYTES + 4096)
     if record.get("csid") != csid or record.get("format", FORMAT) > FORMAT:
         raise durable.StoreCorrupt(pending_path(settings, lineage_id, csid), pending_path(settings, lineage_id, csid), {"csid": "mismatch"})
     return record
@@ -679,8 +722,8 @@ def read_changeset(settings: dict, lineage_id: str, csid: str) -> dict:
 
 def read_done(settings: dict, lineage_id: str, csid: str) -> dict | None:
     """The result of a decided changeset: `done/` (published) or `declined/` (no generation was made), else None."""
-    found = durable.read_sealed(done_path(settings, lineage_id, csid), default=None)
-    return found if found is not None else durable.read_sealed(declined_path(settings, lineage_id, csid), default=None)
+    found = _read_record_once_written(done_path(settings, lineage_id, csid), default=None)
+    return found if found is not None else _read_record_once_written(declined_path(settings, lineage_id, csid), default=None)
 
 
 def write_done(settings: dict, lineage_id: str, csid: str, record: dict) -> dict:
@@ -713,7 +756,7 @@ def _eta_ms(settings: dict, lineage_id: str, position: int) -> int | None:
     samples = []
     for path in files:
         try:
-            record = durable.read_sealed(path, default=None)
+            record = _read_record_once_written(path, default=None)
         except (durable.StoreCorrupt, OSError):
             continue
         if record and isinstance(record.get("build_ms"), (int, float)):
@@ -1631,8 +1674,16 @@ def claim(settings: dict, selected: dict, who: dict, lineage_id: str, lease_s: f
     With CREATE False a missing record is not made."""
     name = who["name"]
     path = record_path(settings, lineage_id, name)
-    path.parent.mkdir(parents=True, exist_ok=True)
     now = time.time()
+    # Most calls find this process's own fresh lease: the answer the locked path below would give is the record as it is, so it
+    # is given without the record lock (a lock wait, a mkdir and a liveness check of every holder per query).
+    current = read_record(settings, lineage_id, name)
+    if current and (who["kind"] == "default" or current.get("id_kind") != "default"):
+        mine = (current.get("holders") or {}).get(BOOT_ID)
+        if (isinstance(mine, dict) and mine.get("pid") == os.getpid() and mine.get("pid_started_ms") == process_started_ms()
+                and isinstance(mine.get("lease_until"), (int, float)) and mine["lease_until"] - now > lease_s - LEASE_REFRESH_S):
+            return current
+    path.parent.mkdir(parents=True, exist_ok=True)
     with _record_lock(settings, lineage_id, name):
         record = read_record(settings, lineage_id, name)
         if record is None and not create:

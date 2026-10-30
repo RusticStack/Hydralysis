@@ -139,6 +139,115 @@ class ProcessMemo(unittest.TestCase):
         self.assertLessEqual(loads.call_count, 1)
 
 
+class QueueRecords(unittest.TestCase):
+    """`status show=queue` read and seal-checked every pending/done/declined record on each poll. They are written once, so a
+    record whose file is unchanged is answered from the last read; a new file, a removed one or a .bak are still honoured."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        getattr(views, "_RECORDS", {}).clear()
+        self.settings = {"root": str(Path(self.tmp.name) / "data")}
+        self.lineage_id = "l-" + "0" * 16
+        from hydralysis import lineage
+        self.patch_dir = patch.object(lineage, "lineage_dir", lambda settings, lid: Path(self.tmp.name) / "lineages" / lid)
+        self.patch_dir.start()
+        self.addCleanup(self.patch_dir.stop)
+
+    def counting(self):
+        from hydralysis import durable
+        return patch.object(durable, "read_sealed_info", side_effect=durable.read_sealed_info)
+
+    def test_a_decided_changeset_is_read_from_disk_once(self):
+        from hydralysis import durable
+        csid = views.new_csid()
+        path = views.done_path(self.settings, self.lineage_id, csid)
+        path.parent.mkdir(parents=True)
+        durable.write_sealed(path, {"csid": csid, "outcome": "applied", "generation": 3})
+        with self.counting() as reads:
+            for _ in range(20):
+                found = views.read_done(self.settings, self.lineage_id, csid)
+                self.assertEqual((found["outcome"], found["generation"]), ("applied", 3))
+                found["outcome"] = "mutated by a caller"
+        self.assertEqual(reads.call_count, 1)
+
+    def test_an_undecided_changeset_reads_nothing(self):
+        with self.counting() as reads:
+            for _ in range(5):
+                self.assertIsNone(views.read_done(self.settings, self.lineage_id, views.new_csid()))
+        self.assertEqual(reads.call_count, 0)
+
+    def test_a_replaced_record_and_a_backup_are_honoured(self):
+        from hydralysis import durable
+        csid = views.new_csid()
+        path = views.declined_path(self.settings, self.lineage_id, csid)
+        path.parent.mkdir(parents=True)
+        durable.write_sealed(path, {"csid": csid, "outcome": "conflict"})
+        self.assertEqual(views.read_done(self.settings, self.lineage_id, csid)["outcome"], "conflict")
+        durable.write_sealed(path, {"csid": csid, "outcome": "skipped"})   # an atomic replace: a new file
+        self.assertEqual(views.read_done(self.settings, self.lineage_id, csid)["outcome"], "skipped")
+        os.replace(path, durable.backup_path(path))                         # only the .bak is left
+        self.assertEqual(views.read_done(self.settings, self.lineage_id, csid)["outcome"], "skipped")
+        durable.backup_path(path).unlink()
+        self.assertIsNone(views.read_done(self.settings, self.lineage_id, csid))
+
+    def test_a_corrupt_changeset_is_still_refused(self):
+        from hydralysis import durable
+        csid = views.new_csid()
+        path = views.pending_path(self.settings, self.lineage_id, csid)
+        path.parent.mkdir(parents=True)
+        durable.write_sealed(path, {"csid": csid, "format": 1, "records": []})
+        self.assertEqual(views.read_changeset(self.settings, self.lineage_id, csid)["csid"], csid)
+        path.write_bytes(b"{ not json")
+        with self.assertRaises(durable.StoreCorrupt):
+            views.read_changeset(self.settings, self.lineage_id, csid)
+
+
+class ViewLease(unittest.TestCase):
+    """A query of an agent's own view refreshed its lease record under the record lock on every call; with a fresh lease of
+    this process the record is answered without the lock, and every other case still takes it."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        from hydralysis import lineage
+        patcher = patch.object(lineage, "lineage_dir", lambda settings, lid: Path(self.tmp.name) / "lineages" / lid)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.settings = {"root": str(Path(self.tmp.name) / "data")}
+        self.selected = {"key": "k" * 16, "name": "t", "lineage": {"id": "l-1", "generation": 0}}
+
+    def locks_taken(self):
+        return patch.object(views, "_record_lock", side_effect=views._record_lock)
+
+    def test_a_fresh_own_lease_takes_no_lock(self):
+        who = {"agent": "agent-a", "kind": "explicit", "name": "agent-a", "shared": False}
+        first = views.claim(self.settings, self.selected, who, "l-1", 600)
+        with self.locks_taken() as taken:
+            for _ in range(10):
+                self.assertEqual(views.claim(self.settings, self.selected, who, "l-1", 600, create=False), first)
+        self.assertEqual(taken.call_count, 0)
+
+    def test_an_old_lease_is_still_refreshed_under_the_lock(self):
+        who = {"agent": "agent-b", "kind": "explicit", "name": "agent-b", "shared": False}
+        first = views.claim(self.settings, self.selected, who, "l-1", 600)
+        with self.locks_taken() as taken, patch.object(views.time, "time", return_value=time.time() + 120):
+            again = views.claim(self.settings, self.selected, who, "l-1", 600)
+        self.assertEqual(taken.call_count, 1)
+        self.assertGreater(again["lease_until"], first["lease_until"])
+
+    def test_another_process_default_view_is_still_refused(self):
+        record = views.claim(self.settings, self.selected, {"agent": "agent-c", "kind": "default", "name": "agent-c",
+                                                            "shared": False}, "l-1", 600)
+        record["holders"] = {"other-boot": {"pid": os.getppid(), "pid_started_ms": __import__("hydralysis.preparation").preparation.process_start_ms(os.getppid()),
+                                            "lease_until": time.time() + 600, "agent_name": "x"}}
+        from hydralysis import durable
+        durable.write_sealed(views.record_path(self.settings, "l-1", "agent-c"), record, max_bytes=65536)
+        with self.assertRaises(views.ViewError):
+            views.claim(self.settings, self.selected, {"agent": "agent-c", "kind": "explicit", "name": "agent-c", "shared": False},
+                        "l-1", 600)
+
+
 @unittest.skipUnless(os.name == "nt", "the queued wait is the Windows kernel lock queue")
 class FollowerWait(unittest.TestCase):
     def setUp(self):
