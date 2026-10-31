@@ -1558,6 +1558,34 @@ def run_publish_job(settings: dict, selected: dict, options: dict, engine=None, 
             watch.close()
 
 
+STATUS_WAIT_S = 0.5   # a status poll of a pending changeset waits at most this long for its decision
+
+
+def wait_decision(settings: dict, lineage_id: str, csid: str, timeout_s: float = STATUS_WAIT_S) -> None:
+    """Let a `status show=queue csid=` poll of a changeset that is still queued wait (Windows: in the kernel, on the change
+    notification of `done/` and `declined/`) until its result is written or TIMEOUT_S passes, instead of answering "pending" at
+    once and being asked again: a polling agent makes a fraction of the calls and learns the decision as it is made. Returns at
+    once for a decided, unknown or malformed changeset, and where there is no change notification."""
+    if os.name != "nt" or not _CSID.fullmatch(csid or ""):
+        return
+    if csid not in outstanding(settings, lineage_id):
+        return
+    watch = _decision_watch(settings, lineage_id)
+    if watch is None:
+        return
+    try:
+        deadline = time.monotonic() + timeout_s
+        while read_done(settings, lineage_id, csid) is None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            from hydralysis import locks
+            locks.wait_handles(watch.handles, left)
+            watch.rearm()
+    finally:
+        watch.close()
+
+
 def _decision_watch(settings: dict, lineage_id: str):
     """A `locks.FolderWatch` on the lineage's `done/` and `declined/` (Windows), else None."""
     if os.name != "nt":

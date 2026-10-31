@@ -731,6 +731,8 @@ class QueryRunner:
             return {"target": {key: selected[key] for key in ("name", "view")}, "lineage": None,
                     "queue": {"length": 0, "leader": False, "changesets": []},
                     "note": "no publish has been made on this target; there is no queue"}
+        if csid:
+            views.wait_decision(self.settings, link["id"], csid)   # a still-queued changeset: answer when it is decided, or in 0.5 s
         return {"target": {key: selected[key] for key in ("name", "view")}, **views.queue_status(self.settings, link["id"], csid)}
 
     def _ask(self, selected: dict, request: dict, timeout_s: int, trace: dict | None = None) -> dict:

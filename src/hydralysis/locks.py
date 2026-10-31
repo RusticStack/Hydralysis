@@ -156,6 +156,15 @@ if _NT:
     _WAIT_OBJECT_0 = 0
 
 
+def wait_handles(handles, timeout_s: float) -> bool:
+    """Wait until one of the waitable kernel HANDLES is signalled (True) or TIMEOUT_S passes (False). Windows only."""
+    if not handles:
+        time.sleep(max(0.0, timeout_s))
+        return False
+    array = (wintypes.HANDLE * len(handles))(*handles)
+    return _k32.WaitForMultipleObjects(len(array), array, False, max(0, min(int(timeout_s * 1000), 0xFFFFFFFE))) == _WAIT_OBJECT_0
+
+
 class _QueuedLock:
     """One exclusive lock on byte 0 of PATH, waited for in the kernel's queue (Windows)."""
 
