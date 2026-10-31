@@ -36,11 +36,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import random
 import re
-import secrets
-import shutil
-import subprocess
 import time
 import uuid
 from collections import OrderedDict
@@ -666,13 +662,27 @@ def publish_lock_path(settings: dict, lineage_id: str) -> Path:
 
 def new_csid() -> str:
     """Sorts in the order changesets were sealed: microseconds since the epoch, then twelve random bits for a tie."""
+    import random   # lazy: nothing else in a query process needs it
     return "c-%013x%03x" % (int(time.time() * 1_000_000), random.getrandbits(12))
 
 
-def _ids_in(folder: Path) -> list[str]:
-    if not folder.is_dir():
+def _ids_in(folder: Path, stamps: dict | None = None) -> list[str]:
+    """The changeset ids of the records in FOLDER. With STAMPS, each id's (size, mtime) is put there: DirEntry.stat() answers from
+    the listing on Windows, so it costs no call."""
+    # One scandir: a missing or non-directory folder has no ids (the old is_dir() check cost a second stat per listing).
+    try:
+        with os.scandir(folder) as entries:
+            found = []
+            for entry in entries:
+                name = entry.name
+                if name.endswith(".json") and _CSID.fullmatch(name[:-5]):
+                    found.append(name[:-5])
+                    if stamps is not None:
+                        info = entry.stat()
+                        stamps[name[:-5]] = (info.st_size, info.st_mtime_ns)
+            return sorted(found)
+    except (FileNotFoundError, NotADirectoryError):
         return []
-    return sorted(item.name[:-5] for item in folder.iterdir() if item.name.endswith(".json") and _CSID.fullmatch(item.name[:-5]))
 
 
 # The queue's records (pending/, done/, declined/) are each written once, by an atomic replace, and never rewritten: an agent
@@ -772,19 +782,33 @@ def outstanding(settings: dict, lineage_id: str) -> list[str]:
     """The changesets sealed and not yet decided, in the order of their ids (the FIFO of D45). The id is allocated before the file
     is written under the view's lock, so two sealers on different views can write in the reverse order of their ids: FIFO is
     nominal at that grain, and costs only the order in which two near-simultaneous changesets are decided."""
-    finished = set(_ids_in(_dir(settings, lineage_id, "done"))) | set(_ids_in(_dir(settings, lineage_id, "declined")))
-    return [csid for csid in _ids_in(_dir(settings, lineage_id, "pending")) if csid not in finished]
+    return _outstanding_from(_listing(settings, lineage_id))
+
+
+def _listing(settings: dict, lineage_id: str, stamps: tuple[dict, dict] | None = None):
+    """The ids in `pending/`, `done/` and `declined/` of one lineage, listed once (a status poll needs the three several times)."""
+    return (_ids_in(_dir(settings, lineage_id, "pending")),
+            _ids_in(_dir(settings, lineage_id, "done"), stamps[0] if stamps else None),
+            _ids_in(_dir(settings, lineage_id, "declined"), stamps[1] if stamps else None))
+
+
+def _outstanding_from(listing: tuple[list[str], list[str], list[str]]) -> list[str]:
+    pending, done, declined = listing
+    finished = set(done) | set(declined)
+    return [csid for csid in pending if csid not in finished]
 
 
 def _eta_ms(settings: dict, lineage_id: str, position: int) -> int | None:
     """Observed, never promised: the median build time of this lineage's last five builds times the changesets ahead. None until
     one was measured (no latency figure is stated before SP7, D45)."""
     folder = _dir(settings, lineage_id, "done")
-    if not folder.is_dir():
+    try:   # one scandir; DirEntry.stat() answers from the listing on Windows (no stat call per file)
+        with os.scandir(folder) as entries:
+            found = sorted(((entry.stat().st_mtime_ns, entry.name) for entry in entries if entry.name.endswith(".json")))[-5:]
+    except (FileNotFoundError, NotADirectoryError):
         return None
-    files = sorted((item for item in folder.iterdir() if item.name.endswith(".json")), key=lambda item: item.stat().st_mtime_ns)[-5:]
     samples = []
-    for path in files:
+    for path in (folder / name for _, name in found):
         try:
             record = _read_record_once_written(path, default=None)
         except (durable.StoreCorrupt, OSError):
@@ -795,15 +819,16 @@ def _eta_ms(settings: dict, lineage_id: str, position: int) -> int | None:
     return int(statistics.median(samples) * position) if samples else None
 
 
-def position_of(settings: dict, lineage_id: str, csid: str) -> int | None:
-    queue = outstanding(settings, lineage_id)
+def position_of(settings: dict, lineage_id: str, csid: str, queue: list[str] | None = None) -> int | None:
+    queue = outstanding(settings, lineage_id) if queue is None else queue
     return queue.index(csid) + 1 if csid in queue else None
 
 
-def pending_info(settings: dict, lineage_id: str, csid: str) -> dict:
-    """`publish_pending{position, etaMs}`, or the result when the changeset is decided."""
+def pending_info(settings: dict, lineage_id: str, csid: str, queue: list[str] | None = None) -> dict:
+    """`publish_pending{position, etaMs}`, or the result when the changeset is decided. QUEUE is a listing the caller took a
+    moment ago (a status poll lists the folders once); the changeset's result is read after it, so a decision made since is seen."""
     result = read_done(settings, lineage_id, csid)
-    position = None if result is not None else position_of(settings, lineage_id, csid)
+    position = None if result is not None else position_of(settings, lineage_id, csid, queue)
     if position is None and result is None:
         # The result may have been written between the two reads: it is read again before the changeset is called unknown.
         result = read_done(settings, lineage_id, csid)
@@ -815,9 +840,15 @@ def pending_info(settings: dict, lineage_id: str, csid: str) -> dict:
             "leader": held(str(publish_lock_path(settings, lineage_id)))}
 
 
+# folder of `done/` -> (the names and file stamps of the ten newest results, their rows): `recent` of a status poll.
+_RECENT: dict = {}
+
+
 def queue_status(settings: dict, lineage_id: str, csid: str | None = None) -> dict:
     """`status show=queue`: who is waiting, whether a leader is running, the recent results."""
-    queue = outstanding(settings, lineage_id)
+    done_stamps, declined_stamps = {}, {}
+    listing = _listing(settings, lineage_id, (done_stamps, declined_stamps))
+    queue = _outstanding_from(listing)
     rows = []
     for position, name in enumerate(queue[:50], start=1):
         try:
@@ -827,10 +858,27 @@ def queue_status(settings: dict, lineage_id: str, csid: str | None = None) -> di
         except (durable.StoreCorrupt, OSError, ValueError):
             rows.append({"csid": name, "position": position, "error": "unreadable"})
     recent = []
-    for name in sorted(set(_ids_in(_dir(settings, lineage_id, "done"))) | set(_ids_in(_dir(settings, lineage_id, "declined"))),
-                       reverse=True)[:10]:
-        result = read_done(settings, lineage_id, name) or {}
-        recent.append({key: result.get(key) for key in ("csid", "outcome", "generation", "build_ms", "at")})
+    done_ids = set(listing[1])
+    latest = sorted(done_ids | set(listing[2]), reverse=True)[:10]
+    # The records are write-once: the ten newest, with the same names, sizes and times as at the last poll, are the same rows.
+    stamp = (_dir(settings, lineage_id, "done"), tuple((name, done_stamps.get(name) if name in done_ids else None,
+                                                        declined_stamps.get(name)) for name in latest))
+    known = _RECENT.get(stamp[0])
+    if known is not None and known[0] == stamp[1]:
+        recent = [dict(row) for row in known[1]]
+    else:
+        for name in latest:
+            # the listing says which folder holds it: `done/` wins when both do, as in read_done
+            result = (_read_record_once_written(done_path(settings, lineage_id, name), default=None) if name in done_ids
+                      else _read_record_once_written(declined_path(settings, lineage_id, name), default=None))
+            if result is None:   # decided between the listing and the read, or the file went: the general lookup
+                result = read_done(settings, lineage_id, name)
+            result = result or {}
+            recent.append({key: result.get(key) for key in ("csid", "outcome", "generation", "build_ms", "at")})
+        if len(recent) == len(latest) and all(row.get("csid") for row in recent):
+            if len(_RECENT) >= 64:
+                _RECENT.clear()
+            _RECENT[stamp[0]] = (stamp[1], [dict(row) for row in recent])
     leading = held(str(publish_lock_path(settings, lineage_id)))
     who = None
     if leading:
@@ -840,7 +888,7 @@ def queue_status(settings: dict, lineage_id: str, csid: str | None = None) -> di
             who = None
     return {"lineage": lineage_id, "queue": {"length": len(queue), "leader": leading, "leader_info": who,
                                               "changesets": rows, "batch_max": PUBLISH_BATCH_MAX},
-            "recent": recent, **({"changeset": pending_info(settings, lineage_id, csid)} if csid else {})}
+            "recent": recent, **({"changeset": pending_info(settings, lineage_id, csid, queue)} if csid else {})}
 
 
 # ---- sealing a changeset (the caller's half) ---------------------------------------------------------------------
@@ -1357,6 +1405,7 @@ def _publish_candidate(settings: dict, lineage_id: str, engine, head: dict, targ
         except Exception:
             pass
         if clone_folder is not None:
+            import shutil   # lazy: only a failed publish needs it
             shutil.rmtree(clone_folder, ignore_errors=True)
 
 
@@ -1507,6 +1556,34 @@ def run_publish_job(settings: dict, selected: dict, options: dict, engine=None, 
             watch.close()
 
 
+STATUS_WAIT_S = 0.5   # a status poll of a pending changeset waits at most this long for its decision
+
+
+def wait_decision(settings: dict, lineage_id: str, csid: str, timeout_s: float = STATUS_WAIT_S) -> None:
+    """Let a `status show=queue csid=` poll of a changeset that is still queued wait (Windows: in the kernel, on the change
+    notification of `done/` and `declined/`) until its result is written or TIMEOUT_S passes, instead of answering "pending" at
+    once and being asked again: a polling agent makes a fraction of the calls and learns the decision as it is made. Returns at
+    once for a decided, unknown or malformed changeset, and where there is no change notification."""
+    if os.name != "nt" or not _CSID.fullmatch(csid or ""):
+        return
+    if csid not in outstanding(settings, lineage_id):
+        return
+    watch = _decision_watch(settings, lineage_id)
+    if watch is None:
+        return
+    try:
+        deadline = time.monotonic() + timeout_s
+        while read_done(settings, lineage_id, csid) is None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            from hydralysis import locks
+            locks.wait_handles(watch.handles, left)
+            watch.rearm()
+    finally:
+        watch.close()
+
+
 def _decision_watch(settings: dict, lineage_id: str):
     """A `locks.FolderWatch` on the lineage's `done/` and `declined/` (Windows), else None."""
     if os.name != "nt":
@@ -1602,7 +1679,7 @@ def outcome_of(result: dict, revision: int | None = None) -> dict:
 # live while its lease holds and its process exists; a view with no live holder is `orphaned`, and the `adoptable` list of
 # a new process names the orphans of the same agent name that still have pending records.
 
-BOOT_ID = secrets.token_hex(8)       # 16 random hex digits, new at every start of this server process (D59, revision 8)
+BOOT_ID = os.urandom(8).hex()        # 16 random hex digits, new at every start of this server process (D59, revision 8)
 RESERVED_VIEWS = ("shared", "master")  # `shared` is the collaboration view (named explicitly); `master` labels reads of the sealed master
 LEASE_S = 600                        # `viewLeaseS`: a holder that makes no call for this long no longer owns the view
 LEASE_REFRESH_S = 60                 # the lease is rewritten when this much of it is gone, not on every call
@@ -1859,6 +1936,7 @@ def start_job(settings: dict, target: str, options: dict, view: str = "") -> dic
         env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent), HYDRALYSIS_HARNESS=hydra.identity()["harness"])
         # No log file: a raw file write outside `durable` is a site `test_durable` counts. What the worker has to say goes into the
         # job record (`error`), which `overlayjobs.status` shows; `main` below puts any uncaught exception there too.
+        import subprocess   # lazy: a query-only process never starts a job, and a job worker never starts one either
         child = proc.popen([sys.executable, "-m", "hydralysis.views", str(path)], env=env, stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL, **({} if os.name == "nt" else {"start_new_session": True}))
         with locked(path.with_suffix(".lock"), what="overlay job"):

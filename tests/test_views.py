@@ -1969,6 +1969,15 @@ class PerAgentViews(AgentWorld, unittest.TestCase):
         self.assertNotIn("follow", reply)
         self.assertEqual(self.ask("agent-9", "decompile", B, follow="head")["function"]["name"], "Theirs")
 
+    def test_status_with_follow_head_answers_from_the_store_the_rebase_wrote(self):
+        self.rename("agent-1", "Mine", A)
+        self.rename("agent-2", "Theirs", B)
+        self.publish(self.view_of("agent-2"))
+        reply = self.ask("agent-1", "status", follow="head")
+        self.assertEqual(reply["base"]["generation"], 1, "the status after the rebase names the generation it moved to")
+        self.assertNotIn("stale", reply)
+        self.assertEqual(reply["view_revision"], self.revision_of("agent-1"))
+
     def test_status_show_views_lists_every_view_with_its_holder_and_pending_records(self):
         self.rename("agent-1", "One", A)
         self.rename("agent-2", "Two", B)

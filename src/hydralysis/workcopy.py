@@ -29,7 +29,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import threading
 import time
 import uuid
@@ -583,13 +582,15 @@ def read_gpr(settings: dict, target: dict) -> str:
     return base_master_gpr(settings, target, store) if stale_reason(store, target) else target["gpr"]
 
 
-def heal(settings: dict, target: dict) -> None:
+def heal(settings: dict, target: dict) -> bool:
     """Settle a commit or revert that died between its CURRENT.log line and its store write, and a publish whose view
-    was not finalized by the leader, before the view is used."""
+    was not finalized by the leader, before the view is used. Returns whether it wrote the store."""
     if target.get("lineage"):
         from hydralysis import commits, views
-        views.settle(settings, target)
-        commits.heal(settings, target)
+        settled = views.settle(settings, target)
+        healed = commits.heal(settings, target)
+        return settled or healed
+    return False
 
 
 def _empty_store(sha256: str) -> dict:
@@ -608,7 +609,9 @@ def _file_id(path: Path, tail: bool = False):
     try:
         found = path.stat()
         end = b""
-        if tail:
+        # A file written more than STABLE_AGE_NS ago cannot be rewritten in place within its own clock tick any more: a later
+        # rewrite changes its time, so the id, time and size are enough and the tail is not opened.
+        if tail and time.time_ns() - found.st_mtime_ns < durable.STABLE_AGE_NS:
             with path.open("rb") as handle:
                 handle.seek(max(0, found.st_size - 256))
                 end = handle.read(256)
@@ -625,7 +628,9 @@ def load_store(settings: dict, target: dict) -> dict:
     the snapshot, its `.bak` and its log are the same files with the same size and time (a write replaces or grows one
     of them). Every call gets its own copy (callers mutate what they get)."""
     path = _store_path(settings, target)
-    key = (os.path.normcase(os.path.abspath(path)), target["sha256"], json.dumps(lineage_binding(target), sort_keys=True))
+    binding = lineage_binding(target)
+    key = (os.path.normcase(os.path.abspath(path)), target["sha256"],
+           (binding["lineage"], binding["generation"]) if binding else None)
     signature = (_file_id(path, True), _file_id(durable.backup_path(path)), _file_id(storelog.log_path(path)))
     with _LOADED_GUARD:
         cached = _LOADED.get(key[0])
@@ -633,7 +638,9 @@ def load_store(settings: dict, target: dict) -> dict:
         return json.loads(cached[2])
     store = _load_store_uncached(settings, target, path)
     text = json.dumps(store)
-    if signature[0] is not None and _file_id(path, True) == signature[0] and json.loads(text) == store:
+    # The parsed store is plain JSON (dicts, lists and scalars built by _load_store_uncached): a round trip through the
+    # text can only give it back, so the serialization is cached without decoding it again here.
+    if signature[0] is not None and _file_id(path, True) == signature[0]:
         with _LOADED_GUARD:
             _LOADED.pop(key[0], None)
             _LOADED[key[0]] = (key, signature, text)
@@ -810,8 +817,9 @@ def _state(settings: dict, target: dict) -> dict:
     return read_json(_directory(settings, target) / "state.json")
 
 
-def summary(settings: dict, target: dict) -> dict:
-    store = load_store(settings, target)
+def summary(settings: dict, target: dict, store: dict | None = None) -> dict:
+    """STORE is the copy the caller already loaded for this reply (one load instead of two)."""
+    store = load_store(settings, target) if store is None else store
     state = _state(settings, target)
     latest = max(store["journal"], key=lambda entry: entry["revision"], default=None)
     pending = pending_of(store)
@@ -862,6 +870,7 @@ def store_corpus(settings: dict, source: str) -> tuple[str, int]:
     value = digest.hexdigest()
     destination = corpus_path(settings, value)
     if not destination.is_file():
+        import shutil   # lazy: shutil pulls in the archive modules, which a query never needs
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_name(destination.name + "." + uuid.uuid4().hex + ".tmp")
         shutil.copyfile(source_path, temporary)
@@ -1082,6 +1091,7 @@ def _build_base(settings: dict, writer: hydra.Engine, target: dict, master: dict
     """Fork the master into FOLDER, bring it to the engine's current format, clear a stale marker, write the marker."""
     from hydralysis.query import open_program
     # A crashed builder left a partial fork here; nothing reads it (no marker), and this builder holds the lock.
+    import shutil   # lazy: only building a base removes folders
     for partial in folder.glob("base-*") if folder.is_dir() else ():
         shutil.rmtree(partial, ignore_errors=True)
     started = time.monotonic()
@@ -1323,6 +1333,7 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
 
 def _retire(engine: hydra.Engine, gprs: list[str]) -> list[str]:
     """Remove old working copies the engine no longer has open; keep the rest for a later sync."""
+    import shutil   # lazy: only a sync that retires a copy removes folders
     try:
         open_now = {str(Path(item.get("gpr", "")).resolve()).lower() for item in engine.call("status").get("projects", [])}
     except (hydra.EngineError, OSError):

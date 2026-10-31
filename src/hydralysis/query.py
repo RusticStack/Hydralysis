@@ -416,15 +416,18 @@ class QueryRunner:
         if lineage_id:
             views.claim(self.settings, selected, who, lineage_id, self._lease(), create=False)
 
-    def _frame(self, selected: dict, mode: str, who: dict) -> dict:
-        """What every reply says about where it came from (4.10): `view`, `agent`, `base` and, when behind, `stale`."""
+    def _frame(self, selected: dict, mode: str, who: dict, store: dict | None = None) -> dict:
+        """What every reply says about where it came from (4.10): `view`, `agent`, `base` and, when behind, `stale`.
+
+        STORE is the copy this call already loaded, when nothing has changed it since."""
         link = selected.get("lineage")
         head = {"lineage": link["id"], "generation": link["generation"]} if link else None
         frame = {"view": selected["view"], "agent": who["agent"]}
         if mode == "master":
             return {**frame, "base": head}
         try:
-            store = workcopy.load_store(self.settings, selected)
+            if store is None:
+                store = workcopy.load_store(self.settings, selected)
         except (ValueError, OSError):
             return {**frame, "base": head}
         base = store.get("base")
@@ -436,7 +439,8 @@ class QueryRunner:
 
     def _stamp(self, payload: dict, ctx: dict) -> dict:
         """Add the frame (without overwriting what the reply already says) and the one-time `view_rebuilt`."""
-        for key, value in self._frame(ctx["selected"], ctx["mode"], ctx["who"]).items():
+        store = ctx.get("store") if ctx.get("store_fresh") else None
+        for key, value in self._frame(ctx["selected"], ctx["mode"], ctx["who"], store).items():
             payload.setdefault(key, value)
         pin = ctx.get("pin")
         if pin is not None and pin.rebuilt and "view_rebuilt" not in payload:
@@ -552,19 +556,30 @@ class QueryRunner:
             raise RuntimeError(json.dumps(error.payload())) from error
         viewgov.arm_session_end(self.settings)   # the process's exit closes the views it used (9.17: no orphaned copies)
         with viewgov.GOVERNOR.hold(selected, self.settings, self._release) as pin:
-            ctx = {"selected": selected, "mode": mode, "who": who, "pin": pin, "trace": {}}
+            ctx = {"selected": selected, "mode": mode, "who": who, "pin": pin, "trace": {},
+                   # A read that cannot move the view may hand its store to the reply frame: one load per call, not three.
+                   "store_fresh": action != "type_edit" and follow != "head"}
             try:
-                pin.update(len(workcopy.pending_of(workcopy.load_store(self.settings, selected))))
+                pin.update(len(workcopy.pending_of(self._store(ctx))))
             except (ValueError, OSError):
                 pass
             try:
                 response = self._run(target, selected, ctx, action, address, limit, cursor, contains, timeout_s, options, follow)
             finally:
                 try:  # the keep-warm rule counts the records the view holds now, edits included
-                    pin.update(len(workcopy.pending_of(workcopy.load_store(self.settings, selected))))
+                    if action == "type_edit":
+                        ctx["store"] = None   # the run may have changed (or rebased) the store: read it again
+                    pin.update(len(workcopy.pending_of(self._store(ctx))))
                 except (ValueError, OSError, RuntimeError):
                     pass
         return self._announce(response, base, who)
+
+    def _store(self, ctx: dict) -> dict:
+        """The view's store, loaded once for this call (the frame and the pending count share it)."""
+        store = ctx.get("store")
+        if store is None:
+            store = ctx["store"] = workcopy.load_store(self.settings, ctx["selected"])
+        return store
 
     def _auto_rebase(self, selected: dict, expect, timeout_s: int) -> tuple[dict | None, int | None]:
         """A view that is behind the head and holds records is rebased first, clean-only (4.10): when a record would conflict
@@ -617,16 +632,21 @@ class QueryRunner:
         if cursor and not re.fullmatch(r"(?:0x)?[0-9a-fA-F]+", cursor):
             raise ValueError("use a numeric VA or hexadecimal row cursor, not a symbol name")
         if mode != "master" and action != "stop":
-            workcopy.heal(self.settings, selected)  # settle a commit that died between its CURRENT.log line and its store write
+            if workcopy.heal(self.settings, selected):  # settle a commit that died between its CURRENT.log line and its store write
+                ctx["store"] = None   # the heal wrote the store: the copy read above the run is old
             workcopy.close_superseded_readers(self.settings, selected)  # 9.17: a copy another process retired, still read here
             if follow == "head" and action != "type_edit":
                 followed = self._auto_rebase(selected, None, timeout_s)[0]
+                if followed:
+                    ctx["store"] = None   # the rebase rewrote the store (revision, base)
                 ctx["followed"] = bool(followed) or not workcopy.stale_reason(workcopy.load_store(self.settings, selected), selected)
         if action == "type_edit":
             # Every mutation, on the shared view and on named views, names the revision it read.
             workcopy.require_revision(self.settings, selected, options.get("expect_revision"), "type_edit")
         if action == "status":
-            return json.dumps(_public(self._stamp(self.status(selected, options, limit, ctx), ctx)), ensure_ascii=False)
+            ctx["store_fresh"] = True   # after any follow=rebase: the copy used for the reply is the current one
+            return json.dumps(_public(self._stamp(self.status(selected, options, limit, ctx, store=self._store(ctx)), ctx)),
+                              ensure_ascii=False)
         if action == "stop":
             # As for a named view: the caller's own view is released and the master stays open for the others; a caller with
             # no view of its own releases the master (and the shared view's copy), which is all it uses.
@@ -731,6 +751,8 @@ class QueryRunner:
             return {"target": {key: selected[key] for key in ("name", "view")}, "lineage": None,
                     "queue": {"length": 0, "leader": False, "changesets": []},
                     "note": "no publish has been made on this target; there is no queue"}
+        if csid:
+            views.wait_decision(self.settings, link["id"], csid)   # a still-queued changeset: answer when it is decided, or in 0.5 s
         return {"target": {key: selected[key] for key in ("name", "view")}, **views.queue_status(self.settings, link["id"], csid)}
 
     def _ask(self, selected: dict, request: dict, timeout_s: int, trace: dict | None = None) -> dict:
@@ -788,7 +810,9 @@ class QueryRunner:
             return response
         raise RuntimeError("program could not be reopened")
 
-    def status(self, selected: dict, options: dict | None = None, limit: int = 40, ctx: dict | None = None) -> dict:
+    def status(self, selected: dict, options: dict | None = None, limit: int = 40, ctx: dict | None = None,
+               store: dict | None = None) -> dict:
+        """STORE is the copy this call already loaded (the reply frame and the summary share it)."""
         options = options or {}
         master = selected.get("master_read")
         target = {key: selected[key] for key in ("name", "program", "sha256", "view")}
@@ -810,7 +834,7 @@ class QueryRunner:
                     "view_revision": 0, "overlays": overlays, "identity": hydra.identity(), "session": session,
                     "note": "this agent has no view yet; it reads the sealed master and its first edit creates its view "
                             "(expect_revision 0)"}
-        overlays = workcopy.summary(self.settings, selected)
+        overlays = workcopy.summary(self.settings, selected, store=store)
         return {"engine": info, "target": {key: selected[key] for key in ("name", "gpr", "program", "sha256", "view")},
                 "view_revision": overlays["view_revision"], "overlays": overlays, "identity": hydra.identity(), "session": session}
 

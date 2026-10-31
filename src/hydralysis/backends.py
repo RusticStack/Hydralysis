@@ -10,9 +10,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import platform
 import re
-import shutil
 import stat
 import threading
 import time
@@ -25,10 +23,14 @@ from hydralysis.paths import root_path
 
 
 def __getattr__(name: str):
-    """`backends.urllib`, imported on first use (tests patch `hydralysis.backends.urllib.request.urlopen`)."""
+    """`backends.urllib` and `backends.shutil`, imported on first use (tests patch
+    `hydralysis.backends.urllib.request.urlopen` and `hydralysis.backends.shutil.which`)."""
     if name == "urllib":
         import urllib.request
         return urllib
+    if name == "shutil":   # only `inspect` looks for javac; the query path never needs the archive modules
+        import shutil
+        return shutil
     raise AttributeError("module %r has no attribute %r" % (__name__, name))
 
 # Official release-asset digests. No executable installer, PATH edits,
@@ -155,6 +157,7 @@ def inspect(settings: dict) -> dict:
         break
     java_candidates = [settings.get("java_home"), os.environ.get("JAVA_HOME"), saved.get("java_home")]
     java_candidates += _children(root / "backends", "jdk*")
+    import shutil   # lazy: only an install/inspection search looks for javac
     javac = shutil.which("javac.exe" if os.name == "nt" else "javac")
     if javac:
         java_candidates.append(Path(javac).resolve().parent.parent)
@@ -192,6 +195,7 @@ def _machine() -> str:
         found = os.environ.get("PROCESSOR_ARCHITEW6432") or os.environ.get("PROCESSOR_ARCHITECTURE")
         if found:
             return found
+    import platform   # lazy: platform reads the OS version and may run `cmd /c ver`
     return platform.machine()
 
 
