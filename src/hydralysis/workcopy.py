@@ -608,7 +608,9 @@ def _file_id(path: Path, tail: bool = False):
     try:
         found = path.stat()
         end = b""
-        if tail:
+        # A file written more than STABLE_AGE_NS ago cannot be rewritten in place within its own clock tick any more: a later
+        # rewrite changes its time, so the id, time and size are enough and the tail is not opened.
+        if tail and time.time_ns() - found.st_mtime_ns < durable.STABLE_AGE_NS:
             with path.open("rb") as handle:
                 handle.seek(max(0, found.st_size - 256))
                 end = handle.read(256)

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
 import uuid
@@ -190,12 +191,27 @@ def append_current(settings: dict, lineage_id: str, record: dict, lock_held: boo
         return build()
 
 
+_HEADS: dict = {}
+
+
 def head(settings: dict, lineage_id: str) -> dict:
     """The head: the last valid CURRENT.log line, with what the reader saw (`torn_tail`, `corrupt`).
 
     A reader never repairs. A torn tail shows an older, consistent state; a mid-log gap resolves to the last good
     line before it and says so (`corrupt`), and commits and reverts are refused until the owner repairs it."""
-    scan = current_log(settings, lineage_id).scan()
+    log = current_log(settings, lineage_id)
+    # A query asks for the head a few times; a CURRENT.log with the same id, size and time as at the last scan (and not written in
+    # the last STABLE_AGE_NS) has the same head. The memo holds JSON text, every caller gets its own copy.
+    try:
+        found = os.stat(log.path)
+        identity = (found.st_ino, found.st_size, found.st_mtime_ns)
+    except OSError:
+        identity = None
+    if identity is not None:
+        known = _HEADS.get(log._key)
+        if known is not None and known[0] == identity:
+            return json.loads(known[1])
+    scan = log.scan()
     if not scan.records:
         raise LineageError("no_lineage", "lineage %s has no valid CURRENT.log line" % lineage_id, torn_tail=scan.torn_tail,
                            corrupt=scan.corrupt)
@@ -203,7 +219,17 @@ def head(settings: dict, lineage_id: str) -> dict:
     for field in ("seq", "gen", "gpr"):
         if field not in last:
             raise LineageError("lineage_corrupt", "a CURRENT.log line has no %s" % field)
-    return {**last, "torn_tail": scan.torn_tail, "corrupt": scan.corrupt, "lines": len(scan.records)}
+    result = {**last, "torn_tail": scan.torn_tail, "corrupt": scan.corrupt, "lines": len(scan.records)}
+    if identity is not None and time.time_ns() - identity[2] >= durable.STABLE_AGE_NS and identity[1] <= 256 * 1024:
+        try:
+            again = os.stat(log.path)
+            if (again.st_ino, again.st_size, again.st_mtime_ns) == identity:
+                if len(_HEADS) >= 128:
+                    _HEADS.clear()
+                _HEADS[log._key] = (identity, json.dumps(result))
+        except OSError:
+            pass
+    return result
 
 
 def history(settings: dict, lineage_id: str) -> list[dict]:

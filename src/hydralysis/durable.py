@@ -291,6 +291,37 @@ def exists(path) -> bool:
 
 _MISSING = object()
 
+# Sealed records are replaced whole (write_sealed -> atomic_write), so a file with the same id, size and write time is the same
+# record. A file written less than STABLE_AGE_NS ago is not remembered: an in-place rewrite of the same size within one clock tick
+# could keep its time (the "racy" window of a file-time check). The memo is small and per process: a poll that read a record
+# several times (targets, view records, lineage) answers from it with one stat instead of an open, a read and a seal check.
+STABLE_AGE_NS = 100_000_000
+_STABLE_MAX_TEXT = 32 * 1024
+_STABLE_ENTRIES = 256
+_STABLE: dict = {}
+
+
+def _stable_key(path: Path, max_bytes, require_seal):
+    try:
+        found = os.stat(path)
+    except OSError:
+        return None, None
+    return (os.path.normcase(os.fspath(path)), max_bytes, require_seal), (found.st_ino, found.st_size, found.st_mtime_ns)
+
+
+def _stable_remember(key, identity, path: Path, value) -> None:
+    if identity[1] > _STABLE_MAX_TEXT or time.time_ns() - identity[2] < STABLE_AGE_NS:
+        return
+    try:
+        again = os.stat(path)
+    except OSError:
+        return
+    if (again.st_ino, again.st_size, again.st_mtime_ns) != identity:
+        return
+    if len(_STABLE) >= _STABLE_ENTRIES:
+        _STABLE.pop(next(iter(_STABLE)), None)
+    _STABLE[key] = (identity, json.dumps(value))
+
 
 def read_sealed_info(path, *, default=_MISSING, max_bytes: int | None = None,
                      require_seal: bool = False) -> tuple[dict, str]:
@@ -301,8 +332,15 @@ def read_sealed_info(path, *, default=_MISSING, max_bytes: int | None = None,
     neither exists. A permission error or a read-budget error is not corruption and propagates.
     """
     path = Path(path)
+    memo_key, identity = _stable_key(path, max_bytes, require_seal)
+    if identity is not None:
+        known = _STABLE.get(memo_key)
+        if known is not None and known[0] == identity:
+            return json.loads(known[1]), "file"
     kind, value, reason = inspect_file(path, max_bytes, require_seal)
     if value is not None:
+        if identity is not None:
+            _stable_remember(memo_key, identity, path, value)
         return value, "file"
     backup = backup_path(path)
     bkind, bvalue, breason = inspect_file(backup, max_bytes, require_seal)
