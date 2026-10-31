@@ -1098,7 +1098,8 @@ def _build_base(settings: dict, writer: hydra.Engine, target: dict, master: dict
     forked = _fork(settings, writer, target, master["id"], "base-", phases, parent=folder)
     upgrading = time.monotonic()
     try:
-        program = open_program(writer, forked["gpr"], target["program"], target["sha256"], writable=True, upgrade=True, refresh=True)
+        program = open_program(writer, forked["gpr"], target["program"], target["sha256"], writable=True, upgrade=True,
+                               refresh=True, project=forked.get("project"))
         upgraded = bool(writer.call("info", program=program["key"]).get("changed"))
         # A generation is a published fork: it carries no overlay_state (commit step 5 cleared it). One that does is
         # stale, a claim about records this base does not hold, so it is cleared before any view forks from it.
@@ -1127,8 +1128,22 @@ def _build_base(settings: dict, writer: hydra.Engine, target: dict, master: dict
     return record
 
 
+def warm_base(settings: dict, writer: hydra.Engine, target: dict, master_gpr: str, lineage_id: str,
+              generation: int) -> dict | None:
+    """Build the shared base of a generation just published, while the leader still holds the engine: every view that
+    rebuilds from that generation then forks a ready base instead of one of them paying for it while the others wait.
+    Best effort - a base is a cache, and the first sync that needs it builds it if this did not."""
+    try:
+        opened = writer.call("open_project", path=master_gpr)
+        master = {"id": opened["id"], "revision": opened.get("revision")}
+        return _base(settings, writer, target, master, {"base": {"lineage": lineage_id, "generation": generation}},
+                     wait_s=2.0)
+    except Exception:  # noqa: BLE001 - the publish is decided already; warming a cache must not change its answer
+        return None
+
+
 def _base(settings: dict, writer: hydra.Engine, target: dict, master: dict, store: dict,
-          phases: _Phases | None = None) -> dict:
+          phases: _Phases | None = None, wait_s: float = BASE_WAIT_S) -> dict:
     """The master in the engine's current database format, once per base key for every view and every process.
 
     A project saved by an older Ghidra is upgraded only in a copy (never in place), and working copies are forked
@@ -1146,7 +1161,9 @@ def _base(settings: dict, writer: hydra.Engine, target: dict, master: dict, stor
         return ready
     folder.parent.mkdir(parents=True, exist_ok=True)
     lease = LaneLock(str(bases_root(settings, target) / (key + ".lock")))
+    marker = folder / "COMPLETE.json"
     started = time.monotonic()
+    delay = 0.002
     while True:
         if lease.acquire():
             try:
@@ -1154,11 +1171,16 @@ def _base(settings: dict, writer: hydra.Engine, target: dict, master: dict, stor
                 return ready or _build_base(settings, writer, target, master, release, key, folder, phases, store.get("base"))
             finally:
                 lease.release()
-        time.sleep(0.05)
-        ready = _base_ready(folder)
-        if ready:
-            return ready
-        if time.monotonic() - started >= BASE_WAIT_S:
+        time.sleep(delay)
+        # The builder writes COMPLETE.json last, so its appearance is the one event worth reading the base for; polling the
+        # marker itself costs a stat, where _base_ready reads and validates the record (a build takes ~0.1 s, and three
+        # views of the same generation usually wait for it).
+        delay = min(delay * 1.5, 0.05)
+        if marker.is_file():
+            ready = _base_ready(folder)
+            if ready:
+                return ready
+        if time.monotonic() - started >= wait_s:
             raise LockBusy("shared base", bases_root(settings, target) / (key + ".lock"), time.monotonic() - started, 2000)
 
 
@@ -1333,6 +1355,8 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
 
 def _retire(engine: hydra.Engine, gprs: list[str]) -> list[str]:
     """Remove old working copies the engine no longer has open; keep the rest for a later sync."""
+    if not gprs:
+        return []   # the usual sync retires nothing: no engine round trip, no status reply to read
     import shutil   # lazy: only a sync that retires a copy removes folders
     try:
         open_now = {str(Path(item.get("gpr", "")).resolve()).lower() for item in engine.call("status").get("projects", [])}
