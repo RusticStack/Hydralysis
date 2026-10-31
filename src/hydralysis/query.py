@@ -67,11 +67,13 @@ def _public(value):
 
 
 def open_program(engine: hydra.Engine, gpr: str, program: str, sha256: str, *, writable: bool = False,
-                 upgrade: bool = False, refresh: bool = False, share: bool = True, backup: str | None = None) -> dict:
+                 upgrade: bool = False, refresh: bool = False, share: bool = True, backup: str | None = None,
+                 project: str | None = None) -> dict:
     """Join (or open) one program and check the build before anything is answered from it.
 
     `share=False` opens a writable program for its caller alone (a commit's candidate); `backup` is the verified
-    backup an upgrading writable open names on an engine with the upgrade gate."""
+    backup an upgrading writable open names on an engine with the upgrade gate; PROJECT is the id of a project this
+    connection has just made (a fork), which saves the `open_project` round trip that would only look it up again."""
     cache_key = (engine.key, str(Path(gpr)).lower(), program, writable)
     while True:
         with _keys_guard:
@@ -92,7 +94,7 @@ def open_program(engine: hydra.Engine, gpr: str, program: str, sha256: str, *, w
                     return _hold(engine, flight.row)
         # A refresh opens again itself after the open in flight, and so does a waiter whose opener was interrupted.
     try:
-        flight.row = _open(engine, cache_key, gpr, program, sha256, writable, upgrade, share, backup)
+        flight.row = _open(engine, cache_key, gpr, program, sha256, writable, upgrade, share, backup, project)
         return flight.row
     except Exception as error:
         flight.error = error
@@ -113,9 +115,11 @@ class _Flight:
 
 
 def _open(engine: hydra.Engine, cache_key: tuple, gpr: str, program: str, sha256: str, writable: bool, upgrade: bool,
-          share: bool, backup: str | None) -> dict:
+          share: bool, backup: str | None, project: str | None = None) -> dict:
     wait = hydra.patience_ms(engine, BUSY_WAIT_MS)
-    opened = engine.call("open_project", path=gpr, writable=writable, wait=wait)
+    # A project this connection has just made is open already: `open_project` would only look it up (and ask for the
+    # writable lock this fork already holds), one engine round trip per rebuilt working copy.
+    opened = {"id": project, "gpr": gpr} if project else engine.call("open_project", path=gpr, writable=writable, wait=wait)
     fields = {"path": program, "project": opened["id"]}
     if writable:
         fields.update(writable=True, share=share, upgrade=upgrade)

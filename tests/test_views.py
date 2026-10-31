@@ -143,6 +143,7 @@ class Publish(ViewWorld, unittest.TestCase):
         self.assertEqual(self.manifest(1)["store"]["ids"], [first])
 
     def test_two_views_on_different_subjects_publish_one_after_the_other_and_the_second_is_rebased(self):
+        self.settings["publish_batch_max"] = 1  # the rule tested here is one generation per changeset
         self.edit("FromOne", A, view="one")
         self.edit("FromTwo", B, view="two")
         sealed_one, sealed_two = self.seal("one"), self.seal("two")
@@ -229,6 +230,7 @@ class Publish(ViewWorld, unittest.TestCase):
 
 class Queue(ViewWorld, unittest.TestCase):
     def test_the_queue_is_first_in_first_out_and_position_and_eta_are_reported(self):
+        self.settings["publish_batch_max"] = 1  # one generation per changeset: the order is read off the generations
         for index in range(3):
             self.edit("Name%d" % index, address(index), view="v%d" % index)
         sealed = [self.seal("v%d" % index) for index in range(3)]
@@ -329,6 +331,7 @@ class Queue(ViewWorld, unittest.TestCase):
     def test_a_generation_settled_after_a_later_one_of_its_view_does_not_replace_it(self):
         """A view's later changeset holds the records of its earlier undecided one, so settling the earlier generation last
         finds them committed already: it adds no commit entry and the newer one stays live."""
+        self.settings["publish_batch_max"] = 1  # two generations of the same view are what this test settles
         first = self.edit("One", A, view="one")["overlay_id"]
         early = self.seal("one")
         second = self.edit("Two", B, view="one")["overlay_id"]
@@ -408,6 +411,34 @@ class Batch(ViewWorld, unittest.TestCase):
         self.assertEqual(self.name_of(A), "Early")
         conflict = self.done(sealed[1]["csid"])["conflicts"][0]
         self.assertEqual((conflict["reason"], conflict["theirs"]), ("chain", "Early"))
+
+    def test_a_batch_the_engine_refuses_is_decided_one_changeset_at_a_time_and_only_the_culprit_fails(self):
+        """A batch shares one candidate, so a hard failure names no changeset: the leader retries the batch one at a time,
+        the innocent changesets land, and the one the engine refuses carries the failure (counted once, not twice)."""
+        self.settings["publish_batch_max"] = 2
+        good = self.edit("Good", A, view="one")["overlay_id"]
+        bad = self.edit("Bad", B, view="two")["overlay_id"]
+        sealed = [self.seal("one"), self.seal("two")]
+        verify = views._verify_candidate
+        seen = []
+
+        def refuse_the_second(settings, engine, job, target, candidate_gpr, clone_folder, source_gpr, applied):
+            seen.append([record["id"] for record in applied])
+            if any(record["id"] == bad for record in applied):
+                raise views.PublishFailure("candidate_failed", "planted: the second record is refused", counted=True,
+                                           csid=sealed[1]["csid"])
+            return verify(settings, engine, job, target, candidate_gpr, clone_folder, source_gpr, applied)
+        with patch.object(views, "_verify_candidate", refuse_the_second):
+            led = views.drain(self.settings, self.lineage_id(), self.engine())
+        self.assertEqual(seen, [[good, bad], [good], [bad]])  # the batch, then one at a time
+        self.assertEqual(led["built"], [1])
+        self.assertEqual(led["failure"]["error"], "candidate_failed")
+        self.assertEqual(self.done(sealed[0]["csid"])["outcome"], "applied")
+        self.assertEqual(self.name_of(A), "Good")
+        failed = json.loads(views.failure_path(self.settings, self.lineage_id(), sealed[1]["csid"]).read_text(encoding="utf-8"))
+        self.assertEqual(failed["attempts"], 1)  # the failed batch was not counted against it
+        self.assertEqual(self.pending_ids("two"), [bad])  # its records stay pending
+        self.assertEqual(self.pending_ids("one"), [])
 
 
 class VerifyBeforeHead(ViewWorld, unittest.TestCase):
@@ -1184,6 +1215,11 @@ class LateRecords(ViewWorld, unittest.TestCase):
     """A record added to a view while its changeset waits, then another view's publish decided first: the remainder is
     classified against the generations the base would jump over (review of Y3, round 1, blocking 2)."""
 
+    def setUp(self):
+        super().setUp()
+        # Two generations decided in one drain are what this scenario is about; a batch would decide them as one.
+        self.settings["publish_batch_max"] = 1
+
     def late_scenario(self):
         """View two seals C0 on A. View one seals C1 on B, then renames A (the view is not stale yet, so the edit is accepted).
         The leader publishes C0 as generation 1 and C1 as generation 2 (rebased)."""
@@ -1340,6 +1376,11 @@ class Storm(ViewWorld, unittest.TestCase):
     """24 publishers (K12, K16, K13)."""
 
     PUBLISHERS = 24
+
+    def setUp(self):
+        super().setUp()
+        # 24 publishers make 24 linear generations here (and 6 winners on 6 subjects): one changeset per generation.
+        self.settings["publish_batch_max"] = 1
 
     def run_publishers(self, plan):
         """PLAN: a list of (view, address, name). Every publisher edits its own view, seals and runs its job in its own thread."""
@@ -1546,6 +1587,9 @@ class Processes(ViewWorld, unittest.TestCase):
         lazy = LazyProjects(self.daemon, {"/owned.exe": {"sha256": self.digest, "functions": 3}})
         lazy.update(self.daemon.projects)
         self.daemon.projects = lazy
+        # A leader killed between its fork and its append leaves one generation to recover: this class kills leaders on every
+        # step of a build, and a storm of 24 publishers gives 24 builds to kill only when each build is one changeset.
+        self.settings["publish_batch_max"] = 1
 
     def spawn(self, sealed, view, fault=None, extra_env=None):
         spec = {"settings": self.settings, "target": "owned", "view": view, "csid": sealed["csid"], "lineage": sealed["lineage"],
