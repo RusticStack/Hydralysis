@@ -1398,6 +1398,12 @@ def _publish_candidate(settings: dict, lineage_id: str, engine, head: dict, targ
                                                     "gpr": candidate_gpr, "manifestSha256": manifest_sha, "engine": body["engine"]})
         _point("after_append")
         build_ms = int((time.monotonic() - started) * 1000)
+        # Warm the shared base of this generation before the results are visible, while the leader still holds the engine:
+        # the views that rebuild from it then fork a ready base instead of one of them building it while the others wait
+        # (the usual 3-of-4 case), and the warm does not compete with their rebuilds. A publish has the slack for it; an
+        # edit does not (targets: 8.7 s vs 0.55 s). A leader that dies in here is resolved from the manifest like any
+        # leader that died before its `done/` file.
+        workcopy.warm_base(settings, engine, target, candidate_gpr, lineage_id, generation)
         for item in accepted:
             write_done(settings, lineage_id, item["cs"]["csid"],
                        {"outcome": item["outcome"], "generation": generation, "gpr": candidate_gpr, "manifestSha256": manifest_sha,
@@ -1407,9 +1413,6 @@ def _publish_candidate(settings: dict, lineage_id: str, engine, head: dict, targ
             _point("after_done")
         for item in accepted:
             settles.append((item["cs"], generation, by_changeset[item["cs"]["csid"]]["ids"]))
-        # Warm the shared base of this generation while the leader still holds the engine: the views that rebuild from it
-        # then fork a ready base instead of one of them building it while the others wait (the usual 3-of-4 case).
-        workcopy.warm_base(settings, engine, target, candidate_gpr, lineage_id, generation)
         return {"generation": generation, "csids": [item["cs"]["csid"] for item in accepted], "manifestSha256": manifest_sha}
     except (durable.FaultInjected, commits.Crash):
         raise  # a simulated kill: nothing more is written, the next leader decides from the files
