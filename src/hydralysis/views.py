@@ -36,11 +36,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import random
 import re
-import secrets
-import shutil
-import subprocess
 import time
 import uuid
 from collections import OrderedDict
@@ -666,6 +662,7 @@ def publish_lock_path(settings: dict, lineage_id: str) -> Path:
 
 def new_csid() -> str:
     """Sorts in the order changesets were sealed: microseconds since the epoch, then twelve random bits for a tie."""
+    import random   # lazy: nothing else in a query process needs it
     return "c-%013x%03x" % (int(time.time() * 1_000_000), random.getrandbits(12))
 
 
@@ -1408,6 +1405,7 @@ def _publish_candidate(settings: dict, lineage_id: str, engine, head: dict, targ
         except Exception:
             pass
         if clone_folder is not None:
+            import shutil   # lazy: only a failed publish needs it
             shutil.rmtree(clone_folder, ignore_errors=True)
 
 
@@ -1681,7 +1679,7 @@ def outcome_of(result: dict, revision: int | None = None) -> dict:
 # live while its lease holds and its process exists; a view with no live holder is `orphaned`, and the `adoptable` list of
 # a new process names the orphans of the same agent name that still have pending records.
 
-BOOT_ID = secrets.token_hex(8)       # 16 random hex digits, new at every start of this server process (D59, revision 8)
+BOOT_ID = os.urandom(8).hex()        # 16 random hex digits, new at every start of this server process (D59, revision 8)
 RESERVED_VIEWS = ("shared", "master")  # `shared` is the collaboration view (named explicitly); `master` labels reads of the sealed master
 LEASE_S = 600                        # `viewLeaseS`: a holder that makes no call for this long no longer owns the view
 LEASE_REFRESH_S = 60                 # the lease is rewritten when this much of it is gone, not on every call
@@ -1938,6 +1936,7 @@ def start_job(settings: dict, target: str, options: dict, view: str = "") -> dic
         env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent), HYDRALYSIS_HARNESS=hydra.identity()["harness"])
         # No log file: a raw file write outside `durable` is a site `test_durable` counts. What the worker has to say goes into the
         # job record (`error`), which `overlayjobs.status` shows; `main` below puts any uncaught exception there too.
+        import subprocess   # lazy: a query-only process never starts a job, and a job worker never starts one either
         child = proc.popen([sys.executable, "-m", "hydralysis.views", str(path)], env=env, stdout=subprocess.DEVNULL,
                            stderr=subprocess.DEVNULL, **({} if os.name == "nt" else {"start_new_session": True}))
         with locked(path.with_suffix(".lock"), what="overlay job"):

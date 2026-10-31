@@ -29,7 +29,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import threading
 import time
 import uuid
@@ -864,6 +863,7 @@ def store_corpus(settings: dict, source: str) -> tuple[str, int]:
     value = digest.hexdigest()
     destination = corpus_path(settings, value)
     if not destination.is_file():
+        import shutil   # lazy: shutil pulls in the archive modules, which a query never needs
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_name(destination.name + "." + uuid.uuid4().hex + ".tmp")
         shutil.copyfile(source_path, temporary)
@@ -1084,6 +1084,7 @@ def _build_base(settings: dict, writer: hydra.Engine, target: dict, master: dict
     """Fork the master into FOLDER, bring it to the engine's current format, clear a stale marker, write the marker."""
     from hydralysis.query import open_program
     # A crashed builder left a partial fork here; nothing reads it (no marker), and this builder holds the lock.
+    import shutil   # lazy: only building a base removes folders
     for partial in folder.glob("base-*") if folder.is_dir() else ():
         shutil.rmtree(partial, ignore_errors=True)
     started = time.monotonic()
@@ -1325,6 +1326,7 @@ def _sync(settings: dict, target: dict, store: dict, timeout_s: int, extra: list
 
 def _retire(engine: hydra.Engine, gprs: list[str]) -> list[str]:
     """Remove old working copies the engine no longer has open; keep the rest for a later sync."""
+    import shutil   # lazy: only a sync that retires a copy removes folders
     try:
         open_now = {str(Path(item.get("gpr", "")).resolve()).lower() for item in engine.call("status").get("projects", [])}
     except (hydra.EngineError, OSError):

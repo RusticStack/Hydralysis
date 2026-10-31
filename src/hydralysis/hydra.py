@@ -14,12 +14,10 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import importlib.util
 import itertools
 import json
 import os
 import re
-import shutil
 import sys
 import threading
 import time
@@ -261,6 +259,7 @@ def load_client(path: str | Path, allow_unpinned: bool = False):
     name = "rusticre_hydra_client_" + hashlib.sha256(str(path).encode()).hexdigest()[:12]
     module = sys.modules.get(name)
     if module is None:
+        import importlib.util   # lazy: only loading the engine client needs it
         spec = importlib.util.spec_from_file_location(name, path)
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
@@ -1640,6 +1639,7 @@ def journal_durable(settings: dict) -> bool:
 
 def install(settings: dict, download, extract, cancelled=lambda: False) -> dict:
     """Download, verify and unpack the pinned engine and its client under root/backends."""
+    import shutil   # lazy: shutil pulls in the archive modules, which a query never needs
     root = root_path(settings)
     backends = root / "backends"
     backends.mkdir(parents=True, exist_ok=True)
