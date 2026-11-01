@@ -132,3 +132,352 @@ send({event:'probe_installed',hook_id:p.id,address:site.toString(),verified_byte
 rpc.exports={status(){return {installed:true};},
  counters(){return {seen:seen,hits:hits,limit:p.limit};},release(){send({event:'probe_removed',hook_id:p.id});listener.detach();}};
 """.replace("PARAMETERS", parameters)
+
+
+# ---- the semantic trace agent (TRACE-1 capture, in process) ---------------------------------------------------------
+#
+# The hot path is a CModule (native code, no JavaScript in a hook): each hooked call writes one fixed-layout record
+# into the calling thread's own single-producer ring (no lock, no allocation, no JSON, no hashing, no symbolization,
+# no file I/O). A timer in the script drains the rings into one binary batch and `send(..., data)`s it. The counters
+# that say what was lost (attempted, dropped, read failures, threads without a ring) live outside the rings and are
+# sent on their own message, so a full ring cannot hide its own overflow. Memory is read with ReadProcessMemory on the
+# calling process: the kernel refuses an unreadable range with an error code, so no fault is raised in the target and
+# no handler (the host's, ours) is ever entered by a probe's read. The layout is documented in `trace_wire`.
+# (CModule calls a function named `init` itself on construction, so the recorder's is `trace_init`; a CModule's own data
+# is read-only on this Frida, so every mutable cell lives in memory the script allocates and the hooks reach it through
+# the site they were attached with.)
+
+TRACE_C = r"""
+#include <glib.h>
+#include <gum/guminterceptor.h>
+#include <string.h>
+
+extern int QueryPerformanceCounter(gint64 *);
+extern int ReadProcessMemory(void *, const void *, void *, gsize, gsize *);
+extern void *TlsGetValue(guint);
+extern int TlsSetValue(guint, void *);
+extern guint GetLastError(void);
+
+#define MAX_RINGS 128
+#define BUFMAX 256
+#define REC_HDR 64
+
+typedef struct {
+  volatile guint32 head;
+  volatile guint32 tail;
+  guint32 attempted, dropped, read_failed, tid, entered, left, busy, ring_id;
+  guint8 *buf;
+} Ring;
+
+/* All mutable state lives in memory the script allocates (a CModule's own data is not writable). */
+typedef struct {
+  guint32 nrings, ring_mask, tls_index, pad;
+  volatile gint mode, next_ring, no_ring, pad2;
+  Ring rings[MAX_RINGS];
+} Shared;
+
+typedef struct { Shared *sh; guint32 id, nargs, flags, buf_max; gint32 buf_ptr_arg, buf_len_arg; guint32 buf_fixed; } Site;
+
+typedef struct {
+  guint16 size; guint8 kind, flags; guint16 site, ring;
+  guint64 qpc; guint32 tid, ring_seq;
+  guint64 ret_addr, qpc_end, retval;
+  guint32 last_error; guint16 nargs, buflen;
+  guint64 buf_addr;
+} Rec;
+
+typedef struct {
+  guint64 args[8]; guint64 qpc; guint64 ret_addr; guint64 buf_addr;
+  Ring *ring; guint32 live, bflags; guint32 buflen; guint8 buf[BUFMAX];
+} Inv;
+
+guint shared_size(void) { return sizeof(Shared); }
+guint site_size(void) { return sizeof(Site); }
+
+void trace_init(Shared *sh, guint8 *mem, guint count, guint bytes, guint tls) {
+  guint i;
+  sh->nrings = count > MAX_RINGS ? MAX_RINGS : count; sh->ring_mask = bytes - 1; sh->tls_index = tls;
+  for (i = 0; i < sh->nrings; i++) { sh->rings[i].buf = mem + (gsize)i * bytes; sh->rings[i].ring_id = i; }
+}
+
+void site_init(Site *s, Shared *sh, guint id, guint nargs, guint flags, gint buf_ptr_arg, gint buf_len_arg, guint buf_fixed, guint buf_max) {
+  s->sh = sh; s->id = id; s->nargs = nargs > 8 ? 8 : nargs; s->flags = flags;
+  s->buf_ptr_arg = buf_ptr_arg; s->buf_len_arg = buf_len_arg; s->buf_fixed = buf_fixed;
+  s->buf_max = buf_max > BUFMAX ? BUFMAX : buf_max;
+}
+
+void set_mode(Shared *sh, gint m) { sh->mode = m; }
+
+static Ring *get_ring(Shared *sh) {
+  Ring *r = (Ring *)TlsGetValue(sh->tls_index);
+  gint i;
+  if (r == (Ring *)1) return 0;
+  if (r) return r;
+  i = g_atomic_int_add(&sh->next_ring, 1);
+  if (i >= (gint)sh->nrings) { TlsSetValue(sh->tls_index, (void *)1); g_atomic_int_add(&sh->no_ring, 1); return 0; }
+  r = &sh->rings[i];
+  TlsSetValue(sh->tls_index, r);
+  return r;
+}
+
+static void read_buf(Site *s, Inv *inv, Ring *r) {
+  gsize want, got = 0;
+  guint64 p;
+  guint i;
+  if (s->buf_ptr_arg < 0) return;
+  p = inv->args[s->buf_ptr_arg];
+  if (!p) return;
+  inv->buf_addr = p;
+  inv->bflags = 16;
+  if (s->flags & 2) { want = s->buf_max; inv->bflags |= 8; }
+  else if (s->buf_len_arg >= 0) { want = (gsize)(inv->args[s->buf_len_arg] & 0xFFFFFFFFu); if (want > s->buf_max) { want = s->buf_max; inv->bflags |= 4; } }
+  else { want = s->buf_fixed > s->buf_max ? s->buf_max : s->buf_fixed; }
+  if (want == 0) return;
+  ReadProcessMemory((void *)-1, (const void *)(gsize)p, inv->buf, want, &got);
+  if (got == 0) { inv->bflags = 16 | 2; inv->buflen = 0; r->read_failed++; return; }
+  if (got < want && !(s->flags & 2)) inv->bflags |= 4;
+  if (s->flags & 2) {
+    for (i = 0; i + 1 < got; i += 2) if (inv->buf[i] == 0 && inv->buf[i + 1] == 0) { got = i + 2; want = got; break; }
+    if (got == want && !(want >= 2 && inv->buf[want - 2] == 0 && inv->buf[want - 1] == 0)) inv->bflags |= 4;
+  }
+  inv->buflen = (guint32)got;
+}
+
+static void emit(Ring *r, Site *s, Inv *inv, guint64 ret, guint32 last_error, guint64 qpc_end, gint has_ret) {
+  guint32 buflen = inv->buflen, total, head, tail, pos, mask = s->sh->ring_mask, cap = mask + 1, pad = 0, seq;
+  Rec *rec;
+  guint i;
+  total = REC_HDR + 8 * s->nargs + ((buflen + 7) & ~7u);
+  seq = r->attempted++;
+  head = r->head; tail = r->tail;
+  pos = head & mask;
+  if (pos + total > cap) pad = cap - pos;
+  if ((guint32)(head - tail) + pad + total > cap) { r->dropped++; return; }
+  if (pad) { *(guint16 *)(r->buf + pos) = (guint16)pad; r->buf[pos + 2] = 2; r->buf[pos + 3] = 0; head += pad; pos = 0; }
+  rec = (Rec *)(r->buf + pos);
+  rec->size = (guint16)total; rec->kind = 1;
+  rec->flags = (guint8)(inv->bflags | (has_ret ? 1 : 0));
+  rec->site = (guint16)s->id; rec->ring = (guint16)r->ring_id;
+  rec->qpc = inv->qpc; rec->tid = r->tid; rec->ring_seq = seq;
+  rec->ret_addr = inv->ret_addr; rec->qpc_end = qpc_end; rec->retval = ret;
+  rec->last_error = last_error; rec->nargs = (guint16)s->nargs; rec->buflen = (guint16)buflen;
+  rec->buf_addr = inv->buf_addr;
+  for (i = 0; i < s->nargs; i++) ((guint64 *)(r->buf + pos + REC_HDR))[i] = inv->args[i];
+  if (buflen) memcpy(r->buf + pos + REC_HDR + 8 * s->nargs, inv->buf, buflen);
+  r->head = head + total;
+}
+
+void on_enter(GumInvocationContext *ic) {
+  Site *s = (Site *)gum_invocation_context_get_listener_function_data(ic);
+  Ring *r;
+  Inv local, *inv;
+  guint i;
+  gint64 t;
+  if (!s->sh->mode) return;
+  r = get_ring(s->sh);
+  if (!r) return;
+  r->busy++;
+  r->tid = (guint32)gum_invocation_context_get_thread_id(ic);
+  inv = (s->flags & 1) ? (Inv *)gum_invocation_context_get_listener_invocation_data(ic, sizeof(Inv)) : &local;
+  inv->buflen = 0; inv->bflags = 0; inv->buf_addr = 0; inv->live = 0;
+  for (i = 0; i < s->nargs; i++) inv->args[i] = (guint64)(gsize)gum_invocation_context_get_nth_argument(ic, i);
+  inv->ret_addr = (guint64)(gsize)gum_invocation_context_get_return_address(ic);
+  read_buf(s, inv, r);
+  QueryPerformanceCounter(&t);
+  inv->qpc = (guint64)t;
+  inv->ring = r;
+  if (s->flags & 1) { inv->live = 1; r->entered++; }
+  else emit(r, s, inv, 0, 0, 0, 0);
+  r->busy--;
+}
+
+void on_leave(GumInvocationContext *ic) {
+  Site *s = (Site *)gum_invocation_context_get_listener_function_data(ic);
+  Inv *inv = (Inv *)gum_invocation_context_get_listener_invocation_data(ic, sizeof(Inv));
+  Ring *r;
+  gint64 t;
+  guint32 err;
+  if (!inv || !inv->live) return;
+  r = inv->ring;
+  r->busy++;
+  err = GetLastError();
+  QueryPerformanceCounter(&t);
+  if (s->sh->mode) emit(r, s, inv, (guint64)(gsize)gum_invocation_context_get_return_value(ic), err, (guint64)t, 1);
+  inv->live = 0;
+  r->left++;
+  r->busy--;
+}
+
+guint drain(Shared *sh, guint8 *out, guint cap, guint *records) {
+  guint i, used = 0, n = 0, limit = sh->next_ring < (gint)sh->nrings ? (guint)sh->next_ring : sh->nrings;
+  for (i = 0; i < limit; i++) {
+    Ring *r = &sh->rings[i];
+    guint32 tail = r->tail, head = r->head;
+    while (tail != head) {
+      guint8 *p = r->buf + (tail & sh->ring_mask);
+      guint16 size = *(guint16 *)p;
+      if (size < 8) { tail = head; break; }
+      if (p[2] == 1) {
+        if (used + size > cap) break;
+        memcpy(out + used, p, size); used += size; n++;
+      }
+      tail += size;
+    }
+    r->tail = tail;
+  }
+  *records = n;
+  return used;
+}
+
+void counters(Shared *sh, guint64 *out) {
+  guint i, limit = sh->next_ring < (gint)sh->nrings ? (guint)sh->next_ring : sh->nrings;
+  guint64 a = 0, d = 0, f = 0, e = 0, l = 0, b = 0;
+  for (i = 0; i < limit; i++) { Ring *r = &sh->rings[i]; a += r->attempted; d += r->dropped; f += r->read_failed; e += r->entered; l += r->left; b += r->busy; }
+  out[0] = a; out[1] = d; out[2] = f; out[3] = (guint64)sh->no_ring; out[4] = e; out[5] = l; out[6] = b; out[7] = limit;
+}
+
+void ring_stats(Shared *sh, guint i, guint64 *out) {
+  Ring *r = &sh->rings[i];
+  out[0] = r->attempted; out[1] = r->dropped; out[2] = r->read_failed; out[3] = r->tid;
+  out[4] = (guint32)(r->head - r->tail); out[5] = r->entered; out[6] = r->left; out[7] = r->busy;
+}
+"""
+
+TRACE_AGENT = r"""
+const P=PARAMETERS;
+const k32=Process.getModuleByName('kernel32.dll'),ntdll=Process.getModuleByName('ntdll.dll');
+const x=(m,n)=>m.getExportByName(n);
+const qpcFn=x(k32,'QueryPerformanceCounter');
+const qpcNative=new NativeFunction(qpcFn,'int',['pointer']);
+const scratch=Memory.alloc(64);
+function qpcNow(){qpcNative(scratch);return scratch.readU64();}
+// ---- non-faulting reads (attach time): a validated readable range, then readVolatile; null on any failure ----------
+function rv(address,n){try{const q=ptr(address),r=Process.findRangeByAddress(q);
+  if(r===null||r.protection.indexOf('r')<0||q.add(n).compare(r.base.add(r.size))>0)return null;
+  const b=q.readVolatile(n);return b===null||b.byteLength!==n?null:b;}catch(e){return null;}}
+function rptr(address){const b=rv(address,Process.pointerSize);if(b===null)return null;
+  return Process.pointerSize===8?ptr(new DataView(b).getBigUint64(0,true).toString()):ptr(new DataView(b).getUint32(0,true));}
+function where(a){if(a===null)return null;const m=Process.findModuleByAddress(a);
+  return m===null?{address:a.toString(),module:null}:{address:a.toString(),module:m.name,rva:a.sub(m.base).toString()};}
+// ---- the host's fault policy as it stands at attach (spec 15.1) -----------------------------------------------------
+function faultContext(){
+  const ctx={debugger_present:Process.isDebuggerAttached(),veh:[],veh_error:null,uef:null,uef_error:null,frida_handler_index:null};
+  try{const isdbg=new NativeFunction(x(k32,'IsDebuggerPresent'),'int',[]);ctx.is_debugger_present_api=isdbg()!==0;}catch(e){ctx.is_debugger_present_api=null;}
+  if(Process.pointerSize===8){try{
+    const add=new NativeFunction(x(ntdll,'RtlAddVectoredExceptionHandler'),'pointer',['uint','pointer']);
+    const rem=new NativeFunction(x(ntdll,'RtlRemoveVectoredExceptionHandler'),'uint',['pointer']);
+    const dec=new NativeFunction(x(ntdll,'RtlDecodePointer'),'pointer',['pointer']);
+    const mine=new NativeCallback(()=>0,'int',['pointer']);
+    const entry=add(1,mine);
+    if(entry.isNull())throw new Error('could not add the probe handler');
+    // The handler slot is found by decoding candidates until one is our own callback.
+    let slot=null;for(const off of [0x10,0x18,0x20,0x8]){const e=rptr(entry.add(off));if(e!==null&&dec(e).equals(mine)){slot=off;break;}}
+    if(slot===null){rem(entry);throw new Error('unrecognised vectored handler entry layout');}
+    let node=rptr(entry),guard=0;const base=ntdll.base,end=ntdll.base.add(ntdll.size);
+    while(node!==null&&!node.isNull()&&guard++<64){
+      if(node.compare(base)>=0&&node.compare(end)<0)break;
+      if(node.equals(entry))break;
+      const enc=rptr(node.add(slot));if(enc===null){ctx.veh.push({error:'unreadable entry at '+node});break;}
+      ctx.veh.push(where(dec(enc)));node=rptr(node);
+    }
+    rem(entry);
+    const fi=ctx.veh.findIndex(v=>v&&v.module&&/frida/i.test(v.module));
+    ctx.frida_handler_index=fi<0?null:fi;
+  }catch(e){ctx.veh_error=String(e);}}
+  try{const set=new NativeFunction(x(k32,'SetUnhandledExceptionFilter'),'pointer',['pointer']);
+    const prev=set(ptr(0));set(prev);ctx.uef=prev.isNull()?null:where(prev);}catch(e){ctx.uef_error=String(e);}
+  return ctx;
+}
+const context=faultContext();
+// ---- the probes: each must match its build before anything is attached ----------------------------------------------
+const mods=Process.enumerateModules();
+function readExact(address,n){const b=rv(address,n);if(b===null)throw new Error('live memory read was incomplete at '+address);return Array.from(new Uint8Array(b));}
+const verified=[];
+for(const pr of P.probes){
+  const hit=mods.filter(m=>m.path===pr.module);
+  if(hit.length!==1||hit[0].base.toString()!==pr.base)throw new Error('module mapping changed before probe installation: '+pr.name);
+  const site=hit[0].base.add(pr.rva);
+  const got=readExact(site,pr.expect.length);
+  if(got.some((b,i)=>b!==pr.expect[i]))throw new Error('PROLOGUE MISMATCH; probe refused: '+pr.name);
+  verified.push({probe:pr,site});
+}
+// ---- the native recorder ------------------------------------------------------------------------------------------------
+const tls=new NativeFunction(x(k32,'TlsAlloc'),'uint',[])();
+const cm=new CModule(P.c_source,{QueryPerformanceCounter:qpcFn,ReadProcessMemory:x(k32,'ReadProcessMemory'),
+  TlsGetValue:x(k32,'TlsGetValue'),TlsSetValue:x(k32,'TlsSetValue'),GetLastError:x(k32,'GetLastError')});
+const f={init:new NativeFunction(cm.trace_init,'void',['pointer','pointer','uint','uint','uint']),
+  shared_size:new NativeFunction(cm.shared_size,'uint',[]),site_size:new NativeFunction(cm.site_size,'uint',[]),
+  site_init:new NativeFunction(cm.site_init,'void',['pointer','pointer','uint','uint','uint','int','int','uint','uint']),
+  set_mode:new NativeFunction(cm.set_mode,'void',['pointer','int']),
+  drain:new NativeFunction(cm.drain,'uint',['pointer','pointer','uint','pointer']),
+  counters:new NativeFunction(cm.counters,'void',['pointer','pointer']),
+  ring_stats:new NativeFunction(cm.ring_stats,'void',['pointer','uint','pointer'])};
+const shared=Memory.alloc(f.shared_size()),siteSize=f.site_size(),siteMem=Memory.alloc(siteSize*(P.probes.length+1));
+const ringMem=Memory.alloc(P.rings*P.ring_bytes);
+f.init(shared,ringMem,P.rings,P.ring_bytes,tls);
+const HDR=64,outCap=P.batch_bytes,out=Memory.alloc(HDR+outCap),cnt=Memory.alloc(64),nrec=Memory.alloc(8),rs=Memory.alloc(64);
+let batchSeq=0,released=false,sentBatches=0,sentBytes=0;
+function readCounters(){f.counters(shared,cnt);const v=[];for(let i=0;i<8;i++)v.push(cnt.add(8*i).readU64().toNumber());return v;}
+function ringRows(){const c=readCounters(),rows=[];for(let i=0;i<c[7];i++){f.ring_stats(shared,i,rs);
+  rows.push({ring:i,attempted:rs.readU64().toNumber(),dropped:rs.add(8).readU64().toNumber(),read_failed:rs.add(16).readU64().toNumber(),
+   tid:rs.add(24).readU64().toNumber(),occupancy:rs.add(32).readU64().toNumber()});}return rows;}
+function flush(){
+  let total=0,sent=0;
+  for(;;){
+    const used=f.drain(shared,out.add(HDR),outCap,nrec);if(used===0)break;
+    const c=readCounters();
+    out.writeU32(0x31425448);out.add(4).writeU16(1);out.add(6).writeU16(HDR);out.add(8).writeU32(P.producer_gen);
+    out.add(12).writeU32(batchSeq>>>0);out.add(16).writeU64(qpcNow());out.add(24).writeU32(nrec.readU32());out.add(28).writeU32(used);
+    out.add(32).writeU64(c[0]);out.add(40).writeU64(c[1]);out.add(48).writeU64(c[2]);out.add(56).writeU64(c[3]);
+    send({event:'trace_batch',batch_seq:batchSeq},out.readByteArray(HDR+used));
+    batchSeq++;sentBatches++;sentBytes+=used;total+=used;sent++;if(sent>=64)break;
+  }
+  return total;
+}
+function counterMessage(final){const c=readCounters();
+  send({event:'trace_counters',final:!!final,t:qpcNow().toString(),attempted:c[0],dropped:c[1],read_failed:c[2],no_ring:c[3],
+    entered:c[4],left:c[5],busy:c[6],rings_used:c[7],batches_sent:sentBatches,batches_next:batchSeq,rings:ringRows()});}
+const flushTimer=setInterval(flush,P.batch_ms);
+const counterTimer=setInterval(()=>counterMessage(false),P.counter_ms);
+// ---- attach (everything is verified above) -----------------------------------------------------------------------------
+const listeners=[],installed=[];
+for(const v of verified){const pr=v.probe,t0=Date.now(),b=pr.buf;
+  const flags=(pr.with_leave?1:0)|(b&&b.wide?2:0);
+  const s=siteMem.add(siteSize*installed.length);
+  f.site_init(s,shared,pr.id,pr.nargs,flags,b?b.ptr_arg:-1,b&&b.len_arg!==null&&b.len_arg!==undefined?b.len_arg:-1,b&&b.fixed?b.fixed:0,b?b.max:0);
+  listeners.push(Interceptor.attach(v.site,pr.with_leave?{onEnter:cm.on_enter,onLeave:cm.on_leave}:{onEnter:cm.on_enter},s));
+  installed.push({id:pr.id,name:pr.name,address:v.site.toString(),install_ms:Date.now()-t0});}
+f.set_mode(shared,1);
+const freqFn=new NativeFunction(x(k32,'QueryPerformanceFrequency'),'int',['pointer']);freqFn(scratch);
+send({event:'trace_ready',context,qpc_freq:scratch.readU64().toString(),producer_gen:P.producer_gen,pid:Process.id,arch:Process.arch,
+  rings:P.rings,ring_bytes:P.ring_bytes,batch_ms:P.batch_ms,installed,qpc:qpcNow().toString(),tls_index:tls});
+rpc.exports={
+  status(){return {installed:true,mode:released?'released':'recording'};},
+  counters(){return {counters:readCounters(),rings:ringRows(),batches_sent:sentBatches};},
+  flush(){return flush();},
+  // Pass-through, detach, prove the callbacks quiescent. A failed proof keeps the recorder in place, in pass-through,
+  // and says so; the worker must not unload the script then (unloading frees the callbacks).
+  release(timeoutMs){
+    f.set_mode(shared,0);
+    Thread.sleep(0.05);
+    flush();
+    for(const l of listeners)l.detach();
+    Interceptor.flush();
+    const t0=Date.now();let stable=0,ok=false;
+    while(Date.now()-t0<timeoutMs){
+      const c=readCounters();
+      if(c[6]===0&&c[4]===c[5]){stable++;if(stable>=3){ok=true;break;}}else stable=0;
+      Thread.sleep(0.025);}
+    const c=readCounters();
+    const result={quiescent:ok,waited_ms:Date.now()-t0,busy:c[6],entered:c[4],left:c[5]};
+    if(ok){clearInterval(flushTimer);clearInterval(counterTimer);flush();counterMessage(true);released=true;
+      result.note='detached and quiescent; the script may be unloaded';}
+    else{flush();result.note='callbacks still in flight; recorder retained in pass-through';}
+    return result;}
+};
+"""
+
+
+def trace_agent_source(parameters: dict) -> str:
+    """The trace agent script for one session. `parameters` is rendered as JSON; the C source travels with it."""
+    return TRACE_AGENT.replace("PARAMETERS", json.dumps({**parameters, "c_source": TRACE_C}), 1)
