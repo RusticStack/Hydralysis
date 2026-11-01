@@ -1,12 +1,12 @@
 {
-  "release": "0.6.0",
-  "testedCommit": "4e0c096ac19214b6e873858aee6d948abe432073",
-  "date": "2026-10-30",
-  "machine": "Windows 11 Pro 10.0.26300, 22 cores, NTFS, Python 3.15, JDK 25.0.4.1 Temurin",
-  "engine": "the published Hydra Engine 12.3-hydra.4 zip (SHA-256 f0f2844ca32b702c3fe711adbf6c7d4743ddac5097073691965faaabf7a8cef0), unzipped",
+  "release": "0.7.0",
+  "testedCommit": "e6c50f28197810a7a1350567570749a47fae7bf2",
+  "date": "2026-11-01",
+  "machine": "Windows 11 Pro 10.0.26300, 24 logical processors, NTFS, Python 3.15, JDK 25.0.4.1 Temurin",
+  "engine": "the published Hydra Engine 12.3-hydra.5 zip (SHA-256 1627dbc59fab78b1d3f64cd861c61ef27c68bd17ec8d9e5b31b4be7240024e13), unzipped",
   "suites": {
-    "unit (tools/run_tests.py)": "1512/1512 OK on 4e0c096 (D:/Projects/Hydra/_logs/final/rel-unit3.log)",
-    "unit + real engine (tools/run_tests.py --integration)": "1512/1512 OK, 0 failed alone, 0 under load, NoStockEndToEnd ran, on 399412f (D:/Projects/Hydra/_logs/final/rel-integ2.log); 399412f..4e0c096 changes only the release workflow, tests/test_release.py and this record",
+    "unit (tools/run_tests.py)": "1640 test results, 0 failed alone, 0 failed only under load; 1 pre-existing task-plan artefact (test_runtime_scenario_fixture ran 23 tests, 22 planned; all its tests OK and it reproduces on the base) (D:/Projects/Hydra/_logs/rust-round4/release/hy-unit.log)",
+    "unit + real engine (tools/run_tests.py --integration)": "test_engine_integration 17/17 OK against the published 12.3-hydra.5 engine (D:/Projects/Hydra/_logs/rust-round4/release/hy-engine.log)",
     "bump_hydra.py --check": "exit 0 against the published SHA256SUMS"
   }
 }
