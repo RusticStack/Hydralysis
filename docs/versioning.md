@@ -15,8 +15,8 @@ The package version lives in `pyproject.toml` and `src/hydralysis/__init__.py`; 
 ## Which release pins which engine
 
 The engine release, protocol and client archive are pinned in one place, `src/hydralysis/hydra.py` (`RELEASE`,
-`PROTOCOL`, `CLIENT_VERSION`, `ASSETS`). Only `tools/bump_hydra.py` changes them, together with the three pin
-statements in `README.md`, `THIRD_PARTY.md` and `docs/upstream-setup.md`.
+`PROTOCOL`, `CLIENT_VERSION`, `ASSETS`). Only `tools/bump_hydra.py` changes them, together with the two pin
+statements in `README.md` and `THIRD_PARTY.md`.
 
 | Hydralysis | Pinned engine | Protocol | Notes |
 |---|---|---|---|

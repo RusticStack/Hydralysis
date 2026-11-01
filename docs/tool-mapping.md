@@ -4,7 +4,7 @@ How the Hydralysis surface relates to the two tools it replaced in agent session
 
 ## Counts, and where each comes from
 
-The counts below are written by `tools/count_surfaces.py` into `docs/data/tool-surfaces.json`, and `tests/test_tool_mapping.py` checks this page against it and against `api.TOOL_NAMES`. Only the Hydralysis count is reproduced from this repository; the other two are third-party figures, listed with the date and the label "not reproduced" in [verification.md](verification.md#owner-reported-third-party-figures-2026-10-28).
+The counts below are written by `tools/count_surfaces.py` into `docs/data/tool-surfaces.json`, and `tests/test_tool_mapping.py` checks this page against it and against `api.TOOL_NAMES`. Only the Hydralysis count is reproduced from this repository; the other two are third-party figures, listed with the date and the label "not reproduced" [below](#owner-reported-third-party-figures-2026-10-28).
 
 | Surface | Count | Source | Status |
 | --- | --- | --- | --- |
@@ -65,10 +65,22 @@ Hydralysis operations with no GhidraMCP counterpart: `trace`, `pcode`, `vtables`
 
 ## REA (207) to Hydralysis
 
-Not mapped. The 207 figure is skill metadata, and no tool list was enumerated for this repository. The research notes in [research.md](research.md) and [upstream-analysis.md](upstream-analysis.md) cite what agents actually called; a row-by-row table is **to verify** and not yet written.
+Not mapped. The 207 figure is skill metadata, and no tool list was enumerated for this repository; a row-by-row table is **to verify** and not yet written.
 
 ## Known open questions
 
 - Which of the 30 GhidraMCP tools were exercised in real sessions, and how often: **to verify** against session logs.
 - Whether the two GUI-only tools account for the owner's 28: **to verify**.
 - Whether REA's 207 matches a live `tools/list`: **to verify**.
+
+## Owner-reported third-party figures, 2026-10-28
+
+Figures that came from the owner or from a third party's own metadata. None was reproduced by running the other tool; each row says where it comes from and what this repository counted instead. A figure here is context, not evidence.
+
+| Figure | Reported by | Counted here | Status |
+| --- | --- | --- | --- |
+| 28 GhidraMCP tools | the owner | 30 `@mcp.tool` functions at bridge revision `1e98025` (recorded in `docs/data/tool-surfaces.json`) | not reproduced |
+| 207 tools in `reverse-engineer-anything` | the skill's `tool_count` metadata | no live `tools/list` was enumerated | not reproduced |
+| 7.0-7.8 s for the same question through the upstream command-line launcher (Ghidra 12.1.4) | the owner | no upstream launcher is used or run by this repository | not reproduced |
+
+The Hydralysis figure next to them is reproduced: 20 tools, counted from `tool_table()` by `tools/count_surfaces.py`.

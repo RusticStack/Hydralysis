@@ -3,7 +3,7 @@
 Runs only against a real Hydra install, with the same variables as tests/test_engine_integration.py. One prepared
 program, one daemon, one data root for the class. The scripts are written by the tests themselves (a few lines of Java).
 
-The .py decision (docs/verification-prepare.md): Hydralysis accepts a `.py` name, stages it and sends it, and an engine that
+The .py decision: Hydralysis accepts a `.py` name, stages it and sends it, and an engine that
 was not started with PyGhidra answers a typed `script did not load` failure; the job ends `failed`, the project is not
 touched and the daemon takes the next script. No Python script runs on the install under test, and a test here pins that
 answer, so an engine that gains PyGhidra shows up as a failing test to be reviewed, not as a silent change.

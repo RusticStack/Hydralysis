@@ -29,7 +29,6 @@ ALLOWED_FILES = {
     "docs/golden-harness.md": "documents the explicit, opt-in stock-Ghidra capture used only to compare an old baseline",
     "tools/golden.py": "the golden harness can run a stock install by explicit path, only to record a comparison baseline",
     "tools/golden/GoldenExport.java": "the harness's export script, which runs under stock analyzeHeadless for that baseline",
-    "docs/prompts/review.md": "historical review prompt, kept as written (it describes agents typing analyzeHeadless by hand)",
 }
 # Files that may name them only on the line that says they are ignored: the upgrade notices.
 ALLOWED_NOTICE_FILES = ("README.md", "THIRD_PARTY.md")

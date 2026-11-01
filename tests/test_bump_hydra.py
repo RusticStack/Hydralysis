@@ -128,7 +128,7 @@ class EditSet(Sandbox):
     def test_pin_sentences_and_fake_constants(self):
         self.sums()
         self.assertEqual(self.run_bump("--write"), 0)
-        for rel in (bump.README, bump.THIRD_PARTY, bump.UPSTREAM_SETUP):
+        for rel in (bump.README, bump.THIRD_PARTY):
             self.assertIn(RELEASE, (self.tree / rel).read_text(encoding="utf-8"), rel)
         fake = (self.tree / bump.FAKE).read_text(encoding="utf-8")
         self.assertIn('"hydraVersion": "%s"' % RELEASE, fake)

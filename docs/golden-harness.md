@@ -48,11 +48,11 @@ of different options for a gate; `diff` refuses unless `--allow-mismatch`. Compa
 
 ```text
 set JAVA_HOME=C:\Program Files\Eclipse Adoptium\jdk-25.0.4.101-hotspot
-set ENG=D:\Projects\Hydra\_engines\hydra-2\extracted\ghidra_12.3_DEV
-set CLIENT=D:\Projects\Hydra\_engines\hydra-2\client\hydra-client-12.3-hydra.2\ghidra_session.py
+set ENG=<hydra install>\ghidra_12.3_DEV
+set CLIENT=<hydra-client dir>\ghidra_session.py
 
 rem A COPY of the analysed project, proven identical, source proven untouched:
-python tools/golden.py project-copy F:\...\kotor D:\Projects\Hydra\_golden\kotor-src-copy
+python tools/golden.py project-copy <kotor project> <goldens>\kotor-src-copy
 
 python tools/golden.py capture --engine %ENG% --client %CLIENT% --project <copy>\kotor.gpr ^
     --path production --label hydra-2 --date 2026-10-27 --out <baselines>\hydra-2\kotor\production
@@ -60,7 +60,7 @@ python tools/golden.py capture --engine %ENG% --client %CLIENT% --project <copy>
     --path explicit  --label hydra-2 --date 2026-10-27 --out <baselines>\hydra-2\kotor\explicit
 
 rem the other engine, same driver, stock Ghidra (explicit path only):
-python tools/golden.py capture --stock F:\...\ghidra_12.1.4_PUBLIC --project <second copy>\kotor.gpr ^
+python tools/golden.py capture --stock <stock ghidra install> --project <second copy>\kotor.gpr ^
     --program-name swkotor.exe --label ghidra-12.1.4 --out <baselines>\ghidra-12.1.4\kotor\explicit
 
 python tools/golden.py diff <baselines>\hydra-2\kotor\explicit <new>\kotor\explicit ^
@@ -69,7 +69,7 @@ python tools/golden.py timing <baselines>\hydra-2\kotor\production
 ```
 
 `capture` starts its own Hydra daemon with a fresh state directory under
-`D:/Projects/Hydra/_golden/state` (`--state-root` to change it), never joins another one, and
+the golden directory's `state` (`--state-root` to change it), never joins another one, and
 stops it afterwards. It sets `GHIDRA_SESSION_UPGRADE_CACHE=off` unless `--upgrade-cache` is
 given, so a project saved by an older Ghidra is upgraded in memory and timings do not compete
 with the cache's background copy. Always capture from a **copy** of the project: open the original
@@ -169,8 +169,8 @@ keeps its convention and its `this` parameter. It needs the fixtures built
    checklist), not by the unit-test CI.
 2. **A real game, local only.** A large analysed project (KotOR 1, about 9,000 functions) catches
    what small fixtures cannot: the corpus gate. Its captures hold C text derived from a binary
-   you do not own the rights to publish, so they stay on the machine, outside any repository
-   (`D:/Projects/Hydra/_golden`). Do not commit them, attach them to an issue or paste excerpts of
+   you do not own the rights to publish, so they stay on the machine, outside any repository.
+   Do not commit them, attach them to an issue or paste excerpts of
    them into a pull request; share counts and hashes. `diff --no-text` writes a report with no C.
 
 CI runs only `tests/test_golden.py` (the normaliser, diff and gate on invented captures).

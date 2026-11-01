@@ -25,7 +25,6 @@ from hydralysis.api import TOOL_NAMES, tool_table
 REPOSITORY = Path(__file__).resolve().parent.parent
 MAPPING = REPOSITORY / "docs" / "tool-mapping.md"
 SURFACES = REPOSITORY / "docs" / "data" / "tool-surfaces.json"
-VERIFICATION = REPOSITORY / "docs" / "verification.md"
 README = REPOSITORY / "README.md"
 DOCUMENTS = ("README.md", "THIRD_PARTY.md", "docs/tool-mapping.md")
 THIRD_PARTY_HEADING = "## Owner-reported third-party figures"
@@ -193,9 +192,9 @@ class ToolMapping(unittest.TestCase):
         self.assertIn("retryAfterMs=%d" % mcp.RETRY_AFTER_MS, README.read_text(encoding="utf-8"))
 
     def test_third_party_figures_are_dated_and_labelled_not_reproduced(self):
-        self.assertEqual(check_not_reproduced(VERIFICATION.read_text(encoding="utf-8")), [])
+        self.assertEqual(check_not_reproduced(MAPPING.read_text(encoding="utf-8")), [])
         # Every non-reproduced surface appears in that table with the count the data file holds.
-        body = section(VERIFICATION.read_text(encoding="utf-8"), THIRD_PARTY_HEADING)
+        body = section(MAPPING.read_text(encoding="utf-8"), THIRD_PARTY_HEADING)
         owner = {s["id"]: s for s in self.surfaces["surfaces"]}
         self.assertIn("%d GhidraMCP tools" % owner["ghidramcp"]["owner_reported"], body)
         self.assertIn("%d tools in `reverse-engineer-anything`" % owner["rea"]["count"], body)

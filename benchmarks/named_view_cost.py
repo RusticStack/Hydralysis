@@ -1,7 +1,7 @@
 """Named-view build cost per phase, shared base against rebuilt base, and the replay run (rows C2-08, C2-57, D61).
 
     python benchmarks/named_view_cost.py --engine <dir> --client <ghidra_session.py> --root <fresh folder on the file system to
-        measure> --out D:/Projects/Hydra/_logs/Z2 --runs 5 --views 1,4,12
+        measure> --out bench-out --runs 5 --views 1,4,12
 
 Two runs of the same script, one with --root on NTFS and one on ReFS, give both file systems.
 

@@ -1,6 +1,6 @@
 # Hydralysis
 
-*Formerly RusticRE.* The GitHub repository keeps the old name until it is renamed; links to it keep working after that.
+*Formerly RusticRE.* The GitHub repository has been renamed; links to the old name redirect.
 
 Twenty reverse-engineering tools for programs you own. One CLI, `hydralysis`, one small MCP server and a Python API over the same operations. Hydra Engine and an optional runtime engine run behind it; REA and GhidraMCP are not dependencies. Hydra Engine is a fork of Ghidra (12.3 DEV, Apache-2.0, with a headless session daemon), so Hydralysis is built on Ghidra's analysis and decompiler, not independent of them. It uses no stock Ghidra and needs none (see [Third-party sources](THIRD_PARTY.md)).
 
@@ -8,7 +8,7 @@ Register an analysed project in place, or give Hydralysis an executable and expl
 
 ## Upgrading from RusticRE
 
-Version 0.5.0.dev0 renames the project and also makes behaviour changes that are not source compatible: `expect_revision` is now required on every `type_edit` and `revert`, two stock-Ghidra settings are no longer honoured, decompiled C is produced with the program's own decompiler options (it changes for about one function in six), and some answers gain fields (see the last rows of the table). The 20 tools keep their names. The old names from the rename keep working for this one release, and each one that is actually used is announced once on stderr and listed under `deprecated` by `backend inspect`.
+Version 0.5.0.dev0 renames the project and also makes behaviour changes that are not source compatible: `expect_revision` is now required on every `type_edit` and `revert`, two stock-Ghidra settings are no longer honoured, decompiled C is produced with the program's own decompiler options (it changes for about one function in six), and some answers gain fields (see the last rows of the table). The 20 tools keep their names. The old names from the rename still work, and each one that is actually used is announced once on stderr and listed under `deprecated` by `backend inspect`.
 
 | Was | Now | Still honoured |
 | --- | --- | --- |
@@ -58,7 +58,7 @@ hydralysis backend install
 hydralysis job <setup-id>
 ```
 
-`backend install` is a background job that installs the pinned Hydra release (**12.3-hydra.5**: the engine and its client) privately under the root (the release is not published yet, so the install works only once it is), verifying each archive's full SHA-256 before extraction, and finds or installs a full JDK. It needs no administrator rights and changes no machine settings. Existing installs are used when `hydra_dir`, `hydra_client` and `java_home` name them.
+`backend install` is a background job that installs the pinned Hydra release (**12.3-hydra.5**: the engine and its client) privately under the root, verifying each archive's full SHA-256 before extraction, and finds or installs a full JDK. It needs no administrator rights and changes no machine settings. Existing installs are used when `hydra_dir`, `hydra_client` and `java_home` name them.
 
 An analysed project is adopted where it is, with no copy and no import:
 
@@ -133,7 +133,7 @@ Edits are bound to the build's hash and applied to a working copy forked from th
 - An import waits in the import queue; at the front it still needs a long slot and fails `busy` after `wait` (10 s default).
 - `cancel` stops requests waiting for a slot and cooperative scripts. On hydra.2/3 a request waiting for a program lock stays until its `wait` runs out; on hydra.4 `cancel` and a `timeout` also end a request-bound lock wait, but not the overlay lifecycle waits (open, rebuild, drop, promote of an overlay), which are untimed.
 
-Queries run as engine requests that share the engine's long-job slots with imports and exports, so heavy parallel use is something to measure, not assume. [The protocol](docs/upstream-analysis.md) and `backend help` describe the options.
+Queries run as engine requests that share the engine's long-job slots with imports and exports, so heavy parallel use is something to measure, not assume. [The protocol](https://github.com/RusticStack/hydra-engine/blob/main/Ghidra/Features/HeadlessSession/PROTOCOL-3.md) and `backend help` describe the options.
 
 `ghidra-query --target sample --action export --options-file export.json` writes a durable JSONL artifact. Use `job <export-id>` for status/cancel and `{"resume":"<export-id>"}` to continue the same selection. Resume refuses changed builds, source analysis, implementation or overlays. See [export options and limits](docs/exports.md).
 
@@ -143,7 +143,7 @@ There is no GUI. Hydra Engine is headless only; projects it writes cannot be ope
 
 ## Measured, not promised
 
-Numbers here come from the owner's KotOR baseline and depend on the function and the machine; treat them as examples, not guarantees. A warm decompile measured 0.7-2.1 ms for a 1-byte function and 35-45 ms for a 6.7 KB function: native decompile about 1 to 45 ms by function size; through Hydralysis about 25 ms on a small program and about 60 ms on KotOR (single runs). The tool counts in [the tool mapping](docs/tool-mapping.md) are sourced there, with what is still unverified marked.
+Numbers here come from the owner's KotOR baseline and depend on the function and the machine; treat them as examples, not guarantees. The baseline corpus is KotOR 1: `function_counts` total 8,966, internal 8,616, thunks 60. A warm decompile measured 0.7-2.1 ms for a 1-byte function and 35-45 ms for a 6.7 KB function: native decompile about 1 to 45 ms by function size; through Hydralysis about 25 ms on a small program and about 60 ms on KotOR (single runs). The tool counts in [the tool mapping](docs/tool-mapping.md) are sourced there, with what is still unverified marked.
 
 ## Verify runtime evidence
 
@@ -165,7 +165,7 @@ Probes:
 - `sample` summarizes a per-frame call per time window instead of sending one event per call.
 - `patches` compares live code with the file and decodes a detour another tool installed. `accept_patch` probes past it.
 
-Hooks require the module's full hash and **matching exact live bytes** before installation. Wildcards and unrestricted injected scripts cannot bypass that gate. The client that spawned or attached owns the session; others may look but not drive it, and one executable has one driving session. `runtime_lock_check` names a project's own lock command, which is asked before a spawn or attach. Continue, unload and detach release instrumentation; abandoned breakpoint pauses have a watchdog. This backend does not supply CPU instruction stepping or data watchpoints: use the static `writes` action for who writes a field. See [runtime evidence and semantics](docs/upstream-runtime.md).
+Hooks require the module's full hash and **matching exact live bytes** before installation. Wildcards and unrestricted injected scripts cannot bypass that gate. The client that spawned or attached owns the session; others may look but not drive it, and one executable has one driving session. `runtime_lock_check` names a project's own lock command, which is asked before a spawn or attach. Continue, unload and detach release instrumentation; abandoned breakpoint pauses have a watchdog. This backend does not supply CPU instruction stepping or data watchpoints: use the static `writes` action for who writes a field.
 
 ## Small catalog
 
@@ -185,11 +185,11 @@ The CLI retains `sections`, `exports`, `ghidra-scripts` and `ghidra-jobs` aliase
 
 ## Evidence and limits
 
-[Original usage research](docs/research.md), [upstream setup](docs/upstream-setup.md), [analysis research](docs/upstream-analysis.md), and the [KotOR/SWTOR PR review](docs/open-pr-insights.md) explain why these operations earned a place. [Verification on fixtures](docs/verification-fixtures.md) records the current results; [the 0.3.0 report](docs/verification-complete-workflow.md) predates the engine change.
+[Verification on fixtures](docs/verification-fixtures.md) records what each capability is checked against and the results; [the golden harness](docs/golden-harness.md) is the decompiler-diff gate run at every engine release.
 
-Hydralysis covers native PE inspection and saved analysis. It is not a replacement for every upstream Android/browser/firmware feature. Runtime stepping/watchpoints, graphics debugging, automatic unpacking and universal type recovery remain outside the implemented contract. [KotOR](docs/capabilities-kotor.md) and [Night City Together](docs/capabilities-nct.md) still require their own engine/protocol/resource/framework implementations; those do not become game-specific server tools. No finite test corpus establishes that a remaster or multiplayer framework can be completed automatically.
+Hydralysis covers native PE inspection and saved analysis. It is not a replacement for every upstream Android/browser/firmware feature. Runtime stepping/watchpoints, graphics debugging, automatic unpacking and universal type recovery remain outside the implemented contract. Games that need protocol or engine work still require their own implementations; those do not become game-specific server tools. No finite test corpus establishes that a remaster or multiplayer framework can be completed automatically.
 
-**Limits of this client with hydra.4 (PROTOCOL-3.md 6.2).** The engine's module README lists every limit of 6.2 ([Limits of 12.3-hydra.4 and protocol 3](https://github.com/RusticStack/hydra-engine/blob/main/Ghidra/Features/HeadlessSession/README.md#limits-of-123-hydra4-and-protocol-3), L1 to L19 and R6.1 to R6.11). The ones this client owns or sees first:
+**Limits of this client with the pinned engine (PROTOCOL-3.md 6.2).** The engine's module README lists every limit of 6.2 ([Limits of 12.3-hydra.5 and protocol 3](https://github.com/RusticStack/hydra-engine/blob/main/Ghidra/Features/HeadlessSession/README.md#limits-of-123-hydra5-and-protocol-3), L1 to L19 and R6.1 to R6.11). The ones this client owns or sees first:
 
 - **History is capped.** A store with 4096 pending records, or 20 MiB of them, takes no further edit until some are committed (a subset commit works) or exported as a bundle; pending records are not compacted and nothing is dropped automatically.
 - **An append log has no rotation yet.** `CURRENT.log` and `backups.log` are read in full by the lineage open, `verify` and the doctor (linear in their size, one line per commit or backup).
@@ -201,10 +201,10 @@ Hydralysis covers native PE inspection and saved analysis. It is not a replaceme
 - **A backup verifies the bytes it reads back through the OS cache after a flush**, not the media. Re-hash with `backend --action backups` (verify) and keep an independent copy.
 - **The upgrade gate and the backup check are guards against accidents**, not a security boundary: a local process with the engine's rights can forge a manifest.
 - **`private` script isolation reads the stored file**, not unsaved edits; in `shared` isolation `attemptedChanges` is program-wide. An ETA is a rough estimate (`null` without history, or when a long job dominates the lane).
-- **Platform.** Windows x64 and JDK 25 only; no Linux or macOS claim is made. Copy-on-write is ReFS only (a full copy on NTFS), and nothing about ReFS is tested for hydra.4: NTFS is the release file system. A clone is not protection against the loss of the volume. There is no power-cut test: durability rests on flags, process kills and torn-file tests.
-- **Numbers.** The measurements behind the design are single runs or a handful on one machine under foreign load, on KotOR only; they do not transfer to a much larger program, and every timing constant is unmeasured on the target until release gate 9.10 records it.
+- **Platform.** Windows x64 and JDK 25 only; no Linux or macOS claim is made. Copy-on-write is ReFS only (a full copy on NTFS), and nothing about ReFS is tested: NTFS is the release file system. A clone is not protection against the loss of the volume. There is no power-cut test: durability rests on flags, process kills and torn-file tests.
+- **Numbers.** The measurements behind the design are single runs or a handful on one machine under foreign load, on KotOR only; they do not transfer to a much larger program, and every timing constant is unmeasured on the target until the release gate records it.
 
-Tool counts: Hydralysis registers 20 tools (counted from `tool_table()`). The two figures it is compared with, 30 GhidraMCP tools and 207 for the `reverse-engineer-anything` skill, are third-party figures that were not reproduced; see [the tool mapping](docs/tool-mapping.md) and [the dated table](docs/verification.md#owner-reported-third-party-figures-2026-10-28). One MCP process sizes its lanes from the CPUs the OS grants it (its affinity, not the machine's count): the engine lane accepts 2 calls per CPU, at least 8 and at most 24 outstanding calls, each on its own thread; `ghidra_run` and `prepare` have their own long lane of 8, so they never hold up queries; together the two engine lanes stay within the engine's 32 parallel requests per connection. The offline lane runs 4 to 16 workers. The next concurrent call on a full lane from one client gets `Server busy` with `retryAfterMs=2000`, by design: retry it, or wait for a result. On hydra.2/3 at most 4 engine calls run at once (the pool's connections); the rest wait for a connection within their deadline. A `notifications/cancelled` stops a call that is waiting on the engine in this process (`ghidra_run`, `ghidra_query`, `job` and `backend` engine calls): `cancel` is sent, and after a 5 s grace the call returns and frees its slot. `prepare` (its import runs in a subprocess), offline tools and runtime requests run to their end and hold their slot until then. Either way, as MCP says, the cancelled request gets no reply.
+Tool counts: Hydralysis registers 20 tools (counted from `tool_table()`). The two figures it is compared with, 30 GhidraMCP tools and 207 for the `reverse-engineer-anything` skill, are third-party figures that were not reproduced; see [the tool mapping](docs/tool-mapping.md) and [the dated table](docs/tool-mapping.md#owner-reported-third-party-figures-2026-10-28). One MCP process sizes its lanes from the CPUs the OS grants it (its affinity, not the machine's count): the engine lane accepts 2 calls per CPU, at least 8 and at most 24 outstanding calls, each on its own thread; `ghidra_run` and `prepare` have their own long lane of 8, so they never hold up queries; together the two engine lanes stay within the engine's 32 parallel requests per connection. The offline lane runs 4 to 16 workers. The next concurrent call on a full lane from one client gets `Server busy` with `retryAfterMs=2000`, by design: retry it, or wait for a result. On hydra.2/3 at most 4 engine calls run at once (the pool's connections); the rest wait for a connection within their deadline. A `notifications/cancelled` stops a call that is waiting on the engine in this process (`ghidra_run`, `ghidra_query`, `job` and `backend` engine calls): `cancel` is sent, and after a 5 s grace the call returns and frees its slot. `prepare` (its import runs in a subprocess), offline tools and runtime requests run to their end and hold their slot until then. Either way, as MCP says, the cancelled request gets no reply.
 
 ## Development
 

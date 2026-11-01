@@ -5,7 +5,7 @@ Output-size budgets (row C1-15): bytes of an answer per action and function size
 Two parts. The first needs no engine: the transport cap (`mcp.MAX_OUTPUT_BYTES`) and the decompiler's character cap
 hold. The second runs on a real engine (HYDRALYSIS_INTEGRATION_ENGINE and HYDRALYSIS_INTEGRATION_CLIENT, as the other
 integration tests) against the fixture program, picks a small, a medium and the largest function, and asserts each
-answer is within a byte budget. Budgets are bytes, not tokens (docs/verification-complete-workflow.md), with 1.3 to
+answer is within a byte budget. Budgets are bytes, not tokens, with 1.3 to
 3 times the measured size as headroom (the largest answers have the least), because the 0.5.0 options fix changes decompiled C for about one function in
 six. KotOR numbers stay local evidence: nothing from a game is read or stored here.
 """

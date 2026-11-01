@@ -13,8 +13,8 @@ minor step: it changes the publish queue's reply (`failed`, `unled`, `sealed`, `
 subjects a publish actually applied, and moves the engine pin.
 
 The engine and client archives are the `12.3-hydra.5` release files, written by
-`tools/bump_hydra.py` together with the pin statements in `README.md`, `THIRD_PARTY.md` and
-`docs/upstream-setup.md`. The client stays 1.1.0 on protocol 3.
+`tools/bump_hydra.py` together with the pin statements in `README.md` and `THIRD_PARTY.md`.
+The client stays 1.1.0 on protocol 3.
 
 ### Changes in 0.7.0
 
@@ -79,17 +79,17 @@ All numbers are from the engine's round-4 reports and the Hydralysis lanes named
 
 - Warm publish workers, 16 agents, 15 interleaved runs: **Python CPU 6.57 -> 6.07 s (-7.6 %)** and
   Python processes at peak **45-47 -> 37-39**, with 8 publish jobs over 4 worker pids; tree CPU,
-  tree memory and `hy_publish` inside the session noise (`_logs/rust-round4/hyviews/REPORT.md`).
+  tree memory and `hy_publish` inside the session noise (round-4 `hyviews` report).
 - Publish verification and flush, 16 agents, six interleaved runs: leader `build_ms` **922 -> 690 ms**
   and `hy_publish` p50 **1,274 -> 1,105 ms**, with 3 of 6 runs under 1 s (845/960/994 ms); the
   remaining time is eight concurrent publishes over about 1.5 builds plus the harness' 250 ms poll
-  (`_logs/rust-round4/io/REPORT.md`).
+  (round-4 `io` report).
 - Edit reliability, 13 interleaved sessions per engine: **208 edits, 0 failures** (104 on the exact
   final commit) and **208 publishes, 0 failures** in the two series; 412/412 reply keys and the
   canonical digest in 13/13 final-series runs; the h4 control is 104 edits, 0 failures
-  (`_logs/rust-round4/hyedit/REPORT.md`).
+  (round-4 `hyedit` report).
 - Hydralysis suite: **1,640 test results, 0 failed** alone or only under load; engine-gated
-  integration against the `12.3-hydra.5` build: **17/17, OK** (`_logs/rust-round4/hyedit/REPORT.md`).
+  integration against the `12.3-hydra.5` build: **17/17, OK** (round-4 `hyedit` report).
 
 ### Test runs for this release
 

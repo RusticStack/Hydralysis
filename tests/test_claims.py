@@ -28,8 +28,7 @@ SURFACES = {"hydralysis", "engine", "site"}
 # The 25 claims of the audit (PROTOCOL-3.md section 8.3) must all have a row.
 AUDIT_IDS = ["C%d" % n for n in range(1, 12)] + ["U%d" % n for n in range(1, 15)]
 FUTURE_IDS = ["F%d" % n for n in range(1, 6)]
-# The documents this ledger governs. docs/pr6-traceability.md is an audit report that quotes the old
-# wording on purpose, so it is not scanned.
+# The documents this ledger governs.
 GOVERNED = ("README.md", "THIRD_PARTY.md", "skills/hydralysis/SKILL.md", "skills/ghidra-project/SKILL.md",
             "docs/golden-harness.md")
 

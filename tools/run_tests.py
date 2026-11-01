@@ -1,7 +1,7 @@
 """Run the unit suite in parallel.
 
     python tools/run_tests.py                 # all cores, work directories under the system temp
-    python tools/run_tests.py -j 12 --root C:/dev-overflow/hydralysis-tests
+    python tools/run_tests.py -j 12 --root <fast-disk work dir>
     python tools/run_tests.py --record        # also rewrite tests/timings.json from this run
     python tools/run_tests.py -k views        # only tests whose id contains "views"
 

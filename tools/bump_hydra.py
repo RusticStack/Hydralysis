@@ -3,7 +3,7 @@
     python tools/bump_hydra.py --release 12.3-hydra.4 --dist <folder with the release files>            # shows the edits
     python tools/bump_hydra.py --release 12.3-hydra.4 --dist <folder> --write                           # applies them
     python tools/bump_hydra.py --release 12.3-hydra.4 --dist <folder> --check                           # exit 1 if anything would change
-    python tools/bump_hydra.py ... --site-root D:/Projects/hydra-engine-site                             # the site's constants too
+    python tools/bump_hydra.py ... --site-root <site checkout>                             # the site's constants too
 
 PROTOCOL-3.md, section 5 (R1 owns this script, Y4a runs it, S2 owns the site edit it makes). Nothing here tags,
 pushes or publishes: it reads two archives that already exist and edits text files.
@@ -23,16 +23,15 @@ What it writes, and nothing else (``EDIT_SET``; ``tests/test_bump_hydra.py`` ass
 * ``src/hydralysis/hydra.py``: ``RELEASE``, ``PROTOCOL``, ``CLIENT_VERSION`` and ``ASSETS`` (SHA-256 and size);
 * ``tests/fakehydra.py``: the release (``hydraVersion``) of the fake daemon's ``hello``; its base protocol stays 2, a protocol 3
   engine is modelled through ``hello_extra``;
-* ``README.md`` (the ``backend install`` paragraph), ``THIRD_PARTY.md`` (the engine row) and
-  ``docs/upstream-setup.md``: the one pin sentence of each.
+* ``README.md`` (the ``backend install`` paragraph) and ``THIRD_PARTY.md`` (the engine row):
+  the one pin sentence of each.
 
 With ``--site-root`` it also writes the site's release constant (``src/lib/site.ts``, and a ``protocol`` constant there
 when one exists) and the pinned literals of ``installation.ts``, ``clients.ts`` and ``mcp-server.ts``
 (``SITE_EDIT_SET``). The site's ``changelog.tsx`` and the prose example in ``installation.ts`` are history and
 stay as they are.
 
-Historical, never edited: ``docs/golden-harness.md``, ``docs/verification-nct-2.5.md``,
-``docs/verification-fixtures.md``, ``docs/pr6-traceability.md`` (dated reports).
+Historical, never edited: ``docs/golden-harness.md``, ``docs/verification-fixtures.md`` (dated reports).
 
 Every edit is an anchored replacement that must match exactly the expected number of times; a file whose anchor is
 missing or ambiguous stops the run before anything is written (all edits are computed first, then written).
@@ -61,10 +60,8 @@ HYDRA_PY = "src/hydralysis/hydra.py"
 FAKE = "tests/fakehydra.py"
 README = "README.md"
 THIRD_PARTY = "THIRD_PARTY.md"
-UPSTREAM_SETUP = "docs/upstream-setup.md"
-
 #: The files this script may write in the Hydralysis tree. Anything else is a bug (the test asserts it).
-EDIT_SET = (HYDRA_PY, FAKE, README, THIRD_PARTY, UPSTREAM_SETUP)
+EDIT_SET = (HYDRA_PY, FAKE, README, THIRD_PARTY)
 
 SITE_SITE = "src/lib/site.ts"
 SITE_INSTALL = "src/docs/pages/installation.ts"
@@ -73,8 +70,7 @@ SITE_MCP = "src/docs/pages/mcp-server.ts"
 #: The files this script may write in the site repository (--site-root).
 SITE_EDIT_SET = (SITE_SITE, SITE_INSTALL, SITE_CLIENTS, SITE_MCP)
 
-HISTORICAL = ("docs/golden-harness.md", "docs/verification-nct-2.5.md", "docs/verification-fixtures.md",
-              "docs/pr6-traceability.md")
+HISTORICAL = ("docs/golden-harness.md", "docs/verification-fixtures.md")
 
 ENGINE_ASSET = "hydra-engine-{release}-win_x86_64.zip"
 CLIENT_ASSET = "hydra-client-{release}.zip"
@@ -219,11 +215,6 @@ def edit_third_party(text: str, info: dict) -> str:
                          lambda m: m.group(1) + info["release"] + m.group(2), 1, THIRD_PARTY)
 
 
-def edit_upstream_setup(text: str, info: dict) -> str:
-    return replace_exact(text, r"(^release )%s(, a Ghidra \d)" % LITERAL,
-                         lambda m: m.group(1) + info["release"] + m.group(2), 1, UPSTREAM_SETUP)
-
-
 def edit_site_site(text: str, info: dict) -> str:
     text = replace_exact(text, r'(^\s*release: ")%s(",)' % LITERAL, lambda m: m.group(1) + info["release"] + m.group(2), 1, SITE_SITE)
     # A protocol constant is S2's to add; when it is there the script keeps it equal to the pin.
@@ -256,8 +247,7 @@ def read_text(path: Path) -> str:
 def plan(root: Path, info: dict, observed: str, site_root: Path | None) -> dict[Path, str]:
     """Compute every new text first; nothing is written here. Only files whose text changes are returned."""
     jobs = [(root, HYDRA_PY, lambda t: edit_hydra_py(t, info, observed)), (root, FAKE, lambda t: edit_fake(t, info)),
-            (root, README, lambda t: edit_readme(t, info)), (root, THIRD_PARTY, lambda t: edit_third_party(t, info)),
-            (root, UPSTREAM_SETUP, lambda t: edit_upstream_setup(t, info))]
+            (root, README, lambda t: edit_readme(t, info)), (root, THIRD_PARTY, lambda t: edit_third_party(t, info))]
     if site_root is not None:
         jobs += [(site_root, SITE_SITE, lambda t: edit_site_site(t, info)), (site_root, SITE_INSTALL, lambda t: edit_site_install(t, info)),
                  (site_root, SITE_CLIENTS, lambda t: edit_site_clients(t, info)), (site_root, SITE_MCP, lambda t: edit_site_mcp(t, info))]

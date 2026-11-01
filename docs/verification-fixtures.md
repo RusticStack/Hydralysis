@@ -21,9 +21,9 @@ The linker folds identical code (`/OPT:ICF`), as it does in shipped games: on x8
 ## Running
 
 ```text
-python tests/fixtures/build_fixtures.py F:/dev-cache/rusticre/fixtures
-python tests/fixtures/prepare_fixtures.py F:/dev-cache/rusticre/fixtures
-python tests/fixtures/verify_fixtures.py F:/dev-cache/rusticre/fixtures [check ...]
+python tests/fixtures/build_fixtures.py <build-dir>
+python tests/fixtures/prepare_fixtures.py <build-dir>
+python tests/fixtures/verify_fixtures.py <build-dir> [check ...]
 ```
 
 `build` needs the MSVC build tools (found with `vswhere`). `prepare` registers each build
@@ -57,13 +57,9 @@ Items checked elsewhere:
   function found by `orphans` was created, decompiled and reverted on KotOR 1; `thiscall`
   argument mapping and register captures were checked live on KotOR 1.
 
-The later [Cyberpunk 2.5 bounded verification](verification-nct-2.5.md)
-records adoption and a value-flow trace through MCP, with the remaining
-real-game acceptance gaps and limits on the evidence.
-
 ## Several harnesses at once (item 15)
 
-Three Haiku 5.5 agents ran as separate harnesses against one data root at the same time,
+Three agents ran as separate harnesses against one data root at the same time,
 each through the CLI with its own `RUSTICRE_HARNESS`, while the coordinator owned a runtime
 session on the flow fixture:
 

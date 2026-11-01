@@ -132,7 +132,7 @@ def judge(key: str, value: float | None, budgets: dict | None = None) -> dict:
 
 
 def output_dir(arg: str | None) -> Path:
-    """`--out`, else $HYDRA_BENCH_OUT, else ./bench-out. The owner passes D:/Projects/Hydra/_logs/<stream>."""
+    """`--out`, else $HYDRA_BENCH_OUT, else ./bench-out."""
     path = Path(arg or os.environ.get("HYDRA_BENCH_OUT") or "bench-out")
     path.mkdir(parents=True, exist_ok=True)
     return path
