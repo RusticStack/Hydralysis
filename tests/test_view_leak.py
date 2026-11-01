@@ -245,8 +245,8 @@ class PublishRenameOfACalledFunction(ViewWorld, unittest.TestCase):
         self.edit("renamed_callee", A, view="one")
         real = commits._decompile
 
-        def drifted(engine, program, address, sha256):
-            text = real(engine, program, address, sha256)
+        def drifted(engine, program, address):
+            text = real(engine, program, address)
             return text.replace("renamed_callee();", "renamed_callee(); extra();") \
                 if address == B and "publish-verify" in str(program.get("gpr", "")).replace("\\", "/") else text
 
@@ -263,8 +263,8 @@ class PublishRenameOfACalledFunction(ViewWorld, unittest.TestCase):
         self.edit("renamed_callee", A, view="one")
         real = commits._decompile
 
-        def drifted(engine, program, address, sha256):
-            text = real(engine, program, address, sha256)
+        def drifted(engine, program, address):
+            text = real(engine, program, address)
             return text + "x" if address == C and "publish-verify" in str(program.get("gpr", "")).replace("\\", "/") else text
 
         sealed = self.seal("one")

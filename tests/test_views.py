@@ -1005,8 +1005,8 @@ class VerificationCanFail(ViewWorld, unittest.TestCase):
         self.edit("Mine", B, view="one")  # A is the function the fake lists, and the changeset does not touch it
         real, seen = commits._decompile, {}
 
-        def decompile(engine, program, address, sha256):
-            text = real(engine, program, address, sha256)
+        def decompile(engine, program, address):
+            text = real(engine, program, address)
             seen[address] = seen.get(address, 0) + 1
             return text + " tampered" if address == A and seen[address] == 2 else text  # the 2nd call is the candidate's
         with patch.object(commits, "_decompile", decompile):

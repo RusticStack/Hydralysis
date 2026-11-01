@@ -1121,7 +1121,7 @@ def _verify_candidate(settings: dict, engine, job, target: dict, candidate_gpr: 
                     names[effect["subject"].removeprefix("address:")] = effect["after"]
         for address in commits._sample(applied):
             try:
-                text = commits._decompile(engine, read_only, address, target["sha256"])
+                text = commits._decompile(engine, read_only, address)
             except commits.CommitError as error:
                 raise PublishFailure("candidate_failed", str(error), counted=True, address=address) from error
             if address in names and names[address] not in text:
@@ -1133,7 +1133,7 @@ def _verify_candidate(settings: dict, engine, job, target: dict, candidate_gpr: 
                                                  "contains": "", "timeout_s": 60, "options": {}}, 60)
         # A caller of a function the changeset renamed prints the new name: that difference is explained by the records and
         # passes; any other difference fails the candidate (commits.spot_check).
-        spot = commits.spot_check(engine, parent, read_only, target["sha256"], applied, listing.get("functions", []), touched)
+        spot = commits.spot_check(engine, parent, read_only, applied, listing.get("functions", []), touched)
         if spot["diverged"]:
             raise PublishFailure("candidate_failed", "untouched function %s decompiles differently in the candidate, and the "
                                  "changeset's renames do not explain the difference" % spot["diverged"], counted=True,
@@ -1342,11 +1342,12 @@ def _publish_candidate(settings: dict, lineage_id: str, engine, head: dict, targ
                                      candidate=str(candidate_folder)) from refused
             applied.extend(item["apply"])
         culprit = first
+        before_save = commits._file_state(candidate_folder)
         job.call("save", program=program["key"], comment="Hydralysis publish %s" % first, wait=600000)
         _point("after_save")
         job.call("close_project", project=program["project"])
         job.reset()
-        commits._force_files(candidate_folder)
+        commits._force_files(candidate_folder, before_save)
         _point("after_force")
         # The manifest: the ids the generation applied, per changeset, so an acknowledged publish is resolved by reading it.
         settled_all: list[str] = []

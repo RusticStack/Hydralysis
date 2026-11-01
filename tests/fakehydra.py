@@ -641,6 +641,16 @@ class FakeEngine:
     def _cancel(self, target=None, **_):
         return {"cancelled": True}
 
+    def _decompile(self, program, address, maxChars=32000, **_):
+        """The engine's own `decompile` command (the publish verification's path): the same text the
+        RusticQuery decompile action returns, without the script wrapper."""
+        entry = self._program(program)
+        view = self._view(entry) if program in self.writable or entry["live"] is not None else entry["saved"]
+        name = view["names"].get(address, "FUN_" + address.removeprefix("0x"))
+        text = "void %s(void) {}\n" % name
+        return {"entry": address, "name": name, "c": text[:maxChars], "chars": len(text),
+                "completed": True, "signature": "void %s(void)" % name}
+
     def _script(self, script, program=None, args=(), **_):
         if script != "RusticQuery.java":
             return {"output": "user script ran\n", "mode": "contained", "truncated": False}

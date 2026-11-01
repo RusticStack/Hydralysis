@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import time
 import uuid
 from pathlib import Path
@@ -27,6 +28,12 @@ from hydralysis.locks import LaneLock
 
 SAMPLE_PER_KIND = 25
 SPOT_CHECK = 25
+# How many verification decompiles of one commit are in flight at once. The publish's verification is ~50
+# independent decompiles (the 25-function spot check on the parent and on the candidate, plus the reference
+# sample); issued one at a time they are 50 socket round trips on the publish's critical path, and the engine
+# runs read-class requests of one connection in parallel anyway (Connection.READ_CLASS / "parallel":true).
+# The window bounds the fan-out: 8 keeps one agent's verification from taking the whole decompiler gate.
+VERIFY_PARALLEL = 8
 SNAPSHOT_BUDGET_S = 20
 VOLATILE = {"id", "overlay_state", "seconds", "query_s", "engine", "mode", "target", "view", "timeout_s"}
 STEPS = ("PREPARE", "BACKUP_DONE", "CANDIDATE_RESERVED", "FORKED", "APPLIED", "FILES_FORCED", "MANIFEST", "VERIFIED", "SEALED",
@@ -265,14 +272,56 @@ def _program_of(engine, gpr: str, target: dict, writable: bool = False, **fields
     return open_program(engine, gpr, target["program"], target["sha256"], writable=writable, **fields)
 
 
-def _decompile(engine, program: dict, address: str, sha256: str) -> str:
-    from hydralysis.query import run_script
-    request = {"id": uuid.uuid4().hex, "action": "decompile", "address": address, "limit": 40, "cursor": "", "contains": "",
-               "timeout_s": 60, "options": {}, "expected_sha256": sha256}
-    response, _ = run_script(engine, program, request, 60)
-    if not response.get("ok"):
-        raise CommitError("verify_failed", "the decompile of %s failed: %s" % (address, response.get("error")))
-    return lineage.canonical({key: value for key, value in response.items() if key not in VOLATILE}).decode("utf-8")
+def _decompile(engine, program: dict, address: str) -> str:
+    """The function's decompiled C, from the engine's own `decompile` command.
+
+    The command drives the same decompiler as the query script (`RusticQuery` decompile action) and returns
+    the same text (`c`, measured identical on the fixture), but it is one command dispatch instead of a
+    script run: a decompile through `script` costs ~6 ms of script framework per call even when the
+    decompiler answers from its cache, and a publish's verification issues about fifty of them on its
+    critical path. `maxChars` matches the script's `max_characters` default, so the text compared is the
+    text the script produced.
+    """
+    try:
+        reply = engine.call("decompile", program=program["key"], address=address, timeout=60, maxChars=32000)
+    except hydra.EngineError as error:
+        raise CommitError("verify_failed", "the decompile of %s failed: %s" % (address, error)) from error
+    if reply.get("completed") is False or reply.get("error"):
+        raise CommitError("verify_failed", "the decompile of %s failed: %s" % (address, reply.get("error") or "refused"))
+    return reply.get("c") or ""
+
+
+def _decompile_many(engine, program: dict, addresses: list[str]) -> list[str]:
+    """The decompile text of each address, up to VERIFY_PARALLEL requests in flight.
+
+    The texts are those of the same calls made one at a time (the engine answers a decompile from the same
+    program state and the client keeps no order-dependent state): only their latency changes, because the
+    daemon already runs read-class requests of one connection in parallel (`Connection.READ_CLASS`) and the
+    decompiler gate bounds the fan-out. The first failure in the caller's order is the one raised, so a
+    refusal reaches the caller exactly as it did when the calls were sequential.
+    """
+    addresses = list(addresses)
+    if len(addresses) <= 1 or VERIFY_PARALLEL <= 1:
+        return [_decompile(engine, program, address) for address in addresses]
+    from concurrent.futures import ThreadPoolExecutor
+    pool = ThreadPoolExecutor(max_workers=min(VERIFY_PARALLEL, len(addresses)),
+                              thread_name_prefix="commit-verify")
+    try:
+        futures = [pool.submit(_decompile, engine, program, address) for address in addresses]
+        texts: list = []
+        first: BaseException | None = None
+        for future in futures:
+            try:
+                texts.append(future.result())
+            except BaseException as error:  # noqa: BLE001 - re-raised below, first failure first
+                texts.append(None)
+                if first is None:
+                    first = error
+        if first is not None:
+            raise first
+        return texts
+    finally:
+        pool.shutdown(wait=True)
 
 
 def _rows(engine) -> dict[tuple, dict]:
@@ -412,7 +461,7 @@ def explained_by(before: str, after: str, mapping: dict[str, str]) -> bool:
     return new == out
 
 
-def spot_check(engine, parent: dict, candidate: dict, sha256: str, records: list[dict], listing: list[dict],
+def spot_check(engine, parent: dict, candidate: dict, records: list[dict], listing: list[dict],
                touched: set[str]) -> dict:
     """Compare the decompiles of up to SPOT_CHECK functions the records did not touch, parent against candidate.
 
@@ -426,22 +475,36 @@ def spot_check(engine, parent: dict, candidate: dict, sha256: str, records: list
     compared: list[str] = []
     explained: list[str] = []
     affected: list[str] = []
-    for row in listing:
-        address = row.get("address")
-        if not address or address in touched or len(compared) >= SPOT_CHECK:
+    rows = [row.get("address") for row in listing]
+    # One window of candidates at a time, both sides in flight: the decisions are taken in listing order exactly as the
+    # one-at-a-time loop took them (including "the first divergence ends the check"), and the window is what overlaps the
+    # socket waits. The candidate's texts are asked for the whole window, so a window that ends the check part way may
+    # decompile up to VERIFY_PARALLEL - 1 functions the one-at-a-time loop would not have reached; they change nothing.
+    index = 0
+    while index < len(rows) and len(compared) < SPOT_CHECK:
+        window: list[str] = []
+        while index < len(rows) and len(window) < VERIFY_PARALLEL:
+            address = rows[index]
+            index += 1
+            if address and address not in touched:
+                window.append(address)
+        if not window:
             continue
-        before = _decompile(engine, parent, address, sha256)
-        after = _decompile(engine, candidate, address, sha256)
-        if before != after:
-            if mapping and explained_by(before, after, mapping):
-                explained.append(address)
-            elif any(pattern.search(before) for pattern in others):
-                affected.append(address)
-                continue
-            else:
-                return {"compared": len(compared), "explained_by_renames": explained, "users_of_changed_symbols": affected,
-                        "diverged": address}
-        compared.append(address)
+        before = _decompile_many(engine, parent, window)
+        after = _decompile_many(engine, candidate, window)
+        for address, first, second in zip(window, before, after):
+            if len(compared) >= SPOT_CHECK:
+                break
+            if first != second:
+                if mapping and explained_by(first, second, mapping):
+                    explained.append(address)
+                elif any(pattern.search(first) for pattern in others):
+                    affected.append(address)
+                    continue
+                else:
+                    return {"compared": len(compared), "explained_by_renames": explained, "users_of_changed_symbols": affected,
+                            "diverged": address}
+            compared.append(address)
     return {"compared": len(compared), "explained_by_renames": explained, "users_of_changed_symbols": affected, "diverged": None}
 
 
@@ -489,11 +552,39 @@ def _excluded(pending_outside: list[dict]) -> set[str]:
     return found
 
 
-def _force_files(folder: Path) -> dict:
-    """Ghidra's save does not promise an fsync (whether it does is not verified): flush every file unconditionally."""
-    forced = skipped = 0
+def _file_state(folder: Path) -> dict:
+    """(modification time, size) of every file under FOLDER: what the flush compares to see what the save wrote."""
+    state: dict = {}
+    for path in Path(folder).rglob("*"):
+        try:
+            info = path.stat()
+        except OSError:
+            continue
+        if stat.S_ISREG(info.st_mode):
+            state[path] = (info.st_mtime_ns, info.st_size)
+    return state
+
+
+def _force_files(folder: Path, since: dict | None = None) -> dict:
+    """Flush the files the save wrote, so that the manifest names only bytes that are on the disk (E12).
+
+    SINCE is the state taken before the save ({@link _file_state}). A file whose size and modification time
+    did not change since then is one the fork copied and `fork_project` already forced before it published
+    the folder (`ProjectFork.forceTree`), or a read-only version file it shares with the source (forced once,
+    when it was written); Ghidra's save forces its own new version file before renaming it (E8) but not the
+    project's property and state files, so those are the ones this has to flush. Without SINCE every file is
+    flushed, as before.
+
+    Ghidra's save does not promise an fsync of the whole folder (whether it does is not verified here).
+    """
+    forced = skipped = unchanged = 0
     for path in sorted(item for item in Path(folder).rglob("*") if item.is_file()):
         try:
+            if since is not None:
+                info = path.stat()
+                if since.get(path) == (info.st_mtime_ns, info.st_size):
+                    unchanged += 1  # the fork's copy or a shared version file: on the disk already
+                    continue
             # Opened for flushing only: no byte of the file is written (not a record write, so not a durable.* site).
             descriptor = os.open(os.fspath(path), os.O_RDWR | getattr(os, "O_BINARY", 0))
             try:
@@ -503,7 +594,7 @@ def _force_files(folder: Path) -> dict:
             forced += 1
         except OSError:
             skipped += 1  # a read-only file was fsynced by whoever wrote it; counted, never silent
-    return {"forced": forced, "not_forced": skipped}
+    return {"forced": forced, "not_forced": skipped, "unchanged": unchanged}
 
 
 # ---- the commit ------------------------------------------------------------------------------------------------
@@ -764,6 +855,7 @@ def _commit(settings: dict, selected: dict, options: dict, engine, lineage_id: s
         except (ValueError, RuntimeError) as refused:
             raise CommitError("apply_refused", "the engine refused the replay, so nothing was published: %s" % refused) from refused
         final_ids = [record["id"] for record in committing]
+        before_save = _file_state(candidate_folder)
         job.call("save", program=program["key"], comment="Hydralysis commit %s" % cid, wait=600000)
         intent.write("APPLIED", ids_sha256=workcopy._digest_of(sorted(final_ids)), n=len(final_ids), skipped=skipped)
         _point("after_save")
@@ -772,7 +864,7 @@ def _commit(settings: dict, selected: dict, options: dict, engine, lineage_id: s
 
         # 6. FILES_FORCED
         note("FILES_FORCED")
-        forced = _force_files(candidate_folder)
+        forced = _force_files(candidate_folder, before_save)
         intent.write("FILES_FORCED", **forced)
         _point("after_force")
 
@@ -1016,7 +1108,7 @@ def _capture_reference(settings: dict, engine, selected: dict, sync: dict, chose
     for index, address in enumerate(addresses):
         if time.monotonic() > deadline and index:
             break  # the sample shrinks once the budget is spent
-        reference[address] = _decompile(engine, reader, address, selected["sha256"])
+        reference[address] = _decompile(engine, reader, address)
     return reference, marker
 
 
@@ -1051,10 +1143,12 @@ def _verify_candidate(settings: dict, engine, job, selected: dict, candidate_gpr
             if wrong:
                 raise CommitError("verify_failed", "%d applied effect(s) are not what the candidate holds" % len(wrong), mismatches=wrong[:20])
         everything = revisions.WILDCARD in excluded
-        for address, expected in sorted(reference.items()):
-            if address in excluded or everything:
-                continue
-            actual = _decompile(engine, read_only, address, selected["sha256"])
+        # The reference sample: independent decompiles, so they are issued together. The comparison keeps the
+        # sorted order, so the first difference in it is still the one refused.
+        want = [(address, expected) for address, expected in sorted(reference.items())
+                if address not in excluded and not everything]
+        texts = _decompile_many(engine, read_only, [item[0] for item in want])
+        for (address, expected), actual in zip(want, texts):
             if actual != expected:
                 raise CommitError("verify_failed", "the decompile of %s differs from the reference taken at the snapshot" % address,
                                   address=address)
@@ -1069,17 +1163,38 @@ def _verify_candidate(settings: dict, engine, job, selected: dict, candidate_gpr
         shown = _shown_names(committing, listing.get("functions", []))
         compared: list[str] = []
         affected: list[str] = []
-        for row in listing.get("functions", []):
-            address = row.get("address")
-            if address in touched or len(compared) >= SPOT_CHECK:
+        rows = [row.get("address") for row in listing.get("functions", [])]
+        # Two stages, one window of candidates at a time: the parent's texts first, then (only for the ones that do
+        # not mention a symbol the commit renamed or retyped) the candidate's. Every decision is taken in listing
+        # order exactly as the one-at-a-time loop took it; the window is what overlaps the socket waits, and it
+        # bounds the extra decompiles of a window that fills SPOT_CHECK part way (at most VERIFY_PARALLEL - 1).
+        index = 0
+        while index < len(rows) and len(compared) < SPOT_CHECK:
+            window: list[str] = []
+            while index < len(rows) and len(window) < VERIFY_PARALLEL:
+                address = rows[index]
+                index += 1
+                if address not in touched:
+                    window.append(address)
+            if not window:
                 continue
-            before = _decompile(engine, master, address, selected["sha256"])
-            if any(pattern.search(before) for pattern in shown):
-                affected.append(address)
-                continue
-            if before != _decompile(engine, read_only, address, selected["sha256"]):
-                raise CommitError("verify_failed", "untouched function %s decompiles differently in the candidate" % address, address=address)
-            compared.append(address)
+            before = _decompile_many(engine, master, window)
+            keep: list[tuple[str, str]] = []
+            budget = SPOT_CHECK - len(compared)
+            for address, text in zip(window, before):
+                if budget <= 0:
+                    break  # the one-at-a-time loop stops visiting rows once SPOT_CHECK are compared
+                if any(pattern.search(text) for pattern in shown):
+                    affected.append(address)
+                else:
+                    keep.append((address, text))
+                    budget -= 1
+            after = _decompile_many(engine, read_only, [item[0] for item in keep])
+            for (address, text), actual in zip(keep, after):
+                if text != actual:
+                    raise CommitError("verify_failed", "untouched function %s decompiles differently in the candidate" % address,
+                                      address=address)
+                compared.append(address)
         # K3: a disposable clone of a candidate opens writable too (discarded; the clone is deleted below).
         writable = _program_of(job, clone["gpr"], selected, writable=True, upgrade=False, refresh=True)
         job.call("close_project", project=writable["project"], discard=True)

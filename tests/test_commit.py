@@ -516,9 +516,9 @@ class ReferenceSnapshot(World, unittest.TestCase):
         original = commits._decompile
         calls = {"n": 0}
 
-        def decompile(engine, program, address, sha256):
+        def decompile(engine, program, address):
             calls["n"] += 1
-            text = original(engine, program, address, sha256)
+            text = original(engine, program, address)
             return text.replace("Alpha", "Different") if calls["n"] > 1 else text
         with patch.object(commits, "_decompile", decompile), self.assertRaises(commits.CommitError) as raised:
             self.commit()

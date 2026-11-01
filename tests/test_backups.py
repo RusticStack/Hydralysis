@@ -715,6 +715,18 @@ class CallerEngine(fakehydra.FakeEngine):
     CALLEES: dict[str, list[str]] = {}
     ROWS: list[dict] | None = None
 
+    def _decompile(self, program, address, maxChars=32000, **rest):
+        out = super()._decompile(program, address, maxChars=maxChars, **rest)
+        if self.CALLEES.get(address):
+            entry = self._program(program)
+            view = self._view(entry) if program in self.writable or entry["live"] is not None else entry["saved"]
+            calls = "".join("  %s();\n" % view["names"].get(callee, "FUN_" + callee.removeprefix("0x"))
+                            for callee in self.CALLEES[address])
+            text = "void %s(void) {\n%s}\n" % (out["name"], calls)
+            # as the engine answers: the length of the whole text, which a rename of a callee changes (gate 9.17)
+            out.update(c=text[:maxChars], chars=len(text))
+        return out
+
     def _script(self, script, program=None, args=(), **rest):
         result = super()._script(script, program=program, args=args, **rest)
         if script != "RusticQuery.java":
@@ -798,8 +810,8 @@ class CommitHygiene(World, unittest.TestCase):
         self.edit("renamed_callee", address=A)
         real = commits._decompile
 
-        def drifted(engine, program, address, sha256):
-            text = real(engine, program, address, sha256)
+        def drifted(engine, program, address):
+            text = real(engine, program, address)
             return text + "x" if address == test_commit.C and "commit-verify" in str(program.get("gpr", "")).lower() else text
 
         with patch.object(commits, "_decompile", drifted):
