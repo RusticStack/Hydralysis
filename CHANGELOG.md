@@ -6,6 +6,13 @@ Nothing here is a tag: a release is tagged by the owner.
 
 ## Unreleased
 
+- Publish jobs: a publish hands its job file to a warm worker (`python -m hydralysis.viewpool --serve`) instead of
+  spawning `python -m hydralysis.views <job.json>` for every publish, so the package import (0.06 s of CPU, 0.12-0.17 s
+  of wall per worker here) is paid once per process and not once per publish. The worker is still a separate process,
+  runs the same `views.run_job` and writes the same job record; one job runs per worker at a time, at most
+  `publish_batch_max` workers exist per client, at most one is kept idle and an idle one exits after 2 s. A client with
+  every worker busy, or one whose pool cannot start, takes the one-shot worker exactly as before; test-fault runs never
+  pool. Output, job records, ownership, cancellation and kill isolation are unchanged.
 - `backend status` (and every backend report) reads the CPU architecture from `PROCESSOR_ARCHITEW6432` /
   `PROCESSOR_ARCHITECTURE` on Windows instead of `platform.machine()`, which could start `cmd /c ver` when its WMI
   query failed on a loaded machine; status now starts no process in that case either.

@@ -1933,12 +1933,15 @@ def views_status(settings: dict, template: dict, lineage_id: str | None, me: dic
 # A publish job is an overlay job record (`overlay-jobs/<id>/job.json`, read by `overlayjobs.status` and the `job` tool like
 # any other) whose worker process is `python -m hydralysis.views <job.json>`. `overlayjobs.py` belongs to Y0a and Y2 (8.1) and
 # is left as it was: this module starts and runs its own worker rather than adding a job kind there.
+# A warm worker (`viewpool`) may take the job instead of a fresh process: it runs the same `run_job`, reads the same records
+# and is as separate a process, so the publish-only path pays the import once instead of once per publish. Every publish the
+# pool does not serve (first one in a process, every worker busy, pool disabled) takes the one-shot path below unchanged.
 
 def start_job(settings: dict, target: str, options: dict, view: str = "") -> dict:
     """Start the worker of a publish job for the sealed changeset in OPTIONS ({csid, lineage}). Returns the job as
     `overlayjobs.status` shows it, plus `owner_token`."""
     import sys
-    from hydralysis import jobowner, overlayjobs, proc
+    from hydralysis import jobowner, overlayjobs, proc, viewpool
     from hydralysis.backends import read_json, write_json
     from hydralysis.locks import locked
     from hydralysis.paths import root_path
@@ -1957,56 +1960,73 @@ def start_job(settings: dict, target: str, options: dict, view: str = "") -> dic
                 "publish_wait_s", "publish_batch_max", "tmp_dir", "backup_roots")
         write_json(path.parent / "settings.json", {key: settings[key] for key in keys if key in settings})
         env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent), HYDRALYSIS_HARNESS=hydra.identity()["harness"])
-        # No log file: a raw file write outside `durable` is a site `test_durable` counts. What the worker has to say goes into the
-        # job record (`error`), which `overlayjobs.status` shows; `main` below puts any uncaught exception there too.
-        import subprocess   # lazy: a query-only process never starts a job, and a job worker never starts one either
-        child = proc.popen([sys.executable, "-m", "hydralysis.views", str(path)], env=env, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, **({} if os.name == "nt" else {"start_new_session": True}))
-        with locked(path.with_suffix(".lock"), what="overlay job"):
-            current = read_json(path)
-            if current.get("state") == "queued" and not current.get("worker_pid"):
-                current.update(worker_pid=child.pid, worker_started_ms=overlayjobs.proc_start(child.pid), updated_at=time.time())
-                write_json(path, current)
+        if not viewpool.dispatch(path, env, _batch_max(settings)):
+            # No log file: a raw file write outside `durable` is a site `test_durable` counts. What the worker has to say goes into
+            # the job record (`error`), which `overlayjobs.status` shows; `main` below puts any uncaught exception there too.
+            import subprocess   # lazy: a query-only process never starts a job, and a job worker never starts one either
+            child = proc.popen([sys.executable, "-m", "hydralysis.views", str(path)], env=env, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, **({} if os.name == "nt" else {"start_new_session": True}))
+            with locked(path.with_suffix(".lock"), what="overlay job"):
+                current = read_json(path)
+                if current.get("state") == "queued" and not current.get("worker_pid"):
+                    current.update(worker_pid=child.pid, worker_started_ms=overlayjobs.proc_start(child.pid), updated_at=time.time())
+                    write_json(path, current)
         return {**overlayjobs.status(settings, job_id), "owner_token": token}
 
 
 def run_job(path: Path, engine=None, watch: bool = True) -> None:
-    """The worker body of a publish job: lead or follow until the changeset is decided, and record the result in the job."""
+    """The worker body of a publish job: lead or follow until the changeset is decided, and record the result in the job.
+
+    The one-shot worker (`python -m hydralysis.views <job.json>`) calls this once and exits, which closes its engine
+    connection; the warm worker calls it for every job it takes, so the watcher is stopped and the connection this call
+    opened is dropped when the job ends. Both leave the same record behind."""
     import threading
     from hydralysis import overlayjobs
     from hydralysis.backends import read_json
     record = read_json(path)
     settings = read_json(path.parent / "settings.json")
     cancel_file = path.parent / "cancel.request"
+    stop = threading.Event()
 
     def watcher():
-        while True:
+        while not stop.is_set():
             if cancel_file.exists():
                 overlayjobs._update(path, state="cancelled", finished_at=time.time(),
                                     error="cancelled; the changeset stays queued and is published when a leader reaches it")
                 os._exit(3)
-            time.sleep(0.5)
+            stop.wait(0.5)
 
+    own_engine = engine is None
     if watch:
-        threading.Thread(target=watcher, daemon=True).start()
+        threading.Thread(target=watcher, name="hydralysis-publish-cancel", daemon=True).start()
     overlayjobs._update(path, state="running", worker_pid=os.getpid(), worker_started_ms=overlayjobs.proc_start(os.getpid()),
                         started_at=time.time())
     try:
-        selected = workcopy.with_view(targets.resolve(settings, record["target"]), record.get("view", ""))
-        result = run_publish_job(settings, selected, dict(record["options"]), engine, overlayjobs.TIMEOUT_S,
-                                 progress=lambda info: overlayjobs._update(path, publish_pending=info))
-    except ViewError as error:
-        overlayjobs._update(path, state="failed", error="%s: %s" % (error.code, error), error_payload=error.payload(),
-                            finished_at=time.time())
-        return
-    except (commits.CommitError, lineage.LineageError) as error:
-        overlayjobs._update(path, state="failed", error="%s: %s" % (error.code, error), error_payload=error.payload(),
-                            finished_at=time.time())
-        return
-    except Exception as exc:
-        overlayjobs._update(path, state="failed", error="%s: %s" % (type(exc).__name__, exc), finished_at=time.time())
-        return
-    overlayjobs._update(path, state="done", result=result, finished_at=time.time())
+        try:
+            if own_engine:
+                engine = hydra.Engine(settings)   # connects on its first call, exactly as `run_publish_job` would
+            selected = workcopy.with_view(targets.resolve(settings, record["target"]), record.get("view", ""))
+            result = run_publish_job(settings, selected, dict(record["options"]), engine, overlayjobs.TIMEOUT_S,
+                                     progress=lambda info: overlayjobs._update(path, publish_pending=info))
+        except ViewError as error:
+            overlayjobs._update(path, state="failed", error="%s: %s" % (error.code, error), error_payload=error.payload(),
+                                finished_at=time.time())
+            return
+        except (commits.CommitError, lineage.LineageError) as error:
+            overlayjobs._update(path, state="failed", error="%s: %s" % (error.code, error), error_payload=error.payload(),
+                                finished_at=time.time())
+            return
+        except Exception as exc:
+            overlayjobs._update(path, state="failed", error="%s: %s" % (type(exc).__name__, exc), finished_at=time.time())
+            return
+        overlayjobs._update(path, state="done", result=result, finished_at=time.time())
+    finally:
+        stop.set()
+        if own_engine and engine is not None:
+            try:
+                engine.reset()    # what the one-shot worker's exit did: the next job connects afresh
+            except Exception:     # noqa: BLE001 - the job's result is already written; a close that fails changes nothing
+                pass
 
 
 def main(argv: list[str]) -> None:
