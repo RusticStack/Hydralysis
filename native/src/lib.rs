@@ -1,7 +1,9 @@
 //! Optional native helpers for Hydralysis. Every function has a pure-Python twin in `hydralysis.durable` that gives
-//! identical results; tests/test_native.py compares the two.
+//! identical results; tests/test_native.py compares the two. The trace helpers are in `trace.rs` (twin: `hydralysis.trace_wire`).
 
 use pyo3::prelude::*;
+
+mod trace;
 use pyo3::types::PyBytes;
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -44,6 +46,7 @@ fn frame_lines(data: &Bound<'_, PyBytes>, start: usize) -> Vec<(usize, usize, bo
 #[pymodule]
 fn hydralysis_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(frame_lines, module)?)?;
+    trace::register(module)?;
     module.add("ABI", "abi3-py313")?;
     Ok(())
 }
