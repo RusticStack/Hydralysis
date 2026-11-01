@@ -62,9 +62,9 @@ def _reap_children() -> None:
             _children_changed.wait(timeout=0.25)
 
 
-def popen(command, **kwargs) -> subprocess.Popen:
+def _register(child: subprocess.Popen) -> subprocess.Popen:
+    """Keep the handle until the child exits, then reap it without blocking callers."""
     global _reaper
-    child = subprocess.Popen(command, **_defaults(kwargs))
     with _children_changed:
         _children.add(child)
         if _reaper is None or not _reaper.is_alive():
@@ -72,6 +72,27 @@ def popen(command, **kwargs) -> subprocess.Popen:
             _reaper.start()
         _children_changed.notify()
     return child
+
+
+def popen(command, **kwargs) -> subprocess.Popen:
+    if kwargs.get("stdin") is subprocess.PIPE:   # a warm worker (`viewpool`): see `popen_worker`
+        return popen_worker(command, **kwargs)
+    return _register(subprocess.Popen(command, **_defaults(kwargs)))
+
+
+def popen_worker(command, **kwargs) -> subprocess.Popen:
+    """A child this process talks to over a pipe it makes itself: a warm publish worker (`viewpool`).
+
+    Its stdin is a new pipe, never the server's stdin (the invariant of `_defaults` is untouched: `proc.run` still refuses
+    one); its stdout is a new pipe whose other end only `viewpool` reads, and anything that is not its control line is
+    dropped - a job's output went to DEVNULL before and goes nowhere now. Reaped like every other child."""
+    if "input" in kwargs or kwargs.get("stdin") not in (None, subprocess.PIPE):
+        raise ValueError("a piped worker's stdin is made by popen_worker")
+    kwargs["stdin"] = subprocess.PIPE
+    kwargs.setdefault("stdout", subprocess.PIPE)
+    if os.name == "nt" and "creationflags" not in kwargs:
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    return _register(subprocess.Popen(command, **kwargs))
 
 
 _KERNEL: list = []
