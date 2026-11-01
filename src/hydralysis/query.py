@@ -21,6 +21,7 @@ from pathlib import Path
 
 from hydralysis import hydra, lineage, targets, viewgov, views, workcopy
 from hydralysis.analysis import ADVANCED_ACTIONS, BULK_KINDS, validate_options
+from hydralysis.locks import LockBusy
 
 ACTIONS = {"decompile", "function", "functions", "xrefs", "status", "stop"} | ADVANCED_ACTIONS
 ADDRESS_ACTIONS = {"decompile", "function", "xrefs", "variables", "dossier", "blocks", "pcode", "trace", "data", "scan", "vtables"}
@@ -726,6 +727,7 @@ class QueryRunner:
         a publish to the master seals a changeset and answers with a job and its position in the queue."""
         from hydralysis import commits, views
         view = selected["view"]
+        sealed = None
         try:
             clean = views.validate(options)
             if clean["kind"] == "rebase":
@@ -742,6 +744,16 @@ class QueryRunner:
             raise RuntimeError(json.dumps(error.payload())) from error
         except lineage.LineageError as error:
             raise RuntimeError(json.dumps(error.payload())) from error
+        except LockBusy as error:
+            # The changeset was sealed but its worker could not be started (the overlay-jobs lock was held). It stays
+            # pending and the next publish (from any view) leads the queue; name it so the caller can retry at once.
+            payload = error.payload()
+            if sealed is not None:
+                payload.update(csid=sealed.get("csid"), sealed=True,
+                               next={"tool": "ghidra_query", "action": "type_edit",
+                                     "options": {"kind": "publish", "confirm_one_way_upgrade": True,
+                                                 "expect_revision": workcopy.load_store(self.settings, selected)["revision"]}})
+            raise RuntimeError(json.dumps(payload)) from error
         return json.dumps({**job, "csid": sealed["csid"], "reused": sealed["reused"], "view": view,
                            "publish_pending": {key: sealed.get(key) for key in ("state", "csid", "position", "etaMs", "leader")},
                            "position": sealed.get("position"), "etaMs": sealed.get("etaMs"),

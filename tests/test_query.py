@@ -770,6 +770,22 @@ class ViewsThroughQuery(unittest.TestCase):
         self.assertEqual((queue["queue"]["length"], queue["changeset"]["state"], queue["changeset"]["outcome"]),
                          (0, "done", "applied"))
 
+    def test_a_publish_whose_worker_cannot_start_reports_busy_with_the_sealed_changeset(self):
+        """Sealing and starting the worker are two steps: a lock held on the job folder between them must answer a
+        structured `busy` that names the sealed changeset (a later publish reuses it), never a bare ValueError."""
+        from hydralysis import locks
+        self.edit("Mine", "0x140001000", "one")
+        revision = workcopy.load_store(self.world.settings, self.world.target("one"))["revision"]
+        with patch("hydralysis.views.start_job", side_effect=locks.LockBusy("overlay jobs", "jobs.lock", 1.0)):
+            with self.assertRaises(RuntimeError) as raised:
+                self.ask("type_edit", kind="publish", confirm_one_way_upgrade=True, expect_revision=revision, view="one")
+        body = json.loads(str(raised.exception))
+        self.assertEqual((body["error"], body["sealed"]), ("busy", True))
+        self.assertTrue(body["csid"].startswith("c-"))
+        self.assertEqual(body["next"]["options"]["kind"], "publish")
+        queue = self.ask("status", show="queue", csid=body["csid"])
+        self.assertEqual((queue["changeset"]["state"], queue["changeset"]["position"]), ("publish_pending", 1))
+
     def test_the_publish_job_runs_end_to_end_through_its_own_worker_record(self):
         """A job record is made by `views.start_job` (the worker process is patched out), run by `views.run_job` (the worker body)
         and read by `overlayjobs.status` like any overlay job; `overlayjobs.py` is not involved in running it."""

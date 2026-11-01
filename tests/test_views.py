@@ -22,7 +22,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import fakehydra
-from hydralysis import commits, durable, hydra, lineage, locks, query, targets, viewgov, views, workcopy
+from hydralysis import commits, durable, hydra, lineage, locks, overlayjobs, query, targets, viewgov, views, workcopy
 from support import workdir
 from test_commit import A, B, C, World
 
@@ -111,6 +111,34 @@ class Publish(ViewWorld, unittest.TestCase):
         self.assertEqual([item["csid"] for item in store["changesets"]], [sealed["csid"]])
         self.assertEqual(self.name_of(A, view="one"), "Mine")
         self.assertIsNone(workcopy.stale_reason(store, self.target("one")))
+
+    def test_a_finalize_journals_the_published_subjects_not_a_wildcard(self):
+        """The journal says what the base move changed: an edit that read the revision before its own publish settled
+        can then be reconciled exactly (rebased when its subject was not published, a conflict when it was)."""
+        self.edit("Mine", A, view="one")
+        sealed = self.seal("one")
+        self.run_job(sealed, "one")
+        entry = self.store("one")["journal"][-1]
+        self.assertEqual((entry["op"], entry["subjects"]), ("commit", ["address:" + A]))
+
+    def test_an_edit_read_before_the_finalize_of_its_view_is_rebased_when_its_subject_was_not_published(self):
+        self.edit("Mine", A, view="one")
+        before = self.store("one")["revision"]          # what the agent read just before its publish settled
+        sealed = self.seal("one")
+        self.run_job(sealed, "one")                     # the job finalizes: revision 2, subjects [A]
+        result = workcopy.edit(self.settings, self.engine(), self.target("one"), B,
+                               {"kind": "rename", "name": "Other", "source": "test", "expect_revision": before}, 120)
+        self.assertEqual((result["revision"], result["rebased"]), (3, True))
+
+    def test_an_edit_read_before_the_finalize_of_its_view_still_conflicts_on_a_published_subject(self):
+        self.edit("Mine", A, view="one")
+        before = self.store("one")["revision"]
+        sealed = self.seal("one")
+        self.run_job(sealed, "one")
+        body = self.error(lambda: workcopy.edit(self.settings, self.engine(), self.target("one"), A,
+                                                {"kind": "rename", "name": "Again", "source": "test",
+                                                 "expect_revision": before}, 120))
+        self.assertEqual((body["conflict"], body["overlapping"]), ("overlay revision changed", ["address:" + A]))
 
     def test_the_same_pending_records_sealed_twice_are_one_changeset(self):
         self.edit("Mine", A, view="one")
@@ -439,6 +467,63 @@ class Batch(ViewWorld, unittest.TestCase):
         self.assertEqual(failed["attempts"], 1)  # the failed batch was not counted against it
         self.assertEqual(self.pending_ids("two"), [bad])  # its records stay pending
         self.assertEqual(self.pending_ids("one"), [])
+
+
+class PublishRecovery(ViewWorld, unittest.TestCase):
+    """A publish whose worker or leader is gone must fail the waiting client fast and be rebuilt by the next leader."""
+
+    def dead_job(self, csid, lineage_id, state="running"):
+        from hydralysis.backends import write_json
+        job_id = "overlay-0123456789ab"
+        path = overlayjobs.job_path(self.settings, job_id)
+        path.parent.mkdir(parents=True)
+        write_json(path, {"id": job_id, "kind": "publish", "target": "owned", "view": "one", "address": "",
+                          "options": {"csid": csid, "lineage": lineage_id}, "state": state,
+                          "created_at": time.time() - 30, "worker_pid": 999999, "worker_started_ms": 0})
+        return job_id
+
+    def test_a_dead_publish_worker_is_reported_failed_with_its_error_and_a_next_step(self):
+        self.edit("Mine", A, view="one")
+        sealed = self.seal("one")
+        self.dead_job(sealed["csid"], sealed["lineage"])
+        info = views.queue_status(self.settings, self.lineage_id(), sealed["csid"])["changeset"]
+        self.assertEqual((info["state"], info["job_state"]), ("failed", "interrupted"))
+        self.assertIn("worker exited", info["reason"])
+        self.assertIn("publish again", info["next"])
+        self.assertEqual(self.pending_ids("one") != [], True)  # the records stay pending: nothing was lost
+
+    def test_a_sealed_changeset_with_no_worker_and_no_leader_is_reported_unled(self):
+        self.edit("Mine", A, view="one")
+        sealed = self.seal("one")
+        old = time.time() - 30
+        os.utime(views.pending_path(self.settings, self.lineage_id(), sealed["csid"]), (old, old))
+        info = views.queue_status(self.settings, self.lineage_id(), sealed["csid"])["changeset"]
+        self.assertEqual(info["state"], "unled")
+        self.assertIn("publish again", info["next"])
+
+    def test_start_job_does_not_hold_the_registry_lock_across_dispatch(self):
+        """The dispatch may wait for a warm worker; holding `.start.lock` across it made another publisher's start time
+        out after its changeset was sealed (observed under load). The lock covers the job record only."""
+        from hydralysis import locks, viewpool
+        seen = {}
+
+        def dispatch(path, env, max_workers=1):
+            seen["locked"] = locks.held(str(workcopy.root_path(self.settings) / "overlay-jobs" / ".start.lock"))
+            return True
+        with patch.object(viewpool, "dispatch", dispatch):
+            job = views.start_job(self.settings, "owned", {"csid": "c-0123456789abcdef", "lineage": "L-01234567"}, view="one")
+        self.assertEqual((seen.get("locked"), job["kind"], job["state"]), (False, "publish", "queued"))
+
+    def test_a_generation_a_dead_leader_sealed_but_never_logged_is_moved_aside_and_rebuilt(self):
+        self.edit("Mine", A, view="one")
+        sealed = self.seal("one")
+        abandoned = lineage.generation_dir(self.settings, self.lineage_id(), 1)
+        abandoned.mkdir(parents=True)
+        (abandoned / "partial.txt").write_text("sealed by a leader that died before CURRENT.log", encoding="utf-8")
+        led = views.drain(self.settings, self.lineage_id(), self.engine())
+        self.assertEqual(led["built"], [1])
+        self.assertEqual(self.done(sealed["csid"])["outcome"], "applied")
+        self.assertEqual(len([item for item in abandoned.parent.iterdir() if item.name.startswith("0001.abandoned-")]), 1)
 
 
 class VerifyBeforeHead(ViewWorld, unittest.TestCase):

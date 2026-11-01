@@ -1260,7 +1260,13 @@ def finalize(settings: dict, selected: dict, lineage_id: str, cid: str, generati
         if point:
             _point("finalize_mid")
         store["revision"] += 1
-        store["journal"] = revisions.append(store["journal"], revisions.journal_entry(store["revision"], "commit", [revisions.WILDCARD],
+        # The commit's own records are the only changes the base move brings in (a commit builds its generation alone), so
+        # the journal names their subjects: an edit that read the revision before this finalize is rebased when its subject
+        # was not committed, and still conflicts when it was.
+        subjects = sorted({subject for ident in facts["ids"]
+                           for subject in revisions.subjects_of(by_id[ident].get("address", ""), by_id[ident].get("options") or {})}) \
+            or [revisions.WILDCARD]
+        store["journal"] = revisions.append(store["journal"], revisions.journal_entry(store["revision"], "commit", subjects,
                                                                                        workcopy._attribution(), time.time()))
         workcopy._save_store(settings, selected, store)
     if intent is not None:

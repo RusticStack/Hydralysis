@@ -829,9 +829,80 @@ def position_of(settings: dict, lineage_id: str, csid: str, queue: list[str] | N
     return queue.index(csid) + 1 if csid in queue else None
 
 
+# A status poll must never leave a caller waiting on a publish nobody is driving: after this long an outstanding
+# changeset with no worker and no leader is reported "unled" (the next publish, from any view, leads the queue and
+# rebuilds it from the pending changeset). The publish job's own record answers "failed"/"interrupted" sooner.
+UNLED_GRACE_S = 10.0
+_JOB_OF: dict[str, tuple[float, dict | None]] = {}
+
+
+def _mtime_ns(path: Path) -> int:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+def publish_job_of(settings: dict, csid: str) -> dict | None:
+    """The newest overlay job that published CSID, as `overlayjobs.status` shows it (which marks a dead worker interrupted).
+
+    A publish is driven by a job process; the changeset record does not name it, so the job directory is searched
+    (the fifty newest jobs are enough: a publish job is created when its changeset is sealed). A found job is memoised
+    for a second: a poll repeated ten times a second must not read the whole job folder each time. A miss is not
+    memoised, so a job created moments after the seal is seen by the next poll."""
+    root = workcopy.root_path(settings)
+    key = os.path.normcase(str(root)) + "|" + csid
+    known = _JOB_OF.get(key)
+    if known is not None and known[1] is not None and time.time() - known[0] < 1.0:
+        return known[1]
+    from hydralysis.backends import read_json
+    job_id = None
+    try:
+        paths = sorted((root / "overlay-jobs").glob("overlay-*/job.json"), key=_mtime_ns, reverse=True)[:50]
+    except OSError:
+        paths = []
+    for path in paths:
+        try:
+            record = read_json(path)
+        except (OSError, ValueError):
+            continue
+        if record.get("kind") == "publish" and (record.get("options") or {}).get("csid") == csid:
+            job_id = path.parent.name
+            break
+    job = None
+    if job_id is not None:
+        from hydralysis import overlayjobs
+        try:
+            job = overlayjobs.status(settings, job_id)
+        except (OSError, ValueError):
+            job = None
+    if job is not None:
+        if len(_JOB_OF) >= 64:
+            _JOB_OF.clear()
+        _JOB_OF[key] = (time.time(), job)
+    return job
+
+
+def _publish_job_failure(job: dict | None, csid: str, position: int) -> dict | None:
+    """The terminal answer for an outstanding changeset whose worker failed or that no process is driving."""
+    state = (job or {}).get("state")
+    if state in ("failed", "cancelled", "interrupted"):
+        return {"state": "failed", "csid": csid, "position": position, "job": job.get("id"), "job_state": state,
+                "reason": job.get("error") or "the publish worker ended without a result",
+                "next": "read the records with status show=changes; publish again (the changeset is reused) to rebuild "
+                        "it, or rebase the view if the worker's error names a conflict"}
+    if state == "done":
+        return {"state": "failed", "csid": csid, "position": position, "job": job.get("id"), "job_state": state,
+                "reason": "the publish worker finished without writing the changeset's result",
+                "next": "publish again (the changeset is reused and its records stay pending)"}
+    return None
+
+
 def pending_info(settings: dict, lineage_id: str, csid: str, queue: list[str] | None = None) -> dict:
     """`publish_pending{position, etaMs}`, or the result when the changeset is decided. QUEUE is a listing the caller took a
-    moment ago (a status poll lists the folders once); the changeset's result is read after it, so a decision made since is seen."""
+    moment ago (a status poll lists the folders once); the changeset's result is read after it, so a decision made since is seen.
+    An outstanding changeset whose worker failed, or that no worker or leader is driving, is answered `failed`/`unled`
+    instead of `publish_pending`: a caller waiting for it would otherwise wait for a process that is gone."""
     result = read_done(settings, lineage_id, csid)
     position = None if result is not None else position_of(settings, lineage_id, csid, queue)
     if position is None and result is None:
@@ -841,8 +912,24 @@ def pending_info(settings: dict, lineage_id: str, csid: str, queue: list[str] | 
         return {"state": "done", "outcome": result.get("outcome"), "generation": result.get("generation"), "csid": csid}
     if position is None:
         return {"state": "unknown", "csid": csid}
+    job = publish_job_of(settings, csid)
+    stopped = _publish_job_failure(job, csid, position)
+    if stopped is not None:
+        return stopped
+    if job is None or job.get("state") not in ("queued", "running", "cancelling"):
+        leading = held(str(publish_lock_path(settings, lineage_id)))
+        try:
+            age = time.time() - os.stat(pending_path(settings, lineage_id, csid)).st_mtime
+        except OSError:
+            age = 0.0
+        if not leading and age >= UNLED_GRACE_S:
+            return {"state": "unled", "csid": csid, "position": position,
+                    "reason": "no publish worker or leader is driving this changeset",
+                    "next": "publish again from this view: the same changeset is reused and its records stay pending; "
+                            "the new leader rebuilds it (a generation the dead leader sealed but never appended is moved aside)"}
     return {"state": "publish_pending", "csid": csid, "position": position, "etaMs": _eta_ms(settings, lineage_id, position),
-            "leader": held(str(publish_lock_path(settings, lineage_id)))}
+            "leader": held(str(publish_lock_path(settings, lineage_id))),
+            **({"job": job.get("id"), "job_state": job.get("state")} if job is not None else {})}
 
 
 # folder of `done/` -> (the names and file stamps of the ten newest results, their rows): `recent` of a status poll.
@@ -1083,6 +1170,25 @@ def _leader_target(first: dict, head: dict) -> dict:
             "origin_key": origin, "gpr": head["gpr"], "view": "shared"}
 
 
+def _verification_clone(settings: dict, engine, job, candidate_gpr: str, clone_folder: Path) -> dict:
+    """The disposable clone the verification runs on. A `busy` refusal is retried: a fork copies the saved state and
+    changes nothing, and the destination is this publish's own scratch folder (removed before a retry)."""
+    import shutil
+    delay = 0.25
+    for attempt in range(1, 5):
+        try:
+            return job.call("fork_project", project=candidate_gpr, path=str(clone_folder), writable=True,
+                            mode=str(settings.get("fork_mode", "auto")), maxCopyMb=int(settings.get("fork_max_copy_mb", 8192)),
+                            **({"purpose": "fork"} if "forkPurposes" in commits._capabilities(engine) else {}))
+        except hydra.EngineError as error:
+            if error.code != "busy" or attempt == 4:
+                raise
+            shutil.rmtree(clone_folder, ignore_errors=True)
+            wait = (error.retry_after_ms or 0) / 1000.0 or delay
+            time.sleep(min(2.0, max(0.05, wait)))
+            delay = min(2.0, delay * 2)
+
+
 def _verify_candidate(settings: dict, engine, job, target: dict, candidate_gpr: str, clone_folder: Path, source_gpr: str,
                       applied: list[dict]) -> None:
     """4.10 step 4: K2 and K3 on the candidate's files and on a disposable clone (the candidate itself is never opened again):
@@ -1093,9 +1199,7 @@ def _verify_candidate(settings: dict, engine, job, target: dict, candidate_gpr: 
     if not report["ok"]:
         raise PublishFailure("candidate_failed", "the candidate has a database version without a valid header", counted=True, report=report)
     clone_folder.parent.mkdir(parents=True, exist_ok=True)
-    clone = job.call("fork_project", project=candidate_gpr, path=str(clone_folder), writable=True,
-                     mode=str(settings.get("fork_mode", "auto")), maxCopyMb=int(settings.get("fork_max_copy_mb", 8192)),
-                     **({"purpose": "fork"} if "forkPurposes" in commits._capabilities(engine) else {}))
+    clone = _verification_clone(settings, engine, job, candidate_gpr, clone_folder)
     try:
         parent = commits._program_of(engine, source_gpr, target)
         read_only = commits._program_of(engine, clone["gpr"], target, refresh=True)
@@ -1206,8 +1310,8 @@ def _build(settings: dict, lineage_id: str, engine, batch_ids: list[str], timeou
 def _settle_all(settings: dict, lineage_id: str, settles: list[tuple]) -> None:
     """A changeset with a generation does not wait for a busy view: `settle` replays it from CURRENT.log at the view's next
     call. One decided without a generation (already in master, converged) is in no log row, so it keeps the bounded wait."""
-    for cs, generation, ids in settles:
-        settle_one(settings, lineage_id, cs, generation, ids, wait_s=0 if generation is not None else None)
+    for cs, generation, ids, subjects in settles:
+        settle_one(settings, lineage_id, cs, generation, ids, wait_s=0 if generation is not None else None, subjects=subjects)
 
 
 def _build_locked(settings: dict, lineage_id: str, engine, batch_ids: list[str], timeout_s: int, started: float,
@@ -1276,7 +1380,7 @@ def _build_locked(settings: dict, lineage_id: str, engine, batch_ids: list[str],
                     "converged": item["converged"], "in_master": item["in_master"], "unverified": item["unverified"],
                     "build_ms": int((time.monotonic() - started) * 1000)})
         if item["outcome"] != "conflict":
-            settles.append((item["cs"], None, sorted(item["converged"] + item["in_master"])))
+            settles.append((item["cs"], None, sorted(item["converged"] + item["in_master"]), None))
     if not accepted:
         return {"generation": None, "csids": [item["cs"]["csid"] for item in results]}
     return _publish_candidate(settings, lineage_id, engine, head, target, accepted, timeout_s, started, settles)
@@ -1413,7 +1517,7 @@ def _publish_candidate(settings: dict, lineage_id: str, engine, head: dict, targ
                         "spot_check": spot})
             _point("after_done")
         for item in accepted:
-            settles.append((item["cs"], generation, by_changeset[item["cs"]["csid"]]["ids"]))
+            settles.append((item["cs"], generation, by_changeset[item["cs"]["csid"]]["ids"], subjects))
         return {"generation": generation, "csids": [item["cs"]["csid"] for item in accepted], "manifestSha256": manifest_sha}
     except (durable.FaultInjected, commits.Crash):
         raise  # a simulated kill: nothing more is written, the next leader decides from the files
@@ -1436,19 +1540,45 @@ def _publish_candidate(settings: dict, lineage_id: str, engine, head: dict, targ
 # ---- settling a view ---------------------------------------------------------------------------------------------
 
 
-def settle_one(settings: dict, lineage_id: str, cs: dict, generation: int | None, ids: list[str], wait_s: float | None = None) -> bool:
+def _base_move_subjects(settings: dict, lineage_id: str, old_base: int, generation: int,
+                        current: list[str] | None) -> list[str]:
+    """The subjects a base move from OLD_BASE to GENERATION brings into the view, from the sealed manifests.
+
+    A generation's manifest lists `store.subjects`, the subjects of every record its batch applied (all changesets),
+    so the union over the generations the view crosses is what its next working copy gains. A generation whose
+    manifest cannot be read leaves the set unknowable: the caller then keeps the wildcard, because a conflict is
+    always safer than a silent rebase onto a value the editor never saw."""
+    if not isinstance(current, list):
+        return [revisions.WILDCARD]
+    subjects = {str(item) for item in current}
+    if generation > old_base + 1:
+        rows = {row.get("gen"): row for row in live_generations(settings, lineage_id)}
+        for number in range(old_base + 1, generation):
+            row = rows.get(number)
+            crossed = ((_manifest_of(row) if row else {}).get("store") or {}).get("subjects")
+            if not isinstance(crossed, list):
+                return [revisions.WILDCARD]
+            subjects.update(str(item) for item in crossed)
+    if not 0 < len(subjects) <= revisions.MAX_SUBJECTS:
+        return [revisions.WILDCARD]
+    return sorted(subjects)
+
+
+def settle_one(settings: dict, lineage_id: str, cs: dict, generation: int | None, ids: list[str], wait_s: float | None = None,
+               subjects: list[str] | None = None) -> bool:
     """Finalize one decided changeset in the view that sealed it (best effort: a view that is busy settles at its next call).
     WAIT_S bounds the wait for the view's lock (default workcopy.SYNC_LOCK_S; the leader passes 0 for a
-    changeset with a generation)."""
+    changeset with a generation). SUBJECTS are the subjects of every record the changeset's generation applied."""
     try:
         target = workcopy.with_view(targets.resolve(settings, cs["target"]["name"]), "" if cs["view"] == "shared" else cs["view"])
-        return finalize_changeset(settings, target, lineage_id, cs["csid"], generation, ids, cs.get("store_revision"), wait_s=wait_s)
+        return finalize_changeset(settings, target, lineage_id, cs["csid"], generation, ids, cs.get("store_revision"),
+                                  wait_s=wait_s, subjects=subjects)
     except (RuntimeError, LockBusy, OSError, ValueError, durable.StoreCorrupt):
         return False
 
 
 def finalize_changeset(settings: dict, selected: dict, lineage_id: str, csid: str, generation: int | None, ids: list[str],
-                       snapshot: int | None, wait_s: float | None = None) -> bool:
+                       snapshot: int | None, wait_s: float | None = None, subjects: list[str] | None = None) -> bool:
     """In one atomic store write of the sealing view: the decided records become a commit entry of the new generation (the
     previous live entry is archived, as in 4.2) and the base moves to it; with no generation (the values were already there)
     they are dropped. Idempotent by `csid`. Returns whether anything was written.
@@ -1465,9 +1595,13 @@ def finalize_changeset(settings: dict, selected: dict, lineage_id: str, csid: st
         present = [record["id"] for record in store["edits"] if record["id"] in set(ids)]
         committed = workcopy.committed_ids(store)
         present = [ident for ident in present if ident not in committed]
+        records = [record for record in store["edits"] if record["id"] in set(present)]
         remaining = [record["id"] for record in workcopy.pending_of(store) if record["id"] not in set(present)]
         base_before = (store.get("base") or {}).get("generation", 0)
         who, now = workcopy._attribution(), time.time()
+        published = sorted({subject for record in records
+                            for subject in revisions.subjects_of(record.get("address", ""), record.get("options") or {})}) \
+            or [revisions.WILDCARD]
         if generation is not None:
             live = [entry for entry in store["commits"] if not entry.get("reverted")]
             if present:
@@ -1482,16 +1616,16 @@ def finalize_changeset(settings: dict, selected: dict, lineage_id: str, csid: st
             if generation >= old_base and not (remaining and crosses_others):
                 store["base"] = {"lineage": lineage_id, "generation": generation}
                 store["stale"] = None
-            op = "commit"
+            op, journal_subjects = "commit", _base_move_subjects(settings, lineage_id, old_base, generation, subjects)
         else:
             store["edits"] = [record for record in store["edits"] if record["id"] not in set(present)]
             store["reverted"] = (store.get("reverted") or []) + ([{"ids": present, "by": who, "at": now, "reason": "published:already_in_master"}]
                                                                 if present else [])
-            op = "publish"
+            op, journal_subjects = "publish", published
         moved = (store.get("base") or {}).get("generation", 0) != base_before
         store["changesets"] = store["changesets"] + [{"csid": csid, "generation": generation, "ids": sorted(present), "at": now}]
         store["revision"] += 1
-        store["journal"] = revisions.append(store["journal"], revisions.journal_entry(store["revision"], op, [revisions.WILDCARD], who, now))
+        store["journal"] = revisions.append(store["journal"], revisions.journal_entry(store["revision"], op, journal_subjects, who, now))
         workcopy._save_store(settings, selected, store)
         if moved or not workcopy.pending_of(store):
             # The view's working copy holds the published records unsaved on the old base: with nothing pending the view reads
@@ -1523,7 +1657,8 @@ def settle(settings: dict, selected: dict) -> bool:
         if not info:
             continue
         try:
-            changed |= finalize_changeset(settings, selected, link["id"], item["csid"], row["gen"], info["ids"], info.get("snapshot"))
+            changed |= finalize_changeset(settings, selected, link["id"], item["csid"], row["gen"], info["ids"], info.get("snapshot"),
+                                          subjects=(manifest.get("store") or {}).get("subjects"))
         except (RuntimeError, LockBusy):
             return changed  # busy: the next call settles it
     return changed
@@ -1659,7 +1794,15 @@ def _settle_own(settings: dict, lineage_id: str, csid: str, result: dict) -> boo
         cs = read_changeset(settings, lineage_id, csid)
     except (durable.StoreCorrupt, OSError, ValueError):
         return False
-    return settle_one(settings, lineage_id, cs, result.get("generation"), ids)
+    subjects = None
+    if result.get("generation") is not None and result.get("gpr"):
+        # The generation's manifest is sealed before the result is written: its `store.subjects` is what the batch
+        # applied, so the finalize journals those subjects instead of a wildcard (a stale edit of another subject can
+        # then be rebased; one of a published subject still conflicts).
+        manifest = lineage.read_manifest(lineage.project_folder_of(result["gpr"]))
+        if manifest is not None:
+            subjects = (manifest.get("store") or {}).get("subjects")
+    return settle_one(settings, lineage_id, cs, result.get("generation"), ids, subjects=subjects)
 
 
 def _revision_of(settings: dict, selected: dict) -> int | None:
@@ -1947,8 +2090,8 @@ def start_job(settings: dict, target: str, options: dict, view: str = "") -> dic
     from hydralysis.locks import locked
     from hydralysis.paths import root_path
     root = root_path(settings)
+    view = "" if view == "shared" else view
     with locked(root / "overlay-jobs" / ".start.lock", what="overlay jobs"):
-        view = "" if view == "shared" else view
         job_id = "overlay-" + uuid.uuid4().hex[:12]
         path = overlayjobs.job_path(settings, job_id)
         path.parent.mkdir(parents=True)
@@ -1960,19 +2103,21 @@ def start_job(settings: dict, target: str, options: dict, view: str = "") -> dic
                 "hydra_allow_unpinned", "hydra", "fork_mode", "fork_max_copy_mb", "forbidden_drives", "targets", "expected_agents",
                 "publish_wait_s", "publish_batch_max", "tmp_dir", "backup_roots")
         write_json(path.parent / "settings.json", {key: settings[key] for key in keys if key in settings})
-        env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent), HYDRALYSIS_HARNESS=hydra.identity()["harness"])
-        if not viewpool.dispatch(path, env, _batch_max(settings)):
-            # No log file: a raw file write outside `durable` is a site `test_durable` counts. What the worker has to say goes into
-            # the job record (`error`), which `overlayjobs.status` shows; `main` below puts any uncaught exception there too.
-            import subprocess   # lazy: a query-only process never starts a job, and a job worker never starts one either
-            child = proc.popen([sys.executable, "-m", "hydralysis.views", str(path)], env=env, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, **({} if os.name == "nt" else {"start_new_session": True}))
-            with locked(path.with_suffix(".lock"), what="overlay job"):
-                current = read_json(path)
-                if current.get("state") == "queued" and not current.get("worker_pid"):
-                    current.update(worker_pid=child.pid, worker_started_ms=overlayjobs.proc_start(child.pid), updated_at=time.time())
-                    write_json(path, current)
-        return {**overlayjobs.status(settings, job_id), "owner_token": token}
+    # The dispatch can wait for a warm worker's hello: it runs outside the registry lock, so one slow spawn never makes
+    # another publisher's job start time out (the lock covers the record and its settings only).
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parent.parent), HYDRALYSIS_HARNESS=hydra.identity()["harness"])
+    if not viewpool.dispatch(path, env, _batch_max(settings)):
+        # No log file: a raw file write outside `durable` is a site `test_durable` counts. What the worker has to say goes into
+        # the job record (`error`), which `overlayjobs.status` shows; `main` below puts any uncaught exception there too.
+        import subprocess   # lazy: a query-only process never starts a job, and a job worker never starts one either
+        child = proc.popen([sys.executable, "-m", "hydralysis.views", str(path)], env=env, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, **({} if os.name == "nt" else {"start_new_session": True}))
+        with locked(path.with_suffix(".lock"), what="overlay job"):
+            current = read_json(path)
+            if current.get("state") == "queued" and not current.get("worker_pid"):
+                current.update(worker_pid=child.pid, worker_started_ms=overlayjobs.proc_start(child.pid), updated_at=time.time())
+                write_json(path, current)
+    return {**overlayjobs.status(settings, job_id), "owner_token": token}
 
 
 def run_job(path: Path, engine=None, watch: bool = True) -> None:
