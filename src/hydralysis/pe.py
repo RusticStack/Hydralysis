@@ -12,8 +12,32 @@ import re
 from collections import Counter
 from pathlib import Path
 
-import capstone
-import pefile
+_CAPSTONE = None
+_PEFILE = None
+
+
+def capstone():
+    """capstone, imported the first time something disassembles.
+
+    Both C extensions below are only needed by a PE read, but `hydralysis.api` (and with it `hydralysis mcp`, the
+    CLI and every `hydralysis call`) imports this module: importing them here cost 7.7 MB of private commit and
+    ~0.09 s of CPU in every process, including an agent that only ever queries the engine. Imported on demand they
+    cost nothing until the first PE tool runs; the object returned is the module itself (`import capstone`)."""
+    global _CAPSTONE
+    if _CAPSTONE is None:
+        import capstone as module
+        _CAPSTONE = module
+    return _CAPSTONE
+
+
+def pefile():
+    """pefile, imported the first time a PE is parsed (see `capstone` above: 2.0 MB of private commit)."""
+    global _PEFILE
+    if _PEFILE is None:
+        import pefile as module
+        _PEFILE = module
+    return _PEFILE
+
 
 _PRINTABLE = set(range(32, 127))
 
@@ -22,7 +46,7 @@ class Image:
     def __init__(self, path: Path):
         self.path = Path(path)
         self.data = self.path.read_bytes()
-        self.pe = pefile.PE(data=self.data, fast_load=True)
+        self.pe = pefile().PE(data=self.data, fast_load=True)
         self.base = int(self.pe.OPTIONAL_HEADER.ImageBase)
         self.machine = int(self.pe.FILE_HEADER.Machine)
         self.bits = 32 if self.pe.OPTIONAL_HEADER.Magic == 0x10B else 64
@@ -124,13 +148,14 @@ class Image:
     def _decoder(self):
         if self.machine not in (0x14C, 0x8664):
             raise ValueError("instruction decoding supports x86/x64 only; PE machine is %#x" % self.machine)
-        mode = capstone.CS_MODE_32 if self.bits == 32 else capstone.CS_MODE_64
-        return capstone.Cs(capstone.CS_ARCH_X86, mode)
+        cs = capstone()
+        mode = cs.CS_MODE_32 if self.bits == 32 else cs.CS_MODE_64
+        return cs.Cs(cs.CS_ARCH_X86, mode)
 
     def _relocations(self) -> list[tuple[int, int]]:
         """Every base relocation as (rva, width), sorted; parsed once."""
         if getattr(self, "_relocs", None) is None:
-            self.pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_BASERELOC"]])
+            self.pe.parse_data_directories(directories=[pefile().DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_BASERELOC"]])
             found = []
             for block in getattr(self.pe, "DIRECTORY_ENTRY_BASERELOC", []) or []:
                 for entry in block.entries:
@@ -336,7 +361,7 @@ class Image:
 
     def imports_text(self, limit: int = 80, pattern: str = "") -> str:
         """One line per import: its IAT slot (callers reference the slot: xrefs on it finds them), DLL and name."""
-        self.pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
+        self.pe.parse_data_directories(directories=[pefile().DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
         lines = [self.header()]
         wanted = re.compile(pattern, re.I) if pattern else None
         count = 0
@@ -360,7 +385,7 @@ class Image:
         return "\n".join(lines)
 
     def exports_text(self, limit: int = 80) -> str:
-        self.pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_EXPORT"]])
+        self.pe.parse_data_directories(directories=[pefile().DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_EXPORT"]])
         lines = [self.header()]
         symbols = getattr(self.pe, "DIRECTORY_ENTRY_EXPORT", None)
         if symbols is None:
@@ -399,6 +424,7 @@ class Image:
         return "\n".join(lines)
 
     def callees(self, rva: int, limit: int = 30) -> str:
+        cs = capstone()
         md = self._decoder()
         md.detail = True
         bounds = self._bounds(rva)
@@ -411,7 +437,7 @@ class Image:
         blob = self.read_rva(begin, max(0, end - begin))
         hits = []
         for insn in md.disasm(blob, begin):
-            if insn.id == capstone.x86.X86_INS_CALL and insn.operands and insn.operands[0].type == capstone.x86.X86_OP_IMM:
+            if insn.id == cs.x86.X86_INS_CALL and insn.operands and insn.operands[0].type == cs.x86.X86_OP_IMM:
                 hits.append("rva:%#x call rva:%#x" % (insn.address, insn.operands[0].imm))
                 if len(hits) >= limit:
                     break
@@ -502,7 +528,7 @@ def _rip_note(image: Image, insn) -> str:
 
 def _file_version(pe) -> str:
     try:
-        pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_RESOURCE"]])
+        pe.parse_data_directories(directories=[pefile().DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_RESOURCE"]])
     except Exception:
         return ""
     if not hasattr(pe, "FileInfo"):
