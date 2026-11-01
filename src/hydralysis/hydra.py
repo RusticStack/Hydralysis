@@ -26,7 +26,7 @@ from pathlib import Path
 from hydralysis import cancel, compat, durable
 from hydralysis.paths import root_path
 
-RELEASE = "12.3-hydra.4"
+RELEASE = "12.3-hydra.5"
 PROTOCOL = 3
 # The oldest engine protocol this client still speaks: a protocol-3 client library connects to a released protocol-2
 # engine (hydra.2, hydra.3) and negotiates down; the features of 3 are used only when hello advertises them (7.5).
@@ -46,12 +46,12 @@ _BASE = "https://github.com/RusticStack/hydra-engine/releases/download/v" + RELE
 # publishes the release and re-runs `tools/bump_hydra.py --release 12.3-hydra.4 --dist <published files> --write`.
 # Until then the next line (the one `bump_hydra.py` rewrites) is NOT true: the digests and sizes are those of the stand-in
 # dist, not a published SHA256SUMS, and nothing was checked after a download.
-# SHA256SUMS of the release, observed 2026-10-30 and checked after download.
+# SHA256SUMS of the release, observed 2026-11-01 and checked after download.
 ASSETS = {
     "engine": {"url": _BASE + "hydra-engine-" + RELEASE + "-win_x86_64.zip",
-               "sha256": "f0f2844ca32b702c3fe711adbf6c7d4743ddac5097073691965faaabf7a8cef0", "size": 379241326},
+               "sha256": "7f9d0a097b22f1dad5666968541e079529fdd171e1c7152ce07da3696161cb1e", "size": 381563431},
     "client": {"url": _BASE + "hydra-client-" + RELEASE + ".zip",
-               "sha256": "6f086aa2a5a91b043f856d33ee851da6d485cc45ba17925fe5709536dfac7406", "size": 45187},
+               "sha256": "b4b9580f9e5884377fdc2f3271479c0d0c7e81ca84fa68bf903a04ffc99b7fbe", "size": 51807},
 }
 SESSION_MODULE = Path("Ghidra", "Features", "HeadlessSession")
 

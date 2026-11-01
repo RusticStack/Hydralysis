@@ -58,7 +58,7 @@ hydralysis backend install
 hydralysis job <setup-id>
 ```
 
-`backend install` is a background job that installs the pinned Hydra release (**12.3-hydra.4**: the engine and its client) privately under the root (the release is not published yet, so the install works only once it is), verifying each archive's full SHA-256 before extraction, and finds or installs a full JDK. It needs no administrator rights and changes no machine settings. Existing installs are used when `hydra_dir`, `hydra_client` and `java_home` name them.
+`backend install` is a background job that installs the pinned Hydra release (**12.3-hydra.5**: the engine and its client) privately under the root (the release is not published yet, so the install works only once it is), verifying each archive's full SHA-256 before extraction, and finds or installs a full JDK. It needs no administrator rights and changes no machine settings. Existing installs are used when `hydra_dir`, `hydra_client` and `java_home` name them.
 
 An analysed project is adopted where it is, with no copy and no import:
 

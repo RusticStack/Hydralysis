@@ -6,13 +6,46 @@ Nothing here is a tag: a release is tagged by the owner.
 
 ## Unreleased
 
-- Publish jobs: a publish hands its job file to a warm worker (`python -m hydralysis.viewpool --serve`) instead of
+## 0.7.0
+
+This release (0.7.0) pins Hydra Engine `12.3-hydra.5` (protocol 3), released 2026-11-01. It is a
+minor step: it changes the publish queue's reply (`failed`, `unled`, `sealed`, `next`), journals the
+subjects a publish actually applied, and moves the engine pin.
+
+The engine and client archives are the `12.3-hydra.5` release files, written by
+`tools/bump_hydra.py` together with the pin statements in `README.md`, `THIRD_PARTY.md` and
+`docs/upstream-setup.md`. The client stays 1.1.0 on protocol 3.
+
+### Changes in 0.7.0
+
+- **Warm publish worker pool.** A publish hands its job file to a warm worker (`python -m hydralysis.viewpool --serve`) instead of
   spawning `python -m hydralysis.views <job.json>` for every publish, so the package import (0.06 s of CPU, 0.12-0.17 s
   of wall per worker here) is paid once per process and not once per publish. The worker is still a separate process,
   runs the same `views.run_job` and writes the same job record; one job runs per worker at a time, at most
   `publish_batch_max` workers exist per client, at most one is kept idle and an idle one exits after 2 s. A client with
   every worker busy, or one whose pool cannot start, takes the one-shot worker exactly as before; test-fault runs never
   pool. Output, job records, ownership, cancellation and kill isolation are unchanged.
+- **Publish verification through the engine's `decompile` command.** It used 51 `script` calls per
+  publish (6.08 ms each) and now uses the command (0.39 ms each) with a window of 8 in flight, same
+  text, same 25 functions in listing order, first difference refused. A publish's folder flush
+  forces only the files the save wrote (14 -> 5 fsyncs, 27-35 -> 12.5 ms), not the fork's
+  already-forced copies; the manifest is still written after every byte of the generation is forced
+  and the `CURRENT.log` append remains the commit point.
+- **The view finalize journals the subjects the generation applied, not a wildcard.** This fixes the
+  self-publish edit conflict: the lazy finalize's `subjects:["*"]` overlapped every subject, so an
+  agent's next `type_edit` could conflict with its own publish. The subjects now come from the
+  sealed manifest (union across crossed generations); an edit on a subject the publish did not touch
+  rebases, and an edit on a published subject still conflicts. No retry loop and no weakened
+  validation. `commits.finalize` does the same from its manifest ids.
+- **A dead publish worker or leader fails fast, and an unappended generation rolls forward.**
+  `status show=queue csid=` answers `state:"failed"` with the job's `job_state`, exact error and a
+  `next` when the worker is gone (10 s), and `state:"unled"` when no job and no leader exist for
+  10 s. The next publish moves a sealed-but-never-appended generation aside
+  (`gen/NNNN.abandoned-<uuid>`) and rebuilds it; nothing is retried or dropped by `status`. The
+  job-registry lock no longer covers the warm-worker dispatch, so a slow handover cannot time out
+  another publisher after its changeset was sealed; a remaining lock gives a structured `busy` that
+  names the sealed changeset.
+- **Engine pin `12.3-hydra.5`** (protocol 3), replacing `12.3-hydra.4`.
 - `backend status` (and every backend report) reads the CPU architecture from `PROCESSOR_ARCHITEW6432` /
   `PROCESSOR_ARCHITECTURE` on Windows instead of `platform.machine()`, which could start `cmd /c ver` when its WMI
   query failed on a loaded machine; status now starts no process in that case either.
@@ -39,6 +72,51 @@ Nothing here is a tag: a release is tagged by the owner.
   request and is sent without the session request lock when the worker's ready.json says `concurrent_status` (an older
   worker still alive gets the lock as before); every other action stays one at a time. A request that outlasts the
   idle time no longer lets the worker retire as idle.
+
+### Measured for this release
+
+All numbers are from the engine's round-4 reports and the Hydralysis lanes named here.
+
+- Warm publish workers, 16 agents, 15 interleaved runs: **Python CPU 6.57 -> 6.07 s (-7.6 %)** and
+  Python processes at peak **45-47 -> 37-39**, with 8 publish jobs over 4 worker pids; tree CPU,
+  tree memory and `hy_publish` inside the session noise (`_logs/rust-round4/hyviews/REPORT.md`).
+- Publish verification and flush, 16 agents, six interleaved runs: leader `build_ms` **922 -> 690 ms**
+  and `hy_publish` p50 **1,274 -> 1,105 ms**, with 3 of 6 runs under 1 s (845/960/994 ms); the
+  remaining time is eight concurrent publishes over about 1.5 builds plus the harness' 250 ms poll
+  (`_logs/rust-round4/io/REPORT.md`).
+- Edit reliability, 13 interleaved sessions per engine: **208 edits, 0 failures** (104 on the exact
+  final commit) and **208 publishes, 0 failures** in the two series; 412/412 reply keys and the
+  canonical digest in 13/13 final-series runs; the h4 control is 104 edits, 0 failures
+  (`_logs/rust-round4/hyedit/REPORT.md`).
+- Hydralysis suite: **1,640 test results, 0 failed** alone or only under load; engine-gated
+  integration against the `12.3-hydra.5` build: **17/17, OK** (`_logs/rust-round4/hyedit/REPORT.md`).
+
+### Test runs for this release
+
+- Unit suite: 1,640 test results, 0 failed. The one task-plan problem
+  (`test_runtime_scenario_fixture`: "ran 23 tests, 1 were planned") is pre-existing and reproduces
+  identically on the base worktree; all its tests ran.
+- Real-engine suite against the `12.3-hydra.5` build: 17 of 17 engine-gated tests, OK.
+- The 16-agent series: 208 edits, 0 failed; 208 publishes, 0 failed; 412/412 reply keys and the
+  canonical digest in the final series.
+- `tools/bump_hydra.py --release 12.3-hydra.5 --dist <dir> --check` exits 0 on the release
+  artifacts, so every pin statement agrees with the archive hashes.
+
+### Limits of this release
+
+- Windows x64 only. Copy-on-write cloning exists only on a ReFS volume; on NTFS a full copy is made.
+  Nothing about ReFS is tested for this line (no ReFS volume on the release machine); NTFS is the
+  release file system.
+- The one-way upgrade: a commit may write a generation that older engines cannot open.
+- A harness restart is needed once, for the catalog epoch.
+- `hy_publish` is 1.1-1.5 s median at 16 agents under eight concurrent publishes, not below 1 s; a
+  publish with no queue is 845-994 ms end to end in the same runs.
+- Every limit of PROTOCOL-3.md 6.2 is stated in the engine module README ("Limits of 12.3-hydra.4
+  and protocol 3"; the protocol is unchanged in 12.3-hydra.5); the ones this client owns or sees
+  first (the history cap of 4096 records or 20 MiB, no rotation of the append logs, abandoned calls
+  on hydra.2/3, the leave stall, the trusted quick hint, no semantic dependency tracking in subset
+  commits, backups verified through the OS cache, the upgrade gate is not a security boundary) are
+  in `README.md`, "Limits of this client with hydra.4".
 
 ## 0.6.0
 
