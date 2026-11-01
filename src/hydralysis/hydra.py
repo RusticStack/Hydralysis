@@ -49,7 +49,7 @@ _BASE = "https://github.com/RusticStack/hydra-engine/releases/download/v" + RELE
 # SHA256SUMS of the release, observed 2026-11-01 and checked after download.
 ASSETS = {
     "engine": {"url": _BASE + "hydra-engine-" + RELEASE + "-win_x86_64.zip",
-               "sha256": "7f9d0a097b22f1dad5666968541e079529fdd171e1c7152ce07da3696161cb1e", "size": 381563431},
+               "sha256": "1627dbc59fab78b1d3f64cd861c61ef27c68bd17ec8d9e5b31b4be7240024e13", "size": 381561493},
     "client": {"url": _BASE + "hydra-client-" + RELEASE + ".zip",
                "sha256": "b4b9580f9e5884377fdc2f3271479c0d0c7e81ca84fa68bf903a04ffc99b7fbe", "size": 51807},
 }
