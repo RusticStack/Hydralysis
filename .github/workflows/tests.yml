@@ -1,9 +1,8 @@
 name: tests
 
+# Pull requests and manual runs only (gh workflow run tests.yml): main is tested locally before a
+# push, not on every push. release.yml calls this workflow (workflow_call) on every release.
 on:
-  push:
-    branches: [main]
-    paths-ignore: ['**.md']
   pull_request:
     paths-ignore: ['**.md']
   workflow_dispatch:

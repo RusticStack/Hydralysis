@@ -1,8 +1,9 @@
 # Continuous integration
 
-One workflow, `.github/workflows/tests.yml`, runs on every pull request, on pushes to `main` and on demand
-(`workflow_dispatch`). Everything runs on GitHub-hosted `windows-latest`, because Hydralysis targets Windows
-PEs and the engine ships as a Windows build. There are two jobs.
+One workflow, `.github/workflows/tests.yml`, runs on every pull request, on demand (`gh workflow run
+tests.yml`) and from `release.yml` on every release (`workflow_call`). It does not run on pushes to `main`:
+main is tested locally before a push. Everything runs on GitHub-hosted `windows-latest`, because Hydralysis
+targets Windows PEs and the engine ships as a Windows build. There are two jobs.
 
 ## What runs where
 
