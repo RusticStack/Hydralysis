@@ -9,10 +9,36 @@ from pathlib import Path
 
 from hydralysis import __version__
 from hydralysis.config import evidence_path, load
-from hydralysis.evidence import add_claim, list_claims
-from hydralysis.pe import Image, parse_rva
-from hydralysis.prologue import compare
-from hydralysis.query import QueryRunner
+
+# The PE reader (capstone + pefile), the evidence store and the engine client are imported by the branch that uses
+# them, not here: `hydralysis mcp`, `hydralysis call` and the CLI all import this module, and an agent that only
+# queries the engine, or only reads a PE, should not pay for the other stacks. Measured on the shipped MCP server:
+# 22.6 MB private -> 15.4 MB with capstone/pefile deferred, -> ~10.5 MB with the query stack deferred too.
+
+_LAZY_IMPORTS = {
+    "Image": ("hydralysis.pe", "Image"),
+    "parse_rva": ("hydralysis.pe", "parse_rva"),
+    "compare": ("hydralysis.prologue", "compare"),
+    "QueryRunner": ("hydralysis.query", "QueryRunner"),
+    "add_claim": ("hydralysis.evidence", "add_claim"),
+    "list_claims": ("hydralysis.evidence", "list_claims"),
+}
+
+
+def __getattr__(name):
+    """Import a stack the first time a tool of that family runs, then keep it as a module global (PEP 562)."""
+    target = _LAZY_IMPORTS.get(name)
+    if target is None:
+        raise AttributeError("module %r has no attribute %r" % (__name__, name))
+    value = getattr(importlib.import_module(target[0]), target[1])
+    globals()[name] = value
+    return value
+
+
+def _lazy(name):
+    """The lazily imported NAME, with a module global set first (a test's `patch.object(api, name)`) taking precedence."""
+    value = globals().get(name)
+    return __getattr__(name) if value is None else value
 
 # Chosen from what agents actually called, mapped onto generic operations.
 # REA's function dossier -> inspect. Ghidra decompile/xrefs/bytes -> the
@@ -304,12 +330,12 @@ def call(name: str, args: dict | None) -> str:
         if len(expected) > 4096:
             raise ValueError("expect must be at most 4096 bytes")
         data = image.read_rva(_addr(image, args), len(expected))
-        result = image.header() + "\n" + compare(data, str(args["expect"]))
+        result = image.header() + "\n" + _lazy("compare")(data, str(args["expect"]))
         if "PROLOGUE MISMATCH" in result:
             raise ValueError(result)
         return result
     if name == "evidence_add":
-        return add_claim(
+        return _lazy("add_claim")(
             evidence_path(str(args.get("db") or "")),
             game=str(args.get("target") or args.get("game") or ""),
             build=str(args.get("build") or ""),
@@ -331,7 +357,7 @@ def call(name: str, args: dict | None) -> str:
             if not out.is_absolute() or out.suffix != ".md":
                 raise ValueError("export must be an absolute path ending in .md")
             return json.dumps(export(path, out, target, str(args.get("subsystem") or "")), indent=2)
-        return list_claims(path, target, int(args.get("limit") or 50), subsystem=str(args.get("subsystem") or ""),
+        return _lazy("list_claims")(path, target, int(args.get("limit") or 50), subsystem=str(args.get("subsystem") or ""),
                            address=str(args.get("address") or ""), build=str(args.get("build") or ""),
                            include_superseded=bool(args.get("include_superseded")))
     target = str(args.get("target") or args.get("game") or "")
@@ -340,7 +366,7 @@ def call(name: str, args: dict | None) -> str:
         if args.get("action") == "export":
             from hydralysis.exporting import start
             return json.dumps(start(settings, target, args.get("options")), indent=2)
-        runner = QueryRunner(settings)
+        runner = _lazy("QueryRunner")(settings)
         if args.get("action") == "address_map":
             from hydralysis.address_maps import import_map
             options = args.get("options")
@@ -573,7 +599,7 @@ def _script_options(options) -> str:
                     tool="ghidra_run", options=sorted(options))
 
 
-def _live(result: dict, args: dict, image: Image) -> None:
+def _live(result: dict, args: dict, image: "Image") -> None:
     """With a runtime session: each row's live bytes, and who patched them if they differ."""
     from hydralysis.runtime import RuntimeRunner
     module = Path(str(args["exe"])).name
@@ -590,14 +616,14 @@ def _live(result: dict, args: dict, image: Image) -> None:
     result["live_provenance"] = live["provenance"]
 
 
-def _image(args: dict) -> Image:
+def _image(args: dict) -> "Image":
     exe = args.get("exe") or os_exe()
     if not exe:
         raise ValueError("exe is required")
     path = Path(str(exe))
     if not path.is_file():
         raise ValueError("exe not found: %s" % path)
-    return Image(path)
+    return _lazy("Image")(path)
 
 
 def os_exe() -> str:
@@ -605,7 +631,7 @@ def os_exe() -> str:
     return compat.env("EXE", "")
 
 
-def _addr(image: Image, args: dict) -> int:
+def _addr(image: "Image", args: dict) -> int:
     if "address" not in args:
         raise ValueError("address is required")
     text = str(args["address"]).strip()
@@ -613,7 +639,7 @@ def _addr(image: Image, args: dict) -> int:
         from hydralysis.address_maps import resolve
         image._address_resolution = resolve(_settings(), image.fingerprint()["sha256"], text)
         return int(image._address_resolution["rva"], 16)
-    rva = parse_rva(text, image.base)
+    rva = _lazy("parse_rva")(text, image.base)
     if ":" not in text:
         value = int(text, 0)
         if value >= image.base:
