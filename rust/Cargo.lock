@@ -232,13 +232,14 @@ dependencies = [
 name = "hy-store"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "hy-core",
  "rusqlite",
  "serde_json",
  "sha2",
- "tempfile",
  "thiserror",
  "uuid",
+ "windows-sys",
 ]
 
 [[package]]
@@ -248,6 +249,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "hy-core",
+ "hy-store",
  "serde_json",
  "sha2",
  "tempfile",
