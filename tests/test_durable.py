@@ -1060,6 +1060,8 @@ FOLLOW_UP = {  # (file, function, kind) -> (category, note)
     ("crossbuild.py", "run", "write_text"): ("artifact", "diff summary"),
     ("crossbuild.py", "_export_overlay_candidates", "write_text"): ("artifact", "export"),
     ("crossbuild.py", "transfer_checks", "write_text"): ("artifact", "export"),
+    ("decompile_job.py", "start", "open(ab)"): ("artifact", "worker log"),
+    ("decompile_job.py", "run", "write_text"): ("artifact", "decompile reply; the job record turns \"done\" only after this write, so a torn file is never read as a result"),
     ("evidence.py", "export", "write_text"): ("artifact", "evidence export (the database is SQLite WAL)"),
     ("evidence.py", "export", "open(w)"): ("artifact", "evidence export"),
     ("export_worker.py", "run", "open(a)"): ("artifact", "export output rows"),
