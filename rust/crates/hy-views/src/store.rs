@@ -306,6 +306,7 @@ fn reread_closure(path: PathBuf) -> impl Fn() -> hy_core::Result<Option<Value>> 
         store_record(&path).map_err(|e| match e {
             Error::Core(c) => c,
             Error::View(v) => hy_core::Error::value(v.message),
+            Error::Runtime(m) => hy_core::Error::value(m),
         })
     }
 }
@@ -636,18 +637,12 @@ pub fn directory(settings: &Settings, target: &Target) -> PathBuf {
 }
 
 /// `backends.read_json(working/<key>/state.json)`: `{}` when missing or unreadable.
-pub fn working_state(settings: &Settings, target: &Target) -> Map<String, Value> {
-    std::fs::read(directory(settings, target).join("state.json"))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-        .and_then(|v| {
-            if let Value::Object(m) = v {
-                Some(m)
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default()
+pub fn working_state(settings: &Settings, target: &Target) -> Result<Map<String, Value>> {
+    let path = directory(settings, target).join("state.json");
+    match sealed::read_sealed_info(&path, &ReadOptions::default(), Some(json!({})))?.0 {
+        Value::Object(m) => Ok(m),
+        _ => Ok(Map::new()),
+    }
 }
 
 /// A short summary of a store for a reply. `store` is the copy the caller already loaded.
@@ -656,7 +651,7 @@ pub fn summary(settings: &Settings, target: &Target, store: Option<Store>) -> Re
         Some(s) => s,
         None => load_store(settings, target)?,
     };
-    let state = working_state(settings, target);
+    let state = working_state(settings, target)?;
     let journal = store["journal"].as_array().cloned().unwrap_or_default();
     let latest = journal
         .iter()

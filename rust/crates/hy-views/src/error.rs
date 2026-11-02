@@ -64,6 +64,9 @@ pub enum Error {
     View(#[from] ViewError),
     #[error(transparent)]
     Core(#[from] hy_core::Error),
+    /// Python `RuntimeError(message)`: the structured refusals (`busy`, `stale_view`, conflicts) carry a JSON text.
+    #[error("{0}")]
+    Runtime(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

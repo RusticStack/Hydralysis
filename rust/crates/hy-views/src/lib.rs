@@ -16,6 +16,7 @@ pub mod proc;
 pub mod queue;
 pub mod records;
 pub mod revisions;
+pub mod settle;
 pub mod store;
 pub mod viewgov;
 
