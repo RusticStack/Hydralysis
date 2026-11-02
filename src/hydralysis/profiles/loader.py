@@ -193,7 +193,7 @@ def _validate(data: dict, directory: Path | None, files: dict[str, str], errors:
     if len({b["image_sha256"] for b in builds}) != len(builds):
         errors.add("target.builds", "duplicate image_sha256")
 
-    host = _table(data.get("host", {}), "host", errors, {"os", "fault_policy", "record_handler_chain", "allow_debugger"})
+    host = _table(data.get("host", {}), "host", errors, {"os", "fault_policy", "record_handler_chain", "allow_debugger", "sampling", "rate_budget"})
     if host.get("os", "windows-x64") not in HOSTS:
         errors.add("host.os", "only windows-x64 is supported in this release")
     default_fault = host.get("fault_policy", "tolerant")
@@ -203,6 +203,16 @@ def _validate(data: dict, directory: Path | None, files: dict[str, str], errors:
     host_out = {"os": "windows-x64", "fault_policy": default_fault,
                 "record_handler_chain": bool(host.get("record_handler_chain", True)),
                 "allow_debugger": bool(host.get("allow_debugger", True))}
+    # the declared sampling policy of the capture (absent: the recorder's default, adaptive); see docs/trace-overhead.md
+    if "sampling" in host or "rate_budget" in host:
+        mode, budget = host.get("sampling", "adaptive"), host.get("rate_budget", 120000)
+        if mode not in ("adaptive", "exact"):
+            errors.add("host.sampling", "must be adaptive or exact")
+            mode = "adaptive"
+        if isinstance(budget, bool) or not isinstance(budget, int) or not 1000 <= budget <= 50_000_000:
+            errors.add("host.rate_budget", "must be an integer of 1000..50000000 records per second")
+            budget = 120000
+        host_out["sampling"] = {"mode": mode, "rate_budget": budget}
 
     # event kinds first: hooks refer to them
     kinds, kind_names = [], set(CORE_KINDS)

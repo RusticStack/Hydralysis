@@ -21,6 +21,7 @@ const F_READ_FAILED: u8 = 2;
 const F_TRUNCATED: u8 = 4;
 const F_WIDE: u8 = 8;
 const F_BUF: u8 = 16;
+const F_SAMPLED: u8 = 32;
 
 fn err(message: impl Into<String>) -> PyErr {
     PyValueError::new_err(message.into())
@@ -211,7 +212,7 @@ impl Chain {
     #[allow(clippy::too_many_arguments)]
     fn push_event(
         &mut self, out: &mut Vec<u8>, enc: &EnvelopeStatic, source_seq: u64, kind: &str, t_ns: u64, tid: Option<u32>, payload: &Value,
-        va: u64, callstack: &[u64], module: Option<&str>,
+        va: u64, callstack: &[u64], module: Option<&str>, sampled: bool,
     ) -> Result<(), String> {
         const CRC_FIELD: usize = 9; // eight hex digits and a space
         const HASH_FIELD: usize = 8 + 64 + 2; // "hash":"<64 hex>",
@@ -231,7 +232,9 @@ impl Chain {
             }
             out.extend_from_slice(b"],");
         }
-        out.extend_from_slice(b"\"clock_domain\":\"qpc-10mhz\",\"confidence\":\"exact\",");
+        out.extend_from_slice(b"\"clock_domain\":\"qpc-10mhz\",\"confidence\":\"");
+        out.extend_from_slice(if sampled { b"sampled" } else { b"exact" });
+        out.extend_from_slice(b"\",");
         let splice = out.len();
         out.extend_from_slice(&[b' '; HASH_FIELD]); // the hash field, filled in below
         let rest = out.len();
@@ -619,6 +622,7 @@ struct SegmentEncoder {
     chain: Chain,
     envelope: EnvelopeStatic,
     source_seq: u64,
+    sampled_now: bool,
     ring_next: HashMap<u16, u32>,
     batch_next: Option<u32>,
     dropped_seen: u64,
@@ -650,7 +654,7 @@ impl SegmentEncoder {
         let seq = self.source_seq;
         self.source_seq += 1;
         self.stat("events", 1);
-        self.chain.push_event(out, &self.envelope, seq, kind, t_ns, tid, &payload, va, callstack, module)
+        self.chain.push_event(out, &self.envelope, seq, kind, t_ns, tid, &payload, va, callstack, module, self.sampled_now)
     }
 
     fn buffer(&mut self, site: &Site, r: &Rec, artifacts: &mut BTreeMap<String, Vec<u8>>) -> Option<Value> {
@@ -726,6 +730,15 @@ impl SegmentEncoder {
 
     #[allow(clippy::too_many_lines)]
     fn call(&mut self, out: &mut Vec<u8>, r: &Rec, artifacts: &mut BTreeMap<String, Vec<u8>>) -> Result<(), String> {
+        // a record kept while the probe was being thinned says so in the summary confidence of the events it yields
+        self.sampled_now = r.flags & F_SAMPLED != 0;
+        let result = self.call_events(out, r, artifacts);
+        self.sampled_now = false;
+        result
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn call_events(&mut self, out: &mut Vec<u8>, r: &Rec, artifacts: &mut BTreeMap<String, Vec<u8>>) -> Result<(), String> {
         let t0 = tick_ns(r.qpc, self.freq);
         let Some(site) = self.sites.get(&r.site).map(Arc::clone) else {
             return self.event_into(out, "core.error", t0, Some(r.tid), json!({"error": "unknown-site", "site": r.site}), 0, &[], None);
@@ -1036,6 +1049,7 @@ impl SegmentEncoder {
                 v
             } },
             source_seq: 0,
+            sampled_now: false,
             ring_next: HashMap::new(),
             batch_next: None,
             dropped_seen: 0,

@@ -21,7 +21,7 @@ import threading
 import time
 import uuid
 
-from hydralysis.runtime_agents import trace_agent_source
+from hydralysis.runtime_agents import normalize_sampling, trace_agent_source
 from hydralysis.trace_capture import FAULT_POLICIES, TraceRefused, TraceSource, check_probe_policy
 
 RING_BYTES = (1 << 16, 1 << 24)
@@ -29,7 +29,7 @@ RING_BYTES = (1 << 16, 1 << 24)
 DEFAULT_RING_BYTES = 1 << 20
 DEFAULT_RINGS = 32
 BATCH_MS = 10
-BACKPRESSURE_MS = 20.0
+BACKPRESSURE_MS = 2.0     # a hook waits this long for a full ring at most; the sampling policy is the first line, not a stall
 ACK_WINDOW = 16
 MAX_PROBES = 48
 SITE_ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:<>~$@?-]{0,95}$")
@@ -66,6 +66,13 @@ def qpc_frequency() -> int:
     value = ctypes.c_longlong()
     ctypes.WinDLL("kernel32").QueryPerformanceFrequency(ctypes.byref(value))
     return int(value.value)
+
+
+def _hooking(value) -> str:
+    value = "inline" if value is None else value
+    if value not in ("inline", "interceptor"):
+        raise ValueError("hooking is inline (plain call sites patched directly, the default) or interceptor")
+    return value
 
 
 class TraceMixin:
@@ -283,7 +290,8 @@ class TraceMixin:
                       "rings": rings, "ring_bytes": ring_bytes, "batch_ms": int(args.get("batch_ms", BATCH_MS)),
                       "counter_ms": int(args.get("counter_ms", 250)), "batch_bytes": int(args.get("batch_bytes", 1 << 20)),
                       "bp_us": int(float(args.get("bp_ms", BACKPRESSURE_MS)) * 1000), "window": int(args.get("window", ACK_WINDOW)),
-                      "producer_gen": gen, "fault_policy": policy}
+                      "producer_gen": gen, "fault_policy": policy, "sampling": normalize_sampling(args.get("sampling")),
+                      "hooking": _hooking(args.get("hooking"))}
         try:
             self._load(script_id, trace_agent_source(parameters), {"kind": "trace", "probes": self.trace_info["probes"]})
             if not self._trace_ready.wait(10):

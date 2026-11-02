@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import hmac
 import random
 import unittest
@@ -276,6 +277,19 @@ class ProfileEvents(unittest.TestCase):
         results = self.run_all()
         for lines, _enc in results[1:]:
             self.assertEqual(lines, results[0][0])
+
+    def test_a_record_kept_while_thinned_is_a_sampled_event_in_every_encoder(self):
+        records = [{"site": 4, "ring": 1, "ring_seq": 0, "qpc": 25, "tid": 101, "ret_addr": 0x140002100, "args": [41], "flags": tw.F_SAMPLED},
+                   {"site": 4, "ring": 1, "ring_seq": 1, "qpc": 26, "tid": 101, "ret_addr": 0x140002100, "args": [42]}]
+        batch = tw.build_batch(3, 0, 99, (2, 0, 0, 0), records)
+        outputs = []
+        for enc in encoders_for(EVENT_SITES):
+            lines, _artifacts, _info = enc.encode_batch(batch)
+            outputs.append(bytes(lines))
+        for lines in outputs[1:]:
+            self.assertEqual(lines, outputs[0])
+        confidences = [json.loads(line.split(b" ", 1)[1])["confidence"] for line in outputs[0].splitlines() if b"app.frame" in line]
+        self.assertEqual(confidences, ["sampled", "exact"])
 
     def test_a_profile_event_carries_its_declared_fields_and_never_the_text(self):
         events = self.run_all()

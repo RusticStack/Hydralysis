@@ -95,6 +95,7 @@ class TraceSource:
         self.opened_ns: int | None = None
         self.closed_ns: int | None = None
         self.transport = {"batches": 0, "bytes": 0, "decode_failed": 0, "agent_batches_sent": None, "counter_messages": 0}
+        self._skipped_reported: dict = {}
         self.producer: dict = {"attempted": 0, "dropped": 0, "read_failed": 0, "no_ring": 0, "rings": []}
         self.writer = {"lines": 0, "bytes": 0, "write_failed": 0, "retried_bytes": 0, "refused_after_full": 0, "artifacts": 0,
                        "artifact_failed": 0, "syncs": 0}
@@ -208,7 +209,7 @@ class TraceSource:
                        "fault_policy": self.fault_policy, "fault_context": message.get("context"),
                        "probes": message.get("installed"), "rings": message.get("rings"), "ring_bytes": message.get("ring_bytes"),
                        "batch_ms": message.get("batch_ms"), "backpressure_us": message.get("bp_us"),
-                       "ack_window": message.get("window"), "clock": {"domain": "qpc-10mhz", "unit": "qpc-tick",
+                       "ack_window": message.get("window"), "sampling": message.get("sampling"), "clock": {"domain": "qpc-10mhz", "unit": "qpc-tick",
                                                                        "frequency_hz": int(message.get("qpc_freq", 0) or 0)},
                        "scope": {"name": self.scope, "key_id": self.key_id}, "payload_mode": self.payload_authorized,
                        "capabilities_refused": []}
@@ -316,7 +317,27 @@ class TraceSource:
                              # agent held back for an unacknowledged window, and how many rings a later thread reused
                              "stalls": message.get("stalls", 0), "stall_ticks": message.get("stall_ticks", 0),
                              "window_waits": message.get("window_waits", 0), "ring_reuses": message.get("ring_reuses", 0),
-                             "bp_us": message.get("bp_us"), "qpc_freq": message.get("qpc_freq")}
+                             "bp_us": message.get("bp_us"), "qpc_freq": message.get("qpc_freq"),
+                             "sampling": message.get("sampling")}
+            self._sampling_gaps(message.get("sampling"), bool(message.get("final")))
+
+    def _sampling_gaps(self, sampling: dict | None, final: bool) -> None:
+        """Hits the sampling policy skipped are not lost silently: for each probe, the exact number skipped since the last
+        report is one `core.capture.gap` (reason `budget`, `sampled: true`, with the stride in force), so a coverage
+        claim over a sampled probe says how many hits it stands for. The caller holds the lock."""
+        if not sampling or self.finalized:
+            return
+        for row in sampling.get("sites", ()):
+            skipped = int(row.get("skipped", 0))
+            new = skipped - self._skipped_reported.get(row["site"], 0)
+            if new <= 0:
+                continue
+            self._skipped_reported[row["site"]] = skipped
+            self._append(self.encoder.encode_event("core.capture.gap", self._now_ns(), {
+                "reason": "budget", "dropped": new, "sampled": True, "probe": row.get("probe"), "site": row["site"],
+                "policy": sampling.get("policy"), "stride": row.get("stride"), "rate_per_s": row.get("rate_per_s"),
+                "kept": row.get("kept"), "hits": row.get("hits"), "out_of_band": True,
+                "detail": "skipped by the declared sampling policy; kept records carry confidence sampled"}))
 
     # ---- the end -----------------------------------------------------------------------------------------------------------
     def finalize(self, *, detach: dict | None = None, reason: str = "stopped") -> dict:

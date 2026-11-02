@@ -43,6 +43,25 @@ WORKLOADS = {
 FREQ = 10_000_000
 
 
+def _cpu_seconds(handle, job: bool) -> float:
+    """User + kernel CPU of a process (GetProcessTimes) or of every process that ever ran in a job object, in seconds."""
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if not job:
+        times = [wintypes.FILETIME() for _ in range(4)]
+        k32.GetProcessTimes(wintypes.HANDLE(handle), *[ctypes.byref(t) for t in times])
+        return sum(((t.dwHighDateTime << 32) | t.dwLowDateTime) for t in times[2:]) / 1e7
+
+    class Basic(ctypes.Structure):
+        _fields_ = [("TotalUserTime", ctypes.c_int64), ("TotalKernelTime", ctypes.c_int64), ("ThisPeriodTotalUserTime", ctypes.c_int64),
+                    ("ThisPeriodTotalKernelTime", ctypes.c_int64), ("TotalPageFaultCount", wintypes.DWORD), ("TotalProcesses", wintypes.DWORD),
+                    ("ActiveProcesses", wintypes.DWORD), ("TotalTerminatedProcesses", wintypes.DWORD)]
+    info = Basic()
+    k32.QueryInformationJobObject(wintypes.HANDLE(handle), 1, ctypes.byref(info), ctypes.sizeof(info), None)
+    return (info.TotalUserTime + info.TotalKernelTime) / 1e7
+
+
 def read_times(path: Path) -> list[int]:
     data = path.read_bytes()
     return list(struct.unpack("<%dQ" % (len(data) // 8), data[: len(data) // 8 * 8]))
@@ -62,10 +81,12 @@ def summarize(ticks: list[int]) -> dict:
 def run_off(exe: Path, args: list[str], work: Path) -> dict:
     times = work / "times.bin"
     started = time.perf_counter()
-    done = subprocess.run([str(exe), *args, "--times=" + str(times)], capture_output=True, timeout=600, env={**os.environ, "HYDRA_FX_LINGER_MS": "0"})
+    proc = subprocess.Popen([str(exe), *args, "--times=" + str(times)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            env={**os.environ, "HYDRA_FX_LINGER_MS": "0"})
+    _, err = proc.communicate(timeout=600)
     wall = time.perf_counter() - started
-    assert done.returncode == 0, done.stderr
-    return {"wall_s": wall, "frames": summarize(read_times(times))}
+    assert proc.returncode == 0, err
+    return {"wall_s": wall, "frames": summarize(read_times(times)), "tree_cpu_s": _cpu_seconds(int(proc._handle), False)}
 
 
 def run_on(fixtures: Path, exe_name: str, args: list[str], work: Path, hooks: list[str] | None, trace_options: dict) -> dict:
@@ -78,10 +99,12 @@ def run_on(fixtures: Path, exe_name: str, args: list[str], work: Path, hooks: li
         cpu_setup = time.process_time() - cpu0
         wall_setup = time.perf_counter() - wall0
         cpu1, wall1 = time.process_time(), time.perf_counter()
+        job_cpu1 = _cpu_seconds(int(live.job.handle), True)
         live.resume()
         exited = live.wait_exit(900)
         run_wall = time.perf_counter() - wall1
         run_cpu = time.process_time() - cpu1         # the worker's own CPU while the target ran (includes Frida callbacks)
+        target_cpu = _cpu_seconds(int(live.job.handle), True) - job_cpu1     # the target (agent threads included), exited by now
         time.sleep(0.2)
         stopped = live.stop()
     finally:
@@ -92,6 +115,7 @@ def run_on(fixtures: Path, exe_name: str, args: list[str], work: Path, hooks: li
     probes = started["trace"]["probes"]
     return {"wall_s": run_wall, "frames": summarize(read_times(times)), "setup_wall_s": wall_setup, "setup_cpu_s": cpu_setup,
             "worker_cpu_s_during_run": run_cpu, "worker_cpu_share": run_cpu / run_wall if run_wall else None,
+            "target_cpu_s": target_cpu, "tree_cpu_s": target_cpu + run_cpu, "sampling": producer.get("sampling"),
             "install_ms": {p["name"]: p["install_ms"] for p in probes},
             "hits": producer["attempted"], "dropped": producer["dropped"], "no_ring": producer["no_ring"],
             "stalls": producer.get("stalls"), "stall_ticks": producer.get("stall_ticks"), "window_waits": producer.get("window_waits"),
@@ -109,7 +133,8 @@ def report(workload: str, args: list[str], off_runs: list[dict], on_runs: list[d
     for off, on in zip(off_runs, on_runs):
         o, n = off["frames"], on["frames"]
         rounds.append({"p50_overhead": (n["p50_us"] - o["p50_us"]) / o["p50_us"], "mean_overhead": (n["mean_us"] - o["mean_us"]) / o["mean_us"],
-                       "p99_overhead": (n["p99_us"] - o["p99_us"]) / o["p99_us"], "wall_overhead": (n["total_ms"] - o["total_ms"]) / o["total_ms"]})
+                       "p99_overhead": (n["p99_us"] - o["p99_us"]) / o["p99_us"], "wall_overhead": (n["total_ms"] - o["total_ms"]) / o["total_ms"],
+                       "tree_cpu_overhead": (on["tree_cpu_s"] - off["tree_cpu_s"]) / off["tree_cpu_s"] if off.get("tree_cpu_s") else float("nan")})
     hits = [r["hits"] for r in on_runs]
     walls = [r["wall_s"] for r in on_runs]
     return {
@@ -124,6 +149,8 @@ def report(workload: str, args: list[str], off_runs: list[dict], on_runs: list[d
                      "stalls_total": sum(r["stalls"] or 0 for r in on_runs), "stall_ticks_total": sum(r["stall_ticks"] or 0 for r in on_runs),
                      "batches_missing_total": sum(r["batches_missing"] or 0 for r in on_runs),
                      "all_segments_clean": all(r["verify"] == "clean" for r in on_runs),
+                     "skipped_total": sum((r["sampling"] or {}).get("skipped", 0) for r in on_runs),
+                     "tree_cpu_s_off_median": median([r["tree_cpu_s"] for r in off_runs]), "tree_cpu_s_on_median": median([r["tree_cpu_s"] for r in on_runs]),
                      "worker_cpu_share_median": median([r["worker_cpu_share"] for r in on_runs]),
                      "install_ms_median": {k: median([r["install_ms"][k] for r in on_runs]) for k in on_runs[0]["install_ms"]},
                      "segment_bytes_median": median([r["segment_bytes"] for r in on_runs])},
@@ -139,6 +166,8 @@ def main() -> int:
     parser.add_argument("--fixtures", default="")
     parser.add_argument("--label", default="run")
     parser.add_argument("--hooks", default="", help="comma separated hook ids (default: every frameloop hook of the baseline)")
+    parser.add_argument("--sampling", default="", help="sampling policy: adaptive (the default), exact, fixed:N, or a JSON object")
+    parser.add_argument("--hooking", default="", help="inline (the default) or interceptor")
     parser.add_argument("--option", action="append", default=[], help="trace option key=value (int/float), e.g. ring_bytes=262144")
     options = parser.parse_args()
     out = Path(options.out)
@@ -153,6 +182,11 @@ def main() -> int:
     for item in options.option:
         key, value = item.split("=", 1)
         trace_options[key] = float(value) if "." in value else int(value)
+    if options.sampling:
+        raw = options.sampling
+        trace_options["sampling"] = json.loads(raw) if raw.startswith("{") else ({"mode": "fixed", "stride": int(raw[6:])} if raw.startswith("fixed:") else raw)
+    if options.hooking:
+        trace_options["hooking"] = options.hooking
     hooks = [h for h in options.hooks.split(",") if h] or None
     results = {"label": options.label, "machine": {"cpus": os.cpu_count()}, "trace_options": trace_options, "workloads": []}
     for name in [w for w in options.workloads.split(",") if w]:
@@ -175,9 +209,11 @@ def main() -> int:
         print("\n== %s (%d rounds) ==" % (w["workload"], w["rounds"]))
         print("frame p50 %.2f -> %.2f us   p99 %.2f -> %.2f us   mean %.2f -> %.2f us" % (o["p50_us"], n["p50_us"], o["p99_us"], n["p99_us"], o["mean_us"], n["mean_us"]))
         print("overhead (median of rounds): p50 %.1f%%  mean %.1f%%  p99 %.1f%%  wall %.1f%%" % tuple(100 * ov[k] for k in ("p50_overhead", "mean_overhead", "p99_overhead", "wall_overhead")))
-        print("hits/frame %.1f  rate %.0f/s  dropped %d  no_ring %d  stalls %d  missing batches %d  clean %s  worker cpu share %.2f" % (
-            r["hits_per_frame"], r["hit_rate_per_s_median"], r["dropped_total"], r["no_ring_total"], r["stalls_total"], r["batches_missing_total"],
-            r["all_segments_clean"], r["worker_cpu_share_median"]))
+        print("hits/frame %.1f  rate %.0f/s  dropped %d  skipped(policy) %d  no_ring %d  stalls %d  missing batches %d  clean %s  worker cpu share %.2f" % (
+            r["hits_per_frame"], r["hit_rate_per_s_median"], r["dropped_total"], r["skipped_total"], r["no_ring_total"], r["stalls_total"],
+            r["batches_missing_total"], r["all_segments_clean"], r["worker_cpu_share_median"]))
+        print("process-tree CPU (target + worker) off %.3f s -> on %.3f s  (median over rounds of per-round overhead %.1f%%)" % (
+            r["tree_cpu_s_off_median"], r["tree_cpu_s_on_median"], 100 * median([x["tree_cpu_overhead"] for x in w["overhead_per_round"]])))
     print("\nwrote", path)
     return 0
 
