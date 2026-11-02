@@ -1,0 +1,13 @@
+[package]
+name = "hy-agent-dll"
+version = "0.1.0"
+edition = "2024"
+description = "Injected Hydralysis agent: inline-hook engine and per-thread ring recorder (replaces the Frida CModule recorder)"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+hy-agent-proto = { path = "../hy-agent-proto" }
+iced-x86.workspace = true
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Memory", "Win32_System_Threading", "Win32_System_LibraryLoader", "Win32_System_Diagnostics_Debug"] }

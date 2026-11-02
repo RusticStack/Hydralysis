@@ -1,0 +1,13 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.dependencies]
+windows-sys = "0.61"
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "encoder", "block_encoder", "code_asm", "instr_info"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+panic = "abort"
+debug = 1
