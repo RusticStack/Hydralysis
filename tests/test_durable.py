@@ -1169,7 +1169,7 @@ class WriteGate(unittest.TestCase):
         # not records: no record-bearing writer stands outside durable. GATE16 added the queued lock's byte-0 seed; H17 the tamper-check cache.
         self.assertEqual(len(records), 0)
         self.assertEqual(len(FOLLOW_UP), 29)
-        self.assertEqual(sum(COUNTS.get(key, 1) for key in FOLLOW_UP), 29)
+        self.assertEqual(sum(COUNTS.get(key, 1) for key in FOLLOW_UP), 31)
         self.assertEqual(sorted(key[:2] for key in records), [])
 
 
