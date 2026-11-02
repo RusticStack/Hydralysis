@@ -771,5 +771,164 @@ class IPersistFootprint(Gate):
         self.assertEqual(trace_footprint.values_round_trip({"a": 1}, {"a": 1})["verdict"], "round-trips")
 
 
+HANG_HOOKS = hooks("deadlock.exe", [
+    dict(id="fx_main_frame", event="app.frame", symbol="fx_main_frame", nargs=1, capture=["frame:i32@0"]),
+    dict(id="fx_main_lock_a_then_b", event="core.function.enter", symbol="fx_main_lock_a_then_b", nargs=0),
+    dict(id="fx_worker_b_then_a", event="core.function.enter", symbol="fx_worker_b_then_a", nargs=1),
+    dict(id="fx_suspend_all_handler", event="core.function.enter", symbol="fx_suspend_all_handler", nargs=1),
+    dict(id="suspend_thread", event="core.function.enter", module="KERNELBASE.dll", symbol="SuspendThread", nargs=1),
+])
+
+
+@unittest.skipUnless(LIVE, "needs a trace engine (HYDRALYSIS_INTEGRATION_*, HYDRA_TRACE_EXE), Frida and MSVC")
+class IHangDumps(Gate):
+    """Section 15.9: a hung or frozen process captured twice, by the frame-stall watchdog (live stacks) and as a minidump the
+    importer reads; every thread symbolized, patterns with citations, the last session event before each stack."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        import build_fixtures
+        from hydralysis import trace
+        cls.tool = str(trace.find_tool(cls.engine.settings))
+        cls.functions, _data = build_fixtures.symbols(cls.fx / "deadlock.map")
+        cls.cases = {}
+
+    def case(self, mode):
+        """Run deadlock.exe in MODE with the stall watchdog watching it from outside; the deadlock mode also runs under a live
+        capture. (The suspend-all mode suspends every thread of the process it does not name as a survivor, the recorder's own
+        agent threads included, so a recorder inside the target freezes with it: that case is watched from outside only.)"""
+        if mode in self.cases:
+            return self.cases[mode]
+        import subprocess
+        import time
+        import trace_live
+        from hydralysis import trace_capture as tc, trace_dumps, trace_watchdog as wd
+        dump = self.root / ("%s.dmp" % mode)
+        state = self.root / ("%s.txt" % mode)
+        args = ["--mode=" + mode, "--hold=3", "--state-file=" + str(state), "--dump=" + str(dump)]
+        stalls, events, session = [], [], None
+        if mode == "deadlock":
+            profile = g.GateProfile(self.fx, "gate-hang-%s/1" % mode, ["deadlock.exe"], HANG_HOOKS)
+            live = trace_live.Live(self.root / "runs", self.fx / "deadlock.exe", args, linger_ms=600)
+            try:
+                live.start(profile.specs(self.root))
+                live.resume()
+                dog = wd.FrameStallWatchdog(live.pid, wd.counter_reader(live.pid, "deadlock.exe", "g_frame"), 0.6, stalls.append,
+                                            poll_s=0.02).start()
+                self.assertTrue(live.wait_exit(90), "deadlock.exe did not exit")
+                dog.stop()
+                time.sleep(0.3)
+                live.stop()
+                lines, _omitted = tc.export_jsonl(live.segment, live.segment_id, for_import=True)
+                events = [json.loads(line) for line in lines]
+            finally:
+                live.close()
+            session = g.unique("i_" + mode.replace("-", "_"))
+            self.engine.load(session, events)
+        else:
+            proc = subprocess.Popen([str(self.fx / "deadlock.exe"), *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                dog = wd.FrameStallWatchdog(proc.pid, wd.counter_reader(proc.pid, "deadlock.exe", "g_frame"), 0.6, stalls.append,
+                                            poll_s=0.02).start()
+                proc.wait(timeout=90)
+                dog.stop()
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+        self.assertTrue(dump.is_file() and dump.read_bytes()[:4] == b"MDMP", "the fixture wrote its dump")
+        names = {int(a, 16) - 0x140000000: n for n, a in self.functions.items() if n.startswith("fx_")}
+        report = trace_dumps.analyse(self.tool, dump, directories=[self.fx], names={"deadlock.exe": names},
+                                     fault_handlers=["fx_suspend_all_handler"], work=self.root / ("sym-" + mode))
+        self.cases[mode] = (session, stalls, report)
+        return self.cases[mode]
+
+    @staticmethod
+    def chain(thread):
+        return [f["function"] for f in thread["frames"] if f["function"]]
+
+    def test_every_thread_of_the_dump_is_symbolized(self):
+        _session, _stalls, report = self.case("deadlock")
+        self.assertEqual(report["unsymbolized_modules"], ["frida-agent.dll"], "only the recorder's own agent has no symbols here")
+        self.assertEqual(report["unresolved_frames"], [], "every code frame of every stack has a function")
+        self.assertGreaterEqual(len(report["stacks"]), 3)
+        for thread in report["stacks"]:
+            top = thread["frames"][0]
+            self.assertEqual(top["address"], thread["rip"])
+            self.assertTrue(top["function"] is not None or top["module"] in report["unsymbolized_modules"], thread)
+            self.assertEqual(thread["basis"], "return-address candidates found on the stack (inferred)")
+
+    def test_a_lock_cycle_is_reported_with_the_owner_of_each_lock_and_its_citations(self):
+        _session, _stalls, report = self.case("deadlock")
+        threads = {t["thread_id"]: self.chain(t) for t in report["stacks"]}
+        main = next(t for t, chain in threads.items() if "fx_main_lock_a_then_b" in chain)
+        worker = next(t for t, chain in threads.items() if "fx_worker_b_then_a" in chain)
+        cycle = next(p for p in report["patterns"] if p["pattern"] == "lock-wait-cycle")
+        self.assertEqual(sorted(cycle["threads"]), sorted([main, worker]))
+        self.assertEqual(cycle["limitations"], [])
+        owners = {d["thread"]: d["owner"] for d in cycle["detail"]}
+        self.assertEqual(owners, {main: worker, worker: main}, "each waits for a lock the other holds")
+        locks = {d["lock"] for d in cycle["detail"]}
+        self.assertEqual(len(locks), 2)
+        image = next(m for m in report["dump"]["modules"] if m["name"] == "deadlock.exe")
+        self.assertTrue(all(image["base"] <= lock < image["base"] + image["size"] for lock in locks), "both locks are in the program's data")
+        self.assertEqual(len(cycle["frames"]), 2, "one cited wait frame per thread")
+        self.assertTrue(all("stack slot" in d["evidence"] for d in cycle["detail"]))
+        waits = next(p for p in report["patterns"] if p["pattern"] == "threads-waiting-on-one-site")
+        self.assertTrue({main, worker} <= set(waits["threads"]))
+
+    def test_the_watchdog_saw_the_same_stall_and_the_dump_is_joined_to_the_session_per_thread(self):
+        session, stalls, report = self.case("deadlock")
+        self.assertEqual(len(stalls), 1, "one stall is one capture")
+        blocked = [t for t in stalls[0]["stacks"]["threads"] if t.get("state") == "captured"
+                   and any((f.get("at") or "").startswith("deadlock.exe") for f in t["frames"])
+                   and any((f.get("at") or "").startswith("ntdll") for f in t["frames"])]
+        self.assertGreaterEqual(len(blocked), 2, "the main thread and the worker, blocked inside ntdll under the program's own frames")
+        self.assertEqual({t["tid"] for t in blocked} - {t["thread_id"] for t in report["stacks"]}, set(), "the dump lists the same threads")
+        self.assertTrue(all(t.get("suspended_before") == 0 for t in stalls[0]["stacks"]["threads"] if t.get("state") == "captured"))
+        rows = self.engine.rows(session)
+        from hydralysis import trace_dumps
+        last = trace_dumps.last_events(rows, [t["thread_id"] for t in report["stacks"]])
+        main = next(t["thread_id"] for t in report["stacks"] if "fx_main_lock_a_then_b" in self.chain(t))
+        worker = next(t["thread_id"] for t in report["stacks"] if "fx_worker_b_then_a" in self.chain(t))
+        ids = {r["event_id"]: r for r in rows}
+        site = lambda tid: (ids[last[tid]["event_id"]]["p"].get("site") or ids[last[tid]["event_id"]]["p"].get("hook"))
+        self.assertEqual(site(main), "fx_main_lock_a_then_b", ids[last[main]["event_id"]])
+        self.assertEqual(site(worker), "fx_worker_b_then_a", ids[last[worker]["event_id"]])
+        quiet = [t for t, v in last.items() if v["event_id"] is None]
+        self.assertTrue(all("no event of this thread" in last[t]["reason"] for t in quiet))
+
+    def test_the_dump_becomes_events_of_the_session(self):
+        session, _stalls, report = self.case("deadlock")
+        client = self.engine.client()
+        self.assertEqual(client.append(session, report["events"], cap=self.engine.caps[session]).get("rejected") or [], [])
+        rows = self.engine.rows(session, kinds=["dump.thread", "core.module.load"])
+        threads = [r for r in rows if r["kind"] == "dump.thread"]
+        self.assertEqual(len(threads), len(report["stacks"]))
+        self.assertTrue(all(r["source_id"] == "minidump" for r in threads))
+
+    def test_a_process_frozen_by_one_thread_is_in_the_fault_handler_and_the_others_are_suspended(self):
+        from hydralysis import trace_dumps
+        _session, stalls, report = self.case("suspend-all")
+        handler = next(p for p in report["patterns"] if p["pattern"] == "thread-in-fault-handler")
+        self.assertEqual(len(handler["threads"]), 1)
+        culprit = handler["threads"][0]
+        self.assertTrue(handler["frames"], "the handler frame is cited")
+        self.assertIn("fx_suspend_all_handler", self.chain(next(t for t in report["stacks"] if t["thread_id"] == culprit)))
+        self.assertEqual(len(stalls), 1)
+        pattern = trace_dumps.suspend_pattern(stalls[0]["stacks"], [], [culprit])
+        self.assertEqual(pattern["pattern"], "all-threads-suspended")
+        self.assertEqual(pattern["suspended_by"], culprit)
+        self.assertEqual(pattern["basis"], "inferred")
+        self.assertGreaterEqual(len(pattern["suspended_threads"]), 3)
+        self.assertIn(culprit, pattern["not_suspended"])
+        self.assertNotIn(culprit, pattern["suspended_threads"])
+        self.assertEqual(report["unresolved_frames"], [])
+        self.assertNotIn("all-threads-suspended", [p["pattern"] for p in report["patterns"]],
+                         "a minidump of a process that dumped itself carries no suspend counts: the engine does not claim it")
+        # the live capture saw the same threads the dump lists
+        self.assertEqual({t["tid"] for t in stalls[0]["stacks"]["threads"] if t["state"] == "captured"} - {t["thread_id"] for t in report["stacks"]}, set())
+
+
 if __name__ == "__main__":
     unittest.main()
