@@ -53,3 +53,29 @@ pub fn find_export(image: &[u8], name: &str) -> Option<(u32, bool)> {
     }
     None
 }
+
+/// File offset of `rva` in a PE image, if a section maps it.
+pub fn rva_to_offset(image: &[u8], rva: u32) -> Option<usize> {
+    let pe = u32at(image, 0x3c)? as usize;
+    let nsec = u16at(image, pe + 6)? as usize;
+    let sec = pe + 24 + u16at(image, pe + 20)? as usize;
+    for i in 0..nsec {
+        let s = sec + i * 40;
+        let (vsize, va, raw_size, raw) = (
+            u32at(image, s + 8)?,
+            u32at(image, s + 12)?,
+            u32at(image, s + 16)?,
+            u32at(image, s + 20)?,
+        );
+        if rva >= va && rva < va + vsize.max(raw_size) {
+            return Some((rva - va + raw) as usize);
+        }
+    }
+    None
+}
+
+/// `len` bytes of the image at `rva` (what a probe's `expect` must equal).
+pub fn bytes_at_rva(image: &[u8], rva: u32, len: usize) -> Option<&[u8]> {
+    let o = rva_to_offset(image, rva)?;
+    image.get(o..o + len)
+}
