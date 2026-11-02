@@ -90,6 +90,7 @@ class Gate(unittest.TestCase):
         return [r for r in rows if all((r.get("payload") or {}).get(k, r.get(k)) == v for k, v in match.items())]
 
 
+@unittest.skipUnless(LIVE, "needs a trace engine (HYDRALYSIS_INTEGRATION_*, HYDRA_TRACE_EXE), Frida and MSVC")
 class M2Interleave(Gate):
     def loaded(self, name: str = "inter", transform=None) -> tuple[str, list]:
         cap = self.captured("interleave", "interleave.exe", INTERLEAVE)
@@ -207,6 +208,7 @@ class M2Interleave(Gate):
             delayed, done["event_id"], direction="upstream", max_depth=8)["edges"]))
 
 
+@unittest.skipUnless(LIVE, "needs a trace engine (HYDRALYSIS_INTEGRATION_*, HYDRA_TRACE_EXE), Frida and MSVC")
 class M2Diff(Gate):
     """Section 14.7: two configurations of trace_app, aligned before they are compared."""
 
@@ -360,6 +362,7 @@ FRAMELOOP_KEYS = hooks("frameloop.exe", [
 ])
 
 
+@unittest.skipUnless(LIVE, "needs a trace engine (HYDRALYSIS_INTEGRATION_*, HYDRA_TRACE_EXE), Frida and MSVC")
 class M2Roles(Gate):
     """Section 15.2: roles and phases on the frame loop are first-class keys, and the checks read them."""
 
