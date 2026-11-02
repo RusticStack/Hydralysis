@@ -18,8 +18,9 @@ Mean frame time, capture on against off, median over three interleaved rounds, d
 | paced (200 us of work per frame, about 10 hits) | +1.8% (p99 +2.3%), 0 dropped | +0.3% (p99 +0.5%), 0 dropped, all hits kept | -0.1% (p99 0.0%), 556 875 skipped and counted | +0.5%, 0 dropped |
 | tight (bare loop, about 5 us per frame, about 2 million hits/s) | +129% (p50 +106%), 399 805 of 594 000 hits dropped | +3.3% to +4.0% (p50 +6% to +8%, p99 +2% to +11%), 0 dropped in the final run, about 480 000 skipped and counted | +0.5% (p50 +2.1%) | +8.6%, 433 676 dropped and counted |
 
-* The defaults meet the plan's targets on the declared profile: 0.0% at 60 Hz, 0.3% with 200 us frames, 3% to 4% on the bare loop
-  (a stress test, not a game). The bare-loop p50 is above 5% in some rounds: at a 5 us median one 0.1 us tick is 2%, so the
+* On the declared profile the defaults measured 0.0% at 60 Hz and 0.3% with 200 us frames. The bare loop (a stress test, not a game)
+  measured 3% to 4% on the mean in the perf lane run and 22.6% on the mean in the final run on a noisy machine (next section); the
+  5% target is therefore **not established for the bare loop**. The bare-loop p50 is above 5% in some rounds: at a 5 us median one 0.1 us tick is 2%, so the
   per-round median is coarse. The mean and the total run time are the stable figures.
 * The sampled profile (`fixed:16`, one in 16 hits kept) is at or under 2% on every workload that was run (0.5% on the bare loop, -0.1%
   on 200 us frames).
@@ -27,6 +28,33 @@ Mean frame time, capture on against off, median over three interleaved rounds, d
   core: paced 4.11 s -> 4.83 s (+17%) with every hit kept, 4.06 s -> 4.33 s (+6.5%) with `fixed:16`. That is CPU the target does
   not wait for, and it falls with the number of kept records. The bare loop's tree CPU (0.08 s -> 0.17 s) is dominated by the
   one-off cost of setting the session up inside a 0.1 s run.
+
+## Final run (release 0.8.0, noisy machine)
+
+The last run before the release (`benchmarks/trace_overhead.py`, 3 interleaved rounds, defaults, other jobs on the machine;
+`E:/Projects/Hydra/_logs/final2/overhead.log`, `overhead/overhead-run.json`):
+
+| Workload | Mean frame | p50 | Hits thinned and counted | Dropped | Process-tree CPU |
+| --- | --- | --- | --- | --- | --- |
+| paced (200 us frames) | 206.90 -> 207.33 us, +0.2% | +0.3% | 0 | 0 | 4.047 s -> 4.641 s (+14.7%) |
+| tight (bare loop) | 4.71 -> 5.74 us, **+22.6%** | **+10.9%** (4.60 -> 5.10 us) | 486 603 | 0 (no ring stalls, no missing batches) | 0.078 s -> 0.141 s (+80%, a 0.1 s run dominated by session set-up) |
+
+* The bare loop in this run is far above the 3% to 4% of the perf lane run. The two runs differ only in what else the machine was doing
+  as far as is known; the cause of the difference was not isolated. Read the bare-loop overhead as 3% to 23% on the mean, not as a
+  single number.
+* Adaptive sampling is the default. Skipped hits are counted exactly (`hits - kept` per probe and thread, reported as
+  `core.capture.gap` with `reason: "budget"`); **the per-event detail of a thinned hit is not kept, only the count is**.
+* Exact mode (`sampling: exact`) on the bare loop: +8.6%, about 70% of the records dropped and counted (earlier table).
+* ETW: the kernel PID filter stays opt-in (`--kernel-filter` on `hydra-etw`) because the kernel file and registry providers do not
+  apply it.
+
+### Not met in this release
+
+* The bare loop with **every hit kept** has no run under 5%: exact mode is +8.6% and drops about 70% of its records, counted.
+* The 2% sampled target is met only for plain call sites that go through inline hooks, not for probes that need the return value, a
+  buffer or a stack walk (they use the Interceptor, at least about 200 ns a hit).
+* Aggregate counters (counting without recording individual hits) are **not built**.
+* These ratios are for the `frameloop` fixture only; no game was measured.
 
 ## What was expensive and what changed
 
