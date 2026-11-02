@@ -356,5 +356,127 @@ class M4Bypass(Gate):
         self.assertIn(self.functions["fx_put_slot"], self.static_callers)
 
 
+NAMES_HOOKS = hooks("fnv_names.exe", [
+    dict(id="dispatch", event="app.record", symbol="fx_dispatch_record", nargs=1, capture=["hash:u64@0", "id:u32@ret"]),
+])
+COLLISION = ("rec_L9qap7cOoK1", "rec_EQI_EyPfCio")
+
+
+@unittest.skipUnless(LIVE, "needs a trace engine (HYDRALYSIS_INTEGRATION_*, HYDRA_TRACE_EXE), Frida and MSVC")
+class SHashedNames(Gate):
+    """Section 15.6: hashed names. The dictionary comes from the program's own strings; constants are annotated, a name
+    search finds code, the colliding pair is ambiguous, and trace payload hashes are resolved at query time."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        import build_fixtures
+        from hydralysis import trace_hashes
+        from hydralysis.pe import Image
+        cls.exe = cls.fx / "fnv_names.exe"
+        cls.image = Image(cls.exe)
+        cls.functions, cls.data = build_fixtures.symbols(cls.exe.with_suffix(".map"))
+        found = set(re.findall(rb"[a-z]+\.[a-z]+|rec_[A-Za-z0-9_]{11}", cls.image.data))
+        cls.strings = sorted(f.decode() for f in found)
+        cls.expected = json.loads((Path(__file__).parent / "fixtures" / "expected" / "fnv_names.json").read_text())["answers"]
+        cls.dictionary = trace_hashes.Dictionary(algorithms=["fnv1a64"])
+        cls.dictionary.add_lines("\n".join(cls.strings), "fnv_names.exe strings")
+        cls.registry = cls.dictionary.registry
+        cls.hashes = {r["name"]: int(r["hash"], 16) for r in cls.expected["records"]}
+        from hydralysis import query
+        assert cls.engine.prepare(cls.exe, "fnv_gate")["state"] != "failed"
+        runner, cursor, functions = query.QueryRunner(cls.engine.settings), None, []
+        while True:
+            listed = json.loads(runner.query("fnv_gate", "functions", "", limit=200, **({"cursor": cursor} if cursor else {}), options={}))
+            functions.extend(listed["functions"])
+            cursor = listed.get("next_cursor") if listed.get("truncated") else None
+            if not cursor:
+                break
+        cls.bodies = []
+        for f in functions:
+            for part in f["body"]:
+                lo, hi = (int(x, 16) for x in part.strip("[]").split(","))
+                cls.bodies.append((lo - cls.image.base, hi - cls.image.base + 1))
+
+    def test_the_dictionary_built_from_the_image_strings_hashes_like_the_program(self):
+        self.assertTrue(set(self.hashes) <= set(self.strings), "all 64 record names are strings of the image")
+        for name, value in self.hashes.items():
+            self.assertEqual(self.registry.compute("fnv1a64", name), value, name)
+
+    def test_hash_constants_in_the_dispatch_code_are_annotated_with_name_and_source(self):
+        from hydralysis import trace_hashes
+        hits = trace_hashes.scan_constants(self.image, [(v, 64) for v in self.hashes.values()], limit=500, functions=self.bodies)
+        code = [h for h in hits if h["context"] == "code-immediate"]
+        entry = int(self.functions["fx_dispatch_record"], 16) - self.image.base
+        self.assertGreaterEqual(len({h["value"] for h in code}), 60)
+        self.assertEqual({h["function"] for h in code if "function" in h}, {"rva:%#x" % entry})
+        notes = trace_hashes.annotate_constants(self.dictionary, [{"value": h["value"], "where": h["rva"]} for h in code], ["fnv1a64"])
+        by_value = {n["value"]: n for n in notes}
+        health = by_value["0xc5c4191b5a4187c0"]
+        self.assertEqual((health["status"], health["answers"][0]["names"][0]["name"]), ("resolved", "player.health"))
+        self.assertEqual(health["answers"][0]["names"][0]["sources"], ["fnv_names.exe strings"])
+        self.assertEqual({n["status"] for n in notes} - {"resolved", "ambiguous"}, set())
+
+    def test_a_name_search_finds_the_function_that_carries_the_constant(self):
+        from hydralysis import trace_hashes
+        entry = int(self.functions["fx_dispatch_record"], 16) - self.image.base
+        found = trace_hashes.find_name_users(self.dictionary, "player.health", self.image, algorithms=["fnv1a64"], functions=self.bodies)
+        self.assertEqual(found["algorithms"][0]["hash"], "0xc5c4191b5a4187c0")
+        self.assertIn(("code-immediate", "rva:%#x" % entry), [(h["context"], h.get("function")) for h in found["hits"]])
+        self.assertEqual(found["algorithms"][0]["status"], "resolved")
+
+    def test_the_colliding_pair_is_ambiguous_in_every_view_and_never_silently_resolved(self):
+        from hydralysis import trace_hashes
+        value = self.expected["collision"]["hash"]
+        for name in COLLISION:
+            found = trace_hashes.find_name_users(self.dictionary, name, self.image, algorithms=["fnv1a64"])
+            self.assertEqual(found["algorithms"][0]["status"], "ambiguous", name)
+            self.assertEqual(found["algorithms"][0]["hash"], value)
+            self.assertTrue(found["hits"], "the constant is in the image either way")
+        note = trace_hashes.annotate_constants(self.dictionary, [{"value": value}], ["fnv1a64"])[0]
+        self.assertEqual(note["status"], "ambiguous")
+        self.assertEqual(sorted(n["name"] for n in note["answers"][0]["names"]), sorted(COLLISION))
+
+    def capture_events(self):
+        if not hasattr(type(self), "session"):
+            profile = g.GateProfile(self.fx, "gate-names/1", ["fnv_names.exe"], NAMES_HOOKS)
+            cap = g.capture(self.root / "runs", "fnv_names.exe", [], profile.specs(self.root))
+            type(self).session = g.unique("s_names")
+            self.engine.load(self.session, cap.lines())
+        return self.session
+
+    def names_report(self, session, names, parent=None):
+        reply = self.engine.tool("query", session, report="names", kinds=["app.record"], limit=200,
+                                 params={"algorithm": "fnv1a64", "fields": ["hash"], "parent": parent,
+                                         "dictionary": {"fnv_names.exe strings": names}})
+        self.assertNotIn("error", reply, reply)
+        return reply["result"]
+
+    def test_hashed_ids_in_the_trace_are_resolved_at_query_time_as_interpretation_revisions(self):
+        session = self.capture_events()
+        rows = self.engine.rows(session, kinds=["app.record"])
+        self.assertEqual(len(rows), 65)
+        raw = {r["event_id"]: r["p"]["hash"] for r in rows}
+        first = self.names_report(session, [n for n in self.strings if n.startswith("player.")])
+        self.assertEqual(first["interpretation"]["counts"], {"resolved": 16, "ambiguous": 0, "unknown": 49})
+        second = self.names_report(session, self.strings, parent=first["interpretation"]["revision"])
+        self.assertEqual(second["interpretation"]["counts"], {"resolved": 64, "ambiguous": 1, "unknown": 0})
+        self.assertNotEqual(first["interpretation"]["revision"], second["interpretation"]["revision"])
+        self.assertEqual(second["interpretation"]["parent"], first["interpretation"]["revision"])
+        self.assertTrue(second["interpretation"]["raw_preserved"])
+        again = self.names_report(session, self.strings, parent=first["interpretation"]["revision"])
+        self.assertEqual(again["interpretation"]["revision"], second["interpretation"]["revision"], "same inputs, same revision")
+        notes = {n["event_id"]: n for n in second["annotations"]}
+        self.assertEqual(set(notes), set(raw), "every hashed id of the trace was read")
+        for event_id, note in notes.items():
+            self.assertEqual(int(note["raw"], 16), int(raw[event_id], 0) if isinstance(raw[event_id], str) else raw[event_id])
+        health = next(n for n in notes.values() if n["raw"] == "0xc5c4191b5a4187c0")
+        self.assertEqual((health["status"], health["names"][0]["name"]), ("resolved", "player.health"))
+        ambiguous = [n for n in notes.values() if n["status"] == "ambiguous"]
+        self.assertEqual(sorted(x["name"] for x in ambiguous[0]["names"]), sorted(COLLISION))
+        after = {r["event_id"]: r["p"]["hash"] for r in self.engine.rows(session, kinds=["app.record"])}
+        self.assertEqual(after, raw, "the trace itself still holds the raw values")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -677,7 +677,7 @@ def _pair(client: TraceClient, owner: str, replica: str, options: dict) -> dict:
             "replica": {"session": replica, "revision": client.info(replica).get("revision")}}
 
 
-REPORTS = ("survival", "bypass", "writers", "links", "discovery")
+REPORTS = ("survival", "bypass", "writers", "links", "discovery", "names")
 
 
 def _report_events(client: TraceClient, session: str, options: dict) -> list[dict]:
@@ -726,6 +726,17 @@ def _report(client: TraceClient, session: str, options: dict) -> dict:
                                                                  siblings=params.get("siblings"), observed=observed["observed"])}
     elif kind == "links":
         result = trace_bindings.link_events(events, params["table"], window=int(params.get("window", 8)))
+    elif kind == "names":
+        from hydralysis import trace_hashes
+        algorithm = str(params.get("algorithm") or "fnv1a64")
+        dictionary = trace_hashes.Dictionary(algorithms=[algorithm])
+        for source, names in sorted(_object(params.get("dictionary"), "params.dictionary").items()):
+            for name in names:
+                dictionary.add(str(name), str(source))
+        result = trace_hashes.interpret_events(dictionary, algorithm, events, _strings(params.get("fields"), "params.fields"))
+        result["interpretation"]["parent"] = params.get("parent")
+        result["dictionary"] = {"names": len(dictionary), "sha256": dictionary.digest(), "collisions": dictionary.collisions()}
+        result["claim"] = "interpretation only: the raw values are unchanged in the trace; a revision is a reading of them"
     else:
         exercised = [{"key": site, "kind": k, "count": n} for (site, k), n in sorted(
             _count((e["function"], e["kind"]) for e in events if e["function"]).items())]
