@@ -6,7 +6,9 @@ Shared by the end-to-end tests and by benchmarks/trace_overhead.py. Windows with
 from __future__ import annotations
 
 import hashlib
+import os
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -27,6 +29,71 @@ def specs_for(directory: Path, exe_names: list[str], hooks: list[str] | None = N
     return specs, verification
 
 
+# A fixture that hangs (suspended spawn, a debugger call that never returns, a child that ignores its parent's death) must
+# fail fast and never outlive the test: every fixture runs in a kill-on-close job object, a watchdog terminates the job at
+# a hard deadline, and close() always terminates it. Terminating the job also ends any frida call blocked on the target.
+FIXTURE_DEADLINE_S = float(os.environ.get("HYDRA_TEST_FIXTURE_DEADLINE_S", "300"))
+CLEANUP_BUDGET_S = 30.0
+
+
+class KillJob:
+    """A Windows job object that kills every process in it (the fixture and its children) when terminated or closed."""
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+        self.k32 = k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateJobObjectW.restype = wintypes.HANDLE
+        k32.OpenProcess.restype = wintypes.HANDLE
+        k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+        k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        self.lock = threading.Lock()
+        self.handle = k32.CreateJobObjectW(None, None)
+        if not self.handle:
+            raise OSError(ctypes.get_last_error(), "CreateJobObjectW")
+
+        class Basic(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD), ("SchedulingClass", wintypes.DWORD)]
+
+        class IoCounters(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_uint64) for n in ("r", "w", "o", "rb", "wb", "ob")]
+
+        class Extended(ctypes.Structure):
+            _fields_ = [("Basic", Basic), ("Io", IoCounters), ("ProcessMemoryLimit", ctypes.c_size_t),
+                        ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                        ("PeakJobMemoryUsed", ctypes.c_size_t)]
+        info = Extended()
+        info.Basic.LimitFlags = 0x2000          # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not k32.SetInformationJobObject(self.handle, 9, ctypes.byref(info), ctypes.sizeof(info)):
+            raise OSError(ctypes.get_last_error(), "SetInformationJobObject")
+
+    def add(self, pid: int) -> bool:
+        process = self.k32.OpenProcess(0x0100 | 0x0001, False, pid)      # PROCESS_SET_QUOTA | PROCESS_TERMINATE
+        if not process:
+            return False
+        try:
+            return bool(self.k32.AssignProcessToJobObject(self.handle, process))
+        finally:
+            self.k32.CloseHandle(process)
+
+    def kill(self) -> None:
+        with self.lock:
+            if self.handle:
+                self.k32.TerminateJobObject(self.handle, 1)
+
+    def close(self) -> None:
+        with self.lock:
+            if self.handle:
+                self.k32.TerminateJobObject(self.handle, 1)
+                self.k32.CloseHandle(self.handle)
+                self.handle = None
+
+
 class Live:
     """One spawned fixture under a RuntimeAgent worker (in process: the worker class itself, no socket)."""
 
@@ -43,10 +110,30 @@ class Live:
                    "env": {"HYDRA_FX_LINGER_MS": str(linger_ms), **(env or {})}}
         if cwd:
             initial["cwd"] = cwd
-        self.info = self.agent.startup(initial)
+        self.job = KillJob()
+        self.watchdog: threading.Timer | None = None
+        try:
+            self.info = self.agent.startup(initial)
+        except BaseException:
+            self._adopt_orphan()
+            raise
         self.pid = self.agent.pid
+        self.job.add(self.pid)
+        self.watchdog = threading.Timer(FIXTURE_DEADLINE_S, self._deadline)
+        self.watchdog.daemon = True
+        self.watchdog.start()
         self.started: dict | None = None
         self.stopped: dict | None = None
+
+    def _adopt_orphan(self) -> None:
+        pid = getattr(self.agent, "pid", None)
+        if pid:
+            self.job.add(pid)
+        self.job.close()
+
+    def _deadline(self) -> None:
+        print("fixture %s still alive after %.0f s: killing its job" % (self.exe.name, FIXTURE_DEADLINE_S), file=sys.stderr, flush=True)
+        self.job.kill()
 
     def start(self, specs: list[dict], **trace) -> dict:
         option = {"session": "live-" + uuid.uuid4().hex[:8], "hooks": [s["hook"] for s in specs], "probes": specs, **trace}
@@ -81,11 +168,23 @@ class Live:
         return self.agent.trace.segment_id
 
     def close(self) -> None:
-        try:
-            if not self.agent.closed:
-                self.agent.cleanup()
-        except Exception:
-            pass
+        """Clean up the recorder with a bounded wait, then kill the fixture's whole tree whatever happened."""
+        if self.watchdog is not None:
+            self.watchdog.cancel()
+
+        def cleanup():
+            try:
+                if not self.agent.closed:
+                    self.agent.cleanup()
+            except Exception:
+                pass
+        worker = threading.Thread(target=cleanup, daemon=True)
+        worker.start()
+        worker.join(CLEANUP_BUDGET_S)
+        if worker.is_alive():
+            self.job.kill()          # a blocked debugger call returns once the target is gone
+            worker.join(CLEANUP_BUDGET_S)
+        self.job.close()
 
 
 # ---- ingest helpers ----------------------------------------------------------------------------------------------------
