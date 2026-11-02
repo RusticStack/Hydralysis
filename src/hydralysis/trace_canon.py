@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import zlib
 from dataclasses import dataclass, field
 
@@ -32,7 +33,13 @@ class NotCanonical(ValueError):
     """A value TRACE-1 does not allow in a chained record."""
 
 
+_PLAIN = re.compile(r'[ !#-\[\]-~]*')    # 0x20..0x7e without " and \: written as they are
+
+
 def _string(text: str, out: list) -> None:
+    if _PLAIN.fullmatch(text):
+        out.append('"' + text + '"')
+        return
     out.append('"')
     for char in text:
         simple = _SIMPLE.get(char)
@@ -108,6 +115,29 @@ def genesis_hash(segment_id: str) -> str:
 def record_hash(record: dict) -> str:
     """SHA-256 hex of the canonical JSON of RECORD without its `hash` member."""
     return hashlib.sha256(canonical_bytes({key: item for key, item in record.items() if key != "hash"})).hexdigest()
+
+
+def body_hash_matches(body: bytes, record: dict) -> bool:
+    """Whether RECORD's `hash` is the SHA-256 of BODY (the segment line's canonical JSON) without its `hash` member.
+
+    The same answer as `record_hash(record) == record["hash"]` for a body that is the record's canonical JSON, found by
+    cutting the member out of the bytes instead of canonicalising the parsed record again. It answers False, never
+    "wrong", for any other body (not canonical, the digest also appearing elsewhere): the caller then asks
+    `record_hash`, so what is accepted does not change."""
+    claimed = record.get("hash")
+    if not isinstance(claimed, str) or len(claimed) != 64:
+        return False
+    member = b'"hash":"' + claimed.encode("ascii") + b'"'
+    if body.count(member) != 1:
+        return False
+    at = body.find(member)
+    if body[at - 1:at] == b",":
+        cut = body[:at - 1] + body[at + len(member):]
+    elif body[at - 1:at] == b"{" and body[at + len(member):at + len(member) + 1] == b",":
+        cut = body[:at] + body[at + len(member) + 1:]
+    else:
+        return False
+    return hashlib.sha256(cut).hexdigest() == claimed
 
 
 def frame(record: dict) -> bytes:
