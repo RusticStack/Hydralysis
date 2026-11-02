@@ -73,7 +73,9 @@ QUEUE_CAP = 64
 IDEMPOTENT_COMMANDS = frozenset({
     "ping", "hello", "health", "status", "projects", "programs", "overlays", "journal",
     "open_project", "open_program", "switch", "close_project", "close_program", "refresh", "reopen",
-    "project", "list", "info", "functions", "decompile"})
+    "project", "list", "info", "functions", "decompile",
+    # semantic trace reads (hydralysis.trace.IDEMPOTENT_COMMANDS)
+    "trace_list", "trace_info", "trace_query", "trace_explain", "trace_diff", "trace_check"})
 # Retry policy judgement (N4/N5): close_project, refresh, switch and reopen stay retryable. They converge on
 # the same end state however many times they run, so a lost reply cannot be made worse by a resend, and the
 # one harm is a retry that answers not_found/unknown project after the first close landed, which the caller

@@ -58,11 +58,13 @@ COLUMNS = {"subsystem": "TEXT NOT NULL DEFAULT ''", "client": "TEXT NOT NULL DEF
            "parameters": "TEXT NOT NULL DEFAULT ''", "confidence": "TEXT NOT NULL DEFAULT ''",
            "authority": "TEXT NOT NULL DEFAULT ''", "subject_sha256": "TEXT NOT NULL DEFAULT ''",
            "from_capture": "TEXT NOT NULL DEFAULT ''", "evidence_links": "TEXT NOT NULL DEFAULT ''",
-           "provenance": "TEXT NOT NULL DEFAULT ''"}
+           "provenance": "TEXT NOT NULL DEFAULT ''",
+           # semantic trace: the cited session, events and revision; absent from the content (and the id) when empty
+           "from_trace": "TEXT NOT NULL DEFAULT ''"}
 LEGACY_FIELDS = ("id", "game", "build", "kind", "name", "address", "prologue", "note", "source", "created",
                  "subsystem", "client", "harness", "supersedes", "superseded_by")
 FIELDS = LEGACY_FIELDS + ("evidence_id", "coverage", "limitations", "parameters", "confidence", "authority",
-                          "subject_sha256", "from_capture", "evidence_links", "provenance")
+                          "subject_sha256", "from_capture", "evidence_links", "provenance", "from_trace")
 BUSY_TIMEOUT_MS = 15000
 
 CONFIDENCES = ("observed", "derived", "inferred")
@@ -94,12 +96,35 @@ LIMITATIONS = {
     "single_run": (False, "One run of one scenario; other inputs or timing may behave differently."),
     "fixture_only": (False, "Observed on a synthetic fixture, not on the game."),
     "volatile_state": (False, "The value depends on process state that changes from run to run."),
+    # Semantic trace (TRACE-1 section 15). The wire codes are hyphenated (`producer-lost`); a claim stores the same
+    # code with underscores (hydralysis.trace.to_evidence_code).
+    "no_stack": (False, "The event has no captured call stack, so it cannot be tied to a function."),
+    "not_code": (False, "The captured address is not in executable code."),
+    "module_unknown": (False, "The address belongs to no module the trace observed."),
+    "no_symbol": (False, "The address is in a known module but resolves to no function in the program revision."),
+    "producer_lost": (True, "A source stopped or jumped in its numbering without a gap record: events are missing."),
+    "ring_overflow": (True, "A capture ring overflowed; the dropped count travelled out of band and the events are gone."),
+    "read_failure": (True, "A non-faulting read of target memory failed; the value was not captured."),
+    "observer_inactive": (True, "No observer was active over the interval, so absence of events is not coverage."),
+    "clock_uncalibrated": (False, "Two clock domains were joined without a calibration, so their order is not comparable."),
+    "lifetime_unresolved": (False, "The creation or retirement of an identity was not observed."),
+    "alignment_ambiguous": (False, "A diff alignment matched more than one candidate; the match was not chosen silently."),
+    "budget_reached": (True, "A query, explanation or check stopped at its event or byte budget; the rest was not read."),
+    "artifact_evicted": (False, "A payload artifact the claim depends on was evicted by retention."),
+    "payload_not_authorized": (False, "The payload bytes were not authorized for export, so the claim cannot be replayed from them."),
+    "etw_not_elevated": (True, "ETW kernel providers were not consumed because the collector was not elevated."),
+    "optional_hook_refused": (True, "An optional hook did not verify against the build and was disabled; its events are not captured."),
 }
 _CODE = re.compile(r"^(?:[a-z][a-z0-9_.-]{0,31}:)?[a-z][a-z0-9_]{0,63}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _EVIDENCE_ID = re.compile(r"^ev_[0-9a-f]{64}$")
 _CAPTURE_ID = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,79}$")
 _SAFE_INT = 2 ** 53 - 1
+_TRACE_SESSION = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,79}$")
+_TRACE_EVENT = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,119}$")
+MAX_TRACE_EVENTS = 64
+# Content keys a claim may carry or omit. A claim without them has the id it always had.
+OPTIONAL_KEYS = ("from_trace",)
 
 # The REA reference (f196ebf, src/domain/evidence.ts) record fields and where each lives here. A field with no
 # column is a documented gap, not a silent omission: tests/test_evidence_parity.py reads the reference and fails on
@@ -279,10 +304,42 @@ def merge_limitations(coverage: dict, limitations=()) -> list[str]:
 
 # ---- the content that an evidence id commits ------------------------------------------------------------------
 
+def check_from_trace(value) -> dict:
+    """The normal form of a trace citation: {session, events (sorted, unique, at most 64), revision[, interpretation]}.
+
+    A claim from the semantic trace cites the session it was read from, the event ids it rests on and the committed
+    revision it was read at (and the interpretation revision when it depended on one), so it can be re-read and
+    re-checked. A citation without events or without a revision is refused: it would not be a source."""
+    if not isinstance(value, dict) or set(value) - {"session", "events", "revision", "interpretation"}:
+        raise ValueError("from_trace is {session, events, revision[, interpretation]}")
+    session, events, revision = value.get("session"), value.get("events"), value.get("revision")
+    if not isinstance(session, str) or not _TRACE_SESSION.match(session):
+        raise ValueError("from_trace.session must be a trace session id (letters, digits, `_`, `.`, `-`, at most 80)")
+    if not isinstance(events, (list, tuple)) or not 1 <= len(events) <= MAX_TRACE_EVENTS:
+        raise ValueError("from_trace.events lists 1..%d event ids" % MAX_TRACE_EVENTS)
+    if not all(isinstance(item, str) and _TRACE_EVENT.match(item) for item in events):
+        raise ValueError("from_trace.events holds event ids (letters, digits and `_.:-`)")
+    for name, item in (("revision", revision), ("interpretation", value.get("interpretation"))):
+        if name == "interpretation" and item is None:
+            continue
+        if isinstance(item, bool) or not isinstance(item, int) or not 0 <= item <= _SAFE_INT:
+            raise ValueError("from_trace.%s must be a non-negative integer" % name)
+    result = {"session": session, "events": sorted(set(events)), "revision": revision}
+    if value.get("interpretation") is not None:
+        result["interpretation"] = value["interpretation"]
+    return result
+
+
+def content_keys_ok(content: dict) -> bool:
+    """Whether CONTENT has exactly the fields of the evidence model (the optional ones may be absent)."""
+    return set(CONTENT_KEYS) <= set(content) <= set(CONTENT_KEYS) | set(OPTIONAL_KEYS)
+
+
 def build_content(*, game: str, build: str, kind: str, name: str, note: str, source: str, address: str = "",
                   prologue: str = "", subsystem: str = "", parameters: dict | None = None,
                   confidence: str = DEFAULT_CONFIDENCE, authority: str = DEFAULT_AUTHORITY, coverage=None,
-                  limitations=(), subject_sha256: str = "", from_capture: str = "", evidence_links=()) -> dict:
+                  limitations=(), subject_sha256: str = "", from_capture: str = "", evidence_links=(),
+                  from_trace=None) -> dict:
     """The validated semantic content of one claim; `compute_evidence_id` hashes exactly this."""
     for field, value in (("game", game), ("build", build), ("kind", kind), ("name", name), ("note", note),
                          ("source", source)):
@@ -315,11 +372,14 @@ def build_content(*, game: str, build: str, kind: str, name: str, note: str, sou
         "from_capture": str(from_capture) if from_capture else None,
         "evidence_links": links,
     }
+    if from_trace:
+        content["from_trace"] = check_from_trace(from_trace)
     canonical_json(content)  # refuses a float, an unsafe integer or an unpaired surrogate before anything is stored
     return content
 
 
 CONTENT_KEYS = tuple(build_content(game="g", build="b", kind="k", name="n", note="n", source="s"))
+
 
 
 def _loads(text: str, default):
@@ -328,7 +388,7 @@ def _loads(text: str, default):
 
 def content_of_row(row) -> dict:
     """The semantic content of a stored row, decoded without re-validating it (so a damaged row stays visible)."""
-    return {
+    content = {
         "model": MODEL,
         "subject": {"sha256": row["subject_sha256"]} if row["subject_sha256"] else None,
         "game": row["game"], "build": row["build"], "kind": row["kind"], "name": row["name"],
@@ -341,6 +401,9 @@ def content_of_row(row) -> dict:
         "from_capture": row["from_capture"] or None,
         "evidence_links": _loads(row["evidence_links"], []),
     }
+    if "from_trace" in row.keys() and row["from_trace"]:
+        content["from_trace"] = _loads(row["from_trace"], None)
+    return content
 
 
 def verify_content(content: dict, evidence_id: str) -> None:
@@ -372,7 +435,7 @@ def check_content(content, evidence_id: str) -> None:
         return EvidenceIntegrityError("evidence %s has content the evidence model refuses: %s" % (evidence_id, message),
                                       code="evidence_content_invalid", evidence_id=str(evidence_id))
 
-    if not isinstance(content, dict) or set(content) != set(CONTENT_KEYS):
+    if not isinstance(content, dict) or not content_keys_ok(content):
         raise bad("its fields are not those of the evidence model")
     if content["model"] != MODEL:
         raise bad("model is %r, not %r" % (content["model"], MODEL))
@@ -399,7 +462,7 @@ def check_content(content, evidence_id: str) -> None:
             parameters=content["parameters"], confidence=content["confidence"], authority=content["authority"],
             coverage=content["coverage"], limitations=content["limitations"],
             subject_sha256=(subject or {}).get("sha256", ""), from_capture=content["from_capture"] or "",
-            evidence_links=content["evidence_links"])
+            evidence_links=content["evidence_links"], from_trace=content.get("from_trace"))
         same = canonical_json(rebuilt) == canonical_json(content)
     except ValueError as exc:
         raise bad(str(exc)) from exc
@@ -529,15 +592,16 @@ def _insert(db: sqlite3.Connection, content: dict, evidence_id: str, *, created:
         """
         INSERT INTO claims (game, build, kind, name, address, prologue, note, source, created, subsystem, client,
                             harness, supersedes, evidence_id, coverage, limitations, parameters, confidence,
-                            authority, subject_sha256, from_capture, evidence_links, provenance)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            authority, subject_sha256, from_capture, evidence_links, provenance, from_trace)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (content["game"], content["build"], content["kind"], content["name"], content["address"],
          content["prologue"], content["note"], content["source"], created, content["subsystem"], client, harness,
          supersedes, evidence_id, json.dumps(content["coverage"], sort_keys=True), json.dumps(content["limitations"]),
          json.dumps(content["parameters"], sort_keys=True), content["confidence"], content["authority"],
          (content["subject"] or {}).get("sha256", ""), content["from_capture"] or "",
-         json.dumps(content["evidence_links"]), json.dumps(provenance, sort_keys=True)))
+         json.dumps(content["evidence_links"]), json.dumps(provenance, sort_keys=True),
+         json.dumps(content["from_trace"], sort_keys=True) if content.get("from_trace") else ""))
     return cursor.lastrowid
 
 
@@ -562,11 +626,12 @@ def add_claim(
     subject_sha256: str = "",
     from_capture: str = "",
     provenance: dict | None = None,
+    from_trace: dict | None = None,
 ) -> str:
     fields = dict(game=game, build=build, kind=kind, name=name, note=note, source=source, address=address,
                   prologue=prologue, subsystem=subsystem, parameters=parameters, confidence=confidence,
                   authority=authority, coverage=coverage, limitations=limitations, subject_sha256=subject_sha256,
-                  from_capture=from_capture)
+                  from_capture=from_capture, from_trace=from_trace)
     build_content(**fields)  # refuse a bad claim before a database is opened
     provenance = _provenance(provenance)
     client, harness = _who()
@@ -613,6 +678,7 @@ def decode_row(row) -> dict:
         except ValueError:
             result[key] = {"unreadable": result[key]}
     result["from_capture"] = result["from_capture"] or None
+    result["from_trace"] = _loads(row["from_trace"], None) if "from_trace" in row.keys() and row["from_trace"] else None
     result["subject_sha256"] = result["subject_sha256"] or None
     return result
 

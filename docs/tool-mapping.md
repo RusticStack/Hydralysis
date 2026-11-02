@@ -8,13 +8,13 @@ The counts below are written by `tools/count_surfaces.py` into `docs/data/tool-s
 
 | Surface | Count | Source | Status |
 | --- | --- | --- | --- |
-| Hydralysis (formerly RusticRE) MCP tools | 20 | `TOOL_NAMES` in `src/hydralysis/api.py`. The CLI also has four aliases that are not MCP tools (`sections`, `exports`, `ghidra_scripts`, `ghidra_jobs`). | Counted in this repo. |
+| Hydralysis (formerly RusticRE) MCP tools | 21 | `TOOL_NAMES` in `src/hydralysis/api.py`. The CLI also has four aliases that are not MCP tools (`sections`, `exports`, `ghidra_scripts`, `ghidra_jobs`). | Counted in this repo. |
 | GhidraMCP bridge | 30 `@mcp.tool` functions | `src/ghidra_mcp/server.py` of the bridge at pinned revision `1e98025` (the owner's measured figure was 28). | 30 counted from that file. 28 is plausibly 30 minus the two GUI-only tools (`get_current_address`, `get_current_function`), which is **to verify**. |
 | REA (`reverse-engineer-anything`) | 207 | The `tool_count` field in that skill's metadata only. | Not enumerated from a live `tools/list`; treat as the skill's own claim, **to verify**. |
 
 Counts are not capability. REA's surface includes Android, JADX, ADB, apktool, JEB, firmware, browser, Electron, JavaScript, EVM, Hopper, Frida, Objective-C and Swift tooling that Hydralysis deliberately does not register (see [THIRD_PARTY.md](../THIRD_PARTY.md)).
 
-## Hydralysis tools (20)
+## Hydralysis tools (21)
 
 | Tool | Purpose |
 | --- | --- |
@@ -25,6 +25,7 @@ Counts are not capability. REA's surface includes Android, JADX, ADB, apktool, J
 | `backend`, `prepare`, `job` | Setup, adoption, one-time analysis, progress |
 | `ghidra_query`, `ghidra_run` | Saved analysis (decompile, xrefs, types, trace, edits, export, diff) and deliberate scripts |
 | `runtime` | Controlled local runtime sessions |
+| `trace` | Semantic traces: cited, bounded answers about what a program did (query, diff, explain, check, export); capture is `runtime` |
 
 ## GhidraMCP (30) to Hydralysis
 
@@ -83,4 +84,4 @@ Figures that came from the owner or from a third party's own metadata. None was 
 | 207 tools in `reverse-engineer-anything` | the skill's `tool_count` metadata | no live `tools/list` was enumerated | not reproduced |
 | 7.0-7.8 s for the same question through the upstream command-line launcher (Ghidra 12.1.4) | the owner | no upstream launcher is used or run by this repository | not reproduced |
 
-The Hydralysis figure next to them is reproduced: 20 tools, counted from `tool_table()` by `tools/count_surfaces.py`.
+The Hydralysis figure next to them is reproduced: 21 tools, counted from `tool_table()` by `tools/count_surfaces.py`.

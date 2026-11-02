@@ -5,7 +5,7 @@
   "surfaces": [
     {
       "id": "hydralysis",
-      "count": 20,
+      "count": 21,
       "source": "tool_table() in src/hydralysis/api.py (names: TOOL_NAMES)",
       "reproduced": true
     },

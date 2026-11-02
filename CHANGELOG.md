@@ -6,6 +6,21 @@ Nothing here is a tag: a release is tagged by the owner.
 
 ## Unreleased
 
+Semantic trace (for 0.8.0, which pins engine 12.3-hydra.6; the version is bumped at release with `tools/bump_hydra.py`).
+
+- New tool `trace` (the 21st; catalog epoch 3, schema budget 8,192 -> 9,216 bytes): start, stop, status, query, diff, explain, mark,
+  export, check, import and resymbolize. Routed to the engine lane; export, import and resymbolize ride the long lane. Replies are
+  bounded and carry counts, event ids, the revision and the coverage gaps. Offline: segment verify and JSONL import in Python,
+  rebuild and export through the engine install's `hydra-trace.exe`.
+- Evidence: source kind `from_trace` (session, event ids, revision); bundles gain `traces/<session>.json`.
+  Trace limitation codes join the evidence catalog (underscored: `producer_lost`, `optional_hook_refused`, ...).
+- `hydralysis.trace_canon`: Python twin of the TRACE-1 canonical JSON, record hash and segment framing, pinned to vectors.
+- Vendored TRACE-1 schemas (`trace_schema/`) with a validator and a test that they equal the engine's.
+- `hydralysis.profiles`: TOML profile loader, validator, build-bound hook verification, query modules; `docs/trace-profiles.md`.
+- `trace_hashes` (FNV, CRC32, Murmur3, profile codecs, dictionary, interpretation revisions), `trace_bindings` (script/native
+  tables), `trace_corpus_diff` (corpus diff and invalidation report), `trace_reports` (write survival, hook bypass).
+
+
 ## 0.7.0
 
 This release (0.7.0) pins Hydra Engine `12.3-hydra.5` (protocol 3), released 2026-11-01. It is a

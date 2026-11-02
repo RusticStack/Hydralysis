@@ -26,6 +26,9 @@ CATALOG_HISTORY = {
     # "rva:0x... or va:0x..." examples: with them the eight tools would cost +104 bytes (8276 total), over the 8192 budget.
     # Epoch 1 was never released outside this branch.
     2: "9f1051b0cf70c8a8231b9d07fe46e7a9561142dcfba2442fd9aa7e11a6d85423",
+    # Epoch 3 (Hydralysis 0.8.0): the `trace` tool, the 21st, and the `from_trace` object on evidence_add. The catalog
+    # budget moved from 8,192 to 9,216 bytes with it.
+    3: "e767074c93714f7c1d9b7b8183cdbfdd85b529a3615ea118f47e06606cb9f500",
 }
 
 
@@ -91,7 +94,7 @@ class CatalogEpoch(unittest.TestCase):
             checked.append(name)
         self.assertEqual(checked, sorted(carriers))  # the loop ran for all eight, none was skipped
 
-    def test_new_surface_rides_options_and_two_enum_values_on_the_same_twenty_tools(self):
+    def test_new_surface_rides_options_and_two_enum_values_on_the_same_twenty_one_tools(self):
         table = {tool["name"]: tool["inputSchema"]["properties"] for tool in tool_table()}
         self.assertEqual(list(table), list(api.TOOL_NAMES))
         for name in ("backend", "ghidra_run", "job", "ghidra_query", "runtime"):
@@ -100,7 +103,7 @@ class CatalogEpoch(unittest.TestCase):
                          ["inspect", "install", "status", "stop", "help", "doctor", "backups"])
         reply = Server().handle({"id": 1, "method": "tools/list"})
         self.assertEqual(reply["result"]["tools"], tool_table())
-        self.assertEqual(set(api.OPTION_BAGS), {"ghidra_query", "backend", "ghidra_run", "job", "runtime"})
+        self.assertEqual(set(api.OPTION_BAGS), {"ghidra_query", "backend", "ghidra_run", "job", "runtime", "trace"})
 
 
 def no_handler(*capabilities):
@@ -243,8 +246,8 @@ class HandlerRegistry(unittest.TestCase):
 class AgentContracts(unittest.TestCase):
     def test_catalog_stays_small_in_bytes_as_well_as_count(self):
         catalog = tool_table()
-        self.assertEqual(len(catalog), 20)
-        self.assertLess(len(json.dumps(catalog).encode("utf-8")), 8192)
+        self.assertEqual(len(catalog), 21)
+        self.assertLess(len(json.dumps(catalog).encode("utf-8")), 9216)
         for tool in catalog:
             self.assertLess(len(json.dumps(tool["inputSchema"]).encode("utf-8")), 1024, tool["name"])
         self.assertIn("ghidra_query", [tool["name"] for tool in catalog])
