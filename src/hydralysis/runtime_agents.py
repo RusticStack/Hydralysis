@@ -185,7 +185,8 @@ typedef struct {
   volatile gint state;      /* 0 free, 1 owned, 2 retired (owner gone, waiting to be drained) */
   guint32 owners;
   guint8 *buf;
-  guint8 pad[56];
+  volatile gint shedding;   /* a stall ran out of patience: drop (and count) at once until the drain has freed half the ring */
+  guint8 pad[52];
 } Ring;
 
 /* All mutable state lives in memory the script allocates (a CModule's own data is not writable). */
@@ -339,6 +340,10 @@ static void emit(Ring *r, Site *s, Inv *inv, guint64 ret, guint32 last_error, gu
   guint i;
   total = REC_HDR + 8 * s->nargs + 8 * nst + ((buflen + 7) & ~7u);
   seq = r->attempted++;
+  if (r->shedding) {
+    if ((guint32)(r->head - r->tail) <= cap / 2) r->shedding = 0;
+    else { r->dropped++; return; }
+  }
   for (;;) {
     head = r->head; tail = r->tail;
     pos = head & mask;
@@ -348,7 +353,7 @@ static void emit(Ring *r, Site *s, Inv *inv, guint64 ret, guint32 last_error, gu
        is still full after the budget drops the record, and the drop is counted (out of band) and cited. */
     if (!t0) { QueryPerformanceCounter(&t0); r->stalls++; }
     QueryPerformanceCounter(&t1);
-    if ((guint64)(t1 - t0) > s->sh->bp_ticks || total > cap) { r->dropped++; r->stall_ticks += (guint64)(t1 - t0); return; }
+    if ((guint64)(t1 - t0) > s->sh->bp_ticks || total > cap) { r->dropped++; r->shedding = 1; r->stall_ticks += (guint64)(t1 - t0); return; }
     SwitchToThread();
   }
   if (t0) { QueryPerformanceCounter(&t1); r->stall_ticks += (guint64)(t1 - t0); }

@@ -1,6 +1,8 @@
 """Persistent-store footprint: what a run (or an intervention) changed on disk, and whether undoing it round-trips.
 
-A footprint is a snapshot of files under chosen roots (path, size, content hash). ``diff`` compares two snapshots;
+A footprint is a snapshot of files under chosen roots (path, size, content hash) and, on Windows, of the declared
+HKEY_CURRENT_USER keys (every value: name, type, size, hash of the data; the data itself is never copied, so a secret value is
+not leaked into a snapshot). ``diff`` compares two snapshots;
 ``classify`` separates changes the intervention caused from changes an ordinary (control) run makes anyway;
 ``round_trip`` checks that reverting the intervention restored the original state, and says
 ``did not round-trip`` with the differing paths when it did not.
@@ -12,6 +14,82 @@ import os
 from pathlib import Path
 
 NOT_ROUND_TRIP = "did not round-trip"
+MAX_REGISTRY_VALUES = 20000
+_HKCU_PREFIXES = ("hkcu\\", "hkey_current_user\\", "hkcu:\\")
+
+
+def registry_subkey(path: str) -> str:
+    """The sub key path of a declared HKCU key; any other hive is refused (a footprint never reads machine-wide keys)."""
+    text = str(path).replace("/", "\\").strip("\\")
+    lowered = text.lower() + "\\"
+    for prefix in _HKCU_PREFIXES:
+        if lowered.startswith(prefix):
+            sub = text[len(prefix) - 1:].strip("\\")
+            if not sub:
+                raise ValueError("a declared registry key is below HKCU, not the hive itself")
+            return sub
+    raise ValueError("only HKCU keys can be declared in a footprint, got %r" % path)
+
+
+def snapshot_registry(keys: list[str]) -> dict[str, dict]:
+    """``{reg:<key>/<value>: {size, sha256, readable, type}}`` for each declared HKCU key and everything below it.
+
+    A key that does not exist contributes nothing (so its creation is an `added` entry and its removal a `removed` one); an empty
+    existing key is recorded as ``reg:<key>/`` so that creating or deleting it is seen too."""
+    import winreg
+    snap: dict[str, dict] = {}
+    budget = [MAX_REGISTRY_VALUES]
+
+    def walk(sub: str) -> None:
+        try:
+            handle = winreg.OpenKey(winreg.HKEY_CURRENT_USER, sub, 0, winreg.KEY_READ | winreg.KEY_WOW64_64KEY)
+        except FileNotFoundError:
+            return
+        except OSError:
+            snap["reg:" + sub.lower() + "\\"] = {"size": None, "sha256": None, "readable": False, "type": "key"}
+            return
+        with handle:
+            snap["reg:" + sub.lower() + "\\"] = {"size": 0, "sha256": hashlib.sha256(b"key").hexdigest(), "readable": True, "type": "key"}
+            index = 0
+            while budget[0] > 0:
+                try:
+                    name, data, kind = winreg.EnumValue(handle, index)
+                except OSError:
+                    break
+                index += 1
+                budget[0] -= 1
+                raw = data if isinstance(data, bytes) else repr(data).encode("utf-8", "replace")
+                snap["reg:" + (sub + "\\" + name).lower()] = {
+                    "size": len(raw), "sha256": hashlib.sha256(str(kind).encode() + b"\0" + raw).hexdigest(), "readable": True,
+                    "type": kind}
+            index = 0
+            children = []
+            while True:
+                try:
+                    children.append(winreg.EnumKey(handle, index))
+                except OSError:
+                    break
+                index += 1
+        for child in children:
+            walk(sub + "\\" + child)
+
+    for key in keys:
+        walk(registry_subkey(key))
+    if budget[0] <= 0:
+        snap["reg:<truncated>"] = {"size": None, "sha256": None, "readable": False, "type": "limit"}
+    return snap
+
+
+def stores_of(profile, base: Path) -> tuple[list[Path], list[str]]:
+    """The files (relative paths resolve under BASE) and HKCU keys a profile declares as persistent stores."""
+    files, keys = [], []
+    for store in profile.data.get("stores", []):
+        if store["kind"] == "registry":
+            keys.append(store["path"])
+        else:
+            path = Path(store["path"])
+            files.append(path if path.is_absolute() else Path(base) / path)
+    return files, keys
 
 
 def _hash(path: Path) -> str | None:
@@ -25,9 +103,12 @@ def _hash(path: Path) -> str | None:
     return h.hexdigest()
 
 
-def snapshot(roots: list[Path], ignore: tuple[str, ...] = ()) -> dict[str, dict]:
-    """``{normalized path: {size, sha256}}``; a file that cannot be read is recorded as unreadable, not skipped."""
+def snapshot(roots: list[Path], ignore: tuple[str, ...] = (), registry: list[str] | tuple = ()) -> dict[str, dict]:
+    """``{normalized path: {size, sha256}}``; a file that cannot be read is recorded as unreadable, not skipped. REGISTRY lists
+    declared HKCU keys, snapshotted with their values and sub keys under `reg:` names."""
     snap: dict[str, dict] = {}
+    if registry:
+        snap.update(snapshot_registry(list(registry)))
     for root in roots:
         root = Path(root)
         files = [root] if root.is_file() else (p for p in root.rglob("*") if p.is_file()) if root.exists() else []
