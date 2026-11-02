@@ -78,3 +78,24 @@ Classification: **black-box** = uses only the public surface of `hydralysis.evid
 - `diff_python.rs::python_and_rust_agree_on_ledger_bundle_and_text`: the same claims through both implementations; every column of every ledger row, the add_claim messages, every bundle file byte, the Markdown and JSONL export bytes and the `list_claims` text are identical; Rust verifies and imports the Python bundle; Python verifies and compares the Rust ledger and bundle.
 - `diff_python.rs::rust_and_python_agree_on_the_error_messages_of_refused_claims`: `build_content` refusals have identical messages.
 - `evidence_ledger.rs`: `integrity_errors_carry_code_and_row`, `the_time_format_matches_strftime`. `bundle_tests.rs`: `a_bundle_error_payload_has_the_python_shape`, `the_guard_counts_characters_and_names_the_path`, `splitlines_matches_python`.
+
+## Python tests under `HYDRALYSIS_IMPL=rust` (PyO3 binding, `hydralysis_rs.evidence_call`)
+
+`evidence.py` / `evidence_bundle.py` route their public functions through `src/hydralysis/_rust_evidence.py` when the
+variable is `rust`. Result of `tests.test_evidence tests.test_evidence_model tests.test_evidence_parity
+tests.test_evidence_bundle` (60 tests, unchanged): **60 pass under Rust**; under Python 59 pass and 1 errors
+(`test_an_export_beside_a_busy_writer_is_a_consistent_snapshot`, a 120 s subprocess timeout on the slow E: drive, not a
+logic failure; it passed in the Rust run).
+
+Routed (black-box): `canonical_json`, `canonical_digest`, `compute_evidence_id`, `check_limitation_code`,
+`normalize_coverage`, `derived_limitations`, `merge_limitations`, `check_from_trace`, `build_content`,
+`verify_content`, `check_content`, `check_meta`, `add_claim`, `query`, `get_claim`, `verify_ledger`,
+`records_for_bundle`, `import_records`, `list_claims`, `export`; bundle: `guard_payload`, `check_pin`, `stub_pin`,
+`export_bundle`, `load_bundle`, `verify_bundle`, `compare_bundles`, `import_bundle`, `handle`.
+
+Left in Python (white-box, they take or return sqlite objects): `connect`, `_insert`, `_select`, `_backfill`,
+`decode_row`, `verify_row`, `content_of_row`, and the CLI `main`. No test of the four files fails because of this.
+
+Known flake: `test_concurrent_writers_all_land` can raise `database is locked` on E: when the machine is loaded
+(SQLite's busy handler starves one of four writers past 15 s); it passes alone on E: (30 s) and on C: (2-3 s), in both
+implementations.

@@ -637,3 +637,12 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+import os as _os
+import sys as _sys
+
+if _os.environ.get("HYDRALYSIS_IMPL") == "rust":  # the Rust implementation (rust/crates/hy-store) behind the same surface
+    from hydralysis import _rust_evidence
+
+    _rust_evidence.install_bundle(_sys.modules[__name__])
