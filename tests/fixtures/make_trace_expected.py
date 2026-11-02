@@ -552,9 +552,49 @@ def ioctl_client() -> None:
     })
 
 
+# --- field_writers -----------------------------------------------------------------------------------------------------
+
+def field_writers() -> None:
+    frames = 20
+
+    def model(bump: bool) -> tuple:
+        tag, level, other = 1, 0, 0
+        for frame in range(frames):
+            level = 100 + frame
+            if frame % 5 == 4:
+                tag, level, other = frame, 0, frame * 2
+            if frame % 4 == 3:
+                level = 700 + frame
+            if bump:
+                level += 1
+        return level, tag, other
+
+    def run(name: str, args: list, bump: bool) -> dict:
+        level, tag, other = model(bump)
+        return {"id": name, "program": "field_writers.exe", "args": args, "max_seconds": 20, "exit_code": 0,
+                "stdout_lines": ["FX frames=%d level=%d tag=%d other=%d" % (frames, level, tag, other)]}
+    write("field_writers", {
+        "fixture": "field_writers", "spec": ["14.4"], "sources": ["field_writers.c", "trace_common.h"], "outputs": ["field_writers.exe"],
+        "functions": {"observed_writer": "fx_set_level", "never_executed": "fx_bump_level", "whole_object_writer": "fx_reset_thing",
+                      "alias_callee": "fx_alias_write", "alias_caller": "fx_use_alias"},
+        "data": {"object": "g_thing"},
+        "runs": [run("default", [], False), run("bump", ["--bump"], True)],
+        "answers": {
+            "field": {"type": "Thing", "name": "level", "offset": 4, "size": 4, "object": "g_thing"},
+            "may_access": {"static_candidates_at_offset_4": ["fx_set_level", "fx_bump_level"],
+                           "never_executed_in_default_run": "fx_bump_level"},
+            "observed": {"fx_set_level": "every frame, object g_thing",
+                         "fx_reset_thing": "every 5th frame (frame % 5 == 4): writes the whole object, no store at offset 4, so it is not a static candidate"},
+            "unresolved": {"site": "fx_use_alias", "frames": "frame % 4 == 3", "callee": "fx_alias_write (not instrumented)",
+                           "reason": "a pointer to the field flows into a callee that is not instrumented; the write is not observed"},
+            "three_answers": ["may access (fx_bump_level)", "observed (fx_set_level, fx_reset_thing)", "unresolved (alias via fx_use_alias)"],
+        },
+    })
+
+
 def main() -> None:
     for build in (trace_app, interleave, layouts, frameloop, veh_freeze, vcall_fixture, replica, fnv_names, minivm, persist,
-                  deadlock, diff_fixture, ioctl_client):
+                  deadlock, diff_fixture, ioctl_client, field_writers):
         build()
 
 

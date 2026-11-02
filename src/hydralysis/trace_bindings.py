@@ -264,3 +264,35 @@ def link_events(events: list[dict], table: dict, *, window: int = 8) -> dict:
             links.append({"relation": "observed-call", "status": "supported", "from": event.get("event_id"), "to": found.get("event_id"),
                           "script_function": name, "basis": ["binding-table", "same thread order"]})
     return {"links": links, "unlinked": unlinked}
+
+
+# ---- registration call sites from machine code (x64 Microsoft ABI) ---------------------------------------------------------
+
+_LEA = {b"\x48\x8d\x0d": 0, b"\x48\x8d\x15": 1, b"\x4c\x8d\x05": 2, b"\x4c\x8d\x0d": 3}
+_MOV_IMM = {b"\xb9": 0, b"\xba": 1, b"\x41\xb8": 2, b"\x41\xb9": 3}
+
+
+def x64_call_site_args(memory, call_va: int, *, window: int = 40) -> dict:
+    """The constant arguments of the call at CALL_VA, read from the instructions just before it.
+
+    Recognises the constant loads a compiler emits for the first four register arguments (`lea reg,[rip+disp]` for an
+    address, `mov reg,imm32` for a number) in the WINDOW bytes before the call. This is deliberately a small decoder, not an
+    analysis: an argument loaded any other way (from memory, a register, a computation) is simply absent from the result,
+    and the binding row built from it is `unresolved` with that argument named."""
+    call_rva = call_va - memory.base
+    try:
+        code = memory.read_rva(call_rva - window, window)
+    except (ValueError, OSError):
+        return {"site": _site(call_rva), "args": []}
+    found: dict = {}
+    for offset in range(window):
+        for prefix, index in _LEA.items():
+            end = offset + len(prefix) + 4
+            if code[offset:offset + len(prefix)] == prefix and end <= window:
+                displacement = int.from_bytes(code[offset + len(prefix):end], "little", signed=True)
+                found[index] = {"index": index, "rva": call_rva - window + end + displacement}
+        for prefix, index in _MOV_IMM.items():
+            end = offset + len(prefix) + 4
+            if code[offset:offset + len(prefix)] == prefix and end <= window and index not in found:
+                found[index] = {"index": index, "constant": int.from_bytes(code[offset + len(prefix):end], "little")}
+    return {"site": _site(call_rva), "args": [found[i] for i in sorted(found)]}

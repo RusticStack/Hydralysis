@@ -677,6 +677,69 @@ def _pair(client: TraceClient, owner: str, replica: str, options: dict) -> dict:
             "replica": {"session": replica, "revision": client.info(replica).get("revision")}}
 
 
+REPORTS = ("survival", "bypass", "writers", "links", "discovery")
+
+
+def _report_events(client: TraceClient, session: str, options: dict) -> list[dict]:
+    """The session's rows of options.kinds as report events (frame, phase, role, ours and the hook site lifted from payloads;
+    symbolized functions merged when the session has a program and options.symbols is true)."""
+    from hydralysis import trace_reports
+    kinds = _strings(options.get("kinds"), "options.kinds") or None
+    rows, symbols = [], {}
+    after, up_to = None, None
+    while len(rows) < 200_000:
+        reply = client.query(session, kinds=kinds, limit=1000, after=after, up_to=up_to, with_symbols=options.get("symbols") or None)
+        rows.extend(reply.get("rows") or [])
+        for entry in (reply.get("symbols") or {}).get("rows") or []:
+            symbols[entry["seq"]] = entry
+        after, up_to = reply.get("next"), reply.get("up_to")
+        if not after:
+            break
+    return trace_reports.from_engine_rows(rows, names=options.get("names"), symbols=symbols)
+
+
+def _report(client: TraceClient, session: str, options: dict) -> dict:
+    """Spec 15.3 / 15.4 / 14.4 / 15.7 / M4 over the session's live data. options.report picks the builder; the builder's own
+    parameters are options.params. Every answer carries the revision it read."""
+    from hydralysis import trace_bindings, trace_reports
+    kind = options.get("report")
+    if kind not in REPORTS:
+        raise ValueError("options.report is one of: " + ", ".join(REPORTS))
+    params = _object(options.get("params"), "options.params")
+    info = client.info(session)
+    events = _report_events(client, session, options)
+    gaps = params.pop("gaps", None) or []
+    if kind == "survival":
+        result = trace_reports.write_survival(events, field=params["field"], consumer=params["consumer"],
+                                              phases=params.get("phases"), gaps=gaps)
+    elif kind == "writers":
+        result = trace_reports.field_writers(params.get("static_sites") or [], events, object_addr=int(params["object"]),
+                                             offset=int(params["offset"]), size=int(params["size"]), names=params.get("names"))
+    elif kind == "bypass":
+        receivers = {int(k): v for k, v in (params.get("receivers") or {}).items()}
+        edges = trace_reports.edges_from_dispatch(events, _object(params.get("dispatch_sites"), "params.dispatch_sites"),
+                                                  receiver_class=lambda address: receivers.get(address),
+                                                  ignore=tuple(params.get("ignore") or ()))
+        observed = trace_reports.observed_edges(edges, static_candidates=params.get("static_candidates"))
+        result = {"edges": observed, **trace_reports.hook_bypass(events, hook=params["hook"], field=params["field"],
+                                                                 siblings=params.get("siblings"), observed=observed["observed"])}
+    elif kind == "links":
+        result = trace_bindings.link_events(events, params["table"], window=int(params.get("window", 8)))
+    else:
+        exercised = [{"key": site, "kind": k, "count": n} for (site, k), n in sorted(
+            _count((e["function"], e["kind"]) for e in events if e["function"]).items())]
+        result = trace_reports.discovery_report(exercised=exercised, candidates=params.get("candidates") or [],
+                                                observation_gaps=list(info.get("gaps") or []) + list(gaps))
+    return {"report": kind, "result": result, "events_read": len(events), "revision": info.get("revision")}
+
+
+def _count(items) -> dict:
+    out: dict = {}
+    for item in items:
+        out[item] = out.get(item, 0) + 1
+    return out
+
+
 def _import(client: TraceClient, session: str | None, options: dict) -> dict:
     source = Path(str(options.get("input") or options.get("file") or ""))
     read = read_jsonl(source)
@@ -735,6 +798,8 @@ def handle_action(action: str, session: str | None, options: dict, settings: dic
         raise ValueError("trace %s requires session" % action)
     if action == "stop":
         return shape(_stop(client, session, options, settings), session=session, command="trace_close", limit=limit)
+    if action == "query" and options.get("report"):      # spec 15.3 / 15.4 / 14.4 / 15.7 builders over the session's live data
+        return shape(_report(client, session, options), session=session, command="trace_query", limit=limit)
     if action == "query":
         reply = _query(client, session, options, limit)
         return shape(reply, session=session, command="trace_query", limit=limit, requested_revision=options.get("revision"))
