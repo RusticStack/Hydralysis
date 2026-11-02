@@ -127,6 +127,8 @@ class ActionsMixin:
                 events = matching[:limit]
                 return {**self.snapshot(), "worker_alive": True, "events": events,
                         "truncated": len(matching) > limit, "next_after": events[-1]["sequence"] if events else after}
+        if action == "trace_status":
+            return self.trace_action(action, args)
         if action == "detach":
             self._autostop_capture()
             return self.cleanup()
@@ -262,6 +264,8 @@ class ActionsMixin:
                                    "checked_against": "the module file's export table (build hash %s)"
                                                       % module["file_sha256"][:16]}} if export else {}),
                     **({"past_patch": patch} if patch else {})}
+        if action in ("trace_start", "trace_stop"):
+            return self.trace_action(action, args)
         if action == "patches":
             return self.patches(args)
         if action == "capture":

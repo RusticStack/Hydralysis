@@ -19,6 +19,7 @@ from hydralysis.runtime_actions import ActionsMixin
 from hydralysis.runtime_capture import CaptureMixin
 from hydralysis.runtime_events import EventLog
 from hydralysis.runtime_memory import MemoryMixin
+from hydralysis.runtime_trace import TraceMixin
 from hydralysis.runtime_agents import (  # noqa: F401  (re-exported: tests and callers import them from here)
     CONTEXT_HELPER, CONTROL, MEMORY_HELPER, _expect, _probe_source)
 from hydralysis.runtime_ipc import serve as ipc_serve
@@ -225,7 +226,7 @@ def _inside_function(path: str, rva: int) -> bool:
 
 
 
-class RuntimeAgent(MemoryMixin, CaptureMixin, ActionsMixin):
+class RuntimeAgent(MemoryMixin, CaptureMixin, TraceMixin, ActionsMixin):
     def __init__(self, directory: Path, device):
         self.directory = directory
         self.device = device
@@ -243,6 +244,7 @@ class RuntimeAgent(MemoryMixin, CaptureMixin, ActionsMixin):
         self.pauses = {}
         self.log = EventLog(directory, directory.name)
         self.init_memory()
+        self.init_trace()
         self.open_capture = None
         self._publish_gate = threading.Lock()
         self._published = 0.0
@@ -276,7 +278,8 @@ class RuntimeAgent(MemoryMixin, CaptureMixin, ActionsMixin):
                      "detached": self.detached, "scripts": list(self.scripts), "paused_hooks": list(self.pauses),
                      "last_sequence": self.sequence, "dropped_events": self.dropped,
                      "log": self.log.head_info(), "messages_seen": self.log.counters["messages"],
-                     **self.memory_state(), **({"ended": self.ended} if self.ended else {})}
+                     **self.memory_state(), **({"trace": self.trace_snapshot()} if self.trace_snapshot() else {}),
+                     **({"ended": self.ended} if self.ended else {})}
 
     def publish(self):
         state = self.snapshot()
@@ -312,6 +315,11 @@ class RuntimeAgent(MemoryMixin, CaptureMixin, ActionsMixin):
 
     def message(self, script_id: str, message: dict, data=None):
         original = message
+        if self.trace_route(script_id, message, data):
+            # The recorder's batches and counters are written to the trace segment, not per event to this log; they are counted.
+            with self.lock:
+                self.log.count_message(script_id, original, False)
+            return
         encoded = json.dumps(message, ensure_ascii=False, default=str).encode("utf-8")
         clipped = False
         if len(encoded) > 8192:
@@ -404,6 +412,12 @@ class RuntimeAgent(MemoryMixin, CaptureMixin, ActionsMixin):
     def cleanup(self) -> dict:
         self.memory_before_cleanup()  # raises while a watch is not verified clear: the target keeps its handler
         errors = []
+        trace_problems = self.trace_cleanup()
+        if trace_problems:
+            # A recorder that cannot prove its callbacks quiescent must not be freed: no unload, no detach (either would free it).
+            self.state = "cleanup_failed"
+            self.publish()
+            raise RuntimeError("runtime cleanup incomplete: " + "; ".join(trace_problems))
         for script_id in list(self.scripts):
             try:
                 self._unload(script_id)

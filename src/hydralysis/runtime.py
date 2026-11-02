@@ -28,11 +28,11 @@ from hydralysis.runtime_ipc import request as ipc_request
 FRIDA_VERSION = "17.24.3"
 ACTION_NAMES = ("setup", "processes", "spawn", "attach", "status", "modules", "threads", "read", "patches",
                 "observe", "break", "continue", "unload", "resume", "detach", "writers", "capture", "snapshot", "compare",
-                "write", "watch")
+                "write", "watch", "trace_start", "trace_stop", "trace_status")
 # Only the session's owner drives the target; any client may look.
 # Actions that need no session request lock (they read the worker's in-memory state under its own lock).
 LOCK_FREE = frozenset({"status"})
-MUTATING = ("observe", "break", "continue", "unload", "resume", "detach", "writers", "write", "watch")
+MUTATING = ("observe", "break", "continue", "unload", "resume", "detach", "writers", "write", "watch", "trace_start", "trace_stop")
 # capture start/stop write the session's event log: the owner's. read, verify, list, counters and snapshot only look.
 CAPTURE_OWNER_OPS = ("start", "stop")
 # A store site's memory operand, as the analysis prints it: [BASE + 0xOFF].
