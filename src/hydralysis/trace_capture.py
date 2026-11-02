@@ -81,6 +81,9 @@ class TraceSource:
         self.encoder = make(self.segment_id, source_id, producer_gen, process_id, sites, self.key, qpc_freq,
                             payload_authorized=payload_authorized, max_payload=max_payload)
         self.lock = threading.Lock()
+        self.sites = sites
+        self.lifetimes_done = False
+        self.modules_seen: set = set()
         self.notify = notify
         self._fd: int | None = None
         self._pending = bytearray()
@@ -198,16 +201,41 @@ class TraceSource:
     def on_ready(self, message: dict, qpc_ns: int | None = None) -> None:
         """The agent attached: record the host's fault context and the installed probes as a `core.capture.source`."""
         with self.lock:
-            self.context = {k: message.get(k) for k in ("context", "installed", "rings", "ring_bytes", "batch_ms", "arch")}
+            self.context = {k: message.get(k) for k in ("context", "installed", "rings", "ring_bytes", "batch_ms", "arch", "bp_us", "window")}
             self.opened_ns = self._now_ns()
             payload = {"source_type": "inprocess-frida", "state": "activated", "producer_gen": self.producer_gen,
                        "fault_policy": self.fault_policy, "fault_context": message.get("context"),
                        "probes": message.get("installed"), "rings": message.get("rings"), "ring_bytes": message.get("ring_bytes"),
-                       "batch_ms": message.get("batch_ms"), "clock": {"domain": "qpc-10mhz", "unit": "qpc-tick",
+                       "batch_ms": message.get("batch_ms"), "backpressure_us": message.get("bp_us"),
+                       "ack_window": message.get("window"), "clock": {"domain": "qpc-10mhz", "unit": "qpc-tick",
                                                                        "frequency_hz": int(message.get("qpc_freq", 0) or 0)},
                        "scope": {"name": self.scope, "key_id": self.key_id}, "payload_mode": self.payload_authorized,
                        "capabilities_refused": []}
             self._append(self.encoder.encode_event("core.capture.source", self.opened_ns, payload))
+
+    def record_lifetimes(self, process: dict, modules: list[dict], *, late: bool = False) -> int:
+        """The process and its mapped modules as `core.process.start` / `core.module.load`, the lifetime facts an ingester needs to
+        turn an address into (module, rva). Only modules not already recorded are written; LATE marks modules seen after the start."""
+        written = 0
+        with self.lock:
+            if self.finalized:
+                return 0
+            now = self._now_ns()
+            if not late and not self.lifetimes_done:
+                self._append(self.encoder.encode_event("core.process.start", now, {
+                    "pid": self.process_id, "image": process.get("image"), "image_sha256": process.get("image_sha256"),
+                    "observed": "attach"}))
+                self.lifetimes_done = True
+            for item in modules:
+                key = (item.get("name"), item.get("base"))
+                if key in self.modules_seen:
+                    continue
+                self.modules_seen.add(key)
+                payload = {"name": item.get("name"), "path": item.get("path"), "base": int(str(item["base"]), 0),
+                           "size": int(item["size"]), "build": item.get("file_sha256"), "observed": "late" if late else "attach"}
+                self._append(self.encoder.encode_event("core.module.load", now, payload))
+                written += 1
+        return written
 
     def refuse(self, what: str, reason: str, limitation: str | None = None) -> None:
         """A capability that was asked for and not given (an optional hook, ETW without elevation): recorded as a source event."""
@@ -263,7 +291,12 @@ class TraceSource:
             self.producer = {"attempted": message.get("attempted", 0), "dropped": message.get("dropped", 0),
                              "read_failed": message.get("read_failed", 0), "no_ring": message.get("no_ring", 0),
                              "rings": message.get("rings", []), "entered": message.get("entered"), "left": message.get("left"),
-                             "busy": message.get("busy"), "final": bool(message.get("final"))}
+                             "busy": message.get("busy"), "final": bool(message.get("final")),
+                             # backpressure, out of band: how often and how long a hook waited for the drain, how often the
+                             # agent held back for an unacknowledged window, and how many rings a later thread reused
+                             "stalls": message.get("stalls", 0), "stall_ticks": message.get("stall_ticks", 0),
+                             "window_waits": message.get("window_waits", 0), "ring_reuses": message.get("ring_reuses", 0),
+                             "bp_us": message.get("bp_us"), "qpc_freq": message.get("qpc_freq")}
 
     # ---- the end -----------------------------------------------------------------------------------------------------------
     def finalize(self, *, detach: dict | None = None, reason: str = "stopped") -> dict:
@@ -296,6 +329,12 @@ class TraceSource:
     def verify(self) -> dict:
         return verify_segment(self.path, self.segment_id)
 
+    def hits(self, name: str) -> int:
+        """Records seen so far at the probe called NAME (the progress counter of a frame-stall watchdog)."""
+        with self.lock:
+            counts = dict(self.encoder.site_hits())
+            return sum(counts.get(site, 0) for site, row in self.sites.items() if row.get("name") == name)
+
     def health(self, locked: bool = False) -> dict:
         def build():
             producer = self.producer
@@ -305,10 +344,14 @@ class TraceSource:
                 "attached": bool(self.context),
                 "observing": self.transport["batches"] > 0 or self.encoder.stats.get("events", 0) > 1,
                 "finalized": self.finalized,
-                "fault_free": producer.get("read_failed", 0) == 0 and not self.errors and self.encoder.stats.get("read_failures", 0) == 0,
+                # A read of unreadable memory is done with a non-faulting copy and counted (`reads_refused`); no exception is taken,
+                # so it is not a fault. A fault is a writer error here or a handler run reported by the producer.
+                "fault_free": not self.errors and not producer.get("faults", 0),
             }
+            state = "final" if producer.get("final") else ("ended-without-final-counters" if self.finalized else "running")
             return {"segment": SEGMENT, "records": self.encoder.count, "head": self.encoder.head, "full": self.full,
-                    "producer": producer,
+                    "producer": producer, "producer_state": state,
+                    "reads_refused": producer.get("read_failed", 0) + self.encoder.stats.get("read_failures", 0),
                     "transport": {**self.transport, "batches_missing": lost_batches, "gaps_reported": self.encoder.stats.get("transport_gaps", 0)},
                     "writer": dict(self.writer, pending_bytes=len(self._pending)),
                     "encoder": dict(self.encoder.stats), "errors": list(self.errors), "claims": claims,
@@ -361,8 +404,8 @@ def read_events(path: Path, segment_id: str, limit: int | None = None) -> list:
     return out
 
 
-def export_jsonl(path: Path, segment_id: str, *, include_payload_refs: bool = False) -> tuple:
-    """(lines, omitted): the segment's events as JSON lines. Payload artifacts are omitted unless separately authorized:
+def export_jsonl(path: Path, segment_id: str, *, include_payload_refs: bool = False, for_import: bool = False) -> tuple:
+    """(lines, omitted): the segment's events as JSON lines (FOR_IMPORT drops the producer chain hash, which the ingester recomputes). Payload artifacts are omitted unless separately authorized:
     a reference to an artifact loses its digest and path and says `omitted` (the exact range stays in the store)."""
     omitted = 0
     out = []
@@ -379,5 +422,7 @@ def export_jsonl(path: Path, segment_id: str, *, include_payload_refs: bool = Fa
                     return {k: scrub(v) for k, v in value.items()}
                 return value
             event = {**event, "payload": scrub(payload)}
+        if for_import:
+            event = {k: v for k, v in event.items() if k != "hash"}
         out.append(json.dumps(event, sort_keys=True, separators=(",", ":")))
     return out, omitted

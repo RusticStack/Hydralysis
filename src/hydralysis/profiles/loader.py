@@ -235,7 +235,7 @@ def _validate(data: dict, directory: Path | None, files: dict[str, str], errors:
     for index, row in enumerate(_rows(data, "hooks", errors, MAX_HOOKS)):
         where = "hooks[%d]" % index
         row = _table(row, where, errors, {"id", "event", "module", "required", "symbol", "rva", "signature", "prologue",
-                                          "prologue_offset", "fault", "capture", "note"}, {"id", "event", "prologue"})
+                                          "prologue_offset", "fault", "capture", "note", "nargs", "with_leave", "buf", "stack"}, {"id", "event", "prologue"})
         hook_id = _ident(row.get("id"), where + ".id", errors)
         if hook_id in hook_ids:
             errors.add(where + ".id", "%s is declared twice" % hook_id)
@@ -250,7 +250,8 @@ def _validate(data: dict, directory: Path | None, files: dict[str, str], errors:
             errors.add(where, "give exactly one of symbol, rva or signature (found %s)" % (", ".join(locators) or "none"))
         entry = {"id": hook_id, "event": row.get("event"), "module": module, "required": True,
                  "prologue": _prologues(row.get("prologue"), where + ".prologue", errors),
-                 "prologue_offset": 0, "fault": row.get("fault", default_fault), "capture": [], "note": str(row.get("note", ""))[:500]}
+                 "prologue_offset": 0, "fault": row.get("fault", default_fault), "capture": [], "note": str(row.get("note", ""))[:500],
+                 "nargs": 0, "with_leave": False, "buf": None, "stack": 1, "fields": []}
         if not isinstance(row.get("required", True), bool):
             errors.add(where + ".required", "must be true or false")
         else:
@@ -278,12 +279,44 @@ def _validate(data: dict, directory: Path | None, files: dict[str, str], errors:
                 errors.add(where + ".prologue_offset", "must be 0..4096")
             else:
                 entry["prologue_offset"] = offset
+        if "nargs" in row:
+            if isinstance(row["nargs"], bool) or not isinstance(row["nargs"], int) or not 0 <= row["nargs"] <= 8:
+                errors.add(where + ".nargs", "must be 0..8")
+            else:
+                entry["nargs"] = row["nargs"]
+        if "with_leave" in row:
+            if not isinstance(row["with_leave"], bool):
+                errors.add(where + ".with_leave", "must be true or false (true also records the return value and the time spent)")
+            else:
+                entry["with_leave"] = row["with_leave"]
+        if "stack" in row:
+            if isinstance(row["stack"], bool) or not isinstance(row["stack"], int) or not 1 <= row["stack"] <= 16:
+                errors.add(where + ".stack", "call-stack depth is 1..16 (1: the return address only)")
+            else:
+                entry["stack"] = row["stack"]
+        if "buf" in row:
+            buf = _table(row["buf"], where + ".buf", errors, {"arg", "len_arg", "wide", "fixed", "max"}, {"arg"})
+            bad = [k for k in ("arg", "len_arg", "fixed", "max") if k in buf and (isinstance(buf[k], bool) or not isinstance(buf[k], int))]
+            if bad or not 0 <= buf.get("arg", -1) < 8 or not 0 <= buf.get("len_arg", 0) < 8 or not 0 <= buf.get("max", 64) <= 256                     or not 0 <= buf.get("fixed", 0) <= 256 or not isinstance(buf.get("wide", False), bool):
+                errors.add(where + ".buf", "arg and len_arg are argument indexes 0..7, max and fixed are at most 256, wide is true or false")
+            else:
+                entry["buf"] = {"arg": buf["arg"], "len_arg": buf.get("len_arg"), "wide": bool(buf.get("wide", False)),
+                                "fixed": buf.get("fixed", 0), "max": buf.get("max", 64)}
         for item in row.get("capture", []) if isinstance(row.get("capture", []), list) else [None]:
             name, _, kind = str(item).partition(":")
-            if not _FIELD.match(name) or kind.rstrip("?") not in VALUE_TYPES:
-                errors.add(where + ".capture", "entries look like arg0:u64 (types: %s)" % ", ".join(VALUE_TYPES))
+            kind, _, source = kind.partition("@")
+            if not _FIELD.match(name) or kind.rstrip("?") not in VALUE_TYPES or source not in ("", "ret", *map(str, range(8))):
+                errors.add(where + ".capture", "entries look like name:u64 or name:u64@2 (argument 2) or name:u32@ret (types: %s)"
+                           % ", ".join(VALUE_TYPES))
             else:
+                position = len(entry["capture"])
                 entry["capture"].append(str(item))
+                entry["fields"].append({"name": name, "type": kind.rstrip("?"), "source": source or str(position)})
+        if "nargs" not in row:
+            entry["nargs"] = max([int(f["source"]) + 1 for f in entry["fields"] if f["source"] != "ret"]
+                                 + ([entry["buf"]["arg"] + 1] if entry["buf"] else []) + [0])
+        if any(f["source"] == "ret" for f in entry["fields"]):
+            entry["with_leave"] = True      # the return value only exists once the call is done
         if modules and isinstance(module, str) and module not in modules and module != "*":
             errors.add(where + ".module", "%r is not in target.modules" % module)
         hooks.append(entry)

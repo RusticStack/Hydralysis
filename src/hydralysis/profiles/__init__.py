@@ -7,8 +7,9 @@ test fixtures only.
 
 from hydralysis.profiles.loader import (BASELINE, CORE_KINDS, Profile, ProfileError, load_file, load_text,
                                         load_baseline)
+from hydralysis.profiles.probes import host_fault_policy, probe_specs
 from hydralysis.profiles.verify import HookRefused, require, verify_profile
 from hydralysis.profiles.queries import QueryModuleError, compile_query, run_module
 
 __all__ = ["BASELINE", "CORE_KINDS", "HookRefused", "Profile", "ProfileError", "QueryModuleError", "compile_query",
-           "load_baseline", "load_file", "load_text", "require", "run_module", "verify_profile"]
+           "load_baseline", "load_file", "load_text", "probe_specs", "host_fault_policy", "require", "run_module", "verify_profile"]

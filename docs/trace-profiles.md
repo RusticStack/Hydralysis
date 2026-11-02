@@ -118,6 +118,31 @@ A hook that fails is **disabled and reported with its reason; it never guesses**
 | `required = true` | `HookRefused` (`required_hook_refused`): the session or capability that depends on it is refused before anything opens |
 | `required = false` | recorded as a coverage limitation with code `optional-hook-refused` (stored in evidence as `optional_hook_refused`); the session runs, and what it did not capture is stated |
 
+### Probe parameters of a hook
+
+A verified hook becomes a probe in the recorder (spec 5.1, WS-E). Besides the locator and the prologue a hook may say what to
+record. All of it is bounded:
+
+```toml
+nargs = 3                       # 0..8 integer arguments recorded (default: as many as `capture` needs)
+with_leave = true               # also record the return value, GetLastError and the time spent (implied by @ret)
+buf = { arg = 0, max = 128 }    # a buffer argument: arg (pointer index), len_arg or fixed (length), wide (UTF-16), max <= 256
+stack = 4                       # call-stack depth, 1..16 (1: the return address only); unwound from the .pdata, non-faulting
+capture = ["path:string@0", "size:u32@2", "got:u32@ret"]   # name:type[@argN|@ret]; the position is the argument by default
+```
+
+A buffer is never stored as text: the event carries a keyed id and a length. A bounded, redacted preview (at most 256 bytes)
+exists only for a probe named in the capture request's `authorize_preview`, and payload bytes only for one named in
+`authorize_payload`.
+
+### Fixtures-only profiles
+
+The fixtures are built without a PDB and export none of the functions the baseline hooks. A profile with
+`fixtures_only = true` therefore resolves a `symbol` that is not an export through the linker map the fixture build writes
+beside the image (`frameloop.map` for `frameloop.exe`). Such a profile is the union of one section per fixture program: a run
+supplies the images it uses, and the hooks of the other programs are `not-applicable`. A profile that is not `fixtures_only`
+never reads a map and refuses a module it was not given as `module-unknown`.
+
 `trace start` passes `options.profile` (a path, or `baseline`) and `options.images` (`{module: path}`). A build-bound profile
 cannot be started without its images.
 

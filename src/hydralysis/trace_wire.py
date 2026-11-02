@@ -13,10 +13,12 @@ Agent batch (little endian), sent by the in-process agent as `send(message, data
         32 u64 attempted (cumulative)      40 u64 dropped (cumulative, ring full)
         48 u64 read_failed (cumulative)    56 u64 no_ring (cumulative, threads past the ring budget)
     records, back to back, each 8-byte aligned
-        0 u16 size   2 u8 kind (1 call)   3 u8 flags   4 u16 site   6 u16 ring
+        0 u16 size   2 u8 kind (low nibble 1 = call; high nibble = extra call-stack addresses, 0..15)   3 u8 flags
+        4 u16 site   6 u16 ring
         8 u64 qpc    16 u32 thread id     20 u32 ring_seq (every attempted record takes one, dropped or not)
         24 u64 return address   32 u64 qpc at return   40 u64 return value   48 u32 last error
-        52 u16 argument count   54 u16 buffer length   56 u64 buffer address   64 u64 args[count]   then buffer bytes
+        52 u16 argument count   54 u16 buffer length   56 u64 buffer address   64 u64 args[count]
+        then u64 stack[kind >> 4] (the caller chain, the return address first)   then the buffer bytes
 
     flags: 1 has return, 2 buffer read failed, 4 buffer truncated, 8 buffer is a wide string, 16 buffer present
 
@@ -173,6 +175,89 @@ def is_device_path(units: bytes) -> bool:
     return not (len(rest) >= 2 and rest[1:2] == b":" and rest[:1].isalpha())
 
 
+# ---- redacted previews (spec 14.12; at most 256 bytes; only for a probe the capture request authorizes) -----------------
+PREVIEW_MAX = 256
+SECRET_WORDS = ("password", "passwd", "pwd", "secret", "token", "apikey", "api_key", "api-key", "authorization", "credential",
+                "private_key", "private-key", "cookie", "session", "signature", "auth", "bearer", "basic")
+_TOKEN_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/_.-")
+_DELIMITERS = frozenset(" &;,\"'	")
+
+
+def _printable(raw: bytes, wide: bool) -> str:
+    """ASCII text for a preview: printable ASCII stays, everything else becomes '.', up to the first NUL."""
+    out = []
+    if wide:
+        for index in range(0, len(raw) - 1, 2):
+            unit = raw[index] | (raw[index + 1] << 8)
+            if unit == 0:
+                break
+            out.append(chr(unit) if 0x20 <= unit < 0x7F else ".")
+    else:
+        for byte in raw:
+            if byte == 0:
+                break
+            out.append(chr(byte) if 0x20 <= byte < 0x7F else ".")
+    return "".join(out)
+
+
+def redact_preview(raw: bytes, wide: bool = False, limit: int = PREVIEW_MAX) -> tuple:
+    """(preview text, masked span count). Secret-like text never survives:
+
+    1. a secret word (password, token, api key, authorization, bearer, ...), optionally continued by the rest of its name,
+       followed by `:` or `=` (quotes and spaces allowed between), or by a space for `bearer`/`basic`, masks the value up to the next delimiter;
+    2. any run of 20 or more token characters (letters, digits, + / _ . -) that holds a letter and a digit is masked
+       (hex and base64 keys, JWTs, access keys);
+    3. spans merge into one `***`, and the text is cut at `limit` bytes (never more than 256).
+    The scanner is hand-written (no regex) so that the Rust twin gives the same bytes."""
+    text = _printable(raw, wide)
+    lower = text.lower()
+    masked = [False] * len(text)
+    for word in SECRET_WORDS:
+        start = lower.find(word)
+        while start >= 0:
+            i = start + len(word)
+            while i < len(text) and (text[i].isalnum() or text[i] in "_-"):      # the rest of the name: sessionid, token_value
+                i += 1
+            while i < len(text) and text[i] in "\"' ":
+                i += 1
+            if i < len(text) and (text[i] in ":=" or (word in ("bearer", "basic") and start + len(word) < len(text)
+                                                       and text[start + len(word)] == " ")):
+                if text[i] in ":=":
+                    i += 1
+                while i < len(text) and text[i] in "\"' ":
+                    i += 1
+                end = i
+                while end < len(text) and text[end] not in _DELIMITERS:
+                    end += 1
+                for k in range(i, end):
+                    masked[k] = True
+            start = lower.find(word, start + 1)
+    i = 0
+    while i < len(text):
+        if text[i] in _TOKEN_CHARS:
+            j = i
+            while j < len(text) and text[j] in _TOKEN_CHARS:
+                j += 1
+            run = text[i:j]
+            if j - i >= 20 and any(c.isdigit() for c in run) and any(c.isalpha() for c in run):
+                for k in range(i, j):
+                    masked[k] = True
+            i = j
+        else:
+            i += 1
+    out, spans, k = [], 0, 0
+    while k < len(text):
+        if masked[k]:
+            while k < len(text) and masked[k]:
+                k += 1
+            out.append("***")
+            spans += 1
+        else:
+            out.append(text[k])
+            k += 1
+    return "".join(out)[:min(limit, PREVIEW_MAX)], spans
+
+
 # ---- the raw segment -----------------------------------------------------------------------------------------------
 class Chain:
     """Chain records into one segment: sets `n`, `prev` and `hash`, returns the framed line."""
@@ -199,12 +284,15 @@ def build_batch(producer_gen: int, batch_seq: int, qpc: int, counters: tuple, re
     for r in records:
         args = list(r.get("args", ()))
         buf = bytes(r.get("buf", b""))
-        size = RECORD_BYTES + 8 * len(args) + (len(buf) + 7) // 8 * 8
+        stack = list(r.get("stack", ()))[:15]
+        size = RECORD_BYTES + 8 * len(args) + 8 * len(stack) + (len(buf) + 7) // 8 * 8
         flags = r.get("flags", 0) | (F_BUF if (buf or r.get("flags", 0) & F_READ_FAILED) else 0)
-        body += RECORD.pack(size, 1, flags, r["site"], r["ring"], r["qpc"], r["tid"], r["ring_seq"], r.get("ret_addr", 0),
+        body += RECORD.pack(size, 1 | (len(stack) << 4), flags, r["site"], r["ring"], r["qpc"], r["tid"], r["ring_seq"], r.get("ret_addr", 0),
                             r.get("qpc_end", 0), r.get("retval", 0), r.get("last_error", 0), len(args), len(buf),
                             r.get("buf_addr", 0))
         for a in args:
+            body += struct.pack("<Q", a)
+        for a in stack:
             body += struct.pack("<Q", a)
         body += buf + b"\0" * ((-len(buf)) % 8)
     attempted, dropped, read_failed, no_ring = counters
@@ -229,11 +317,13 @@ def decode_batch(data: bytes) -> tuple:
             raise WireError("record runs past the batch")
         (size, kind, flags, site, ring, rqpc, tid, rseq, ret_addr, qpc_end, retval, last_error, nargs, buflen,
          buf_addr) = RECORD.unpack_from(data, cursor)
-        if size != RECORD_BYTES + 8 * nargs + (buflen + 7) // 8 * 8 or cursor + size > len(data):
+        depth = kind >> 4
+        if kind & 15 != 1 or size != RECORD_BYTES + 8 * nargs + 8 * depth + (buflen + 7) // 8 * 8 or cursor + size > len(data):
             raise WireError("record size is inconsistent")
         args = list(struct.unpack_from("<%dQ" % nargs, data, cursor + RECORD_BYTES)) if nargs else []
-        start = cursor + RECORD_BYTES + 8 * nargs
-        records.append({"kind": kind, "flags": flags, "site": site, "ring": ring, "qpc": rqpc, "tid": tid, "ring_seq": rseq,
+        stack = list(struct.unpack_from("<%dQ" % depth, data, cursor + RECORD_BYTES + 8 * nargs)) if depth else []
+        start = cursor + RECORD_BYTES + 8 * nargs + 8 * depth
+        records.append({"kind": kind & 15, "stack": stack, "flags": flags, "site": site, "ring": ring, "qpc": rqpc, "tid": tid, "ring_seq": rseq,
                         "ret_addr": ret_addr, "qpc_end": qpc_end, "retval": retval, "last_error": last_error,
                         "args": args, "buf": bytes(data[start:start + buflen]), "buf_addr": buf_addr})
         cursor += size
@@ -250,7 +340,9 @@ def _tick_ns(ticks: int, freq: int) -> int:
 class SegmentEncoder:
     """Turns agent batches into chained TRACE-1 events. The Python twin of `hydralysis_native.SegmentEncoder`.
 
-    `sites` maps a site id to {name, kind ("call" | "open" | "ioctl" | "devquery"), module, va, buf: "id" | "payload" | None}.
+    `sites` maps a site id to {name, kind ("call" | "open" | "ioctl" | "devquery" | "close" | "event"), module, va,
+    buf: "id" | "payload" | None, preview: bytes of redacted preview (0: none), wide: the buffer is UTF-16, buf_arg: the
+    argument holding the buffer pointer, event: the event kind a profile hook produces, fields: [{name, type, source}]}.
     Outputs are lines to append to the segment; `artifacts` (payload mode only) must be durable before the lines are.
     """
 
@@ -269,13 +361,18 @@ class SegmentEncoder:
         self.dropped_seen = 0
         self.dropped_attributed = 0
         self.handles: dict = {}
+        self.hits: dict = {}
         self.stats = {"batches": 0, "records": 0, "events": 0, "gaps": 0, "ring_gaps": 0, "transport_gaps": 0,
-                      "dropped_in_band": 0, "read_failures": 0, "payload_refused": 0, "last_attempted": 0, "last_dropped": 0,
+                      "dropped_in_band": 0, "read_failures": 0, "payload_refused": 0, "previews": 0, "redactions": 0, "close_unknown": 0, "last_attempted": 0, "last_dropped": 0,
                       "last_read_failed": 0, "last_no_ring": 0, "bad_batches": 0}
 
     @property
     def head(self) -> str:
         return self.chain.head
+
+    def site_hits(self) -> dict:
+        """Records seen per site id (a frame counter for the stall watchdog needs only this)."""
+        return dict(self.hits)
 
     @property
     def count(self) -> int:
@@ -401,6 +498,11 @@ class SegmentEncoder:
                     raw = raw[:index]
                     break
         entry.update(id=keyed_id(self.key, raw), len=len(raw), truncated=bool(r["flags"] & F_TRUNCATED))
+        if site.get("preview"):
+            text, spans = redact_preview(raw, bool(r["flags"] & F_WIDE), int(site["preview"]))
+            entry.update(preview=text, redacted=spans)
+            self.stats["previews"] += 1
+            self.stats["redactions"] += spans
         if site.get("buf") == "payload":
             if self.payload_ok:
                 digest = hashlib.sha256(raw[:self.max_payload]).hexdigest()
@@ -411,14 +513,50 @@ class SegmentEncoder:
                 entry["payload"] = "payload-not-authorized"
         return entry
 
+    def _field(self, field: dict, r: dict, site: dict, buf):
+        """One declared field of a profile event, from an argument or the return value. A buffer is never stored as
+        text: it is a keyed id and a length (and a redacted preview only when the capture authorized one)."""
+        source = field["source"]
+        if source == "ret":
+            if not r["flags"] & F_RET:
+                return None
+            value = r["retval"]
+        else:
+            index = int(source)
+            if index >= len(r["args"]):
+                return None
+            value = r["args"][index]
+        kind = field["type"]
+        is_buf = source != "ret" and site.get("buf_arg") == int(source)
+        if kind in ("string", "bytes"):
+            return buf if is_buf and buf is not None else None
+        if kind == "key":
+            if is_buf and buf is not None:
+                return buf.get("id")                # None when the read failed: an id of nothing would link unrelated reads
+            return keyed_id(self.key, struct.pack("<Q", value))
+        if kind == "bool":
+            return (value & 0xFFFFFFFF) != 0
+        if kind in ("u8", "u16", "u32"):
+            return value & ((1 << {"u8": 8, "u16": 16, "u32": 32}[kind]) - 1)
+        if kind == "i32":
+            value &= 0xFFFFFFFF
+            return value - (1 << 32) if value >> 31 else value
+        if kind == "i64":
+            return value - (1 << 64) if value >> 63 else value
+        if kind == "hex":
+            return "0x%x" % value
+        return value
+
     def _call(self, r: dict, artifacts: dict) -> bytes:
         site = self.sites.get(r["site"])
         t0 = _tick_ns(r["qpc"], self.freq)
         if site is None:
             return self._event("core.error", t0, r["tid"], {"error": "unknown-site", "site": r["site"]})
         name, kind = site["name"], site["kind"]
+        self.hits[r["site"]] = self.hits.get(r["site"], 0) + 1
         call = "%d:%d" % (r["ring"], r["ring_seq"])
-        va, module, stack = site.get("va"), site.get("module"), [r["ret_addr"]] if r["ret_addr"] else []
+        va, module = site.get("va"), site.get("module")
+        stack = list(r.get("stack") or ([r["ret_addr"]] if r["ret_addr"] else []))
         args, has_ret = r["args"], bool(r["flags"] & F_RET)
         buf = self._buffer(site, r, artifacts)
         out = bytearray()
@@ -445,6 +583,8 @@ class SegmentEncoder:
                        "disposition": args[4] & 0xFFFFFFFF if len(args) > 4 else None,
                        "handle": handle if has_ret else None, "ok": bool(ok), "last_error": r["last_error"],
                        "read_failed": bool(r["flags"] & F_READ_FAILED), "buf_addr": r["buf_addr"]}
+            if buf is not None and "preview" in buf:
+                payload["preview"], payload["redacted"] = buf["preview"], buf["redacted"]
             if ok:
                 self.handles[handle] = (rid, device)
             out += emit("core.resource.open", _tick_ns(r["qpc_end"] or r["qpc"], self.freq), payload)
@@ -468,6 +608,24 @@ class SegmentEncoder:
             if buf is not None:
                 ioctl["in_buffer"] = buf
             out += emit("driver.ioctl", t0, ioctl)
+        elif kind == "close":
+            handle = args[0] if args else 0
+            known = self.handles.pop(handle, None)
+            if known is None:
+                self.stats["close_unknown"] += 1        # a handle this capture never saw opened: not an event of ours
+            else:
+                ok = has_ret and (r["retval"] & 0xFFFFFFFF) != 0
+                out += emit("core.resource.close", _tick_ns(r["qpc_end"] or r["qpc"], self.freq),
+                            {"api": name, "handle": handle, "resource_id": known[0], "device": known[1],
+                             "ok": bool(ok) if has_ret else None, "last_error": r["last_error"]})
+        elif kind == "event":
+            payload = {"site": name, "hook": site.get("hook", name)}
+            for field in site.get("fields", ()):
+                payload[field["name"]] = self._field(field, r, site, buf)
+            if has_ret:
+                payload["end_ns"] = _tick_ns(r["qpc_end"] or r["qpc"], self.freq)
+                payload["last_error"] = r["last_error"]
+            out += emit(site.get("event") or "core.function.enter", t0, payload)
         elif kind == "devquery":
             family = "driver.cfgmgr" if name.lower().startswith("cm_") else "driver.setupapi"
             payload = {"api": name, "resource_kind": "device-enum", "ret": r["retval"] if has_ret else None,

@@ -234,6 +234,25 @@ sys.stdin.readline()
 buf = ctypes.create_string_buffer(8)
 if mode == "blocked":
     k.Sleep(60000)
+if mode == "secret":
+    for i in range(n):
+        k.CreateFileW("C:\\Users\\x\\password=hunter2secret\\missing%d.cfg" % i, 0x80000000, 3, None, 3, 0, None)
+        k.CreateFileW("C:\\Users\\x\\Authorization: Bearer abc123def456ghi789jkl\\n.cfg", 0x80000000, 3, None, 3, 0, None)
+    print("done", flush=True)
+    sys.stdin.readline()
+    sys.exit(0)
+if mode == "threads":
+    import threading
+    def one():
+        k.CreateFileW("\\\\.\\NUL", 0xC0000000, 3, None, 3, 0, None)
+    for i in range(n):
+        t = threading.Thread(target=one)
+        t.start()
+        t.join()
+        time.sleep(0.05)
+    print("done", flush=True)
+    sys.stdin.readline()
+    sys.exit(0)
 for i in range(n):
     h = k.CreateFileW("\\\\.\\NUL", 0xC0000000, 3, None, 3, 0, None)
     k.DeviceIoControl(h, 0x00220004, b"\x01\x02\x03\x04", 4, buf, 8, None, None)
@@ -340,8 +359,8 @@ class Recorder(unittest.TestCase):
     def test_a_ring_that_fills_counts_and_cites_every_drop(self):
         p = self.target(n=3000)
         agent = self.attach(p)
-        # The smallest ring and a drain far slower than the target: the ring must overflow.
-        agent.handle("trace_start", {"builtin": ["driver-boundary"], "ring_bytes": 1 << 16, "batch_ms": 4000, "counter_ms": 100})
+        # The smallest ring, a drain far slower than the target and almost no patience (bp_ms): the ring must overflow.
+        agent.handle("trace_start", {"builtin": ["driver-boundary"], "ring_bytes": 1 << 16, "batch_ms": 4000, "counter_ms": 100, "bp_ms": 0.2})
         self.run_loop(p)
         stopped = agent.handle("trace_stop", {})
         health = stopped["health"]
@@ -390,6 +409,94 @@ class Recorder(unittest.TestCase):
         lines, omitted = tc.export_jsonl(agent.trace.path, agent.trace.segment_id)
         self.assertEqual(omitted, 5)
         self.assertNotIn(digest, "\n".join(lines))
+        p.stdin.write("x\n")
+
+    def test_close_handle_pairs_with_the_open_by_the_handle_it_closed(self):
+        p = self.target(n=40)
+        agent = self.attach(p)
+        agent.handle("trace_start", {"builtin": ["driver-boundary", "handle-lifetime"]})
+        self.run_loop(p)
+        stopped = agent.handle("trace_stop", {})
+        events = tc.read_events(agent.trace.path, agent.trace.segment_id)
+        opens = {e["payload"]["handle"]: e["payload"]["resource_id"] for e in events if e["kind"] == "core.resource.open"}
+        closes = [e["payload"] for e in events if e["kind"] == "core.resource.close"]
+        self.assertEqual(len(closes), 40)
+        self.assertTrue(all(c["resource_id"] for c in closes))
+        self.assertTrue(all(c["resource_id"] in opens.values() for c in closes))
+        self.assertEqual(stopped["health"]["producer"]["dropped"], 0)
+        # 40 handles of the hosts file were opened and never closed: opens without a close, not an error
+        self.assertEqual(len([e for e in events if e["kind"] == "core.resource.open"]), 80)
+        p.stdin.write("x\n")
+
+    def test_the_call_stack_is_deeper_than_one_and_every_frame_is_inside_a_module(self):
+        p = self.target(n=30)
+        agent = self.attach(p)
+        agent.handle("trace_start", {"probes": [{"name": "CreateFileW", "module": "KernelBase.dll", "export": "CreateFileW", "nargs": 7,
+                                                 "kind": "open", "with_leave": True, "required": True, "stack": 8,
+                                                 "buf": {"ptr_arg": 0, "wide": True, "max": 64}}]})
+        self.run_loop(p)
+        agent.handle("trace_stop", {})
+        events = [e for e in tc.read_events(agent.trace.path, agent.trace.segment_id) if e["kind"] == "core.resource.open"]
+        self.assertEqual(len(events), 60)
+        depth = sorted(len(e["callstack"]) for e in events)
+        self.assertGreaterEqual(depth[len(depth) // 2], 4)              # the median call has a real chain, not one return address
+        self.assertLessEqual(depth[-1], 8)                              # and it is bounded by the declared depth
+        modules = {m["base"]: m for m in agent.control.exports_sync.modules(200)["modules"]} if not agent.detached else {}
+        for event in events[:5]:
+            for address in event["callstack"]:
+                self.assertTrue(any(int(m["base"], 16) <= address < int(m["base"], 16) + m["size"] for m in modules.values()), hex(address))
+        p.stdin.write("x\n")
+
+    def test_a_preview_is_redacted_and_the_secret_is_nowhere_on_disk(self):
+        p = self.target(mode="secret", n=10)
+        agent = self.attach(p)
+        agent.handle("trace_start", {"builtin": ["driver-boundary"], "authorize_preview": {"scope": "fixture", "sites": ["CreateFileW"], "max_bytes": 128}})
+        self.run_loop(p)
+        stopped = agent.handle("trace_stop", {})
+        self.assertEqual(stopped["health"]["producer"]["dropped"], 0)
+        events = [e for e in tc.read_events(agent.trace.path, agent.trace.segment_id) if e["kind"] == "core.resource.open"]
+        previews = [e["payload"]["preview"] for e in events]
+        self.assertEqual(len(previews), 20)
+        self.assertTrue(all(len(x) <= 128 for x in previews))
+        self.assertTrue(any("password=***" in x for x in previews), previews[:3])
+        self.assertTrue(any("***" in x and "Authorization" in x for x in previews), previews[:3])
+        lines, _ = tc.export_jsonl(agent.trace.path, agent.trace.segment_id)
+        secrets = (b"hunter2secret", "hunter2secret".encode("utf-16le"), b"abc123def456ghi789jkl", "abc123def456ghi789jkl".encode("utf-16le"))
+        blobs = [("\n".join(lines)).encode()]
+        for path in Path(agent.directory).rglob("*"):
+            if path.is_file():
+                blobs.append(path.read_bytes())
+        for blob in blobs:
+            for secret in secrets:
+                self.assertNotIn(secret, blob)
+        p.stdin.write("x\n")
+
+    def test_a_preview_without_authorization_records_no_text_and_one_for_a_site_without_a_buffer_is_refused(self):
+        p = self.target(mode="secret", n=3)
+        agent = self.attach(p)
+        started = agent.handle("trace_start", {"builtin": ["driver-boundary"], "authorize_preview": {"scope": "fixture", "sites": ["DeviceIoControl"], "max_bytes": 64}})
+        self.assertIn("preview-not-possible", [r["limitation"] for r in started["refusals"]])
+        self.run_loop(p)
+        agent.handle("trace_stop", {})
+        text = agent.trace.path.read_text()
+        self.assertNotIn('"preview"', text.replace('"preview":null', ""))
+        p.stdin.write("x\n")
+        with self.assertRaises(ValueError):
+            agent2 = self.attach(self.target(mode="secret", n=1))
+            agent2.handle("trace_start", {"builtin": ["driver-boundary"], "authorize_preview": {"scope": "x", "sites": ["CreateFileW"], "max_bytes": 4096}})
+
+    def test_a_ring_is_reused_after_its_thread_exits(self):
+        p = self.target(mode="threads", n=40)
+        agent = self.attach(p)
+        agent.handle("trace_start", {"builtin": ["driver-boundary"], "rings": 3, "batch_ms": 5})
+        self.run_loop(p)
+        time.sleep(0.3)
+        stopped = agent.handle("trace_stop", {})
+        producer = stopped["health"]["producer"]
+        self.assertGreaterEqual(producer["attempted"], 40)                                             # the 40 threads (and the interpreter's own opens)
+        self.assertEqual((producer["dropped"], producer["no_ring"]), (0, 0))                          # 40 threads through 3 rings, none starved
+        self.assertGreater(producer["ring_reuses"], 20)
+        self.assertEqual(stopped["health"]["encoder"]["records"], producer["attempted"])
         p.stdin.write("x\n")
 
     def test_a_recorder_that_cannot_prove_quiescence_stays_in_pass_through_and_says_so(self):

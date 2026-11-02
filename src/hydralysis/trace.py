@@ -441,6 +441,48 @@ def _verify_profile(profile, options: dict) -> dict:
     return result
 
 
+TRACE_CAPTURE_KEYS = ("ring_bytes", "rings", "batch_ms", "batch_bytes", "counter_ms", "bp_ms", "window", "authorize_payload",
+                      "authorize_preview", "builtin", "watchdog", "etw", "fault_policy", "producer_gen")
+
+
+def _trace_option(session: str, profile, verification, capture_options: dict) -> dict:
+    """The `trace` object of `capture start`: which trace session the capture feeds, the owner's lease, the enabled hook ids
+    and, resolved from the verified profile, the probes to arm. Recorder settings the caller gives are passed through."""
+    from hydralysis import profiles
+    unknown = set(capture_options) - set(TRACE_CAPTURE_KEYS)
+    if unknown:
+        raise ValueError("unknown options.capture_options: %s; accepted: %s" % (", ".join(sorted(unknown)), ", ".join(TRACE_CAPTURE_KEYS)))
+    option = {"session": session, "owner": _TOKENS.get(session), "hooks": list((verification or {}).get("enabled", []))}
+    if profile is not None and verification is not None:
+        option["probes"] = profiles.probe_specs(profile, verification)
+        enabled = [h for h in profile.data["hooks"] if h["id"] in option["hooks"]]
+        option["fault_policy"] = profiles.host_fault_policy(profile, enabled)
+        option["profile"] = {"id": profile.id, "sha256": profile.sha256}
+        watch = _watchdog_option(profile, capture_options.get("watchdog"))
+        if watch:
+            option["watchdog"] = watch
+    for key, value in capture_options.items():
+        if key != "watchdog":
+            option[key] = value
+    return option
+
+
+def _watchdog_option(profile, requested) -> dict | None:
+    """The frame-stall watchdog of the declared main loop: the first frame phase of the profile names the hook whose hits are
+    the frames. `requested` is {stall_s, hook?}; absent, no watchdog runs."""
+    if not requested:
+        return None
+    if not isinstance(requested, dict):
+        raise ValueError("options.capture_options.watchdog is {stall_s, hook?, after_s?}")
+    hook = requested.get("hook")
+    if hook is None:
+        frames = [p for p in profile.data["phases"] if p["kind"] == "frame"]
+        hook = frames[0]["open"] if frames else None
+    if hook is None or profile.hook(hook) is None:
+        raise ValueError("the watchdog needs the hook that marks a frame: the profile declares no frame phase (or %r is not a hook)" % hook)
+    return {"hook": hook, "stall_s": float(requested.get("stall_s", 2.0)), "after_s": float(requested.get("after_s", 0.0))}
+
+
 def _start(client: TraceClient, session: str | None, options: dict, settings: dict) -> dict:
     from hydralysis import profiles
     profile = _load_profile(options)
@@ -470,9 +512,9 @@ def _start(client: TraceClient, session: str | None, options: dict, settings: di
         try:
             started = runner.call(action, {key: value for key, value in launch.items() if key != "action"})
             runtime_session = str(started.get("session") or "")
-            capture = runner.call("capture", {"op": "start", "session": runtime_session, "trace": {
-                "session": name, "owner": _TOKENS.get(name), "hooks": (verification or {}).get("enabled", [])},
-                **_object(options.get("capture_options"), "options.capture_options")})
+            capture = runner.call("capture", {"op": "start", "session": runtime_session,
+                                              "trace": _trace_option(name, profile, verification,
+                                                                     _object(options.get("capture_options"), "options.capture_options"))})
         except Exception as exc:  # noqa: BLE001 - the session was opened; close it so no orphan keeps a writer lease
             try:
                 client.close(name, reason="launch failed: %s" % exc, owner=_TOKENS.pop(name, None))

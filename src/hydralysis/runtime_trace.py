@@ -25,6 +25,12 @@ from hydralysis.runtime_agents import trace_agent_source
 from hydralysis.trace_capture import FAULT_POLICIES, TraceRefused, TraceSource, check_probe_policy
 
 RING_BYTES = (1 << 16, 1 << 24)
+# The defaults a capture runs with (no flag changes them for a normal run; a request may override them for a test).
+DEFAULT_RING_BYTES = 1 << 20
+DEFAULT_RINGS = 32
+BATCH_MS = 10
+BACKPRESSURE_MS = 20.0
+ACK_WINDOW = 16
 MAX_PROBES = 48
 SITE_ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:<>~$@?-]{0,95}$")
 
@@ -42,6 +48,16 @@ DRIVER_BOUNDARY = [
     {"name": "CM_Get_Device_IDW", "module": "cfgmgr32.dll", "export": "CM_Get_Device_IDW", "kind": "devquery", "nargs": 4,
      "with_leave": True, "buf": None},
 ]
+
+
+HANDLE_LIFETIME = [
+    {"name": "CreateFileW", "module": "KernelBase.dll", "export": "CreateFileW", "kind": "open", "nargs": 7, "with_leave": True,
+     "buf": {"ptr_arg": 0, "wide": True, "max": 256}, "required": True},
+    {"name": "CloseHandle", "module": "KernelBase.dll", "export": "CloseHandle", "kind": "close", "nargs": 1, "with_leave": True,
+     "buf": None, "required": True},
+]
+BUILTIN_SETS = {"driver-boundary": DRIVER_BOUNDARY, "handle-lifetime": HANDLE_LIFETIME}
+MAX_STACK = 15
 
 
 def qpc_frequency() -> int:
@@ -67,7 +83,12 @@ class TraceMixin:
         payload = message.get("payload") if message.get("type") == "send" else None
         event = payload.get("event") if isinstance(payload, dict) else None
         if event == "trace_batch" and data is not None:
-            trace.on_batch(data)
+            try:
+                trace.on_batch(data)
+            finally:
+                # Acknowledge in every case (a batch that did not decode too): the agent holds at most `window` batches
+                # in flight, and a missing acknowledgement would stall it, not the writer.
+                self._trace_ack(script_id, payload.get("batch_seq"))
             return True
         if event == "trace_counters":
             trace.on_counters(payload)
@@ -78,6 +99,15 @@ class TraceMixin:
             self._trace_ready.set()
             return False        # the ready message is also kept in the session's event log
         return False
+
+    def _trace_ack(self, script_id: str, seq) -> None:
+        entry = self.scripts.get(script_id)
+        if entry is None or not isinstance(seq, int):
+            return
+        try:
+            entry["handle"].post({"type": "ack", "seq": seq})
+        except Exception:        # the script is going away; the agent no longer needs the acknowledgement
+            pass
 
     # ---- building the probe plan ----------------------------------------------------------------------------------------------
     def _trace_probe(self, spec: dict, policy: str, site_id: int) -> dict:
@@ -118,10 +148,19 @@ class TraceMixin:
         nargs = int(spec.get("nargs", 0))
         if not 0 <= nargs <= 8:
             raise TraceRefused("%s: nargs must be 0..8" % name)
-        return {"id": site_id, "name": name, "kind": str(spec.get("kind") or "call"), "module": module["path"],
+        stack = int(spec.get("stack", 1))
+        if not 1 <= stack <= MAX_STACK:
+            raise TraceRefused("%s: stack depth is 1..%d" % (name, MAX_STACK))
+        fields = [{"name": str(f["name"]), "type": str(f["type"]), "source": str(f["source"])} for f in spec.get("fields") or []]
+        kind = str(spec.get("kind") or "call")
+        if spec.get("event") and kind not in ("open", "ioctl", "devquery", "close"):
+            kind = "event"
+        return {"id": site_id, "name": name, "kind": kind, "module": module["path"],
                 "module_name": module["name"], "base": module["base"], "rva": rva, "expect": expected, "nargs": nargs,
-                "with_leave": bool(spec.get("with_leave")), "buf": buf, "va": int(address, 16),
-                "module_sha256": module["file_sha256"], "payload": bool(spec.get("payload"))}
+                "with_leave": bool(spec.get("with_leave")) or any(f["source"] == "ret" for f in fields), "buf": buf,
+                "va": int(address, 16), "module_sha256": module["file_sha256"], "payload": bool(spec.get("payload")),
+                "stack": stack, "event": spec.get("event"), "hook": spec.get("hook"), "fields": fields,
+                "buf_arg": buf["ptr_arg"] if buf else None}
 
     def _loaded_name(self, name: str) -> str:
         """The module's name as the process spells it (Windows names compare without case; the control script does not)."""
@@ -138,11 +177,19 @@ class TraceMixin:
             raise ValueError("fault_policy is one of %s" % ", ".join(FAULT_POLICIES))
         specs = [dict(item) for item in (args.get("probes") or [])]
         for extra in args.get("builtin") or []:
-            if extra != "driver-boundary":
-                raise ValueError("builtin probe set must be driver-boundary")
-            specs += [dict(item) for item in DRIVER_BOUNDARY]
+            if extra not in BUILTIN_SETS:
+                raise ValueError("builtin probe set must be one of %s" % ", ".join(sorted(BUILTIN_SETS)))
+            specs += [dict(item) for item in BUILTIN_SETS[extra] if all(item["name"] != have.get("name") for have in specs)]
         if not 1 <= len(specs) <= MAX_PROBES:
             raise ValueError("trace_start needs 1..%d probes (probes=[...] or builtin=['driver-boundary'])" % MAX_PROBES)
+        preview = args.get("authorize_preview")
+        preview_sites: set = set()
+        if preview is not None:
+            if (not isinstance(preview, dict) or not str(preview.get("scope") or "") or not isinstance(preview.get("sites"), list)
+                    or not isinstance(preview.get("max_bytes", 128), int) or isinstance(preview.get("max_bytes"), bool)
+                    or not 1 <= preview.get("max_bytes", 128) <= 256):
+                raise ValueError("authorize_preview is {scope, sites: [probe names], max_bytes: 1..256}")
+            preview_sites = {str(x) for x in preview["sites"]}
         auth = args.get("authorize_payload")
         payload_sites = set()
         if auth is not None:
@@ -166,6 +213,11 @@ class TraceMixin:
                                  "required": False})
         if not probes:
             raise TraceRefused("every probe was refused: %s" % "; ".join(r["reason"] for r in refusals))
+        for probe in probes:
+            probe["preview"] = int(preview.get("max_bytes", 128)) if probe["name"] in preview_sites and probe["buf"] else 0
+        for name in sorted(preview_sites - {p["name"] for p in probes if p["buf"]}):
+            refusals.append({"probe": name, "reason": "a preview needs a probe that records a buffer", "limitation": "preview-not-possible",
+                             "required": False})
         return probes, refusals, policy, (int(auth.get("max_bytes", 256)) if auth else 0), auth
 
     # ---- actions ------------------------------------------------------------------------------------------------------------
@@ -189,25 +241,29 @@ class TraceMixin:
             raise ValueError("a trace capture is already active in this session; trace_stop it first")
         if self.control is None:
             raise RuntimeError("target session is not attached")
-        ring_bytes = int(args.get("ring_bytes", 1 << 18))
+        ring_bytes = int(args.get("ring_bytes", DEFAULT_RING_BYTES))
         if not RING_BYTES[0] <= ring_bytes <= RING_BYTES[1] or ring_bytes & (ring_bytes - 1):
             raise ValueError("ring_bytes is a power of two between 64 KiB and 16 MiB")
-        rings = int(args.get("rings", 32))
+        rings = int(args.get("rings", DEFAULT_RINGS))
         if not 1 <= rings <= 128:
             raise ValueError("rings is 1..128 (one per thread that hits a probe)")
         probes, refusals, policy, max_payload, auth = self.trace_plan(args)
         script_id = uuid.uuid4().hex
         gen = int(args.get("producer_gen", 1))
         sites = {p["id"]: {"name": p["name"], "kind": p["kind"], "module": p["module_name"], "va": p["va"],
-                           "buf": ("payload" if p["payload"] else ("id" if p["buf"] else None))} for p in probes}
+                           "buf": ("payload" if p["payload"] else ("id" if p["buf"] else None)), "preview": p["preview"],
+                           **({"buf_arg": p["buf_arg"]} if p["buf_arg"] is not None else {}),
+                           **({"event": p["event"], "hook": p["hook"] or p["name"], "fields": p["fields"]} if p["kind"] == "event" else {})}
+                 for p in probes}
         self.trace = TraceSource(self.directory, session=self.directory.name, producer_gen=gen, process_id=self.pid, sites=sites,
                                  qpc_freq=qpc_frequency(), fault_policy=policy, payload_authorized=bool(auth),
                                  max_payload=max(1, max_payload or 256))
         self.trace_info = {"script_id": script_id, "refusals": refusals, "probes": [{k: p[k] for k in ("id", "name", "kind", "module_name", "rva", "module_sha256")} for p in probes]}
         self._trace_ready.clear()
-        parameters = {"probes": [{k: p[k] for k in ("id", "name", "kind", "module", "base", "rva", "expect", "nargs", "with_leave", "buf")} for p in probes],
-                      "rings": rings, "ring_bytes": ring_bytes, "batch_ms": int(args.get("batch_ms", 10)),
+        parameters = {"probes": [{k: p[k] for k in ("id", "name", "kind", "module", "base", "rva", "expect", "nargs", "with_leave", "buf", "stack")} for p in probes],
+                      "rings": rings, "ring_bytes": ring_bytes, "batch_ms": int(args.get("batch_ms", BATCH_MS)),
                       "counter_ms": int(args.get("counter_ms", 250)), "batch_bytes": int(args.get("batch_bytes", 1 << 20)),
+                      "bp_us": int(float(args.get("bp_ms", BACKPRESSURE_MS)) * 1000), "window": int(args.get("window", ACK_WINDOW)),
                       "producer_gen": gen, "fault_policy": policy}
         try:
             self._load(script_id, trace_agent_source(parameters), {"kind": "trace", "probes": self.trace_info["probes"]})
@@ -219,12 +275,75 @@ class TraceMixin:
             raise
         for item in refusals:
             self.trace.refuse("probe:" + str(item["probe"]), item["reason"], item["limitation"])
+        try:
+            self._record_lifetimes()
+        except Exception as exc:     # the facts are a convenience for the ingester; the capture itself does not depend on them
+            self.trace.errors.append("lifetimes: %r" % exc)
+        self.trace_info["etw"] = None
+        if args.get("etw"):
+            self._start_etw(args["etw"])
+        self.trace_info["watchdog"] = None
+        if args.get("watchdog"):
+            self._start_watchdog(args["watchdog"], probes)
         self.publish()
         ready = self.trace_info.get("ready") or {}
         return {"started": True, "script_id": script_id, "probes": ready.get("installed"), "refusals": refusals,
                 "fault_context": ready.get("context"), "fault_policy": policy, "segment": str(self.trace.path),
                 "scope": {"name": self.trace.scope, "key_id": self.trace.key_id}, "producer_gen": gen,
                 "overhead_note": "install pauses per probe are in `probes[].install_ms`"}
+
+    def _start_etw(self, spec) -> None:
+        """Start the ETW consumer beside the recorder. Its refusal (not elevated), a missing tool or a failed start is recorded in the
+        segment as a refused source and in the health claims as missing coverage; it never stops the recorder."""
+        from hydralysis import trace_etw
+        providers = spec.get("providers") if isinstance(spec, dict) else None
+        consumer = trace_etw.EtwConsumer(self.trace.directory, self.trace.session, [self.pid], self.trace.directory / "scope.key",
+                                         providers=providers)
+        started = consumer.start()
+        self.trace_info["etw"] = consumer
+        self.trace_info["etw_start"] = started
+        if started.get("state") not in ("running", "starting"):
+            self.trace.refuse("etw", str(started.get("stderr") or started.get("limitation") or started.get("state")),
+                              started.get("limitation") or "etw-" + str(started.get("state")))
+
+    def _etw_summary(self) -> dict | None:
+        consumer = self.trace_info.get("etw")
+        if consumer is None:
+            return None
+        stopped = consumer.stop()
+        return {"start": self.trace_info.get("etw_start"), "stop": stopped, "coverage": consumer.coverage(),
+                "segment_id": consumer.segment_id}
+
+    def _record_lifetimes(self, late: bool = False) -> None:
+        listed = self.control.exports_sync.modules(200)
+        process = {"image": self.target_exe, "image_sha256": self.target_sha256}
+        self.trace.record_lifetimes(process, listed["modules"], late=late)
+
+    def _start_watchdog(self, spec: dict, probes: list) -> None:
+        """The frame-stall watchdog of the declared main loop: it reads the hit count of the frame probe and, when that stops
+        advancing for `stall_s`, captures every thread stack from this (the worker) process by the unwind tables."""
+        from hydralysis import trace_watchdog as wd
+        hook = str(spec.get("hook") or "")
+        if hook not in {p["name"] for p in probes}:
+            raise ValueError("watchdog hook %r is not one of the armed probes" % hook)
+        trace = self.trace
+        stall_dir = self.directory / "trace"
+
+        def on_stall(result: dict) -> None:
+            result["hook"] = hook
+            result["file"] = str(wd.write_stall(stall_dir, result))
+
+        dog = wd.FrameStallWatchdog(self.pid, lambda: trace.hits(hook), float(spec.get("stall_s", 2.0)), on_stall,
+                                    after_s=float(spec.get("after_s", 0.0)))
+        self.trace_info["watchdog"] = dog.start()
+
+    def _watchdog_summary(self) -> dict | None:
+        dog = self.trace_info.get("watchdog")
+        if dog is None:
+            return None
+        dog.stop()
+        return {"captures": dog.captures, "errors": list(dog.errors), "stall_s": dog.stall_s,
+                "last": None if dog.last is None else {k: dog.last[k] for k in ("stalled_for_s", "progress", "file", "hook")}}
 
     def trace_stop(self, args: dict) -> dict:
         trace = getattr(self, "trace", None)
@@ -233,13 +352,23 @@ class TraceMixin:
         if trace.finalized and not self.trace_info.get("detach_failed"):
             return {"stopped": True, "already": True, "health": trace.health()}
         script_id = self.trace_info["script_id"]
+        watchdog = self._watchdog_summary()
+        etw = self._etw_summary()
+        if not self.detached and not trace.finalized:
+            try:
+                self._record_lifetimes(late=True)
+            except Exception as exc:
+                trace.errors.append("lifetimes at stop: %r" % exc)
         entry = self.scripts.get(script_id)
         detach = {"quiescent": True, "note": "the recorder was already gone"}
         if entry is not None:
             try:
                 detach = entry["handle"].exports_sync.release(int(args.get("timeout_ms", 3000)))
             except Exception as exc:
-                detach = {"quiescent": False, "note": "release failed: %s" % exc, "error": str(exc)}
+                if self.detached:       # the target is gone: nothing runs the recorder any more, and nothing can be left patched
+                    detach = {"quiescent": True, "note": "the target exited; the recorder ended with it", "error": str(exc)}
+                else:
+                    detach = {"quiescent": False, "note": "release failed: %s" % exc, "error": str(exc)}
         # The recorder's last messages follow its reply: wait until every batch it says it sent has arrived.
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline and detach.get("quiescent"):
@@ -257,7 +386,7 @@ class TraceMixin:
             self.trace_info["detach_failed"] = True
             self.state = "trace_detach_failed"
         self.publish()
-        return {"stopped": bool(detach.get("quiescent")), "detach": detach, "health": health,
+        return {"stopped": bool(detach.get("quiescent")), "detach": detach, "health": health, "watchdog": watchdog, "etw": etw,
                 "safe_state": None if detach.get("quiescent") else "recorder retained in pass-through; the session stays attached"}
 
     def trace_cleanup(self) -> list:
