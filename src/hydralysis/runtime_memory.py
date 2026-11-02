@@ -1,10 +1,17 @@
-"""Runtime memory write and hardware watchpoints (Z12): FIXTURE-ONLY, gated, owner-driven.
+"""Runtime memory write and hardware watchpoints (Z12): FIXTURE-ONLY by default, gated, owner-driven.
 
-A mixin of `runtime_worker.RuntimeAgent`. Nothing here runs against a game: every `write` and `watch` request needs
+A mixin of `runtime_worker.RuntimeAgent`. Every `write` and `watch` request needs the gate the client adds (`options`
+cannot carry it), and exactly one of two modes admits it:
 
-  * the gate the client adds (`options` cannot carry it): the target's SHA-256 is in the setting
-    `runtime_fixture_sha256`, and
-  * the fixture marker (`FIXTURE_MARKER`) inside the target's own file, which only the verification fixtures hold.
+  * FIXTURE (the default): the target's SHA-256 is in the setting `runtime_fixture_sha256` and the fixture marker
+    (`FIXTURE_MARKER`) is inside the target's own file, which only the verification fixtures hold.
+  * AUTHORIZED (issue #7, opt-in by the owner): the exact build's SHA-256 has an entry in the setting
+    `runtime_authorized_targets` declaring its actions, a maximum size and bounded address ranges (see
+    `runtime_authorize`); a watch also needs that build's own conformance stamp. Anything outside the declared ranges,
+    or any build without an entry, is refused with a coded reason (`[not_authorized]`, `[outside_authorized_range]`,
+    `[conformance_stamp_missing]`, ...). A game or application with no entry keeps the static `writes` + live probe path.
+
+Both modes share the rest of the contract below (executable ranges refused, compare-and-swap, undo, disarm readback).
 
 `write` is a compare-and-swap with a required reason, refused in any executable range, with an undo log that reports
 DIVERGED instead of overwriting what changed since. `watch` is a state machine
@@ -16,7 +23,9 @@ conformance stamp that `tools/watch_conformance.py` writes after its real-proces
 Settings (config.json, read by the client, never by the worker):
 
   * `runtime_fixture_sha256`: list of SHA-256 build hashes of the fixture executables a write or watch may target.
-    Empty or missing means every write and watch is refused. `tools/watch_conformance.py` sets it for the builds it uses.
+    Empty or missing means no fixture is admitted. `tools/watch_conformance.py` sets it for the builds it uses.
+  * `runtime_authorized_targets`: list of owner authorizations (sha256, actions, max_size, bounded ranges), see
+    `runtime_authorize`. Empty or missing means no authorized mode.
   * `runtime_watch_conformance_run`: boolean, set only by `tools/watch_conformance.py` for the duration of its own run
     so that the run can arm watches before a stamp exists. Leave it unset otherwise.
 
@@ -30,6 +39,9 @@ import re
 import time
 import uuid
 from pathlib import Path
+
+from hydralysis import runtime_authorize
+from hydralysis.runtime_authorize import AuthorizationRefused
 
 
 def _pid_gone(pid, created_ms) -> bool:
@@ -213,26 +225,48 @@ class MemoryMixin:
     # ---- gate
 
     def _gate(self, action: str, args: dict) -> dict:
+        """Admit the request as `fixture` (default) or `authorized` (owner allow-list), else refuse with a coded reason."""
         gate = args.pop("_gate", None)
-        if not isinstance(gate, dict) or str(gate.get("fixture_sha256") or "") != self.target_sha256:
-            raise PermissionError("%s is fixture-only: the target's SHA-256 must be listed in the setting "
-                                  "runtime_fixture_sha256; it is not (no game process, no unlisted build)" % action)
-        if not fixture_marked(self.target_exe):
-            raise PermissionError("%s is fixture-only: the target file does not carry the fixture marker; refused" % action)
-        return gate
+        gate = gate if isinstance(gate, dict) else {}
+        auth = gate.get("authorized")
+        auth = auth if isinstance(auth, dict) and str(auth.get("sha256") or "") == self.target_sha256 else None
+        if str(gate.get("fixture_sha256") or "") == self.target_sha256 and self.target_sha256:
+            if fixture_marked(self.target_exe):
+                return {**gate, "mode": "fixture"}
+            if auth is None:
+                raise AuthorizationRefused("fixture_marker_missing", "%s is fixture-only: the target file does not carry the "
+                                           "fixture marker; refused" % action)
+        if auth is not None:
+            return {**gate, "mode": "authorized", "authorized": auth, "conformance": False}
+        why = str(gate.get("authorization_error") or "this build is not in runtime_authorized_targets")
+        raise AuthorizationRefused("not_authorized", "%s is fixture-only by default: the target's SHA-256 must be listed in the "
+                                   "setting runtime_fixture_sha256 (verification fixtures) or authorized by the owner in "
+                                   "runtime_authorized_targets (%s); neither applies. Fallback for an unverified build: "
+                                   "static `writes` plus a live store probe" % (action, why))
 
     def _stamp(self, gate: dict) -> dict:
-        if gate.get("conformance"):  # the run that produces the stamp (tools/watch_conformance.py sets it in its own settings)
+        if gate.get("conformance") and gate.get("mode") != "authorized":  # the run that produces the stamp
             return {}
         arch = self.control.exports_sync.info(self.target_exe)["arch"]
-        stamp = (gate.get("stamps") or {}).get(arch)
         version = str(gate.get("frida") or "")
+        if gate.get("mode") == "authorized":
+            stamp = gate.get("authorized_stamp")
+            if not runtime_authorize.valid_stamp(stamp, self.target_sha256, arch, version, STAMP_ITERATIONS):
+                raise AuthorizationRefused("conformance_stamp_missing", "watch needs a passing per-build conformance stamp "
+                                           "for this exact build (%s, frida %s): run tools/watch_conformance.py "
+                                           "--bind-build <exe>; none matches" % (arch, version))
+            return stamp
+        stamp = (gate.get("stamps") or {}).get(arch)
         if (not isinstance(stamp, dict) or stamp.get("result") != "pass" or stamp.get("arch") != arch
                 or stamp.get("fixture_sha256") != self.target_sha256 or stamp.get("frida") != version
                 or int(stamp.get("iterations", 0)) < STAMP_ITERATIONS):
             raise PermissionError("watch needs a passing conformance stamp for %s (frida %s) on this fixture build: run "
                                   "tools/watch_conformance.py; none matches" % (arch, version))
         return stamp
+
+    def _authorize_span(self, gate: dict, action: str, address: int, size: int, module) -> None:
+        if gate.get("mode") == "authorized":
+            runtime_authorize.check(gate["authorized"], action, address, size, module)
 
     # ---- the script
 
@@ -290,12 +324,12 @@ class MemoryMixin:
     # ---- write
 
     def memory_write(self, args: dict) -> dict:
-        self._gate("write", args)
+        gate = self._gate("write", args)
         op = str(args.get("op") or "write")
         if op == "log":
             return {"writes": self.writes, "count": len(self.writes)}
         if op == "undo":
-            return self._undo(args)
+            return self._undo(args, gate)
         if op != "write":
             raise ValueError("write op is write, undo or log")
         reason = str(args.get("reason") or "").strip()
@@ -310,13 +344,14 @@ class MemoryMixin:
             raise ValueError("EXECUTABLE RANGE (%s); write refused: this tool changes data on fixtures, not code" % protection)
         if "w" not in protection:
             raise ValueError("range %s is not writable; write refused" % protection)
+        self._authorize_span(gate, "write", address, len(value), module)
         result = self._memory().exports_sync.writeCas(hex(address), expect, value)
         if not result.get("ok"):
             raise ValueError("CAS MISMATCH; nothing written: expected %s, found %s"
                              % (hexed(expect), hexed(result.get("actual") or [])))
         entry = {"id": uuid.uuid4().hex[:12], "address": hex(address), "size": len(value), "before": hexed(expect),
                  "after": hexed(value), "reason": reason, "at_ms": int(time.time() * 1000), "status": "applied",
-                 "module": (module or {}).get("name")}
+                 "module": (module or {}).get("name"), "mode": gate["mode"]}
         self.writes.append(entry)
         self._persist_memory()
         self._memory_marker("memory_write", {"entry": entry})
@@ -324,15 +359,16 @@ class MemoryMixin:
         return {"written": True, "entry": entry, "atomicity": "compare and write in one agent call; the target's own "
                 "threads are not stopped, so a racing writer can still win after the write"}
 
-    def _undo(self, args: dict) -> dict:
+    def _undo(self, args: dict, gate: dict) -> dict:
         wanted = str(args.get("id") or "")
         applied = [e for e in self.writes if e["status"] == "applied"]
         entry = next((e for e in reversed(applied) if not wanted or e["id"] == wanted), None)
         if entry is None:
             raise ValueError("no applied write to undo" + (" with id " + wanted if wanted else ""))
-        address, _, rng = self._target_span({"address": entry["address"]}, entry["size"])
+        address, module, rng = self._target_span({"address": entry["address"]}, entry["size"])
         if "x" in str(rng.get("protection") or "") or "w" not in str(rng.get("protection") or ""):
             raise ValueError("the range is no longer a writable data range; undo refused")
+        self._authorize_span(gate, "write", address, entry["size"], module)
         result = self._memory().exports_sync.writeCas(hex(address), parse_hex(entry["after"], "after"),
                                                       parse_hex(entry["before"], "before"))
         if not result.get("ok"):
@@ -407,17 +443,18 @@ class MemoryMixin:
         limit = int(args.get("limit", 20))
         if size not in SIZES or kind not in KINDS or not 1 <= limit <= 200:
             raise ValueError("watch size is 1, 2, 4 or 8; access is write or readwrite; limit 1..200")
-        address, _, rng = self._target_span(args, size)
+        address, module, rng = self._target_span(args, size)
         if address % size:
             raise ValueError("a hardware watch must be aligned to its size")
         if "x" in str(rng.get("protection") or ""):
             raise ValueError("EXECUTABLE RANGE; watch refused")
+        self._authorize_span(gate, "watch", address, size, module)
         used = {w["slot"] for w in self.watches.values() if w["state"] != "clear"}
         free = [s for s in range(SLOTS) if s not in used]
         if not free:
             raise ValueError("all %d debug-register slots are in use; disarm one" % SLOTS)
         watch = {"id": uuid.uuid4().hex[:12], "state": "arming", "slot": free[0], "address": hex(address), "size": size,
-                 "access": kind, "limit": limit, "reason": reason, "hits": 0, "threads": [], "failed": [],
+                 "access": kind, "limit": limit, "reason": reason, "mode": gate["mode"], "hits": 0, "threads": [], "failed": [],
                  "coverage": "the threads that existed at arm time; rearm adds later ones"}
         self.watches[watch["id"]] = watch
         self._persist_memory()

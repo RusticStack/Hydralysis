@@ -31,6 +31,9 @@ CATALOG_HISTORY = {
     3: "e767074c93714f7c1d9b7b8183cdbfdd85b529a3615ea118f47e06606cb9f500",
     # Epoch 4: the trace tool gains reprocess, relations, evict and bundle (and their option bag).
     4: "05169528ef9132f2594bd580c409e2c731c7df46431cc2f387ab286c3c116e47",
+    # Epoch 5: ghidra_query gains `max_result_mb` (the engine's whole-reply bound for decompile) and its description says how
+    # it differs from options.max_characters.
+    5: "7d5fe723148db2813b1cf2555db3a78e056fca48faa786066e0c5b4fb826a9fd",
 }
 
 

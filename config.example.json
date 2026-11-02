@@ -9,6 +9,8 @@
   "viewIdleDeleteS": 86400,
   "evidence": "D:/hydralysis-data/evidence.db",
   "runtime_lock_check": [],
+  "runtime_fixture_sha256": [],
+  "runtime_authorized_targets": [],
   "targets": {
     "sample": {
       "gpr": "F:/re/Sample/Sample.gpr",

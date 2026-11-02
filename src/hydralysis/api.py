@@ -35,6 +35,10 @@ def __getattr__(name):
     return value
 
 
+def _lazy_analysis():
+    return importlib.import_module("hydralysis.analysis")
+
+
 def _lazy(name):
     """The lazily imported NAME, with a module global set first (a test's `patch.object(api, name)`) taking precedence."""
     value = globals().get(name)
@@ -99,7 +103,7 @@ REJECTED = (
 # MCP initialize result under _meta (mcp.py). ghidra_query status is built in query.py and does not carry it.
 # Everything added after epoch 1 rides the free-form `options` objects (see OPTION_BAGS).
 # Epoch 3 adds the `trace` tool (Hydralysis 0.8.0: the 21st tool) and the `from_trace` source of evidence_add.
-CATALOG_EPOCH = 4
+CATALOG_EPOCH = 5
 
 # Which `options` bag carries which feature (PROTOCOL-3.md 7.7). The bags are free-form objects
 # in the schema, so a later package changes a handler, never the schema.
@@ -233,11 +237,11 @@ def tool_table() -> list[dict]:
             "args": {"type": "array", "items": string},
             "timeout_s": integer, "options": options,
         }, ["target", "script"]),
-        tool("ghidra_query", "Query saved analysis; pages use next_cursor. address_map imports cited name/hash maps; export starts a job. See backend help.", {
+        tool("ghidra_query", "Query saved analysis; pages use next_cursor. address_map imports cited name/hash maps; export starts a job. decompile: options.max_characters clips the C text, max_result_mb bounds the whole reply; truncated/fragments mark a partial result. See backend help.", {
             "target": string,
             "action": {"type": "string", "enum": ["decompile", "function", "functions", "xrefs", "types", "type", "data", "scan", "variables", "dossier", "blocks", "pcode", "trace", "type_edit", "diff", "vcalls", "vtables", "writes", "orphans", "export", "address_map", "status", "stop"]},
             "address": string, "limit": integer, "cursor": string, "contains": string, "timeout_s": integer,
-            "options": options,
+            "max_result_mb": integer, "options": options,
         }, ["target"]),
         tool("backend", "Discover/install private analysis or runtime engines, never other MCPs. install returns a durable job. status/stop the shared engine. doctor and backups take options. help gives operation options.", {
             "action": {"type": "string", "enum": ["inspect", "install", "status", "stop", "help", "doctor", "backups"]},
@@ -399,7 +403,7 @@ def call(name: str, args: dict | None) -> str:
             target, str(args.get("action") or "decompile"), address,
             int(args.get("limit", 40)), str(args.get("cursor") or ""), str(args.get("contains") or ""),
             int(args.get("timeout_s", 30)),
-            args.get("options"),
+            _lazy_analysis().with_decompile_limits(args.get("options"), max_result_mb=args.get("max_result_mb")),
         )
         if resolution:
             decoded = json.loads(result)

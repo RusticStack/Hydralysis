@@ -18,7 +18,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
-from hydralysis import durable, hydra, proc, runtime_capture as capture
+from hydralysis import durable, hydra, proc, runtime_authorize, runtime_capture as capture
 from hydralysis.locks import LaneLock
 from hydralysis.paths import root_path
 from hydralysis.proc import identity as _identity, stop as _stop
@@ -401,12 +401,21 @@ class RuntimeRunner:
 
     def _memory_gate(self, directory: Path, args: dict) -> dict:
         """The fixture gate of `write` and `watch` (Z12). The caller cannot supply it: the client adds it from its own
-        settings (`runtime_fixture_sha256`, a list of build hashes) and the conformance stamps it holds."""
+        settings (`runtime_fixture_sha256`, a list of build hashes; `runtime_authorized_targets`, the owner allow-list of issue
+        #7) and the conformance stamps it holds."""
         args.pop("_gate", None)
         digest = str(_json(directory / "start.json").get("sha256") or "")
         allowed = self.settings.get("runtime_fixture_sha256") or []
         gate = {"fixture_sha256": digest if digest in allowed else "", "frida": FRIDA_VERSION, "stamps": {},
                 "conformance": bool(self.settings.get("runtime_watch_conformance_run"))}
+        auth, why = runtime_authorize.lookup(self.settings, digest)
+        if auth is not None:
+            gate["authorized"] = auth
+            stamp = _json(_root(self.settings) / "watch-stamps" / "authorized" / (digest + ".json"))
+            if stamp:
+                gate["authorized_stamp"] = stamp
+        elif self.settings.get("runtime_authorized_targets"):
+            gate["authorization_error"] = why
         for arch in ("x64", "x86"):
             stamp = _json(_root(self.settings) / "watch-stamps" / (arch + ".json"))
             if stamp:

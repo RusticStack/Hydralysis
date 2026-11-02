@@ -7,7 +7,7 @@ import sys
 
 from hydralysis.api import TOOL_NAMES, call
 from hydralysis.mcp import Server
-from hydralysis.analysis import ADVANCED_ACTIONS
+from hydralysis.analysis import ADVANCED_ACTIONS, MAX_RESULT_MB, with_decompile_limits
 
 
 # The same enum as the MCP tool (api.py): doctor and backups answer `not_available` until Y4b and Y2 land their handlers.
@@ -91,6 +91,14 @@ def main(argv: list[str] | None = None) -> int:
     query.add_argument("--cursor", default="")
     query.add_argument("--contains", default="")
     query.add_argument("--timeout", type=int, default=30)
+    query.add_argument("--max-characters", type=int, default=None, metavar="N",
+                       help="decompile: keep at most N characters (1..2097152, default 32000) of the C text; the rest is cut "
+                            "and the reply says truncated with total_characters. A presentation clip of one function's text")
+    query.add_argument("--max-result-mb", type=int, default=None, metavar="MB",
+                       help="decompile: bound the engine's WHOLE reply (C text, fragments, metadata) to MB MiB (1..%d). "
+                            "Unlike --max-characters, which only clips the text after decompiling, this stops the engine "
+                            "early on a huge function; the reply is then partial (truncated, bytes_emitted, reason, "
+                            "fragments of class code/data/unknown), not a failure" % MAX_RESULT_MB)
     _options_arguments(query)
 
     backend = sub.add_parser("backend", help="Discover or privately install analysis/runtime engines; doctor and backups "
@@ -192,7 +200,9 @@ def _pair(args: argparse.Namespace) -> tuple[str, dict]:
     if command == "ghidra_query":
         return command, {"target": args.target, "action": args.action, "address": args.address,
                          "limit": args.limit, "cursor": args.cursor, "contains": args.contains,
-                         "timeout_s": args.timeout, "options": _options(args)}
+                         "timeout_s": args.timeout,
+                         "options": with_decompile_limits(_options(args), max_characters=args.max_characters,
+                                                          max_result_mb=args.max_result_mb)}
     if command == "ghidra_jobs":
         return command, {}
     if command in ("fingerprint", "sections", "imports", "exports"):

@@ -87,6 +87,10 @@ LIMITATIONS = {
     "sampled": (True, "The probe reported a rate, minimum and maximum per window, not every call."),
     "indirect_calls_unresolved": (True, "Calls through a register or a table were not resolved; the callers and "
                                         "callees listed are those direct references."),
+    "decompile_truncated": (True, "The decompile stopped at a size bound (truncated, reason, bytes_emitted); the rest of the "
+                                  "function body was not emitted."),
+    "non_code_fragments": (False, "Part of the function body is data or unclassified bytes (decompile fragments), not "
+                                  "instructions; the C shows only the code fragments."),
     "analysis_incomplete": (True, "Analysis of the subject had not finished when this was read."),
     "static_only": (False, "Static analysis only: no process ran, so runtime behavior is not covered."),
     "module_file_hash_only": (False, "The check covers the module's backing file SHA-256 and the live bytes of the "

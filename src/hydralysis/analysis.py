@@ -38,10 +38,30 @@ def _text(value, name: str, maximum: int, required: bool = False) -> str:
     return value
 
 
+MAX_RESULT_MB = 256
+
+
 def _integer(value, name: str, low: int, high: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
         raise ValueError("%s must be an integer in %d..%d" % (name, low, high))
     return value
+
+
+def with_decompile_limits(options, **limits) -> dict | None:
+    """Fold the top-level decompile limits (`max_characters`, `max_result_mb`) into the options object.
+
+    A limit is given once: in the options object or as its own argument, and naming both is an error."""
+    given = {name: value for name, value in limits.items() if value is not None}
+    if not given:
+        return options
+    if options is not None and not isinstance(options, dict):
+        raise ValueError("options must be an object")
+    merged = dict(options or {})
+    for name, value in given.items():
+        if name in merged and merged[name] != value:
+            raise ValueError("%s is given twice with different values" % name)
+        merged[name] = value
+    return merged
 
 
 def validate_options(action: str, options: dict | None, *, _record: bool = False) -> dict:
@@ -51,7 +71,7 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
     if not isinstance(options, dict):
         raise ValueError("options must be an object")
     allowed = {
-        "decompile": {"max_characters"}, "data": {"table"}, "scan": {"end", "mnemonic", "operand", "regex"},
+        "decompile": {"max_characters", "max_result_mb"}, "data": {"table"}, "scan": {"end", "mnemonic", "operand", "regex"},
         "status": {"show", "since", "state"}, "types": set(), "type": {"path"}, "variables": set(), "dossier": set(),
         "blocks": set(), "pcode": {"nodes"}, "diff": {"against", "against_view", "checks"}, "vtables": set(),
         "vcalls": {"offset", "receiver_from", "receiver_type", "receiver_global", "vtable"},
@@ -69,6 +89,9 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
     out = dict(options)
     if action == "decompile":
         out["max_characters"] = _integer(out.get("max_characters", 32000), "max_characters", 1, 2097152)
+        if "max_result_mb" in out:
+            # The engine's bound on the whole reply (C text, fragments, metadata) in MiB; see ghidra-query --help.
+            out["max_result_mb"] = _integer(out["max_result_mb"], "max_result_mb", 1, MAX_RESULT_MB)
     elif action == "data":
         if "table" in out and not isinstance(out["table"], bool):
             raise ValueError("data table must be a boolean")

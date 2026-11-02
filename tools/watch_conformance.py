@@ -15,6 +15,11 @@ runtime backend (`runtime setup` done). Per architecture it runs, against a real
 A passing architecture gets its stamp in <root>/watch-stamps/<arch>.json; the runtime's `watch arm` refuses without
 the stamp for the target's architecture, the fixture build and the pinned Frida. The exit status is 0 only when every
 architecture asked for passed; 2 when the backend or the fixtures are not there (nothing is stamped then).
+Owner-authorized builds (issue #7): `--bind-build <exe>` (repeatable) runs the same matrix and, when the architecture of
+<exe> passed, also writes <root>/watch-stamps/authorized/<sha256 of exe>.json, the per-build stamp that `watch arm` needs
+for a build listed in the setting `runtime_authorized_targets`. The matrix still runs on the fixtures only, never on <exe>;
+the stamp therefore says "the watch mechanism passes for this architecture and this Frida", bound to the owner's build.
+It does not prove the application tolerates debug registers (anti-debug, its own use of them): that is the owner's call.
 Never run against anything but the fixtures: write and watch also refuse any build not listed in the setting
 `runtime_fixture_sha256`, which this tool adds for the fixture it built and nothing else.
 """
@@ -49,6 +54,13 @@ def make_stamp(arch: str, fixture_sha256: str, frida: str, iterations: int, fail
     return {"version": STAMP_VERSION, "result": "pass" if passed else "fail", "arch": arch,
             "fixture_sha256": fixture_sha256, "frida": frida, "iterations": iterations,
             "failures": failures[:20], "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+
+
+def bind_stamp(stamp: dict, exe_sha256: str, exe_arch: str) -> dict:
+    """The per-build stamp for an owner-authorized build, derived from a passing fixture stamp of the same architecture."""
+    ok = stamp.get("result") == "pass" and stamp.get("arch") == exe_arch
+    return {**stamp, "result": "pass" if ok else "fail", "target_sha256": exe_sha256, "arch": exe_arch,
+            "matrix_fixture_sha256": stamp.get("fixture_sha256")}
 
 
 def exit_status(stamps: dict, wanted=ARCHES) -> int:
@@ -218,8 +230,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument("fixtures")
     parser.add_argument("--arch", default="both", choices=("x64", "x86", "both"))
     parser.add_argument("--iterations", type=int, default=MIN_ITERATIONS)
+    parser.add_argument("--bind-build", action="append", default=[], metavar="EXE",
+                        help="also write the per-build stamp of this owner-authorized executable")
     options = parser.parse_args(argv)
-    from hydralysis import config, runtime
+    from hydralysis import config, runtime, runtime_authorize
     manifest_path = Path(options.fixtures) / "manifest.json"
     if not manifest_path.is_file():
         print("no manifest.json in", options.fixtures, "(run tests/fixtures/build_fixtures.py)")
@@ -249,6 +263,18 @@ def main(argv: list[str]) -> int:
         print(arch, stamp["result"].upper(), "iterations", stamp["iterations"], "failures", len(stamp["failures"]))
         for failure in stamp["failures"]:
             print("  ", failure)
+    for exe in options.bind_build:
+        import hashlib
+        arch = runtime_authorize.pe_arch(exe)
+        if arch not in stamps:
+            print("bind-build", exe, "skipped: architecture", arch or "unknown", "was not part of this run")
+            continue
+        digest = hashlib.sha256(Path(exe).read_bytes()).hexdigest()
+        bound = bind_stamp(stamps[arch], digest, arch)
+        target = runtime._root(settings) / "watch-stamps" / "authorized" / (digest + ".json")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        runtime._write(target, bound)
+        print("bound", digest, arch, bound["result"].upper())
     status = exit_status(stamps, wanted)
     print("conformance", "PASS" if status == 0 else "FAIL", {a: s["result"] for a, s in stamps.items()})
     return status

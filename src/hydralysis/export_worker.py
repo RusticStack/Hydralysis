@@ -11,7 +11,7 @@ import sys
 import time
 from pathlib import Path
 
-from hydralysis import targets, workcopy
+from hydralysis import decompile_result, targets, workcopy
 from hydralysis.backends import read_json, write_json
 from hydralysis.exporting import MAX_OUTPUT_BYTES, MAX_ROW_BYTES, code_sha256, master_revision, provenance, update
 from hydralysis.locks import LaneLock
@@ -220,6 +220,18 @@ def _query(runner, record, action, **kwargs):
             if attempt:
                 raise Paused("backend remained busy after one retry: " + str(exc)) from exc
             time.sleep(0.5)
+
+
+def decompile_row(response: dict) -> dict:
+    """The row fields for a decompile reply that carries the engine's completeness fields (none for an older engine)."""
+    summary = decompile_result.summarize(response)
+    if not summary:
+        return {}
+    out = {"decompile": summary, "coverage": decompile_result.coverage(response)}
+    codes = decompile_result.limitations(response)
+    if codes:
+        out["limitations"] = codes
+    return out
 
 
 def partial(response: dict) -> bool:
@@ -447,6 +459,8 @@ def run(path: Path, generation: str, runner_factory=QueryRunner):
                         else:
                             response = _query(runner, record, "decompile", address=key, options={"max_characters": 2097152}, timeout_s=selected["timeout_s"])
                         row.update(state="done", result=response, truncated=partial(response))
+                        if selected["mode"] == "decompile":
+                            row.update(decompile_row(response))
                         if "c" in response:
                             row["c_sha256"] = hashlib.sha256(response["c"].encode("utf-8")).hexdigest()
                             row["c_hash_scope"] = "exact exported UTF-8 C text; inspect truncated before claiming a complete body"
@@ -455,10 +469,20 @@ def run(path: Path, generation: str, runner_factory=QueryRunner):
                     except (RuntimeError, ValueError, TimeoutError) as exc:
                         if isinstance(exc, Paused):
                             raise
-                        expected_failure = isinstance(exc, TimeoutError) or any(word in str(exc).lower() for word in ("decompile refused", "no analysed function", "unknown type", "no type"))
-                        if not expected_failure:
-                            raise Paused("backend query failed; output preserved: " + str(exc)) from exc
-                        row.update(state="failed", error=str(exc)[:4000], truncated=False)
+                        stopped = decompile_result.from_error(str(exc)) if selected["mode"] == "decompile" else None
+                        if stopped is not None:
+                            # the engine stopped this decompile on purpose: keep what it emitted as a partial row
+                            response = {**stopped, "c": stopped.get("c") if isinstance(stopped.get("c"), str) else "", "ok": True}
+                            row.update(state="done", result=response, truncated=True, **decompile_row(response))
+                            if isinstance(response.get("c"), str):
+                                row["c_sha256"] = hashlib.sha256(response["c"].encode("utf-8")).hexdigest()
+                                row["c_hash_scope"] = "exact exported UTF-8 C text; inspect truncated before claiming a complete body"
+                            row.update(body_hash(response, image))
+                        else:
+                            expected_failure = isinstance(exc, TimeoutError) or any(word in str(exc).lower() for word in ("decompile refused", "no analysed function", "unknown type", "no type"))
+                            if not expected_failure:
+                                raise Paused("backend query failed; output preserved: " + str(exc)) from exc
+                            row.update(state="failed", error=str(exc)[:4000], truncated=False)
                     frozen(record)
                     encoded = json.dumps(row, ensure_ascii=False) + "\n"
                     if len(encoded.encode("utf-8")) > MAX_ROW_BYTES:

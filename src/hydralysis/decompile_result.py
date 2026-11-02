@@ -1,0 +1,126 @@
+"""Partial decompile results: carry the engine's `fragments`, `truncated`, `bytes_emitted` and `reason` through.
+
+An engine that stops a decompile at a size bound (`max_result_mb`, or its own cap) or finds that part of a function is
+not code replies with
+
+    {"truncated": true, "bytes_emitted": 1048576, "reason": "max_result_mb",
+     "fragments": [{"start": "0x140001000", "end": "0x140001040", "class": "code"}, {... "class": "data"}, ...]}
+
+`fragments` partition the function body by what the bytes are (`code`, `data` or `unknown`; a jump table or a
+literal pool is data, not instructions). Such a reply is a PARTIAL result, not a failure: it says what was decoded and
+why it stops. This module validates those fields, summarises them, and turns them into the evidence `coverage` object
+so a claim built from a partial decompile says `partial` with a limitation code instead of passing for complete.
+Replies from an engine that does not send the fields are unchanged.
+"""
+
+from __future__ import annotations
+
+import json
+
+CLASSES = ("code", "data", "unknown")
+MAX_FRAGMENTS = 4096
+LIMIT_TRUNCATED = "decompile_truncated"
+LIMIT_NON_CODE = "non_code_fragments"
+
+
+def _address(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    try:
+        number = int(str(value), 0)
+    except (TypeError, ValueError):
+        return None
+    return number if number >= 0 else None
+
+
+def fragments(value) -> tuple[list[dict], str]:
+    """(well-formed fragments in the engine's order, "" or why some were dropped). Start and end are kept as sent."""
+    if value is None:
+        return [], ""
+    if not isinstance(value, list):
+        return [], "fragments is not a list"
+    kept, bad = [], 0
+    for item in value[:MAX_FRAGMENTS]:
+        start = _address(item.get("start")) if isinstance(item, dict) else None
+        end = _address(item.get("end")) if isinstance(item, dict) else None
+        if start is None or end is None or end < start or item.get("class") not in CLASSES:
+            bad += 1
+            continue
+        kept.append({"start": item["start"], "end": item["end"], "class": item["class"]})
+    note = []
+    if bad:
+        note.append("%d malformed fragment(s) dropped" % bad)
+    if len(value) > MAX_FRAGMENTS:
+        note.append("only the first %d fragments are kept" % MAX_FRAGMENTS)
+    return kept, "; ".join(note)
+
+
+def summarize(reply: dict) -> dict:
+    """What the engine said about completeness: `partial`, `reason`, `bytes_emitted` and the fragment byte totals.
+
+    Empty when the reply carries none of the fields (an engine without them) and is not truncated, so old replies stay as they were."""
+    if not isinstance(reply, dict):
+        return {}
+    # `truncated: false` alone is what an engine without the new fields always said: nothing to add then.
+    if not (reply.get("truncated") is True or any(name in reply for name in ("fragments", "bytes_emitted", "reason"))):
+        return {}
+    kept, note = fragments(reply.get("fragments"))
+    out: dict = {"partial": reply.get("truncated") is True}
+    if isinstance(reply.get("reason"), str) and reply["reason"]:
+        out["reason"] = reply["reason"][:200]
+    emitted = reply.get("bytes_emitted")
+    if isinstance(emitted, int) and not isinstance(emitted, bool) and emitted >= 0:
+        out["bytes_emitted"] = emitted
+    if "fragments" in reply:
+        totals = {name: 0 for name in CLASSES}
+        for item in kept:
+            totals[item["class"]] += _address(item["end"]) - _address(item["start"])
+        out["fragment_bytes"] = totals
+        out["fragment_count"] = len(kept)
+        if note:
+            out["fragments_note"] = note
+    return out
+
+
+def annotate(reply: dict) -> dict:
+    """Add `decompile` (the summary) to a decompile reply that carries the new fields; the fields themselves stay."""
+    summary = summarize(reply)
+    if summary:
+        reply["decompile"] = summary
+    return reply
+
+
+def limitations(reply: dict) -> list[str]:
+    summary = summarize(reply)
+    codes = []
+    if summary.get("partial"):
+        codes.append(LIMIT_TRUNCATED)
+    if (summary.get("fragment_bytes") or {}).get("data") or (summary.get("fragment_bytes") or {}).get("unknown"):
+        codes.append(LIMIT_NON_CODE)
+    return codes
+
+
+def coverage(reply: dict) -> dict:
+    """The evidence coverage for a claim read from this decompile: `partial` when it stopped, else complete.
+
+    A reply without the engine's fields says `unknown`: there is nothing to base completeness on."""
+    summary = summarize(reply)
+    if not summary:
+        return {"status": "unknown", "reason": "the decompile reply carries no truncated/fragments fields"}
+    if summary["partial"]:
+        return {"status": "partial", "limitations": [LIMIT_TRUNCATED]}
+    return {"status": "complete"}
+
+
+def from_error(message: str) -> dict | None:
+    """The reply behind a RuntimeError message when it is a partial decompile (truncated with text, bytes or fragments)."""
+    try:
+        reply = json.loads(message)
+    except (TypeError, ValueError):
+        return None
+    if (not isinstance(reply, dict) or reply.get("truncated") is not True
+            or not (isinstance(reply.get("c"), str) or reply.get("fragments") or "bytes_emitted" in reply)):
+        return None
+    return reply
