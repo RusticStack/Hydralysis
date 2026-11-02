@@ -268,7 +268,7 @@ class LedgerFile(unittest.TestCase):
         live = live_values(REPOSITORY)
         self.assertEqual(check_numbers(self.ledger, REPOSITORY, live), [])
         by_id = {entry["id"]: entry["value"] for entry in self.ledger["numbers"]}
-        self.assertEqual((by_id["catalog_tools"], by_id["catalog_bytes"], by_id["catalog_limit"]), (21, 8796, 9216))
+        self.assertEqual((by_id["catalog_tools"], by_id["catalog_bytes"], by_id["catalog_limit"]), (21, 8878, 9216))
         self.assertEqual((by_id["kotor_functions_total"], by_id["kotor_functions_internal"], by_id["kotor_functions_thunks"]), (8966, 8616, 60))
         self.assertIsNone(by_id["x0_baselines"])
 

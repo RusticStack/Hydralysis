@@ -29,6 +29,8 @@ CATALOG_HISTORY = {
     # Epoch 3 (Hydralysis 0.8.0): the `trace` tool, the 21st, and the `from_trace` object on evidence_add. The catalog
     # budget moved from 8,192 to 9,216 bytes with it.
     3: "e767074c93714f7c1d9b7b8183cdbfdd85b529a3615ea118f47e06606cb9f500",
+    # Epoch 4: the trace tool gains reprocess, relations, evict and bundle (and their option bag).
+    4: "05169528ef9132f2594bd580c409e2c731c7df46431cc2f387ab286c3c116e47",
 }
 
 

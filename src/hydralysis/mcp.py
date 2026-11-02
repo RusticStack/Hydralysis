@@ -54,7 +54,7 @@ ENGINE_TOOLS = frozenset({"ghidra_run", "ghidra_query", "backend", "prepare", "j
 # The engine tools that can hold the engine for minutes: a user script, an adopt or import. They get their own lane.
 LONG_TOOLS = frozenset({"ghidra_run", "prepare"})
 # `trace` is a short engine-lane tool except for the actions that are jobs on the engine (export, import, resymbolize).
-LONG_TRACE_ACTIONS = frozenset({"export", "import", "resymbolize"})
+LONG_TRACE_ACTIONS = frozenset({"export", "import", "resymbolize", "reprocess", "relations", "evict"})
 # The engine runs at most this many parallel requests per client connection (hydra-engine Connection.MAX_PARALLEL);
 # more get BUSY. On hydra.4 every engine call of this process goes through one shared connection, so the engine and
 # long lanes together stay within it.

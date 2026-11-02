@@ -15,11 +15,35 @@ unresolved is `unknown` to them, never a pass.
 A **missing marker** is not papered over: if a frame shows stage markers k and j but the profile declares stages between
 them that never opened, the events between k and j are `unresolved: missing-marker:<stages>` and not attributed to k.
 
-Role resolvers other than `function` need the thread's start address or name, which the in-process recorder does not
-observe; they are reported in the result as `unsupported` and leave the role unresolved with that reason.
+Role resolvers:
+
+    function         the thread that ran hook X (always available)
+    thread_start_rva the thread whose `core.thread.start` event carries `payload.start_rva` equal to the resolver's value
+    thread_name      the thread whose `core.thread.start` (or `core.marker` thread-name) event carries `payload.name` equal to it
+    pool             not evaluated by any producer; refused
+
+A resolver whose evidence is absent from the events is **refused explicitly**, never silently skipped: the report lists it
+under `refused_resolvers` with the reason (for example "no core.thread.start event carries start_rva"), and every event
+that no resolver matched says why in `payload.unresolved.role`. `annotate(..., strict=True)` raises `RoleResolverRefused`
+instead of returning, for a caller that must not proceed on a partial answer.
 """
 
 from __future__ import annotations
+
+
+class RoleResolverRefused(ValueError):
+    """A role resolver of the profile cannot be evaluated from these events."""
+
+    def __init__(self, refused: dict):
+        super().__init__("role resolvers refused: " + "; ".join("%s: %s" % item for item in sorted(refused.items())))
+        self.refused = refused
+
+
+def _norm_rva(value) -> str | None:
+    try:
+        return hex(int(str(value), 0))
+    except (TypeError, ValueError):
+        return None
 
 
 def _thread(event: dict):
@@ -39,7 +63,7 @@ def _matches(index: int, phase: dict, event: dict) -> bool:
     return number is None or number == index + 1
 
 
-def annotate(events: list[dict], profile) -> tuple[list[dict], dict]:
+def annotate(events: list[dict], profile, *, strict: bool = False) -> tuple[list[dict], dict]:
     """(events with frame/phase/role stamped, a report of what was and was not resolved). EVENTS are not modified."""
     data = profile.data
     roles = data.get("roles", [])
@@ -47,7 +71,28 @@ def annotate(events: list[dict], profile) -> tuple[list[dict], dict]:
     frame_phases = [p for p in phases if p["kind"] == "frame"]
     stages = [p for p in phases if p["kind"] == "stage"]
     stage_ids = [p["id"] for p in stages]
-    unsupported = sorted({r["resolve"] for r in roles if r["resolve"] != "function"})
+    # evidence for the resolvers that look at how a thread started
+    starts: dict = {}
+    for event in events:
+        if event.get("kind") in ("core.thread.start", "core.marker"):
+            payload = event.get("payload") or {}
+            seen = starts.setdefault(_thread(event), {"rva": set(), "name": set()})
+            if payload.get("start_rva") is not None and _norm_rva(payload["start_rva"]) is not None:
+                seen["rva"].add(_norm_rva(payload["start_rva"]))
+            if isinstance(payload.get("name"), str) and (event.get("kind") == "core.thread.start" or payload.get("thread_name")):
+                seen["name"].add(payload["name"])
+    refused: dict = {}
+    for role in roles:
+        kind = role["resolve"]
+        if kind == "pool":
+            refused[role["id"]] = "the pool resolver is not evaluated by any producer"
+        elif kind == "thread_start_rva" and not any(v["rva"] for v in starts.values()):
+            refused[role["id"]] = "no core.thread.start event carries payload.start_rva"
+        elif kind == "thread_name" and not any(v["name"] for v in starts.values()):
+            refused[role["id"]] = "no core.thread.start event carries payload.name"
+    if strict and refused:
+        raise RoleResolverRefused(refused)
+    unsupported = sorted({r["resolve"] for r in roles if r["id"] in refused})
 
     # ---- roles: the threads that ran the resolver's hook ---------------------------------------------------------------
     ran: dict = {}
@@ -59,6 +104,10 @@ def annotate(events: list[dict], profile) -> tuple[list[dict], dict]:
     for thread, hooks in ran.items():
         found = sorted(r["id"] for r in roles if r["resolve"] == "function" and r["value"] in hooks)
         thread_role[thread] = found
+    for thread, seen in starts.items():
+        extra = sorted(r["id"] for r in roles if (r["resolve"] == "thread_start_rva" and _norm_rva(r["value"]) in seen["rva"])
+                       or (r["resolve"] == "thread_name" and r["value"] in seen["name"]))
+        thread_role[thread] = sorted(set(thread_role.get(thread, [])) | set(extra))
     # ---- frames and stages, per thread, in the thread's own order -------------------------------------------------------
     by_thread: dict = {}
     for index, event in enumerate(events):
@@ -161,5 +210,5 @@ def annotate(events: list[dict], profile) -> tuple[list[dict], dict]:
         if unresolved:
             payload["unresolved"] = unresolved
         out.append({**event, "payload": payload})
-    return out, {"counts": counts, "unsupported_role_resolvers": unsupported,
+    return out, {"counts": counts, "unsupported_role_resolvers": unsupported, "refused_resolvers": refused,
                  "roles": {"%s/%s" % thread: roles for thread, roles in sorted(thread_role.items(), key=lambda kv: str(kv[0]))}}
