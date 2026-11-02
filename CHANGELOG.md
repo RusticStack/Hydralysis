@@ -6,6 +6,10 @@ Nothing here is a tag: a release is tagged by the owner.
 
 ## Unreleased
 
+Test runs for 0.8.0 (prepared 2026-11-02, nothing tagged): unit suite 1,996 of 1,996 and engine-gated suite 1,996 of 1,996
+against a locally assembled 12.3-hydra.6 install (one `M3Pairing` timing test failed under load and passed alone); `bump_hydra.py` was not run
+because the release zips do not exist yet. Details in `.github/local-test-record.json` and the engine's `docs/release-notes-12.3-hydra.6.md`.
+
 Semantic trace (for 0.8.0, which pins engine 12.3-hydra.6; the version is bumped at release with `tools/bump_hydra.py`).
 
 - New tool `trace` (the 21st; catalog epoch 3, schema budget 8,192 -> 9,216 bytes): start, stop, status, query, diff, explain, mark,
