@@ -38,7 +38,8 @@ def _text(value, name: str, maximum: int, required: bool = False) -> str:
     return value
 
 
-MAX_RESULT_MB = 256
+MAX_RESULT_MB = 1024   # the engine accepts 1..1024 (PROTOCOL-3 8.21); omitted means its adaptive budget
+MAX_RESULT_KB = 1048576
 
 
 def _integer(value, name: str, low: int, high: int) -> int:
@@ -71,7 +72,7 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
     if not isinstance(options, dict):
         raise ValueError("options must be an object")
     allowed = {
-        "decompile": {"max_characters", "max_result_mb"}, "data": {"table"}, "scan": {"end", "mnemonic", "operand", "regex"},
+        "decompile": {"max_characters", "max_result_mb", "max_result_kb", "offset"}, "data": {"table"}, "scan": {"end", "mnemonic", "operand", "regex"},
         "status": {"show", "since", "state"}, "types": set(), "type": {"path"}, "variables": set(), "dossier": set(),
         "blocks": set(), "pcode": {"nodes"}, "diff": {"against", "against_view", "checks"}, "vtables": set(),
         "vcalls": {"offset", "receiver_from", "receiver_type", "receiver_global", "vtable"},
@@ -92,6 +93,10 @@ def validate_options(action: str, options: dict | None, *, _record: bool = False
         if "max_result_mb" in out:
             # The engine's bound on the whole reply (C text, fragments, metadata) in MiB; see ghidra-query --help.
             out["max_result_mb"] = _integer(out["max_result_mb"], "max_result_mb", 1, MAX_RESULT_MB)
+        if "max_result_kb" in out:
+            out["max_result_kb"] = _integer(out["max_result_kb"], "max_result_kb", 1, MAX_RESULT_KB)   # wins over max_result_mb
+        if "offset" in out:
+            out["offset"] = _integer(out["offset"], "offset", 0, 2 ** 31 - 1)   # characters; the reply's next_offset
     elif action == "data":
         if "table" in out and not isinstance(out["table"], bool):
             raise ValueError("data table must be a boolean")

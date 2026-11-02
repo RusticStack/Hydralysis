@@ -307,32 +307,58 @@ def run_script(engine: hydra.Engine, program: dict, request: dict, timeout_s: in
     return json.loads(lines[-1]), result
 
 
-def engine_decompile(engine: hydra.Engine, program: dict, request: dict, timeout_s: int, response: dict) -> dict:
+FALLBACK_TIMEOUT_S = 3600   # the engine's own decompile of a huge function: minutes (370 s measured), never the script's 30 s
+ENGINE_FIELDS = (("max_result_mb", "maxResultMb"), ("max_result_kb", "maxResultKb"), ("offset", "offset"))
+
+
+class DeferDecompile(RuntimeError):
+    """A decompile that needs the engine's long path and so runs as a job (`decompile_job`) instead of blocking the caller."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def engine_decompile(engine: hydra.Engine, program: dict, request: dict, timeout_s: int, response: dict,
+                     inline: bool = False) -> dict:
     """RESPONSE of a decompile, completed with the engine's own `decompile` answer where that carries more.
 
-    RusticQuery decompiles on its own and knows neither the engine's whole-reply bound (`max_result_mb`) nor its fragment
-    report for a body in several pieces. So the engine's command is asked too when the caller set `max_result_mb`, or when
-    the script could not decompile at all (a non-contiguous body fails there). Its fields are merged by
-    `decompile_result.merge`; an engine that refuses the command leaves RESPONSE as it was."""
+    RusticQuery decompiles on its own and knows neither the engine's whole-reply bound (`max_result_mb`, `max_result_kb`),
+    its paging (`offset`) nor its fragment report for a body in several pieces. So the engine's command is asked too when the
+    caller set one of those, or when the script could not decompile at all ("No pcode", a timeout, a buffer overflow). That
+    second answer can take minutes: unless INLINE (the job worker) the call raises DeferDecompile and the caller starts a job.
+    The answer of a failed script is labelled `fallback`. Its fields are merged by `decompile_result.merge`."""
     if request.get("action") != "decompile":
         return response
     options = request.get("options") or {}
-    bound = options.get("max_result_mb")
-    if bound is None and response.get("ok") is not False:
+    explicit = {engine_name: options[name] for name, engine_name in ENGINE_FIELDS if options.get(name) is not None}
+    failed = response.get("ok") is False
+    if not explicit and not failed:
         return response
-    fields = {"maxChars": int(options.get("max_characters", 32000))}
-    if bound is not None:
-        fields["maxResultMb"] = bound
+    reason = str(response.get("error") or response.get("message") or "")[:600] if failed else ""
+    if failed and not inline:
+        raise DeferDecompile(reason or "the script could not decompile")
+    fields = {"maxChars": int(options.get("max_characters", 32000)), **explicit}
+    timeout = FALLBACK_TIMEOUT_S if failed else timeout_s + 5
+    started = time.monotonic()
     try:
-        reply = engine.call("decompile", program=program["key"], address=request["address"], timeout=timeout_s + 5, **fields)
-    except hydra.EngineError:
-        return response
-    return decompile_result.merge(response, reply)
+        reply = engine.call("decompile", program=program["key"], address=request["address"], timeout=timeout, **fields)
+    except hydra.EngineError as error:
+        slow = error.code in ("timeout", "deadline", "timed_out") or "timeout" in str(error.details.get("reason", "")).lower()             or "timed out" in error.message.lower()
+        if inline or not slow:   # a refusal keeps the script's answer; only a clock that ran out becomes a job
+            return response
+        raise DeferDecompile("the engine decompile did not answer in %d s: %s" % (timeout, str(error)[:300])) from error
+    merged = decompile_result.merge(response, reply)
+    if failed and merged is not response:
+        merged["fallback"] = {"via": "engine_decompile", "reason": reason, "engine_s": round(time.monotonic() - started, 1),
+                              "timeout_s": timeout}
+    return merged
 
 
 class QueryRunner:
     def __init__(self, settings: dict, engine: hydra.Engine | None = None):
         self.settings = settings
+        self.inline = False   # True in a decompile job's worker: a long engine decompile runs here instead of becoming a job
         self.engine = engine or hydra.Engine(settings)
         self.requests = Path(settings["root"]) / "hydra" / "requests"
 
@@ -553,6 +579,11 @@ class QueryRunner:
         for attempt in (0, 1):
             try:
                 return self._query(target, action, address, limit, cursor, contains, timeout_s, options)
+            except DeferDecompile as deferred:
+                if self.inline:
+                    raise
+                from hydralysis import decompile_job
+                return json.dumps(decompile_job.start(self.settings, call, deferred.reason), ensure_ascii=False)
             except hydra.EngineError as error:
                 if (attempt == 0 and error.code == "busy" and str(error.details.get("reason")) == "capacity"
                         and viewgov.GOVERNOR.evict_lru(self._release)):
@@ -807,6 +838,27 @@ class QueryRunner:
             views.wait_decision(self.settings, link["id"], csid)   # a still-queued changeset: answer when it is decided, or in 0.5 s
         return {"target": {key: selected[key] for key in ("name", "view")}, **views.queue_status(self.settings, link["id"], csid)}
 
+    def _scripted(self, engine, program: dict, request: dict, timeout_s: int, **extra) -> tuple[dict, dict]:
+        """The RusticQuery answer, with the engine's decompile where the script cannot answer (see `engine_decompile`)."""
+        decompile = request.get("action") == "decompile"
+        try:
+            response, raw = run_script(engine, program, request, timeout_s, self.requests, **extra)
+        except hydra.EngineError as error:
+            if not decompile or error.code in ("no_program", "not_found", "no_project", "closed", "busy", "sealed", "corrupt_newest"):
+                raise
+            failure = error
+        except RuntimeError as error:
+            if not decompile:
+                raise
+            failure = error
+        else:
+            return engine_decompile(engine, program, request, timeout_s, response, self.inline), raw
+        stub = {"ok": False, "error": str(failure)[:2000]}
+        answer = engine_decompile(engine, program, request, timeout_s, stub, self.inline)
+        if answer is stub:
+            raise failure
+        return answer, {}
+
     def _ask(self, selected: dict, request: dict, timeout_s: int, trace: dict | None = None) -> dict:
         expected_state = None if selected.get("master_read") else workcopy.expected_state(self.settings, selected)
         for attempt in (0, 1):
@@ -817,15 +869,13 @@ class QueryRunner:
                     program = self.program_for(selected, engine=reader)
                 try:
                     if pool is None:
-                        response, raw = run_script(reader, program, request, timeout_s, self.requests,
-                                                   deadline_s=self._native_deadline(timeout_s))
-                        response = engine_decompile(reader, program, request, timeout_s, response)
+                        response, raw = self._scripted(reader, program, request, timeout_s,
+                                                       deadline_s=self._native_deadline(timeout_s))
                     else:
                         # One attempt, one entry: the opens and the script run on it with one clock (7.6). A retry takes another.
                         with pool.attempt(self._deadline(timeout_s)) as entry:
                             program = self.program_for(selected, engine=entry)
-                            response, raw = run_script(entry, program, request, timeout_s, self.requests)
-                            response = engine_decompile(entry, program, request, timeout_s, response)
+                            response, raw = self._scripted(entry, program, request, timeout_s)
                 except hydra.EngineError as error:
                     if attempt == 0 and error.code in ("no_program", "not_found", "no_project", "closed"):
                         if pool is not None and error.code == "closed":

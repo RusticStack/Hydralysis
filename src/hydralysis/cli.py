@@ -98,7 +98,15 @@ def main(argv: list[str] | None = None) -> int:
                        help="decompile: bound the engine's WHOLE reply (C text, fragments, metadata) to MB MiB (1..%d). "
                             "Unlike --max-characters, which only clips the text after decompiling, this stops the engine "
                             "early on a huge function; the reply is then partial (truncated, bytes_emitted, reason, "
-                            "fragments of class code/data/unknown), not a failure" % MAX_RESULT_MB)
+                            "fragments of class code/data/unknown), not a failure. Omit it for the engine's adaptive budget" % MAX_RESULT_MB)
+    query.add_argument("--max-result-kb", type=int, default=None, metavar="KB",
+                       help="decompile: like --max-result-mb in KiB (1..1048576); wins when both are given")
+    query.add_argument("--offset", type=int, default=None, metavar="N",
+                       help="decompile: return the page of the C text from character N (pages are --max-characters long); "
+                            "the reply's next_offset is where the next page starts")
+    query.add_argument("--wait", type=int, default=3600, metavar="SECONDS",
+                       help="decompile: a function the script cannot decompile runs as an engine job; wait for it up to SECONDS, "
+                            "reporting progress on stderr (0 = print the job and return)")
     _options_arguments(query)
 
     backend = sub.add_parser("backend", help="Discover or privately install analysis/runtime engines; doctor and backups "
@@ -151,11 +159,41 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "call":
             return _call_json(args)
-        print(call(*_pair(args)))
+        output = call(*_pair(args))
+        if args.command == "ghidra-query" and getattr(args, "wait", 0):
+            output = _await_decompile_job(output, args.wait)
+        print(output)
         return 0
     except (ValueError, OSError, KeyError, RuntimeError) as exc:
         print("%s: %s" % (type(exc).__name__, exc), file=sys.stderr)
         return 1
+
+
+def _await_decompile_job(output: str, wait_s: int) -> str:
+    """A decompile that became an engine job (the script could not answer): follow it, progress on stderr, and give its result."""
+    import json
+    import time
+    try:
+        reply = json.loads(output)
+    except ValueError:
+        return output
+    if not isinstance(reply, dict) or not str(reply.get("id", "")).startswith("decompile-"):
+        return output
+    deadline = time.monotonic() + wait_s
+    shown = ""
+    while reply.get("state") in ("queued", "running"):
+        line = "%s %s: %s" % (reply["id"], reply["state"], reply.get("stage", ""))
+        if line != shown:
+            print(line, file=sys.stderr, flush=True)
+            shown = line
+        if time.monotonic() >= deadline:
+            return json.dumps({**reply, "waiting_stopped": "still running after %d s; `job` with this id reports it" % wait_s},
+                              ensure_ascii=False, indent=2)
+        time.sleep(5)
+        reply = json.loads(call("job", {"id": reply["id"]}))
+    if reply.get("state") != "done":
+        raise RuntimeError("decompile job %s %s: %s" % (reply["id"], reply.get("state"), reply.get("error", "")))
+    return json.dumps(reply["result"], ensure_ascii=False, indent=2)
 
 
 def _pair(args: argparse.Namespace) -> tuple[str, dict]:
@@ -202,7 +240,8 @@ def _pair(args: argparse.Namespace) -> tuple[str, dict]:
                          "limit": args.limit, "cursor": args.cursor, "contains": args.contains,
                          "timeout_s": args.timeout,
                          "options": with_decompile_limits(_options(args), max_characters=args.max_characters,
-                                                          max_result_mb=args.max_result_mb)}
+                                                          max_result_mb=args.max_result_mb,
+                                                          max_result_kb=args.max_result_kb, offset=args.offset)}
     if command == "ghidra_jobs":
         return command, {}
     if command in ("fingerprint", "sections", "imports", "exports"):

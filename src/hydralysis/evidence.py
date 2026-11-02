@@ -89,6 +89,9 @@ LIMITATIONS = {
                                         "callees listed are those direct references."),
     "decompile_truncated": (True, "The decompile stopped at a size bound (truncated, reason, bytes_emitted); the rest of the "
                                   "function body was not emitted."),
+    "decompile_budget_limited": (True, "The engine's adaptive response budget (no cap was named) stopped the decompile; only the front "
+                                       "of the C text (cut, budget) was recovered. Ask again with max_result_mb for a larger bound."),
+    "decompile_paged": (True, "This is one page of the C text (offset, next_offset); the text after next_offset was not read."),
     "non_code_fragments": (False, "Part of the function body is data or unclassified bytes (decompile fragments), not "
                                   "instructions; the C shows only the code fragments."),
     "analysis_incomplete": (True, "Analysis of the subject had not finished when this was read."),

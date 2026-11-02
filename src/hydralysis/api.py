@@ -542,6 +542,11 @@ def _workflow(name: str, args: dict) -> str:
             scripts = sorted((Path(settings["root"]) / "jobs").glob("job-*.json"),
                              key=lambda item: item.stat().st_mtime_ns, reverse=True)[:limit]
             records.extend(read_json(item) for item in scripts)
+            from hydralysis.decompile_job import status as decompile_status
+            decompiles = sorted((Path(settings["root"]) / "decompile-jobs").glob("decompile-*/job.json"),
+                                key=lambda item: item.stat().st_mtime_ns, reverse=True)[:limit]
+            records.extend({key: value for key, value in decompile_status(settings, item.parent.name).items() if key != "result"}
+                           for item in decompiles)
             from hydralysis.overlayjobs import status as overlay_status
             overlays = sorted((Path(settings["root"]) / "overlay-jobs").glob("overlay-*/job.json"),
                               key=lambda item: item.stat().st_mtime_ns, reverse=True)[:limit]
@@ -554,6 +559,9 @@ def _workflow(name: str, args: dict) -> str:
         if job_id.startswith("export-"):
             from hydralysis.exporting import status as export_status
             return json.dumps(export_status(settings, job_id), indent=2)
+        if job_id.startswith("decompile-"):
+            from hydralysis.decompile_job import status as decompile_status
+            return json.dumps(decompile_status(settings, job_id), indent=2)
         if job_id.startswith("overlay-"):
             from hydralysis.overlayjobs import status as overlay_status
             return json.dumps(overlay_status(settings, job_id), indent=2)
