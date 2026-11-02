@@ -469,7 +469,9 @@ class RealWorker(Hydra4Only, unittest.TestCase):
             self.run_script("Y4eDeaf", timeout_s=8)
         elapsed = time.monotonic() - started
         self.assertLess(elapsed, 60, "the deaf script ran on past its timeout (%.1f s)" % elapsed)
-        self.assertIn("killed", str(caught.exception))
+        # under load the engine's own deadline can answer first ("script timed out", cancelled) before the worker is
+        # reported killed: either way the deaf script was stopped at its timeout and the job failed
+        self.assertRegex(str(caught.exception), "killed|timed out")
         self.assertEqual(self.job("Y4eDeaf.java")["state"], "failed")
         self.assertFalse(self.changed())
         self.assertIn("first=y4e_edited", self.run_script("Y4eFirst"), "the next script runs after the kill")
