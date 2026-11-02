@@ -6,6 +6,13 @@ Nothing here is a tag: a release is tagged by the owner.
 
 ## Unreleased
 
+- Native MCP host (`native/hydralysis-mcp`, optional): a Rust build of the stdio server that keeps a few megabytes resident instead of a
+  Python interpreter. Same catalog (epoch 5, same hash and bytes, from `native/hydralysis-mcp/catalog.json`), lanes, output cap and error
+  envelopes. It answers `fingerprint`, `imports`, `function`, `bytes`, `strings`, `sigscan`, `callers` and `xrefs` itself for well-formed
+  images and runs everything else, and every call it is not sure about, in `python -m hydralysis.worker`, started on demand and closed when
+  idle. `hydralysis mcp` starts the binary when `src/hydralysis/bin/` (or `HYDRALYSIS_MCP_BIN`) has it and falls back to the Python server
+  otherwise; `HYDRALYSIS_MCP=python` forces the Python server. Build with `tools/build_mcp_host.py`. See docs/clients.md.
+
 ## 0.8.0
 
 Released 2026-11-02 (the date the release was prepared; the tag is the owner's). 0.8.0 pins Hydra Engine `12.3-hydra.6` (protocol 3);
