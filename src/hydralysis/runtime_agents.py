@@ -764,11 +764,11 @@ function flush(){
 // in `stride`. Ring overflow halves the effective budget; calm periods win it back.
 const SP=Object.assign({mode:'adaptive',rate_budget:120000,stride:1,exact:[],interval_ms:25},P.sampling||{});
 const sites=[],ss=Memory.alloc(16*64+64);
-const sampler={t0:qpcNow().toNumber(),mode:SP.mode,budget:SP.rate_budget,effective:SP.rate_budget,lastT:null,lastHits:{},lastDrops:0,rate:{},stride:{},changes:0,thinned_ms:0};
+const sampler={t0:qpcNow().toNumber(),mode:SP.mode,budget:SP.rate_budget,effective:SP.rate_budget,lastT:null,lastHits:{},lastDrops:0,rate:{},stride:{},thinned:{},changes:0,thinned_ms:0};
 function strideFor(id,name){return SP.exact.indexOf(name)>=0?1:null;}
 function pow2ge(x){let p=1;while(p<x&&p<65536)p*=2;return p;}
 function readSiteStats(){f.site_stats(shared,ss);const o={};for(const st of sites){o[st.id]={hits:ss.add(16*st.id).readU64().toNumber(),kept:ss.add(16*st.id+8).readU64().toNumber()};}return o;}
-function applyStride(st,stride){if(sampler.stride[st.id]!==stride){sampler.stride[st.id]=stride;f.set_mask(st.ptr,stride-1);sampler.changes++;}}
+function applyStride(st,stride){if(sampler.stride[st.id]!==stride){sampler.stride[st.id]=stride;if(stride>1)sampler.thinned[st.id]=true;f.set_mask(st.ptr,stride-1);sampler.changes++;}}
 function policy(){
   if(sites.length===0)return;
   const nowT=qpcNow().toNumber();
@@ -794,9 +794,14 @@ function policy(){
     if(r<=share){left-=r;applyStride(st,1);}
     else{const stride=pow2ge(Math.ceil(r/share));applyStride(st,stride);left-=r/stride;}}
 }
+// hits and kept are two counters of a thread that is running while they are read: a hit the gate has counted but whose
+// record is not yet counted kept is in flight, and h-k would show it as skipped. A probe whose stride was never above 1 cannot
+// have skipped a hit, so its skipped is 0 (this is what keeps exact mode, and an adaptive probe under its share, from
+// reporting a phantom skip); a thinned probe's h-k is exact once the target is quiet and at most one per running thread above it
+// before.
 function samplingReport(){const cur=readSiteStats(),rows=[];let hits=0,skipped=0;
-  for(const st of sites){const h=cur[st.id].hits,k=cur[st.id].kept;hits+=h;skipped+=h-k;
-    rows.push({site:st.id,probe:st.name,hits:h,kept:k,skipped:h-k,stride:sampler.stride[st.id]||1,rate_per_s:Math.round(sampler.rate[st.id]||0),exact:!!st.exact});}
+  for(const st of sites){const h=cur[st.id].hits,k=cur[st.id].kept,sk=sampler.thinned[st.id]?Math.max(0,h-k):0;hits+=h;skipped+=sk;
+    rows.push({site:st.id,probe:st.name,hits:h,kept:k,skipped:sk,stride:sampler.stride[st.id]||1,rate_per_s:Math.round(sampler.rate[st.id]||0),exact:!!st.exact});}
   return {policy:sampler.mode,rate_budget_per_s:sampler.budget,effective_budget_per_s:Math.round(sampler.effective),stride_changes:sampler.changes,
     hits,skipped,sites:rows};}
 function counterMessage(final){const c=readCounters();
