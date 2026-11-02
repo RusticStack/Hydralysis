@@ -429,11 +429,11 @@ def constant_forms(value: int, bits: int) -> list[bytes]:
     return [value.to_bytes(size, "little")]
 
 
-def scan_constants(image, hashes: list[tuple[int, int]], *, limit: int = 50) -> list[dict]:
+def scan_constants(image, hashes: list[tuple[int, int]], *, limit: int = 50, functions: list[tuple[int, int]] | None = None) -> list[dict]:
     """Where an image carries the constants. HASHES is [(value, bits)]. Searches every section's file bytes.
 
     Each hit says the section, the RVA, whether the section is executable (an immediate in code) and, when the image
-    can say (x64 pdata), the containing function. Hits are bounded by LIMIT and `truncated` says so."""
+    can say (x64 pdata, or FUNCTIONS: analysed [start, end) RVA ranges for leaf functions without unwind data), the containing function. Hits are bounded by LIMIT and `truncated` says so."""
     hits: list[dict] = []
     truncated = False
     for section in image.sections:
@@ -459,6 +459,8 @@ def scan_constants(image, hashes: list[tuple[int, int]], *, limit: int = 50) -> 
                         bounds = image._bounds(rva) if executable else None
                     except Exception:  # noqa: BLE001 - an image without pdata simply has no function to name
                         bounds = None
+                    if bounds is None and executable and functions:
+                        bounds = next(((a, b) for a, b in functions if a <= rva < b), None)
                     if bounds:
                         hit["function"] = "rva:%#x" % bounds[0]
                     hits.append(hit)
@@ -471,7 +473,8 @@ def scan_constants(image, hashes: list[tuple[int, int]], *, limit: int = 50) -> 
     return sorted(hits, key=lambda hit: (int(hit["rva"][4:], 16), hit["value"])) if not truncated else hits
 
 
-def find_name_users(dictionary: Dictionary, name: str, image, *, algorithms: list[str] | None = None, limit: int = 50) -> dict:
+def find_name_users(dictionary: Dictionary, name: str, image, *, algorithms: list[str] | None = None, limit: int = 50,
+                    functions: list[tuple[int, int]] | None = None) -> dict:
     """A search for NAME: its hash under each algorithm, and the code or data in IMAGE that carries each hash.
 
     A hash that the dictionary also gives to another name is flagged `ambiguous`: a hit is then a candidate, not proof."""
@@ -490,5 +493,5 @@ def find_name_users(dictionary: Dictionary, name: str, image, *, algorithms: lis
         if pair not in seen:
             seen.add(pair)
             unique.append(pair)
-    hits = scan_constants(image, unique, limit=limit)
+    hits = scan_constants(image, unique, limit=limit, functions=functions)
     return {"name": name, "algorithms": per_algorithm, "hits": hits, "truncated": len(hits) >= limit}

@@ -306,9 +306,20 @@ class CaptureMixin:
 
     def capture(self, args: dict) -> dict:
         op = str(args.get("op") or "")
-        unknown = set(args) - {"op", "name", "capture", "after", "limit", "session", "trace"}
+        unknown = set(args) - {"op", "name", "capture", "after", "limit", "session", "trace", "owner", "scope"}
         if unknown:
             raise ValueError("unknown capture options: %s" % ", ".join(sorted(unknown)))
+        active = getattr(self, "trace", None) is not None and not self.trace.finalized
+        if active and op in ("start", "stop", "scope"):
+            self._require_trace_owner(op, args.get("owner"))
+        if op == "scope":
+            if not active:
+                raise ValueError("no trace capture is running; there is no scope to change")
+            added = args.get("scope") or {}
+            if not isinstance(added, dict):
+                raise ValueError("scope is an object {add: [...]}")
+            self.trace_scope_added = list(getattr(self, "trace_scope_added", [])) + list(added.get("add") or [])
+            return {"scope": {"added": self.trace_scope_added}, "by": "owner"}
         if op == "start":
             trace_args = self._trace_option(args["trace"]) if args.get("trace") is not None else None
             started = self._capture_start(_capture_name(args.get("name")))
@@ -333,6 +344,12 @@ class CaptureMixin:
         if result is None:
             raise ValueError("capture op is one of start, stop, read, verify, list, counters")
         return result
+
+    def _require_trace_owner(self, op: str, presented) -> None:
+        """Arming, widening the scope of and stopping a running trace belong to its owner (the writer capability)."""
+        expected = getattr(self, "trace_owner", None)
+        if expected and presented != expected:
+            raise PermissionError("not_owner: this trace capture belongs to another client; %s needs the owner's capability" % op)
 
     def _trace_option(self, option) -> dict:
         """The `trace` option of `capture start`: {session, owner?, hooks, probes, ...recorder settings}. The probes are the verified

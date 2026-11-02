@@ -9,8 +9,12 @@
    feature, and writes persist_save.dat. The poke changes only record 2 (1 -> 0): the intervention-caused change,
    which survives removing the intervention because it is now in the file.
    load: a fresh process reads persist_save.dat. The loader only knows type 1; the type-2 tag of record 4 is dropped
-   (it does not round-trip). */
+   (it does not round-trip).
+   With --reg=<subkey> the program also mirrors its records into HKEY_CURRENT_USER\<subkey>: a type-1 record is a REG_DWORD
+   named by its tag, a type-2 record a REG_SZ named by its tag; load reads the type-1 values back (the registry store is
+   the second persistent store of spec 15.8). */
 #include "trace_common.h"
+#pragma comment(lib, "advapi32.lib")
 
 typedef struct Record { unsigned id, type; int value; char tag[8]; } Record;
 
@@ -62,8 +66,29 @@ static void show(const char *what) {
         say("%s id=%u type=%u value=%d tag=%s", what, g_records[i].id, g_records[i].type, g_records[i].value, g_records[i].tag);
 }
 
+static void write_registry(const char *subkey) {
+    for (int i = 0; i < g_count; ++i) {
+        if (g_records[i].type == 1) RegSetKeyValueA(HKEY_CURRENT_USER, subkey, g_records[i].tag, REG_DWORD, &g_records[i].value, 4);
+        else RegSetKeyValueA(HKEY_CURRENT_USER, subkey, g_records[i].tag, REG_SZ, "present", 8);
+    }
+}
+
+static void read_registry(const char *subkey) {
+    for (int i = 0; i < g_count; ++i) {
+        DWORD value = 0, size = 4;
+        if (g_records[i].type == 1 && RegGetValueA(HKEY_CURRENT_USER, subkey, g_records[i].tag, RRF_RT_REG_DWORD, NULL, &value, &size) == 0)
+            say("reg %s=%d", g_records[i].tag, (int)value);
+    }
+}
+
+static const char *reg_arg(int argc, char **argv) {
+    for (int i = 3; i < argc; ++i) if (strncmp(argv[i], "--reg=", 6) == 0) return argv[i] + 6;
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     char save[MAX_PATH], before[MAX_PATH];
+    const char *subkey = reg_arg(argc, argv);
     int dropped = 0;
     if (argc < 3) { fprintf(stderr, "usage: persist <dir> save|load [--poke]\n"); return 2; }
     fx_arm_watchdog(20);
@@ -74,6 +99,7 @@ int main(int argc, char **argv) {
         int loaded = fx_read_store(save, 1, &dropped);
         if (loaded < 0) return 3;
         show("loaded");
+        if (subkey) read_registry(subkey);
         say("loaded_count=%d dropped=%d", loaded, dropped);
         return 0;
     }
@@ -81,6 +107,7 @@ int main(int argc, char **argv) {
     if (!fx_write_store(before)) return 4;
     if (fx_flag(argc, argv, "--poke")) fx_instrument_poke(2, 0);
     if (!fx_write_store(save)) return 5;
+    if (subkey) write_registry(subkey);
     show("saved");
     say("saved_count=%d poke=%d", g_count, fx_flag(argc, argv, "--poke"));
     return 0;

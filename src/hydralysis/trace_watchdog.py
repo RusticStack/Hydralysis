@@ -384,7 +384,8 @@ def capture_stacks(pid: int, depth: int = 24, scan_bytes: int = 4096) -> dict:
             try:
                 ctx = CONTEXT()
                 ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER
-                if k32.SuspendThread(handle) == 0xFFFFFFFF:
+                before = k32.SuspendThread(handle)       # the previous suspend count: above 0, somebody else suspended the thread
+                if before == 0xFFFFFFFF:
                     threads.append({"tid": tid, "state": "unreadable", "reason": "SuspendThread failed"})
                     continue
                 try:
@@ -392,7 +393,7 @@ def capture_stacks(pid: int, depth: int = 24, scan_bytes: int = 4096) -> dict:
                     frames = _walk(process, ctx, mods, depth, scan_bytes, unwinder) if ok else []
                 finally:
                     k32.ResumeThread(handle)
-                threads.append({"tid": tid, "state": "captured" if ok else "unreadable", "frames": frames})
+                threads.append({"tid": tid, "state": "captured" if ok else "unreadable", "frames": frames, "suspended_before": int(before)})
             finally:
                 k32.CloseHandle(handle)
     finally:

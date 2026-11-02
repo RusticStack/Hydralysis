@@ -44,7 +44,9 @@ def fixtures_dir() -> Path:
         import build_fixtures
         persistent = os.environ.get("HYDRA_TRACE_FX")
         root = Path(persistent) if persistent else Path(workdir("trace-gate-fx").name)
-        for group in build_fixtures.TRACE_GROUPS:
+        for group, outputs in build_fixtures.TRACE_GROUPS.items():
+            if persistent and all((root / "x64" / out).is_file() for out in outputs):
+                continue            # a persistent build directory is reused as it is (delete a file to rebuild its group)
             tf.build_group(group, root, ("x64",))
         _BUILT["dir"] = root / "x64"
     return _BUILT["dir"]

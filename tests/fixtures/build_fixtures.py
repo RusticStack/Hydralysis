@@ -44,6 +44,7 @@ TRACE_BUILDS = [
     ("persist.exe", "persist.c", []),
     ("deadlock.exe", "deadlock.c", []),
     ("ioctl_client.exe", "ioctl_client.c", []),
+    ("field_writers.exe", "field_writers.c", []),
 ]
 # Fixture name (the expected/<name>.json file) -> the outputs it needs. vcall_fixture and diff_fixture are the extended
 # existing fixtures, built into manifest.json.
@@ -53,6 +54,7 @@ TRACE_GROUPS = {
     "layouts": ["layouts.exe"], "frameloop": ["frameloop.exe"], "veh_freeze": ["veh_freeze.exe"],
     "replica": ["replica_a.exe", "replica_b.exe"], "fnv_names": ["fnv_names.exe"], "minivm": ["minivm.exe"],
     "persist": ["persist.exe"], "deadlock": ["deadlock.exe"], "ioctl_client": ["ioctl_client.exe"],
+    "field_writers": ["field_writers.exe"],
     "vcall_fixture": ["vcall_fixture.exe"], "diff_fixture": ["diff1.exe", "diff2.exe"],
 }
 ARCHES = (("x64", "x64"), ("x86", "x86"))

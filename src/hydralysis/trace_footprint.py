@@ -157,3 +157,45 @@ def round_trip(original: dict, restored: dict, ordinary: set[str] | None = None)
     if left:
         return {"verdict": NOT_ROUND_TRIP, "paths": left}
     return {"verdict": "round-trips", "ignored_ordinary": sorted(_paths(d) & (ordinary or set()))}
+
+
+def values_round_trip(saved: dict, reloaded: dict) -> dict:
+    """Whether what a program saved is what a fresh run reads back. SAVED and RELOADED map a record key to its value.
+
+    A key that is saved but not read back is `dropped`, a key whose value differs is `changed`; either one is `did not
+    round-trip` (the file or registry value can be intact while the program's own loader loses it)."""
+    dropped = [{"key": key, "value": saved[key]} for key in sorted(saved) if key not in reloaded]
+    changed = [{"key": key, "saved": saved[key], "reloaded": reloaded[key]} for key in sorted(saved)
+               if key in reloaded and reloaded[key] != saved[key]]
+    extra = sorted(set(reloaded) - set(saved))
+    verdict = NOT_ROUND_TRIP if dropped or changed else "round-trips"
+    return {"verdict": verdict, "dropped": dropped, "changed": changed, "appeared": extra}
+
+
+def footprint_report(baseline: dict, control: dict, intervened: dict, removed: dict, *, writes: list[dict] | None = None,
+                     saved: dict | None = None, reloaded: dict | None = None) -> dict:
+    """What an intervention left in persistent stores (files and HKCU keys), from four snapshots of the same stores:
+    BASELINE (before anything ran), CONTROL (after an ordinary run), INTERVENED (after the run with the intervention) and
+    REMOVED (after the intervention was taken away again, with nothing else changed).
+
+    * `ordinary`   - changes the control run makes anyway; never blamed on the intervention;
+    * `caused`     - paths the intervened run left different from the control run, each with whether it `survives_removal`
+                     (still different from the control after REMOVED: the change is now data, not code) and its attribution:
+                     the observed WRITES (trace events {event_id, site}) when there are any, else `unattributed`;
+    * `round_trip` - values SAVED against RELOADED by a fresh run, when given."""
+    ordinary = _paths(diff(baseline, control))
+    versus_control = diff(control, intervened)
+    left = _paths(diff(control, removed))
+    attribution = [{"event_id": w.get("event_id"), "site": w.get("site")} for w in writes or []]
+    caused = []
+    for path in sorted(_paths(versus_control)):
+        kind = "added" if path in versus_control["added"] else "removed" if path in versus_control["removed"] else "changed"
+        caused.append({"path": path, "change": kind, "survives_removal": path in left,
+                       "classification": "intervention-caused, survives removing the intervention" if path in left
+                       else "intervention-caused, gone with the intervention",
+                       "attribution": attribution or "unattributed"})
+    report = {"ordinary": sorted(ordinary), "caused": caused, "removal": round_trip(control, removed),
+              "verdict": "caused" if caused else "none"}
+    if saved is not None and reloaded is not None:
+        report["round_trip"] = values_round_trip(saved, reloaded)
+    return report

@@ -630,7 +630,7 @@ def _stop(client: TraceClient, session: str, options: dict, settings: dict) -> d
         from hydralysis.runtime import RuntimeRunner
         runner = RuntimeRunner(settings)
         result["runtime"] = {"session": runtime_session, "capture": runner.call(
-            "capture", {"op": "stop", "session": runtime_session})}
+            "capture", {"op": "stop", "session": runtime_session, "owner": options.get("cap") or _TOKENS.get(session)})}
         if options.get("detach", True):
             result["runtime"]["detach"] = runner.call("detach", {"session": runtime_session})
     result["closed"] = client.close(session, cap=options.get("cap") or _TOKENS.get(session))
@@ -692,6 +692,120 @@ def _check(client: TraceClient, session: str, options: dict, limit: int) -> dict
                          "write_precedes_read_in_frame, at_most_once_per_frame, no_frame_without, round_trip)")
     return client.check(session, assertions=assertions, persist=options.get("persist"),
                         cap=options.get("cap") or _TOKENS.get(session))
+
+
+def _rows(client: TraceClient, session: str, kinds: list[str], cap: int = 200_000) -> list[dict]:
+    """Every row of KINDS of a session on one pinned snapshot, payload decoded (a paired comparison reads whole sessions)."""
+    out, after, up_to = [], None, None
+    while len(out) < cap:
+        reply = client.query(session, kinds=kinds, limit=1000, after=after, up_to=up_to)
+        for row in reply.get("rows") or []:
+            payload = row.get("payload")
+            out.append({"event_id": row["event_id"], "kind": row["kind"], "t_mono_ns": row["t_mono_ns"], "seq": row.get("seq"),
+                        "payload": json.loads(payload) if isinstance(payload, str) else (payload or {})})
+        after, up_to = reply.get("next"), reply.get("up_to")
+        if not after:
+            break
+    return out
+
+
+def _pair(client: TraceClient, owner: str, replica: str, options: dict) -> dict:
+    """Spec 15.5 as a diff mode: SESSION is the owner, options.against the replica; options.pair names the event kinds."""
+    from hydralysis import trace_pairing
+    spec = {**trace_pairing.DEFAULT_SPEC, **_object(options.get("pair"), "options.pair")}
+    owner_kinds = [spec[k] for k in ("owner_sync", "truth", "create")]
+    replica_kinds = [spec[k] for k in ("replica_sync", "mirror", "extrapolated")]
+    report = trace_pairing.pair_report(_rows(client, owner, owner_kinds), _rows(client, replica, replica_kinds), spec)
+    return {**report, "owner": {"session": owner, "revision": client.info(owner).get("revision")},
+            "replica": {"session": replica, "revision": client.info(replica).get("revision")}}
+
+
+REPORTS = ("survival", "bypass", "writers", "links", "discovery", "names", "footprint")
+
+
+def _report_events(client: TraceClient, session: str, options: dict) -> list[dict]:
+    """The session's rows of options.kinds as report events (frame, phase, role, ours and the hook site lifted from payloads;
+    symbolized functions merged when the session has a program and options.symbols is true)."""
+    from hydralysis import trace_reports
+    kinds = _strings(options.get("kinds"), "options.kinds") or None
+    rows, symbols = [], {}
+    after, up_to = None, None
+    while len(rows) < 200_000:
+        reply = client.query(session, kinds=kinds, limit=1000, after=after, up_to=up_to, with_symbols=options.get("symbols") or None)
+        rows.extend(reply.get("rows") or [])
+        for entry in (reply.get("symbols") or {}).get("rows") or []:
+            symbols[entry["seq"]] = entry
+        after, up_to = reply.get("next"), reply.get("up_to")
+        if not after:
+            break
+    return trace_reports.from_engine_rows(rows, names=options.get("names"), symbols=symbols)
+
+
+def _report(client: TraceClient, session: str, options: dict) -> dict:
+    """Spec 15.3 / 15.4 / 14.4 / 15.7 / M4 over the session's live data. options.report picks the builder; the builder's own
+    parameters are options.params. Every answer carries the revision it read."""
+    from hydralysis import trace_bindings, trace_reports
+    kind = options.get("report")
+    if kind not in REPORTS:
+        raise ValueError("options.report is one of: " + ", ".join(REPORTS))
+    params = _object(options.get("params"), "options.params")
+    info = client.info(session)
+    events = _report_events(client, session, options)
+    gaps = params.pop("gaps", None) or []
+    if kind == "survival":
+        result = trace_reports.write_survival(events, field=params["field"], consumer=params["consumer"],
+                                              phases=params.get("phases"), gaps=gaps)
+    elif kind == "writers":
+        result = trace_reports.field_writers(params.get("static_sites") or [], events, object_addr=int(params["object"]),
+                                             offset=int(params["offset"]), size=int(params["size"]), names=params.get("names"))
+    elif kind == "bypass":
+        receivers = {int(k): v for k, v in (params.get("receivers") or {}).items()}
+        edges = trace_reports.edges_from_dispatch(events, _object(params.get("dispatch_sites"), "params.dispatch_sites"),
+                                                  receiver_class=lambda address: receivers.get(address),
+                                                  ignore=tuple(params.get("ignore") or ()),
+                                                  candidates=params.get("static_candidates"))
+        observed = trace_reports.observed_edges(edges, static_candidates=params.get("static_candidates"))
+        result = {"edges": observed, **trace_reports.hook_bypass(events, hook=params["hook"], field=params["field"],
+                                                                 siblings=params.get("siblings"), observed=observed["observed"])}
+    elif kind == "links":
+        field = params.get("script_field")
+        if field:      # the called script function is the first word of the script line the VM hook captured
+            for event in events:
+                line = event["payload"]
+                for part in field.split("."):      # "buf.preview": the redacted preview an authorized probe recorded
+                    line = line.get(part) if isinstance(line, dict) else None
+                if isinstance(line, str) and line.split() and "script_function" not in event["payload"]:
+                    event["payload"]["script_function"] = line.split()[0]
+        result = trace_bindings.link_events(events, params["table"], window=int(params.get("window", 8)))
+    elif kind == "footprint":
+        from hydralysis import trace_footprint
+        writes = [{"event_id": e["event_id"], "site": e["function"]} for e in events if e["kind"] == "core.state.write"]
+        result = trace_footprint.footprint_report(*(_object(params.get(k), "params." + k) for k in ("baseline", "control", "intervened", "removed")),
+                                                  writes=writes, saved=params.get("saved"), reloaded=params.get("reloaded"))
+    elif kind == "names":
+        from hydralysis import trace_hashes
+        algorithm = str(params.get("algorithm") or "fnv1a64")
+        dictionary = trace_hashes.Dictionary(algorithms=[algorithm])
+        for source, names in sorted(_object(params.get("dictionary"), "params.dictionary").items()):
+            for name in names:
+                dictionary.add(str(name), str(source))
+        result = trace_hashes.interpret_events(dictionary, algorithm, events, _strings(params.get("fields"), "params.fields"))
+        result["interpretation"]["parent"] = params.get("parent")
+        result["dictionary"] = {"names": len(dictionary), "sha256": dictionary.digest(), "collisions": dictionary.collisions()}
+        result["claim"] = "interpretation only: the raw values are unchanged in the trace; a revision is a reading of them"
+    else:
+        exercised = [{"key": site, "kind": k, "count": n} for (site, k), n in sorted(
+            _count((e["function"], e["kind"]) for e in events if e["function"]).items())]
+        result = trace_reports.discovery_report(exercised=exercised, candidates=params.get("candidates") or [],
+                                                observation_gaps=list(info.get("gaps") or []) + list(gaps))
+    return {"report": kind, "result": result, "events_read": len(events), "revision": info.get("revision")}
+
+
+def _count(items) -> dict:
+    out: dict = {}
+    for item in items:
+        out[item] = out.get(item, 0) + 1
+    return out
 
 
 def _import(client: TraceClient, session: str | None, options: dict) -> dict:
@@ -791,11 +905,15 @@ def handle_action(action: str, session: str | None, options: dict, settings: dic
         raise ValueError("trace %s requires session" % action)
     if action == "stop":
         return shape(_stop(client, session, options, settings), session=session, command="trace_close", limit=limit)
+    if action == "query" and options.get("report"):      # spec 15.3 / 15.4 / 14.4 / 15.7 builders over the session's live data
+        return shape(_report(client, session, options), session=session, command="trace_query", limit=limit)
     if action == "query":
         reply = _query(client, session, options, limit)
         return shape(reply, session=session, command="trace_query", limit=limit, requested_revision=options.get("revision"))
     if action == "diff":
         other = _session(options.get("against") or options.get("session_b"), "options.against")
+        if options.get("mode") == "pair":
+            return shape(_pair(client, session, other, options), session=session, command="trace_diff", limit=limit)
         group = options.get("group_by")
         group = group[0] if isinstance(group, list) and len(group) == 1 else group
         if group is not None and not isinstance(group, str):

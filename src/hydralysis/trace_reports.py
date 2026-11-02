@@ -214,7 +214,8 @@ def hook_bypass(events: list[dict], *, hook: str, field: str, siblings: list[str
         else:
             kind = "unexplained"
         entry = {"class": kind, "event_id": event["event_id"], "frame": event["frame"], "site": _site(event), "path": path,
-                 "receiver_class": (edge or {}).get("receiver_class"), "via": (edge or {}).get("site")}
+                 "receiver_class": (edge or {}).get("receiver_class"), "via": (edge or {}).get("site"),
+                 "reached_through": "indirect call at %s (slot %s)" % (edge["site"], edge.get("slot")) if edge else None}
         by_class[kind] = by_class.get(kind, 0) + 1
         if sum(1 for b in bypasses if b["class"] == kind) < per_class:
             bypasses.append(entry)
@@ -237,3 +238,150 @@ def discovery_report(*, exercised: list[dict], candidates: list[dict], observati
                                       "meaning": "static candidates with no observed execution in the observed intervals"},
             "observation_gaps": {"count": len(observation_gaps), "items": observation_gaps,
                                  "meaning": "intervals or sites where nothing could be observed; absence there proves nothing"}}
+
+
+# ---- 14.4: who writes this field? -----------------------------------------------------------------------------------------
+
+def _entry(value) -> int | None:
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value), 16)
+    except (TypeError, ValueError):
+        return None
+
+
+def field_writers(static_sites: list[dict], events: list[dict], *, object_addr: int, offset: int, size: int,
+                  names: dict | None = None, escape_kind: str = "app.escape", write_kinds=("core.state.write",),
+                  per_site: int = 3) -> dict:
+    """14.4: the writers of one field of one object, as three answers that are never merged.
+
+    STATIC_SITES are the static candidates (`writes` rows: {function: entry address, site, instruction?}); NAMES maps a
+    function entry address to its name so a candidate can be matched with an observed site. EVENTS are trace rows. An event
+    of a kind in WRITE_KINDS with payload {object, offset?, size?} (default offset 0, the span the write covers) writes the
+    selected bytes when [object+offset, +size) overlaps [OBJECT_ADDR+OFFSET, +SIZE); an event of ESCAPE_KIND with payload
+    {object, offset, callee} says a pointer into the selected bytes was passed to code that is not instrumented.
+
+    * `observed`  - a site whose write was seen: count, objects, events; `static_candidate` says whether the static scan
+                    listed it (a site it did not list is a writer no scan of the field would have found);
+    * `may_access` - a static candidate with no observation in the observed intervals. It may run later, or never;
+    * `unresolved` - a pointer to the field reached uninstrumented code: the write is neither confirmed nor excluded.
+
+    The reply never presents the static scan as a complete inventory."""
+    names = {_entry(address): name for address, name in (names or {}).items()}
+    lo, hi = object_addr + offset, object_addr + offset + size
+    by_function: dict = {}
+    for row in static_sites:
+        entry = _entry(row.get("function"))
+        by_function.setdefault(entry, {"function": names.get(entry) or row.get("function_name") or row.get("function"),
+                                       "entry": row.get("function"), "sites": []})["sites"].append(
+            {"site": row.get("site"), "instruction": row.get("instruction")})
+    candidate_names = {value["function"] for value in by_function.values()}
+    observed: dict = {}
+    escapes: dict = {}
+    for event in map(normalize_event, events):
+        payload = event["payload"]
+        base = payload.get("object")
+        if not isinstance(base, int):
+            continue
+        start = base + int(payload.get("offset", 0))
+        name = event["function"] or payload.get("site") or "unresolved"
+        if event["kind"] in write_kinds:
+            if start < hi and start + int(payload.get("size", size)) > lo:
+                entry = observed.setdefault(name, {"site": name, "count": 0, "objects": set(), "frames": [],
+                                                   "events": [], "static_candidate": name in candidate_names})
+                entry["count"] += 1
+                entry["objects"].add(base)
+                if event["frame"] is not None and len(entry["frames"]) < per_site * 2 and event["frame"] not in entry["frames"]:
+                    entry["frames"].append(event["frame"])
+                if event["event_id"] and len(entry["events"]) < per_site:
+                    entry["events"].append(event["event_id"])
+        elif event["kind"] == escape_kind and lo <= start < hi:
+            entry = escapes.setdefault(name, {"site": name, "callee": payload.get("callee"), "count": 0, "events": []})
+            entry["count"] += 1
+            if event["event_id"] and len(entry["events"]) < per_site:
+                entry["events"].append(event["event_id"])
+    observed_rows = []
+    for name in sorted(observed):
+        row = observed[name]
+        row["objects"] = sorted(row["objects"])
+        row["status"] = "observed"
+        row["on_selected_object"] = object_addr in row["objects"]
+        if not row["static_candidate"]:
+            row["note"] = "not among the static candidates: no scan of this field would have listed it"
+        observed_rows.append(row)
+    seen = {row["site"] for row in observed_rows}
+    may = [{"site": value["function"], "status": "may access", "static_sites": value["sites"],
+            "basis": "static candidate (a store at offset %#x); never observed in the observed intervals" % offset}
+           for value in sorted(by_function.values(), key=lambda v: str(v["function"])) if value["function"] not in seen]
+    unresolved = [{"site": name, "status": "unresolved", "callee": row["callee"], "count": row["count"], "events": row["events"],
+                   "stopped_by": "alias: a pointer into the field is passed to %s, which is not instrumented; whether it writes "
+                                 "the field is neither observed nor excluded" % (row["callee"] or "an uninstrumented callee")}
+                  for name, row in sorted(escapes.items())]
+    return {"field": {"object": object_addr, "offset": offset, "size": size}, "observed": observed_rows, "may_access": may,
+            "unresolved": unresolved, "static_inventory_complete": False,
+            "claim": "three distinct answers: observed writers, static candidates never seen to run, and aliases that stop the analysis; "
+                     "none of them is a complete writer inventory"}
+
+
+# ---- adapters: trace rows -> the events the reports read ---------------------------------------------------------------------
+
+def from_engine_rows(rows: list[dict], *, names: dict | None = None, symbols: dict | None = None) -> list[dict]:
+    """Engine query rows ({event_id, kind, seq, payload, process_gen, thread_gen, ...}, payload JSON text or object) as report
+    events. The producer-stamped `frame`, `phase`, `role` and `ours` of the payload become the event's own; the site is the
+    hook's id (payload.site) unless a symbolized function is known for the seq (SYMBOLS: seq -> {function, stack}); NAMES
+    maps a `FUN_<hex address>` name to the program's own name for that address."""
+    import json
+    names = {int(str(k), 16) if not isinstance(k, int) else k: v for k, v in (names or {}).items()}
+
+    def rename(name):
+        if isinstance(name, str) and name.startswith("FUN_"):
+            try:
+                return names.get(int(name[4:], 16), name)
+            except ValueError:
+                return name
+        return name
+    out = []
+    for row in rows:
+        payload = row.get("payload")
+        payload = json.loads(payload) if isinstance(payload, str) else dict(payload or {})
+        known = (symbols or {}).get(row.get("seq")) or {}
+        out.append({"event_id": row.get("event_id"), "kind": row.get("kind"), "seq": row.get("seq"), "frame": payload.get("frame"),
+                    "phase": payload.get("phase"), "role": payload.get("role"),
+                    "thread_gen": (row.get("process_gen"), row.get("thread_gen")) if row.get("thread_gen") is not None else None,
+                    "function": rename(known.get("function")) or payload.get("site"),
+                    "stack": [rename(n) for n in known.get("stack") or [] if n], "va": row.get("va"),
+                    "ours": bool(payload.get("ours", False)), "payload": payload,
+                    "rva": int(str(payload["rva"]), 0) if payload.get("rva") is not None else None})
+    return out
+
+
+def edges_from_dispatch(events: list[dict], dispatch_sites: dict, *, receiver_class=None, ignore=(), candidates: dict | None = None) -> list[dict]:
+    """15.4: observed indirect-call edges from instrumented dispatch sites.
+
+    DISPATCH_SITES maps a site (the hook id of a function that makes an indirect call) to {slot}; a dispatch event carries
+    payload.receiver (the object the call goes through). The target is the very next instrumented event of the same thread
+    (events of IGNORE are skipped); if that is itself a dispatch event there is no observed target. Several source functions
+    can share one site (identical code is folded), so when CANDIDATES ({site: [targets]}) is given the next event only counts
+    when it is one of the site's candidates. This is an observation of order on one thread, not of the jump itself, and each
+    edge says so. RECEIVER_CLASS(receiver) names the class from the object's vtable pointer where that is known, else None."""
+    rows = [normalize_event(e) for e in events]
+    by_thread: dict = {}
+    for row in sorted(rows, key=lambda r: r["seq"] if r["seq"] is not None else 0):
+        if row["function"] not in ignore:
+            by_thread.setdefault(row["thread_gen"], []).append(row)
+    out = []
+    for thread in by_thread.values():
+        for index, row in enumerate(thread[:-1]):
+            site = row["function"]
+            if site not in dispatch_sites:
+                continue
+            target = thread[index + 1]
+            if target["function"] in dispatch_sites or (candidates and target["function"] not in (candidates.get(site) or ())):
+                continue
+            receiver = row["payload"].get("receiver")
+            out.append({"event_id": row["event_id"], "kind": "core.function.enter", "seq": row["seq"], "frame": row["frame"],
+                        "payload": {"site": site, "target": target["function"], "slot": dispatch_sites[site].get("slot"),
+                                    "receiver_class": receiver_class(receiver) if receiver_class and receiver is not None else None,
+                                    "basis": "next instrumented event on the same thread after the dispatch (%s)" % target["event_id"]}})
+    return out

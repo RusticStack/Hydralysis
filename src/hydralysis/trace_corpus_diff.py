@@ -161,6 +161,36 @@ def dependents_from_profile(profile) -> list[dict]:
     return items
 
 
+def position_independent_reader(image):
+    """A bytes reader for `invalidation_report(readers=...)` that compares code, not placement: the displacement of every
+    RIP-relative operand and the target of every relative call or jump are zeroed, so the same function placed at another
+    address (against data placed elsewhere too) reads the same. Anything else, including an immediate or a stack offset, is
+    kept: a changed constant is a changed function. x64 images only (capstone decides what an instruction is)."""
+    from hydralysis.pe import capstone
+
+    def read(rva: int, size: int):
+        try:
+            raw = image.read_rva(rva, size + 16)
+        except ValueError:
+            try:
+                raw = image.read_rva(rva, size)
+            except ValueError:
+                return None
+        cs = capstone()
+        decoder = cs.Cs(cs.CS_ARCH_X86, cs.CS_MODE_64)
+        decoder.detail = True
+        out = bytearray(raw)
+        for insn in decoder.disasm(raw, image.base + rva):
+            if insn.disp_size == 4 and any(op.type == cs.x86.X86_OP_MEM and op.mem.base == cs.x86.X86_REG_RIP for op in insn.operands):
+                start = insn.address - (image.base + rva) + insn.disp_offset
+                out[start:start + 4] = bytes(4)
+            elif insn.imm_size == 4 and insn.group(cs.CS_GRP_JUMP) or insn.imm_size == 4 and insn.group(cs.CS_GRP_CALL):
+                start = insn.address - (image.base + rva) + insn.imm_offset
+                out[start:start + 4] = bytes(4)
+        return bytes(out[:size])
+    return read
+
+
 # ---- the report ------------------------------------------------------------------------------------------------
 
 def _function_status(ref: dict, diff: dict, a: dict, b: dict, readers) -> tuple[str, str]:
@@ -177,6 +207,12 @@ def _function_status(ref: dict, diff: dict, a: dict, b: dict, readers) -> tuple[
         return "unplaced", "%s cannot be matched in build B" % name
     moved = next((m for m in diff["functions"]["moved"] if m["name"] == name), None)
     if moved:
+        length = _compare_length(ref, a["functions"].get(name))
+        if not ref.get("rva") and readers is not None:      # cited by name: only the code matters, not where it sits
+            old, new = readers[0](_address(moved["a"]), length), readers[1](_address(moved["b"]), length)
+            if old is not None and new is not None and old == new:
+                return "carried", "identical bytes (%d) at its new address %s (was %s); cited by name, not by address" % (
+                    length, moved["b"], moved["a"])
         return "candidate", "%s moved from %s to %s; its bytes and callers need independent evidence" % (name, moved["a"], moved["b"])
     retyped = next((m for m in diff["functions"]["retyped"] if m["name"] == name), None)
     if retyped:
@@ -184,12 +220,20 @@ def _function_status(ref: dict, diff: dict, a: dict, b: dict, readers) -> tuple[
     address = _address(b["functions"][name].get("address"))
     if readers is None or address is None:
         return "candidate", "%s matches by name and address, but no bytes of both builds were given to compare" % name
-    length = max(8, len(str(ref["prologue"]).split())) if ref.get("prologue") else 16
+    length = _compare_length(ref, a["functions"].get(name))
     old = readers[0](_address(a["functions"][name].get("address")), length) if name in a["functions"] else None
     new = readers[1](address, length)
     if old is not None and new is not None and old == new:
         return "carried", "identical bytes (%d) at the same address" % length
     return "candidate", "%s keeps its address but its bytes differ or could not be read" % name
+
+
+def _compare_length(ref: dict, record: dict | None) -> int:
+    """How many bytes of a function to compare: all of it when the corpus knows its `size` (at most 4096), else the prologue
+    the reference carries, else 16."""
+    if record and isinstance(record.get("size"), int) and record["size"] > 0:
+        return min(record["size"], 4096)
+    return max(8, len(str(ref["prologue"]).split())) if ref.get("prologue") else 16
 
 
 def _address(value) -> int | None:

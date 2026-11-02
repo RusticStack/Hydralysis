@@ -289,7 +289,7 @@ prologue = "{prologue}"
             self.assertEqual(calls[1][1]["trace"]["owner"], "tok")
             stopped, _ = run("stop", "s1", {}, engine=engine)
         self.assertEqual([c[0] for c in calls], ["spawn", "capture", "capture", "detach"])
-        self.assertEqual(calls[2][1], {"op": "stop", "session": "r" * 32})
+        self.assertEqual(calls[2][1], {"op": "stop", "session": "r" * 32, "owner": "tok"})
         self.assertEqual(engine.commands(), ["trace_open", "trace_close"])
         self.assertEqual(engine.calls[1][1]["cap"], "tok")
         self.assertEqual(stopped["closed"]["revision"], 77)
