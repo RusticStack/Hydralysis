@@ -537,8 +537,9 @@ class RequestGate:
 
 
 def main() -> int:
-    import frida
+    from hydralysis.runtime_device import get_local_device
     if len(sys.argv) > 1 and sys.argv[1] == "--processes":
+        import frida
         limit = int(sys.argv[2])
         processes = frida.get_local_device().enumerate_processes()
         print(json.dumps({"ok": True, "processes": [{"pid": p.pid, "name": p.name} for p in processes[:limit]],
@@ -546,7 +547,7 @@ def main() -> int:
         return 0
     directory = Path(sys.argv[1]).resolve()
     initial = _read(directory / "start.json")
-    agent = RuntimeAgent(directory, frida.get_local_device())
+    agent = RuntimeAgent(directory, get_local_device())
     worker = {"pid": os.getpid(), "started_ms": _created_ms(os.getpid())}
     try:
         # A blocked native attach/spawn must not bypass the startup budget.

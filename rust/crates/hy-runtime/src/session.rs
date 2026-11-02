@@ -112,6 +112,14 @@ pub struct ModuleInfo {
     pub size: u32,
 }
 
+/// Options for `Session::spawn_opts`.
+#[derive(Clone, Debug, Default)]
+pub struct SpawnOpts {
+    pub stdout: Option<std::path::PathBuf>,
+    pub cwd: Option<std::path::PathBuf>,
+    pub env: Option<Vec<(String, String)>>,
+}
+
 pub struct Session {
     pub process: HANDLE,
     pub thread: HANDLE,
@@ -244,6 +252,22 @@ impl Session {
         sites: &[SiteSpec],
         stdout: Option<&Path>,
     ) -> io::Result<Session> {
+        let opts = SpawnOpts {
+            stdout: stdout.map(Path::to_path_buf),
+            ..Default::default()
+        };
+        Session::spawn_opts(exe, args, sites, &opts)
+    }
+
+    /// Spawn suspended with a working directory and an environment block when given (the environment replaces the
+    /// parent's, as Frida's `envp` does).
+    pub fn spawn_opts(
+        exe: &Path,
+        args: &[String],
+        sites: &[SiteSpec],
+        opts: &SpawnOpts,
+    ) -> io::Result<Session> {
+        let stdout = opts.stdout.as_deref();
         unsafe {
             let mut cmd = format!("\"{}\"", exe.display());
             for a in args {
@@ -293,15 +317,33 @@ impl Session {
                 si.hStdInput = stdin;
                 inherit = 1;
             }
+            let env_block: Option<Vec<u16>> = opts.env.as_ref().map(|vars| {
+                let mut b: Vec<u16> = Vec::new();
+                for (k, v) in vars {
+                    b.extend(format!("{k}={v}").encode_utf16());
+                    b.push(0);
+                }
+                b.push(0);
+                if vars.is_empty() {
+                    b.push(0);
+                }
+                b
+            });
+            let cwdw: Option<Vec<u16>> = opts
+                .cwd
+                .as_ref()
+                .map(|c| c.as_os_str().encode_wide().chain(Some(0)).collect());
             let created = CreateProcessW(
                 exew.as_ptr(),
                 cmdw.as_mut_ptr(),
                 core::ptr::null(),
                 core::ptr::null(),
                 inherit,
-                CREATE_SUSPENDED,
-                core::ptr::null(),
-                core::ptr::null(),
+                CREATE_SUSPENDED | if env_block.is_some() { 0x400 } else { 0 },
+                env_block
+                    .as_ref()
+                    .map_or(core::ptr::null(), |b| b.as_ptr() as *const _),
+                cwdw.as_ref().map_or(core::ptr::null(), |c| c.as_ptr()),
                 &si,
                 &mut pi,
             );
@@ -614,6 +656,24 @@ impl Session {
         c.attempted = c.sites.iter().map(|s| s.hits).sum();
         c.no_ring = self.rd32(proto::H_NO_RING) as u64;
         c
+    }
+
+    /// Per ring: `(ring, attempted, dropped, read_failed)` as the agent counts them. `attempted` is the ring's
+    /// sequence counter, which every attempted record advances, dropped or not.
+    pub fn ring_rows(&self) -> Vec<(u32, u64, u64, u64)> {
+        let claimed = (self.rd32(proto::H_NRINGS) as usize).min(proto::MAX_RINGS);
+        (0..claimed)
+            .map(|i| unsafe {
+                let r = self.view.add(proto::ring_offset(i));
+                let u = |o: usize| (r.add(o) as *const u32).read_volatile() as u64;
+                (
+                    i as u32,
+                    u(proto::R_SEQ),
+                    u(proto::R_DROPPED),
+                    u(proto::R_READ_FAILED),
+                )
+            })
+            .collect()
     }
 
     /// Out-of-band events (breakpoint hits, watch hits, auto-continues) since the last call.

@@ -310,15 +310,56 @@ unsafe fn arg(fr: *const u64, i: usize) -> u64 {
     }
 }
 
+/// Read up to `want` bytes of a buffer. Returns `(length kept, extra record flags, failed)`. A wide string stops after
+/// its UTF-16 terminator, a C string before its NUL; a read cut by an unmapped page keeps what was readable.
 #[inline(always)]
-unsafe fn read_buf(dst: *mut MaybeUninit<u8>, src: u64, n: usize) -> bool {
+unsafe fn capture(
+    dst: *mut MaybeUninit<u8>,
+    src: u64,
+    want: usize,
+    mode: u32,
+) -> (usize, u8, bool) {
     unsafe {
-        if src == 0 || n == 0 {
-            return n == 0;
+        if want == 0 {
+            return (0, 0, false);
         }
         let mut got = 0usize;
-        let ok = ReadProcessMemory(-1isize as _, src as *const _, dst as *mut _, n, &mut got);
-        ok != 0 && got == n
+        ReadProcessMemory(-1isize as _, src as *const _, dst as *mut _, want, &mut got);
+        if got == 0 {
+            return (0, 0, true);
+        }
+        let b = dst as *const u8;
+        let wide = mode & p::F_BUF_WIDE != 0;
+        let mut rf = 0u8;
+        if got < want && !wide {
+            rf |= p::RF_BUF_TRUNC;
+        }
+        if wide {
+            let mut i = 0;
+            let mut found = false;
+            while i + 1 < got {
+                if *b.add(i) == 0 && *b.add(i + 1) == 0 {
+                    got = i + 2;
+                    found = true;
+                    break;
+                }
+                i += 2;
+            }
+            if !found && got == want {
+                rf |= p::RF_BUF_TRUNC;
+            }
+        } else if mode & p::F_BUF_CSTR != 0 {
+            let mut i = 0;
+            while i < got && *b.add(i) != 0 {
+                i += 1;
+            }
+            if i == got && got == want {
+                rf |= p::RF_BUF_TRUNC;
+            } else {
+                got = i;
+            }
+        }
+        (got, rf, false)
     }
 }
 
@@ -342,7 +383,8 @@ unsafe extern "system" fn on_hit(h: *const Hook, fr: *const u64, saved: *const u
             }
         }
         c.add(1).write_volatile(c.add(1).read_volatile() + 1); // kept
-        next.write_volatile((cfg.add(p::S_MASK) as *const u32).read_volatile() as u64);
+        let mask = (cfg.add(p::S_MASK) as *const u32).read_volatile();
+        next.write_volatile(mask as u64);
 
         let flags = (cfg.add(p::S_FLAGS) as *const u32).read();
         let want_return = flags & p::F_RETURN != 0;
@@ -372,7 +414,8 @@ unsafe extern "system" fn on_hit(h: *const Hook, fr: *const u64, saved: *const u
         };
         // Only the scalar fields are written eagerly; the arrays are filled up to their used length.
         e.site = h.site;
-        e.rec_flags = 0;
+        // A record kept while the sampling policy was thinning this site says so.
+        e.rec_flags = if mask != 0 { p::RF_SAMPLED } else { 0 };
         e.tid = ring::teb_tid();
         e.ret_addr = *slot;
         e.slot = slot as usize;
@@ -395,24 +438,39 @@ unsafe extern "system" fn on_hit(h: *const Hook, fr: *const u64, saved: *const u
         if (0..16).contains(&buf_arg) {
             let ptr = arg(fr, buf_arg as usize);
             let len_arg = (cfg.add(p::S_BUF_LEN_ARG) as *const i32).read();
-            let want = if len_arg >= 0 {
-                arg(fr, len_arg as usize) as u32 as usize
+            let max = ((cfg.add(p::S_BUF_MAX) as *const u32).read() as usize).min(p::BUF_MAX);
+            let mut rf = 0u8;
+            let want = if flags & (p::F_BUF_WIDE | p::F_BUF_CSTR) != 0 {
+                max
+            } else if len_arg >= 0 {
+                let w = arg(fr, len_arg as usize) as u32 as usize;
+                if w > max {
+                    rf |= p::RF_BUF_TRUNC;
+                }
+                w.min(max)
             } else {
-                (cfg.add(p::S_BUF_FIXED) as *const u32).read() as usize
+                ((cfg.add(p::S_BUF_FIXED) as *const u32).read() as usize).min(max)
             };
-            let nbuf = want
-                .min((cfg.add(p::S_BUF_MAX) as *const u32).read() as usize)
-                .min(p::BUF_MAX);
-            e.buf_addr = ptr;
-            e.buf_ptr = ptr;
-            e.buf_len = nbuf as u32;
-            if flags & p::F_BUF_ON_RETURN != 0 && want_return && !shadow_entry.is_null() {
-                e.buf_on_return = true;
-            } else if read_buf(e.buf.as_mut_ptr(), ptr, nbuf) {
-                e.buflen = nbuf as u16;
-            } else {
-                e.rec_flags |= p::RF_BUF_FAILED;
-                ring::bump32(ring, p::R_READ_FAILED);
+            if flags & p::F_BUF_WIDE != 0 {
+                rf |= p::RF_BUF_WIDE;
+            }
+            if ptr != 0 {
+                e.buf_addr = ptr;
+                e.buf_ptr = ptr;
+                e.buf_len = want as u32;
+                e.buf_mode = flags;
+                e.rec_flags |= rf;
+                if flags & p::F_BUF_ON_RETURN != 0 && want_return && !shadow_entry.is_null() {
+                    e.buf_on_return = true;
+                } else {
+                    let (n, more, failed) = capture(e.buf.as_mut_ptr(), ptr, want, flags);
+                    e.buflen = n as u16;
+                    e.rec_flags |= more;
+                    if failed {
+                        e.rec_flags |= p::RF_BUF_FAILED;
+                        ring::bump32(ring, p::R_READ_FAILED);
+                    }
+                }
             }
         }
         e.nstack = 0;
@@ -517,10 +575,15 @@ unsafe extern "system" fn on_return(frame: *mut u64) {
             let e = &mut s.ents[s.depth];
             orig = e.ret_addr;
             if e.buf_on_return {
-                let n = e.buf_len as usize;
-                if read_buf(e.buf.as_mut_ptr(), e.buf_ptr, n) {
-                    e.buflen = n as u16;
-                } else {
+                let (n, more, failed) = capture(
+                    e.buf.as_mut_ptr(),
+                    e.buf_ptr,
+                    e.buf_len as usize,
+                    e.buf_mode,
+                );
+                e.buflen = n as u16;
+                e.rec_flags |= more;
+                if failed {
                     e.rec_flags |= p::RF_BUF_FAILED;
                     if !ring.is_null() {
                         ring::bump32(ring, p::R_READ_FAILED);

@@ -45,7 +45,30 @@ removed. Counts are `def test_` per file.
 | test_runtime_watch.py (33), test_runtime_write.py (19) remaining cases | gate construction from client settings, fixture marker in the file, detached-session handling, `undo` without id | client/worker layer |
 | test_runtime_authorized.py::test_the_client_builds_the_gate..., ::test_the_fixture_conformance_flag... | client layer | client port |
 | test_trace_capture.py (28), test_trace_gates*.py (53), test_trace_g2*.py (12), test_trace_extras.py (10) | need the TRACE-1 segment encoder/pump (h7 trace-pump lane) fed from `Session::drain` | h7 `trace.rs` integration |
-| test_trace_e2e.py (13), test_trace_g2_live.py (3) | black-box through the tool surface | PyO3 surface |
 | test_agent_cost.py (24) | measures the Frida agent (JS/CModule sizes, install ms); replaced by `hy-bench` | -- |
 | tools/watch_conformance.py | drives the Python worker | port with the client |
 | sealed mailbox / HMAC IPC, event-log hash chain, TRACE-1 canonical JSON | storage/IPC lanes (hy-store) | hy-store crates |
+
+## Stage 4: the PyO3 surface (`HYDRALYSIS_IMPL=rust`)
+
+`hy-py` builds `hydralysis_rt` (a PyO3 module over `Session`); `src/hydralysis/rust_frida.py` answers the Frida-shaped calls the
+runtime layer makes (`spawn`, `attach`, `resume`, `create_script`, `exports_sync`, `post`), and `runtime_device.get_local_device()`
+picks it when the variable says `rust`. The default stays Frida. Served: the CONTROL script and the TRACE recorder (arming through the
+mailbox, wire batches with the acknowledgement window, counters, sampling, release). Not served: the observe/break probe templates and
+the memory agent as *scripts*; their functions exist on `RtSession` (`arm_site(pause=True)`, `write_cas`, `undo_write`, `arm_watch`) and
+are tested directly.
+
+Run with `HYDRALYSIS_IMPL=rust` and the pyd on `PYTHONPATH` (or `HYDRALYSIS_RT_PYD`), agent DLL at `HYDRALYSIS_AGENT_DLL`:
+
+| Python test | Result under the Rust runtime | Note |
+| --- | --- | --- |
+| test_trace_e2e.py (13): frameloop, trace_app, interleave, veh_freeze, deadlock watchdog, exact, thinned, overflow, restart, kill-writer, etw, attach-to-nothing, ingest by hydra-trace | 12 pass unchanged | the real worker, TRACE-1 encoder, `hydra-trace` ingest and symbolization |
+| test_trace_e2e.py::test_failure_modes_lose_the_producer_versus_a_clean_stop | differs by design | it asserts `ended-without-final-counters` after a kill, which is how Frida's in-process producer behaves. The rings here live in the host's mapping, so the final drain and counters still happen (`final`). The new test below asserts that instead |
+| test_trace_g2_live.py (3), test_runtime_capture.py (49) | all pass except the one that uses the `observe` template (`test_capture_window_snapshot_and_compare_end_to_end`) | refused with NotImplementedError and a clear message |
+| tests/test_rust_runtime.py (new, 11) | 11 pass | device is Rust; CONTROL info/modules/locate/read; frameloop 120 frames + 180 stages without loss; exact; adaptive thinning with every skip counted (kept + skipped = hits); killed target still yields its records; unsupported templates refused; CAS write + undo + refusals; authorization range refusal; watch from old and new threads; breakpoint parks until continued |
+
+Other Python suites (test_runtime*.py using fake Frida, test_runtime_write/watch/snapshot, test_trace_gates*) were not run against the
+Rust device: they exercise the worker with the memory agent or fakes, not the device.
+
+Known differences, kept honest: `entered`/`left` counters are not reported (None), the stall tick count and `rate_per_s` are 0, the
+`threads` export has no register contexts, and `trace_module` (module load/unload while recording) is not emitted.

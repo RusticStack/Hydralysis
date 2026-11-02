@@ -99,12 +99,12 @@ class Live:
 
     def __init__(self, root: Path, exe: Path, argv: list[str] | None = None, cwd: str | None = None,
                  env: dict | None = None, linger_ms: int = 600):
-        import frida
+        from hydralysis.runtime_device import get_local_device
         from hydralysis.runtime_worker import RuntimeAgent
         self.dir = Path(root) / uuid.uuid4().hex
         self.dir.mkdir(parents=True)
         self.exe = Path(exe)
-        self.agent = RuntimeAgent(self.dir, frida.get_local_device())
+        self.agent = RuntimeAgent(self.dir, get_local_device())
         initial = {"action": "spawn", "exe": str(self.exe), "sha256": hashlib.sha256(self.exe.read_bytes()).hexdigest(),
                    "argv": list(argv or []),
                    "env": {"HYDRA_FX_LINGER_MS": str(linger_ms), **(env or {})}}

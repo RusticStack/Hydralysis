@@ -1,0 +1,19 @@
+[package]
+name = "hy-py"
+version = "0.1.0"
+edition = "2024"
+description = "PyO3 surface over hy-runtime: the Python runtime layer's Frida-free session (HYDRALYSIS_IMPL=rust)"
+
+[lib]
+name = "hydralysis_rt"
+crate-type = ["cdylib"]
+
+[dependencies]
+hy-runtime = { path = "../hy-runtime" }
+pyo3 = { version = "0.27", features = ["extension-module", "abi3-py313", "generate-import-lib"] }
+serde_json = "1"
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Performance",
+] }

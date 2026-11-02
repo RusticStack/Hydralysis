@@ -68,6 +68,8 @@ pub const F_RETURN: u32 = 1; // record at return: retval, last error, end time
 pub const F_STACK: u32 = 2; // walk the stack
 pub const F_PAUSE: u32 = 4; // park the thread (breakpoint)
 pub const F_BUF_ON_RETURN: u32 = 8; // read the buffer when the call returns
+pub const F_BUF_WIDE: u32 = 32; // the buffer is a UTF-16 string: read up to the terminator
+pub const F_BUF_CSTR: u32 = 64; // the buffer is a NUL-terminated byte string
 pub const F_INSTRUCTION: u32 = 16; // mid-function site: no return / args semantics beyond registers
 
 pub const BUF_MAX: usize = 256;
@@ -169,6 +171,9 @@ pub const K_HIT: u8 = 1;
 pub const RF_RETURNED: u8 = 1;
 pub const RF_HAS_RETURN: u8 = 2;
 pub const RF_BUF_FAILED: u8 = 4;
+pub const RF_BUF_TRUNC: u8 = 16; // the buffer was cut at the site's maximum
+pub const RF_BUF_WIDE: u8 = 32; // the buffer is a UTF-16 string
+pub const RF_SAMPLED: u8 = 64; // kept while the sampling policy was thinning the site
 pub const RF_NO_SHADOW: u8 = 8; // wanted a return record but the shadow stack was full: entry data only
 
 pub fn site_offset(i: usize) -> usize {

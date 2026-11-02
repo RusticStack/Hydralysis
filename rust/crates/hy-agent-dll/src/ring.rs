@@ -37,6 +37,7 @@ pub struct Entry {
     pub slot: usize,
     pub buf_ptr: u64,
     pub buf_len: u32,
+    pub buf_mode: u32,
     pub buf_on_return: bool,
     pub args: [MaybeUninit<u64>; p::MAX_ARGS],
     pub stack: [MaybeUninit<u64>; p::MAX_STACK],
@@ -58,6 +59,7 @@ impl Entry {
             slot: 0,
             buf_ptr: 0,
             buf_len: 0,
+            buf_mode: 0,
             buf_on_return: false,
             args: [MaybeUninit::uninit(); p::MAX_ARGS],
             stack: [MaybeUninit::uninit(); p::MAX_STACK],
@@ -270,12 +272,13 @@ pub unsafe fn emit(
         let nstack = e.nstack as usize;
         let buflen = e.buflen as usize;
         let total = (p::REC_HDR + nargs * 8 + nstack * 8 + buflen + 7) & !7;
+        // Every attempted record takes a sequence number, dropped or not: a gap in a ring's sequence is a loss.
+        let seq = a32(ring, p::R_SEQ).load(Ordering::Relaxed);
+        a32(ring, p::R_SEQ).store(seq.wrapping_add(1), Ordering::Relaxed);
         let (w, new_head) = reserve(ring, total);
         if w.is_null() {
             return;
         }
-        let seq = a32(ring, p::R_SEQ).load(Ordering::Relaxed);
-        a32(ring, p::R_SEQ).store(seq.wrapping_add(1), Ordering::Relaxed);
         let mut flags = e.rec_flags;
         if returned {
             flags |= p::RF_RETURNED;
