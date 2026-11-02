@@ -15,8 +15,8 @@ typedef struct Thing { int tag; int level; int other; } Thing;
 Thing g_thing = { 1, 0, 0 };
 static volatile int g_sink;
 
-FX void fx_set_level(Thing *t, int value) { t->level = value; }
-FX void fx_bump_level(Thing *t) { t->level = t->level + 1; }
+FX void fx_set_level(Thing *t, int value) { t->level = value; g_sink += value; }
+FX void fx_bump_level(Thing *t) { t->level = t->level + 1; g_sink += 3; }
 FX void fx_reset_thing(Thing *t, int tag) {
     Thing fresh;
     fresh.tag = tag;
@@ -24,8 +24,8 @@ FX void fx_reset_thing(Thing *t, int tag) {
     fresh.other = tag * 2;
     *t = fresh;
 }
-FX void fx_alias_write(int *p, int value) { *p = value; }
-FX void fx_use_alias(Thing *t, int value) { fx_alias_write(&t->level, value); }
+FX void fx_alias_write(int *p, int value) { *p = value; g_sink += 5; }
+FX void fx_use_alias(Thing *t, int value) { fx_alias_write(&t->level, value); g_sink += 7; }
 FX void fx_note_frame(int frame) { g_sink += frame; }
 
 int main(int argc, char **argv) {

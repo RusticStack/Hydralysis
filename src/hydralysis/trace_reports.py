@@ -252,7 +252,7 @@ def _entry(value) -> int | None:
 
 
 def field_writers(static_sites: list[dict], events: list[dict], *, object_addr: int, offset: int, size: int,
-                  names: dict | None = None, escape_kind: str = "app.pointer.escape", write_kinds=("core.state.write",),
+                  names: dict | None = None, escape_kind: str = "app.escape", write_kinds=("core.state.write",),
                   per_site: int = 3) -> dict:
     """14.4: the writers of one field of one object, as three answers that are never merged.
 

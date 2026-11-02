@@ -139,5 +139,89 @@ class M4Survival(Gate):
         self.assertEqual(result["overwriters"], [])
 
 
+def writer_hooks(*, alias_write: bool = False):
+    rows = [
+        dict(id="fx_set_level", event="core.state.write", symbol="fx_set_level", nargs=2, capture=["object:u64@0", "value:u32@1"],
+             const={"offset": 4, "size": 4}),
+        dict(id="fx_reset_thing", event="core.state.write", symbol="fx_reset_thing", nargs=2, capture=["object:u64@0"],
+             const={"offset": 0, "size": 12}),
+        dict(id="fx_bump_level", event="core.state.write", symbol="fx_bump_level", nargs=1, capture=["object:u64@0"],
+             const={"offset": 4, "size": 4}),
+        dict(id="fx_use_alias", event="app.escape", symbol="fx_use_alias", nargs=2, capture=["object:u64@0"],
+             const={"offset": 4, "callee": "fx_alias_write"}),
+    ]
+    if alias_write:
+        rows.append(dict(id="fx_alias_write", event="core.state.write", symbol="fx_alias_write", nargs=2, capture=["object:u64@0"],
+                         const={"offset": 0, "size": 4}))
+    return hooks("field_writers.exe", rows)
+
+
+@unittest.skipUnless(LIVE, "needs a trace engine (HYDRALYSIS_INTEGRATION_*, HYDRA_TRACE_EXE), Frida and MSVC")
+class M4FieldWriters(Gate):
+    """Section 14.4: who writes one field of one object, as three answers that are never merged, over a REAL static scan
+    (the engine's `writes` query on the built program) and LIVE trace data."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        import build_fixtures
+        from hydralysis import query
+        exe = cls.fx / "field_writers.exe"
+        cls.functions, cls.data = build_fixtures.symbols(exe.with_suffix(".map"))
+        cls.names = {address: name for name, address in cls.functions.items()}
+        status = cls.engine.prepare(exe, "fw_gate")
+        assert status["state"] not in ("failed",), status
+        scan = json.loads(query.QueryRunner(cls.engine.settings).query("fw_gate", "writes", "", limit=64, options={"offset": "0x4"}))
+        ours = set(cls.names)
+        cls.static_sites = [r for r in scan["writes"] if r["function"] in ours]
+
+    def writers(self, key, args=(), alias_write=False):
+        profile = g.GateProfile(self.fx, "gate-fw-%s/1" % key, ["field_writers.exe"], writer_hooks(alias_write=alias_write))
+        cap = g.capture(self.root / "runs", "field_writers.exe", ["--frames=20", *args], profile.specs(self.root))
+        session = g.unique("m4_fw_" + key)
+        self.engine.load(session, cap.lines())
+        sets = self.engine.rows(session, kinds=["core.state.write"])
+        first = next(r["p"] for r in sets if r["p"].get("site") == "fx_set_level")
+        obj = first["object"]
+        self.assertEqual(obj & 0xffff, int(self.data["g_thing"], 16) & 0xffff, "the traced object is g_thing")
+        reply = self.engine.tool("query", session, report="writers", kinds=["core.state.write", "app.escape"], limit=200,
+                                 params={"object": obj, "offset": 4, "size": 4, "static_sites": self.static_sites,
+                                         "names": self.names})
+        self.assertNotIn("error", reply, reply)
+        return reply["result"]
+
+    def test_the_static_scan_lists_exactly_the_stores_at_the_field_offset(self):
+        self.assertEqual(sorted({self.names[r["function"]] for r in self.static_sites}),
+                         ["fx_bump_level", "fx_reset_thing", "fx_set_level"])
+
+    def test_a_static_candidate_that_never_ran_is_may_access_not_a_writer(self):
+        result = self.writers("plain")
+        self.assertEqual([w["site"] for w in result["observed"]], ["fx_reset_thing", "fx_set_level"])
+        self.assertTrue(all(w["static_candidate"] and w["on_selected_object"] for w in result["observed"]))
+        self.assertEqual({w["site"]: w["count"] for w in result["observed"]}, {"fx_reset_thing": 4, "fx_set_level": 20})
+        self.assertEqual([m["site"] for m in result["may_access"]], ["fx_bump_level"])
+        self.assertEqual(result["may_access"][0]["status"], "may access")
+        self.assertFalse(result["static_inventory_complete"])
+
+    def test_an_uninstrumented_alias_stays_unresolved_and_is_not_attributed(self):
+        result = self.writers("alias")
+        self.assertEqual([(u["site"], u["callee"], u["count"]) for u in result["unresolved"]], [("fx_use_alias", "fx_alias_write", 5)])
+        self.assertIn("neither observed nor excluded", result["unresolved"][0]["stopped_by"])
+        self.assertNotIn("fx_use_alias", [w["site"] for w in result["observed"]], "an escape is not a confirmed write")
+        self.assertNotIn("fx_use_alias", [m["site"] for m in result["may_access"]])
+
+    def test_a_writer_the_scan_did_not_list_is_observed_and_flagged(self):
+        result = self.writers("hooked", alias_write=True)
+        row = next(w for w in result["observed"] if w["site"] == "fx_alias_write")
+        self.assertFalse(row["static_candidate"])
+        self.assertIn("no scan of this field would have listed it", row["note"])
+        self.assertEqual(row["count"], 5)
+
+    def test_running_the_candidate_moves_it_from_may_access_to_observed(self):
+        result = self.writers("bump", args=("--bump",))
+        self.assertIn("fx_bump_level", [w["site"] for w in result["observed"]])
+        self.assertEqual(result["may_access"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
