@@ -73,10 +73,13 @@ class SegmentTail:
                     self.damage = {"kind": "corrupt", "offset": self.offset + cursor}
                 break
             record = parsed[0]
-            try:
-                expected = trace_canon.record_hash(record)
-            except trace_canon.NotCanonical:
-                expected = None
+            if trace_canon.body_hash_matches(data[cursor + 9:end], record):
+                expected = record["hash"]
+            else:
+                try:
+                    expected = trace_canon.record_hash(record)
+                except trace_canon.NotCanonical:
+                    expected = None
             if record.get("n") != self.count or record.get("prev") != self.head or expected != record.get("hash"):
                 self.damage = {"kind": "chain_break", "offset": self.offset + cursor, "n": record.get("n")}
                 break
