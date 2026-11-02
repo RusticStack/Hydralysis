@@ -81,6 +81,40 @@ class M1(unittest.TestCase):
             time.sleep(0.1)
         self.fail("the producer wrote no batches to the segment")
 
+    @staticmethod
+    def exit_code(live):
+        import ctypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = ctypes.c_void_p
+        handle = k32.OpenProcess(0x1000, False, live.pid)       # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return "unknown (process gone)"
+        try:
+            code = ctypes.c_ulong()
+            k32.GetExitCodeProcess(ctypes.c_void_p(handle), ctypes.byref(code))
+            return "still running" if code.value == 259 else hex(code.value)
+        finally:
+            k32.CloseHandle(ctypes.c_void_p(handle))
+
+    def wait_attempted(self, live, count, timeout=90.0):
+        # readiness on the producer's own counters (the periodic trace_counters message), not on segment bytes: those are mostly
+        # setup events, and a kill that comes before the first counters message leaves `attempted` at what the batches carried
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if live.agent.trace.health().get("producer", {}).get("attempted", 0) > count:
+                return
+            time.sleep(0.1)
+        self.fail("the producer reported fewer than %d attempted records in %.0f s" % (count, timeout))
+
+    def stop_quiescent(self, live):
+        # `capture stop` gives the recorder trace_stop's default 3 s to prove its callbacks quiescent; on a machine loaded by parallel
+        # suites that proof can lapse, the recorder then stays in pass-through (`stopped: false`) and no final counters are sent. The
+        # production stop is called first with a longer bound, then the capture is closed; the result is the same as live.stop()
+        reply = live.agent.trace_stop({"reason": "capture stopped", "timeout_ms": 60000})
+        self.assertTrue(reply["stopped"], ({k: v for k, v in reply.items() if k != "health"}, "target exit code: %s" % self.exit_code(live), "detached: %s %r" % (live.agent.detached, live.agent.detach_reason)))
+        live.stopped = live.agent.handle("capture", {"op": "stop"})
+        return reply
+
     def events(self, live):
         return tc.read_events(live.segment, live.segment_id)
 
@@ -173,13 +207,14 @@ class M1(unittest.TestCase):
 
     def test_failure_modes_lose_the_producer_versus_a_clean_stop(self):
         live = self.traced("frameloop.exe", ["--frames=100000", "--spin-us=1000"], wait=False)
-        self.wait_segment(live)
-        stopped_alive = live.stop()["trace"]["health"]
+        self.wait_segment(live, min_bytes=65536)
+        stopped_alive = self.stop_quiescent(live)["health"]
         subprocess.run(["taskkill", "/F", "/PID", str(live.pid)], capture_output=True)
         self.assertEqual(stopped_alive["producer_state"], "final")                          # the producer reported its last counters
         self.assertEqual(stopped_alive["transport"]["batches_missing"], 0)
         killed = self.traced("frameloop.exe", ["--frames=100000", "--spin-us=1000"], wait=False)
         self.wait_segment(killed)
+        self.wait_attempted(killed, 100)
         subprocess.run(["taskkill", "/F", "/PID", str(killed.pid)], capture_output=True)
         time.sleep(1.0)
         health = killed.stop()["trace"]["health"]
@@ -195,7 +230,7 @@ class M1(unittest.TestCase):
         self.assertGreater(health["producer"]["dropped"], 0)
         gaps = [e["payload"] for e in self.events(live) if e["kind"] == "core.capture.gap"]
         self.assertTrue(gaps)
-        self.assertTrue({g["reason"] for g in gaps} <= {"ring-overflow", "producer-lost"})
+        self.assertTrue({g["reason"] for g in gaps} <= {"ring-overflow", "producer-lost"}, [g for g in gaps if g["reason"] not in ("ring-overflow", "producer-lost")][:3])
         cited = sum(g["dropped"] for g in gaps if g["reason"] in ("ring-overflow", "producer-lost"))
         self.assertGreaterEqual(cited + health["encoder"]["records"], health["producer"]["attempted"])   # every attempt is a record or cited
 

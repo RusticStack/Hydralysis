@@ -1060,6 +1060,8 @@ FOLLOW_UP = {  # (file, function, kind) -> (category, note)
     ("crossbuild.py", "run", "write_text"): ("artifact", "diff summary"),
     ("crossbuild.py", "_export_overlay_candidates", "write_text"): ("artifact", "export"),
     ("crossbuild.py", "transfer_checks", "write_text"): ("artifact", "export"),
+    ("decompile_job.py", "start", "open(ab)"): ("artifact", "worker log"),
+    ("decompile_job.py", "run", "write_text"): ("artifact", "decompile reply; the job record turns \"done\" only after this write, so a torn file is never read as a result"),
     ("evidence.py", "export", "write_text"): ("artifact", "evidence export (the database is SQLite WAL)"),
     ("evidence.py", "export", "open(w)"): ("artifact", "evidence export"),
     ("export_worker.py", "run", "open(a)"): ("artifact", "export output rows"),
@@ -1166,8 +1168,8 @@ class WriteGate(unittest.TestCase):
         # Y1 deleted the legacy analysis.save_overlay (its two rows). What is left is the artifact sites that are
         # not records: no record-bearing writer stands outside durable. GATE16 added the queued lock's byte-0 seed; H17 the tamper-check cache.
         self.assertEqual(len(records), 0)
-        self.assertEqual(len(FOLLOW_UP), 27)
-        self.assertEqual(sum(COUNTS.get(key, 1) for key in FOLLOW_UP), 29)
+        self.assertEqual(len(FOLLOW_UP), 29)
+        self.assertEqual(sum(COUNTS.get(key, 1) for key in FOLLOW_UP), 31)
         self.assertEqual(sorted(key[:2] for key in records), [])
 
 

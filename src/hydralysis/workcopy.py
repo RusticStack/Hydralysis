@@ -603,15 +603,17 @@ _LOADED: dict[str, tuple] = {}
 _LOADED_GUARD = threading.Lock()
 
 
-def _file_id(path: Path, tail: bool = False):
+def _file_id(path: Path, tail: bool = False, force_tail: bool = False):
     """Which file is at PATH: id, time, size and (TAIL) its last 256 bytes, which hold the seal of a sealed record, so
-    an in-place rewrite of the same size within one clock tick is still seen."""
+    an in-place rewrite of the same size within one clock tick is still seen. FORCE_TAIL reads the tail whatever the age: a
+    check that a file is still what an earlier look (which read the tail) saw must read it too, or a file that crossed
+    STABLE_AGE_NS meanwhile would compare unequal to itself."""
     try:
         found = path.stat()
         end = b""
         # A file written more than STABLE_AGE_NS ago cannot be rewritten in place within its own clock tick any more: a later
         # rewrite changes its time, so the id, time and size are enough and the tail is not opened.
-        if tail and time.time_ns() - found.st_mtime_ns < durable.STABLE_AGE_NS:
+        if tail and (force_tail or time.time_ns() - found.st_mtime_ns < durable.STABLE_AGE_NS):
             with path.open("rb") as handle:
                 handle.seek(max(0, found.st_size - 256))
                 end = handle.read(256)
@@ -640,7 +642,7 @@ def load_store(settings: dict, target: dict) -> dict:
     text = json.dumps(store)
     # The parsed store is plain JSON (dicts, lists and scalars built by _load_store_uncached): a round trip through the
     # text can only give it back, so the serialization is cached without decoding it again here.
-    if signature[0] is not None and _file_id(path, True) == signature[0]:
+    if signature[0] is not None and _file_id(path, True, force_tail=bool(signature[0][3])) == signature[0]:
         with _LOADED_GUARD:
             _LOADED.pop(key[0], None)
             _LOADED[key[0]] = (key, signature, text)

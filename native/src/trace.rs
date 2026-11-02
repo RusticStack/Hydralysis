@@ -48,7 +48,9 @@ fn hex(bytes: &[u8]) -> String {
 fn canon_string(s: &str, out: &mut Vec<u8>) {
     out.push(b'"');
     // Fast path: printable ASCII with nothing to escape is copied as one run.
-    if s.bytes().all(|b| (0x20..=0x7e).contains(&b) && b != b'"' && b != b'\\') {
+    if s.bytes()
+        .all(|b| (0x20..=0x7e).contains(&b) && b != b'"' && b != b'\\')
+    {
         out.extend_from_slice(s.as_bytes());
         out.push(b'"');
         return;
@@ -146,7 +148,10 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
         if let Ok(v) = obj.extract::<u64>() {
             return Ok(Value::from(v));
         }
-        return obj.extract::<i64>().map(Value::from).map_err(|_| err("integer out of range"));
+        return obj
+            .extract::<i64>()
+            .map(Value::from)
+            .map_err(|_| err("integer out of range"));
     }
     if obj.cast::<pyo3::types::PyFloat>().is_ok() {
         return Err(err("not canonical: floating point number"));
@@ -155,10 +160,18 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
         return Ok(Value::String(s));
     }
     if let Ok(list) = obj.cast::<PyList>() {
-        return list.iter().map(|item| py_to_value(&item)).collect::<PyResult<Vec<_>>>().map(Value::Array);
+        return list
+            .iter()
+            .map(|item| py_to_value(&item))
+            .collect::<PyResult<Vec<_>>>()
+            .map(Value::Array);
     }
     if let Ok(tuple) = obj.cast::<PyTuple>() {
-        return tuple.iter().map(|item| py_to_value(&item)).collect::<PyResult<Vec<_>>>().map(Value::Array);
+        return tuple
+            .iter()
+            .map(|item| py_to_value(&item))
+            .collect::<PyResult<Vec<_>>>()
+            .map(Value::Array);
     }
     if let Ok(dict) = obj.cast::<PyDict>() {
         let mut map = Map::new();
@@ -203,7 +216,10 @@ struct Chain {
 
 impl Chain {
     fn new(segment: &str) -> Self {
-        Self { head: hex(&Sha256::digest(format!("{GENESIS}{segment}").as_bytes())), n: 0 }
+        Self {
+            head: hex(&Sha256::digest(format!("{GENESIS}{segment}").as_bytes())),
+            n: 0,
+        }
     }
 
     /// Frame one event as a segment line, chained after the previous one. The event is written once, canonical, with
@@ -211,8 +227,18 @@ impl Chain {
     /// `"hash"` spliced in at its sorted position (after `confidence`, before `kind`). There is no intermediate map.
     #[allow(clippy::too_many_arguments)]
     fn push_event(
-        &mut self, out: &mut Vec<u8>, enc: &EnvelopeStatic, source_seq: u64, kind: &str, t_ns: u64, tid: Option<u32>, payload: &Value,
-        va: u64, callstack: &[u64], module: Option<&str>, sampled: bool,
+        &mut self,
+        out: &mut Vec<u8>,
+        enc: &EnvelopeStatic,
+        source_seq: u64,
+        kind: &str,
+        t_ns: u64,
+        tid: Option<u32>,
+        payload: &Value,
+        va: u64,
+        callstack: &[u64],
+        module: Option<&str>,
+        sampled: bool,
     ) -> Result<(), String> {
         const CRC_FIELD: usize = 9; // eight hex digits and a space
         const HASH_FIELD: usize = 8 + 64 + 2; // "hash":"<64 hex>",
@@ -344,7 +370,10 @@ fn decode(data: &[u8]) -> Result<(Header, Vec<Rec>), String> {
     if data.len() < HEADER_BYTES {
         return Err("batch shorter than its header".into());
     }
-    if u32_at(data, 0) != MAGIC || u16_at(data, 4) != 1 || usize::from(u16_at(data, 6)) != HEADER_BYTES {
+    if u32_at(data, 0) != MAGIC
+        || u16_at(data, 4) != 1
+        || usize::from(u16_at(data, 6)) != HEADER_BYTES
+    {
         return Err("not an HTB1 batch".into());
     }
     let plen = u32_at(data, 28) as usize;
@@ -371,11 +400,18 @@ fn decode(data: &[u8]) -> Result<(Header, Vec<Rec>), String> {
         let nargs = usize::from(u16_at(data, cursor + 52));
         let buflen = usize::from(u16_at(data, cursor + 54));
         let depth = usize::from(data[cursor + 2] >> 4);
-        if data[cursor + 2] & 15 != 1 || size != RECORD_BYTES + 8 * nargs + 8 * depth + buflen.div_ceil(8) * 8 || cursor + size > data.len() {
+        if data[cursor + 2] & 15 != 1
+            || size != RECORD_BYTES + 8 * nargs + 8 * depth + buflen.div_ceil(8) * 8
+            || cursor + size > data.len()
+        {
             return Err("record size is inconsistent".into());
         }
-        let args = (0..nargs).map(|i| u64_at(data, cursor + RECORD_BYTES + 8 * i)).collect();
-        let stack = (0..depth).map(|i| u64_at(data, cursor + RECORD_BYTES + 8 * nargs + 8 * i)).collect();
+        let args = (0..nargs)
+            .map(|i| u64_at(data, cursor + RECORD_BYTES + 8 * i))
+            .collect();
+        let stack = (0..depth)
+            .map(|i| u64_at(data, cursor + RECORD_BYTES + 8 * nargs + 8 * i))
+            .collect();
         let start = cursor + RECORD_BYTES + 8 * nargs + 8 * depth;
         records.push(Rec {
             stack,
@@ -403,7 +439,10 @@ fn decode(data: &[u8]) -> Result<(Header, Vec<Rec>), String> {
 
 /// Decode a batch into `(header dict, [record dict])` (the twin of `trace_wire.decode_batch`).
 #[pyfunction]
-fn decode_batch<'py>(py: Python<'py>, data: &[u8]) -> PyResult<(Bound<'py, PyDict>, Bound<'py, PyList>)> {
+fn decode_batch<'py>(
+    py: Python<'py>,
+    data: &[u8],
+) -> PyResult<(Bound<'py, PyDict>, Bound<'py, PyList>)> {
     let (h, records) = decode(data).map_err(err)?;
     let header = PyDict::new(py);
     header.set_item("producer_gen", h.producer_gen)?;
@@ -504,8 +543,24 @@ fn is_device_path(units: &[u8]) -> bool {
 
 const PREVIEW_MAX: usize = 256;
 const SECRET_WORDS: [&str; 18] = [
-    "password", "passwd", "pwd", "secret", "token", "apikey", "api_key", "api-key", "authorization", "credential",
-    "private_key", "private-key", "cookie", "session", "signature", "auth", "bearer", "basic",
+    "password",
+    "passwd",
+    "pwd",
+    "secret",
+    "token",
+    "apikey",
+    "api_key",
+    "api-key",
+    "authorization",
+    "credential",
+    "private_key",
+    "private-key",
+    "cookie",
+    "session",
+    "signature",
+    "auth",
+    "bearer",
+    "basic",
 ];
 
 fn printable(raw: &[u8], wide: bool) -> Vec<u8> {
@@ -517,7 +572,11 @@ fn printable(raw: &[u8], wide: bool) -> Vec<u8> {
             if unit == 0 {
                 break;
             }
-            out.push(if (0x20..0x7F).contains(&unit) { u8::try_from(unit).unwrap_or(b'.') } else { b'.' });
+            out.push(if (0x20..0x7F).contains(&unit) {
+                u8::try_from(unit).unwrap_or(b'.')
+            } else {
+                b'.'
+            });
             i += 2;
         }
     } else {
@@ -545,7 +604,9 @@ fn redact_preview(raw: &[u8], wide: bool, limit: usize) -> (String, u64) {
         let w = word.as_bytes();
         let mut from = 0;
         while from + w.len() <= n {
-            let Some(rel) = lower[from..].windows(w.len()).position(|x| x == w) else { break };
+            let Some(rel) = lower[from..].windows(w.len()).position(|x| x == w) else {
+                break;
+            };
             let start = from + rel;
             let mut i = start + w.len();
             while i < n && (text[i].is_ascii_alphanumeric() || text[i] == b'_' || text[i] == b'-') {
@@ -554,7 +615,9 @@ fn redact_preview(raw: &[u8], wide: bool, limit: usize) -> (String, u64) {
             while i < n && (text[i] == b'"' || text[i] == b'\'' || text[i] == b' ') {
                 i += 1;
             }
-            let space_word = (word == "bearer" || word == "basic") && start + w.len() < n && text[start + w.len()] == b' ';
+            let space_word = (word == "bearer" || word == "basic")
+                && start + w.len() < n
+                && text[start + w.len()] == b' ';
             if i < n && (text[i] == b':' || text[i] == b'=' || space_word) {
                 if text[i] == b':' || text[i] == b'=' {
                     i += 1;
@@ -581,7 +644,10 @@ fn redact_preview(raw: &[u8], wide: bool, limit: usize) -> (String, u64) {
                 j += 1;
             }
             let run = &text[i..j];
-            if j - i >= 20 && run.iter().any(u8::is_ascii_digit) && run.iter().any(u8::is_ascii_alphabetic) {
+            if j - i >= 20
+                && run.iter().any(u8::is_ascii_digit)
+                && run.iter().any(u8::is_ascii_alphabetic)
+            {
                 for m in &mut masked[i..j] {
                     *m = true;
                 }
@@ -632,8 +698,24 @@ struct SegmentEncoder {
 }
 
 const STAT_KEYS: [&str; 18] = [
-    "batches", "records", "events", "gaps", "ring_gaps", "transport_gaps", "dropped_in_band", "read_failures",
-    "payload_refused", "previews", "redactions", "close_unknown", "last_attempted", "last_dropped", "last_read_failed", "last_no_ring", "bad_batches", "dummy",
+    "batches",
+    "records",
+    "events",
+    "gaps",
+    "ring_gaps",
+    "transport_gaps",
+    "dropped_in_band",
+    "read_failures",
+    "payload_refused",
+    "previews",
+    "redactions",
+    "close_unknown",
+    "last_attempted",
+    "last_dropped",
+    "last_read_failed",
+    "last_no_ring",
+    "bad_batches",
+    "dummy",
 ];
 
 impl SegmentEncoder {
@@ -642,7 +724,16 @@ impl SegmentEncoder {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn event(&mut self, kind: &str, t_ns: u64, tid: Option<u32>, payload: Value, va: u64, callstack: &[u64], module: Option<&str>) -> Result<Vec<u8>, String> {
+    fn event(
+        &mut self,
+        kind: &str,
+        t_ns: u64,
+        tid: Option<u32>,
+        payload: Value,
+        va: u64,
+        callstack: &[u64],
+        module: Option<&str>,
+    ) -> Result<Vec<u8>, String> {
         let mut out = Vec::new();
         self.event_into(&mut out, kind, t_ns, tid, payload, va, callstack, module)?;
         Ok(out)
@@ -650,14 +741,41 @@ impl SegmentEncoder {
 
     /// Append one chained event line to OUT.
     #[allow(clippy::too_many_arguments)]
-    fn event_into(&mut self, out: &mut Vec<u8>, kind: &str, t_ns: u64, tid: Option<u32>, payload: Value, va: u64, callstack: &[u64], module: Option<&str>) -> Result<(), String> {
+    fn event_into(
+        &mut self,
+        out: &mut Vec<u8>,
+        kind: &str,
+        t_ns: u64,
+        tid: Option<u32>,
+        payload: Value,
+        va: u64,
+        callstack: &[u64],
+        module: Option<&str>,
+    ) -> Result<(), String> {
         let seq = self.source_seq;
         self.source_seq += 1;
         self.stat("events", 1);
-        self.chain.push_event(out, &self.envelope, seq, kind, t_ns, tid, &payload, va, callstack, module, self.sampled_now)
+        self.chain.push_event(
+            out,
+            &self.envelope,
+            seq,
+            kind,
+            t_ns,
+            tid,
+            &payload,
+            va,
+            callstack,
+            module,
+            self.sampled_now,
+        )
     }
 
-    fn buffer(&mut self, site: &Site, r: &Rec, artifacts: &mut BTreeMap<String, Vec<u8>>) -> Option<Value> {
+    fn buffer(
+        &mut self,
+        site: &Site,
+        r: &Rec,
+        artifacts: &mut BTreeMap<String, Vec<u8>>,
+    ) -> Option<Value> {
         if r.flags & F_BUF == 0 {
             return None;
         }
@@ -669,7 +787,11 @@ impl SegmentEncoder {
             entry.insert("len".into(), 0.into());
             return Some(Value::Object(entry));
         }
-        let raw: &[u8] = if r.flags & F_WIDE != 0 { cut_at_nul(&r.buf) } else { &r.buf };
+        let raw: &[u8] = if r.flags & F_WIDE != 0 {
+            cut_at_nul(&r.buf)
+        } else {
+            &r.buf
+        };
         entry.insert("id".into(), keyed(&self.key, raw).into());
         entry.insert("len".into(), raw.len().into());
         entry.insert("truncated".into(), (r.flags & F_TRUNCATED != 0).into());
@@ -685,7 +807,10 @@ impl SegmentEncoder {
                 let kept = &raw[..raw.len().min(self.max_payload)];
                 let digest = hex(&Sha256::digest(kept));
                 artifacts.insert(digest.clone(), kept.to_vec());
-                entry.insert("artifact".into(), json!({"sha256": digest, "len": kept.len(), "export": false}));
+                entry.insert(
+                    "artifact".into(),
+                    json!({"sha256": digest, "len": kept.len(), "export": false}),
+                );
             } else {
                 self.stat("payload_refused", 1);
                 entry.insert("payload".into(), "payload-not-authorized".into());
@@ -701,7 +826,9 @@ impl SegmentEncoder {
             }
             r.retval
         } else {
-            let Ok(index) = source.parse::<usize>() else { return Value::Null };
+            let Ok(index) = source.parse::<usize>() else {
+                return Value::Null;
+            };
             match r.args.get(index) {
                 Some(v) => *v,
                 None => return Value::Null,
@@ -729,7 +856,12 @@ impl SegmentEncoder {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn call(&mut self, out: &mut Vec<u8>, r: &Rec, artifacts: &mut BTreeMap<String, Vec<u8>>) -> Result<(), String> {
+    fn call(
+        &mut self,
+        out: &mut Vec<u8>,
+        r: &Rec,
+        artifacts: &mut BTreeMap<String, Vec<u8>>,
+    ) -> Result<(), String> {
         // a record kept while the probe was being thinned says so in the summary confidence of the events it yields
         self.sampled_now = r.flags & F_SAMPLED != 0;
         let result = self.call_events(out, r, artifacts);
@@ -738,14 +870,34 @@ impl SegmentEncoder {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn call_events(&mut self, out: &mut Vec<u8>, r: &Rec, artifacts: &mut BTreeMap<String, Vec<u8>>) -> Result<(), String> {
+    fn call_events(
+        &mut self,
+        out: &mut Vec<u8>,
+        r: &Rec,
+        artifacts: &mut BTreeMap<String, Vec<u8>>,
+    ) -> Result<(), String> {
         let t0 = tick_ns(r.qpc, self.freq);
         let Some(site) = self.sites.get(&r.site).map(Arc::clone) else {
-            return self.event_into(out, "core.error", t0, Some(r.tid), json!({"error": "unknown-site", "site": r.site}), 0, &[], None);
+            return self.event_into(
+                out,
+                "core.error",
+                t0,
+                Some(r.tid),
+                json!({"error": "unknown-site", "site": r.site}),
+                0,
+                &[],
+                None,
+            );
         };
         *self.hits.entry(r.site).or_insert(0) += 1;
         let call = format!("{}:{}", r.ring, r.ring_seq);
-        let stack: Vec<u64> = if !r.stack.is_empty() { r.stack.clone() } else if r.ret_addr != 0 { vec![r.ret_addr] } else { vec![] };
+        let stack: Vec<u64> = if !r.stack.is_empty() {
+            r.stack.clone()
+        } else if r.ret_addr != 0 {
+            vec![r.ret_addr]
+        } else {
+            vec![]
+        };
         let has_ret = r.flags & F_RET != 0;
         let buf = self.buffer(&site, r, artifacts);
         let t_end = tick_ns(if r.qpc_end != 0 { r.qpc_end } else { r.qpc }, self.freq);
@@ -759,12 +911,20 @@ impl SegmentEncoder {
         let module = site.module.as_deref();
         match site.kind.as_str() {
             "open" => {
-                let path: &[u8] = if r.flags & F_READ_FAILED != 0 { &[] } else { &r.buf };
+                let path: &[u8] = if r.flags & F_READ_FAILED != 0 {
+                    &[]
+                } else {
+                    &r.buf
+                };
                 let norm_full = normalize_path(&path[..path.len() / 2 * 2]);
                 let norm = cut_at_nul(&norm_full).to_vec();
                 let device = is_device_path(path);
                 let ok = has_ret && r.retval != u64::MAX && r.retval != 0;
-                let rid = if r.flags & F_READ_FAILED != 0 { None } else { Some(keyed(&self.key, &norm)) };
+                let rid = if r.flags & F_READ_FAILED != 0 {
+                    None
+                } else {
+                    Some(keyed(&self.key, &norm))
+                };
                 let payload = json!({
                     "api": site.name, "resource_kind": if device { "device" } else { "file" }, "resource_id": rid,
                     "path_len": norm.len(), "truncated": r.flags & F_TRUNCATED != 0,
@@ -776,16 +936,37 @@ impl SegmentEncoder {
                 if let (Some(Value::Object(b)), Value::Object(m)) = (&buf, &mut payload) {
                     if let Some(pv) = b.get("preview") {
                         m.insert("preview".into(), pv.clone());
-                        m.insert("redacted".into(), b.get("redacted").cloned().unwrap_or(Value::Null));
+                        m.insert(
+                            "redacted".into(),
+                            b.get("redacted").cloned().unwrap_or(Value::Null),
+                        );
                     }
                 }
                 if ok {
                     self.handles.insert(r.retval, (rid.clone(), device));
                 }
-                self.event_into(out, "core.resource.open", t_end, Some(r.tid), with_call(payload), site.va, &stack, module)?;
+                self.event_into(
+                    out,
+                    "core.resource.open",
+                    t_end,
+                    Some(r.tid),
+                    with_call(payload),
+                    site.va,
+                    &stack,
+                    module,
+                )?;
                 if device {
                     let p = json!({"api": site.name, "resource_id": rid, "handle": if has_ret { Some(r.retval) } else { None }, "ok": ok});
-                    self.event_into(out, "driver.device_open", t_end, Some(r.tid), with_call(p), site.va, &stack, module)?;
+                    self.event_into(
+                        out,
+                        "driver.device_open",
+                        t_end,
+                        Some(r.tid),
+                        with_call(p),
+                        site.va,
+                        &stack,
+                        module,
+                    )?;
                 }
             }
             "ioctl" => {
@@ -794,13 +975,30 @@ impl SegmentEncoder {
                 let known = self.handles.get(&handle).cloned();
                 let ok = has_ret && (r.retval & 0xFFFF_FFFF) != 0;
                 let rid = known.as_ref().and_then(|k| k.0.clone());
-                let unresolved = if known.is_some() { Value::Null } else { Value::from("lifetime-unresolved") };
+                let unresolved = if known.is_some() {
+                    Value::Null
+                } else {
+                    Value::from("lifetime-unresolved")
+                };
                 let in_size = arg(3).map_or(0, |v| v & 0xFFFF_FFFF);
                 let out_size = arg(5).map_or(0, |v| v & 0xFFFF_FFFF);
-                let ok_v = if has_ret { Value::from(ok) } else { Value::Null };
+                let ok_v = if has_ret {
+                    Value::from(ok)
+                } else {
+                    Value::Null
+                };
                 let p = json!({"api": site.name, "handle": handle, "resource_id": rid, "resource_unresolved": unresolved,
                     "op": "ioctl", "bytes_in": in_size, "bytes_out": out_size, "ok": ok_v});
-                self.event_into(out, "core.resource.write", t0, Some(r.tid), with_call(p), site.va, &stack, module)?;
+                self.event_into(
+                    out,
+                    "core.resource.write",
+                    t0,
+                    Some(r.tid),
+                    with_call(p),
+                    site.va,
+                    &stack,
+                    module,
+                )?;
                 let mut p = json!({"api": site.name, "handle": handle, "resource_id": rid, "resource_unresolved": unresolved,
                     "in_size": in_size, "out_size": out_size, "code": code, "device_type": code >> 16,
                     "access": (code >> 14) & 3, "function": (code >> 2) & 0xFFF, "method": code & 3, "ok": ok_v,
@@ -808,16 +1006,38 @@ impl SegmentEncoder {
                 if let (Some(b), Value::Object(m)) = (buf, &mut p) {
                     m.insert("in_buffer".into(), b);
                 }
-                self.event_into(out, "driver.ioctl", t0, Some(r.tid), with_call(p), site.va, &stack, module)?;
+                self.event_into(
+                    out,
+                    "driver.ioctl",
+                    t0,
+                    Some(r.tid),
+                    with_call(p),
+                    site.va,
+                    &stack,
+                    module,
+                )?;
             }
             "close" => {
                 let handle = arg(0).unwrap_or(0);
                 if let Some(known) = self.handles.remove(&handle) {
                     let ok = has_ret && (r.retval & 0xFFFF_FFFF) != 0;
-                    let ok_v = if has_ret { Value::from(ok) } else { Value::Null };
+                    let ok_v = if has_ret {
+                        Value::from(ok)
+                    } else {
+                        Value::Null
+                    };
                     let p = json!({"api": site.name, "handle": handle, "resource_id": known.0, "device": known.1,
                         "ok": ok_v, "last_error": r.last_error});
-                    self.event_into(out, "core.resource.close", t_end, Some(r.tid), with_call(p), site.va, &stack, module)?;
+                    self.event_into(
+                        out,
+                        "core.resource.close",
+                        t_end,
+                        Some(r.tid),
+                        with_call(p),
+                        site.va,
+                        &stack,
+                        module,
+                    )?;
                 } else {
                     self.stat("close_unknown", 1);
                 }
@@ -825,9 +1045,18 @@ impl SegmentEncoder {
             "event" => {
                 let mut m = Map::new();
                 m.insert("site".into(), site.name.clone().into());
-                m.insert("hook".into(), site.hook.clone().unwrap_or_else(|| site.name.clone()).into());
+                m.insert(
+                    "hook".into(),
+                    site.hook
+                        .clone()
+                        .unwrap_or_else(|| site.name.clone())
+                        .into(),
+                );
                 for (fname, ftype, source) in &site.fields {
-                    m.insert(fname.clone(), self.field(ftype, source, r, &site, buf.as_ref()));
+                    m.insert(
+                        fname.clone(),
+                        self.field(ftype, source, r, &site, buf.as_ref()),
+                    );
                 }
                 for (cname, cvalue) in &site.consts {
                     m.insert(cname.clone(), cvalue.clone());
@@ -836,38 +1065,102 @@ impl SegmentEncoder {
                     m.insert("end_ns".into(), t_end.into());
                     m.insert("last_error".into(), r.last_error.into());
                 }
-                let kind = site.event.clone().unwrap_or_else(|| "core.function.enter".into());
-                self.event_into(out, &kind, t0, Some(r.tid), with_call(Value::Object(m)), site.va, &stack, module)?;
+                let kind = site
+                    .event
+                    .clone()
+                    .unwrap_or_else(|| "core.function.enter".into());
+                self.event_into(
+                    out,
+                    &kind,
+                    t0,
+                    Some(r.tid),
+                    with_call(Value::Object(m)),
+                    site.va,
+                    &stack,
+                    module,
+                )?;
             }
             "devquery" => {
-                let family = if site.name.to_lowercase().starts_with("cm_") { "driver.cfgmgr" } else { "driver.setupapi" };
-                let ret = if has_ret { Value::from(r.retval) } else { Value::Null };
+                let family = if site.name.to_lowercase().starts_with("cm_") {
+                    "driver.cfgmgr"
+                } else {
+                    "driver.setupapi"
+                };
+                let ret = if has_ret {
+                    Value::from(r.retval)
+                } else {
+                    Value::Null
+                };
                 let mut p = json!({"api": site.name, "resource_kind": "device-enum", "ret": ret, "last_error": r.last_error, "args": r.args});
-                let query_id = buf.as_ref().and_then(|b| b.get("id")).cloned().unwrap_or(Value::Null);
+                let query_id = buf
+                    .as_ref()
+                    .and_then(|b| b.get("id"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
                 if let (Some(b), Value::Object(m)) = (&buf, &mut p) {
                     m.insert("query".into(), b.clone());
                     m.insert("resource_id".into(), query_id.clone());
                 }
-                self.event_into(out, "core.resource.open", t0, Some(r.tid), with_call(p), site.va, &stack, module)?;
+                self.event_into(
+                    out,
+                    "core.resource.open",
+                    t0,
+                    Some(r.tid),
+                    with_call(p),
+                    site.va,
+                    &stack,
+                    module,
+                )?;
                 let p = json!({"api": site.name, "ret": ret, "last_error": r.last_error, "query_id": query_id});
-                self.event_into(out, family, t0, Some(r.tid), with_call(p), site.va, &stack, module)?;
+                self.event_into(
+                    out,
+                    family,
+                    t0,
+                    Some(r.tid),
+                    with_call(p),
+                    site.va,
+                    &stack,
+                    module,
+                )?;
             }
             _ => {
                 let mut p = json!({"site": site.name, "args": r.args});
                 if let (Some(b), Value::Object(m)) = (buf, &mut p) {
                     m.insert("buf".into(), b);
                 }
-                self.event_into(out, "core.function.enter", t0, Some(r.tid), with_call(p), site.va, &stack, module)?;
+                self.event_into(
+                    out,
+                    "core.function.enter",
+                    t0,
+                    Some(r.tid),
+                    with_call(p),
+                    site.va,
+                    &stack,
+                    module,
+                )?;
                 if has_ret {
                     let p = json!({"site": site.name, "ret": r.retval, "last_error": r.last_error});
-                    self.event_into(out, "core.function.exit", t_end, Some(r.tid), with_call(p), site.va, &stack, module)?;
+                    self.event_into(
+                        out,
+                        "core.function.exit",
+                        t_end,
+                        Some(r.tid),
+                        with_call(p),
+                        site.va,
+                        &stack,
+                        module,
+                    )?;
                 }
             }
         }
         Ok(())
     }
 
-    fn encode(&mut self, data: &[u8], artifacts: &mut BTreeMap<String, Vec<u8>>) -> Result<(Vec<u8>, u32, usize), String> {
+    fn encode(
+        &mut self,
+        data: &[u8],
+        artifacts: &mut BTreeMap<String, Vec<u8>>,
+    ) -> Result<(Vec<u8>, u32, usize), String> {
         let (header, records) = match decode(data) {
             Ok(v) => v,
             Err(e) => {
@@ -878,7 +1171,10 @@ impl SegmentEncoder {
         let mut out = Vec::new();
         let t_flush = tick_ns(header.qpc, self.freq);
         if header.producer_gen != self.producer_gen {
-            return Err(format!("batch is from producer generation {}, this encoder is generation {}", header.producer_gen, self.producer_gen));
+            return Err(format!(
+                "batch is from producer generation {}, this encoder is generation {}",
+                header.producer_gen, self.producer_gen
+            ));
         }
         if let Some(next) = self.batch_next {
             if header.batch_seq != next {
@@ -895,7 +1191,14 @@ impl SegmentEncoder {
         let mut keyed_idx: Vec<(u16, u32, usize)> = records
             .iter()
             .enumerate()
-            .map(|(i, r)| (r.ring, r.ring_seq.wrapping_sub(self.ring_next.get(&r.ring).copied().unwrap_or(0)), i))
+            .map(|(i, r)| {
+                (
+                    r.ring,
+                    r.ring_seq
+                        .wrapping_sub(self.ring_next.get(&r.ring).copied().unwrap_or(0)),
+                    i,
+                )
+            })
             .collect();
         keyed_idx.sort_by_key(|k| (k.0, k.1, k.2));
         let mut before: HashMap<usize, u32> = HashMap::new();
@@ -923,11 +1226,24 @@ impl SegmentEncoder {
                 self.stat("gaps", 1);
                 let first = self.source_seq;
                 self.source_seq += u64::from(missing);
-                let reason = if ring_part == u64::from(missing) { "ring-overflow" } else { "producer-lost" };
+                let reason = if ring_part == u64::from(missing) {
+                    "ring-overflow"
+                } else {
+                    "producer-lost"
+                };
                 let p = json!({"reason": reason, "dropped": missing, "ring": r.ring, "out_of_band": false,
                     "first_missing_source_seq": first, "last_missing_source_seq": first + u64::from(missing) - 1,
                     "attributed_to_overflow": ring_part});
-                self.event_into(&mut out, "core.capture.gap", tick_ns(r.qpc, self.freq), Some(r.tid), p, 0, &[], None)?;
+                self.event_into(
+                    &mut out,
+                    "core.capture.gap",
+                    tick_ns(r.qpc, self.freq),
+                    Some(r.tid),
+                    p,
+                    0,
+                    &[],
+                    None,
+                )?;
             }
             self.call(&mut out, r, artifacts)?;
         }
@@ -1043,11 +1359,15 @@ impl SegmentEncoder {
             payload_ok: payload_authorized,
             max_payload,
             chain: Chain::new(segment_id),
-            envelope: EnvelopeStatic { process_id, producer_gen, source_id_json: {
-                let mut v = Vec::new();
-                canon_string(source_id, &mut v);
-                v
-            } },
+            envelope: EnvelopeStatic {
+                process_id,
+                producer_gen,
+                source_id_json: {
+                    let mut v = Vec::new();
+                    canon_string(source_id, &mut v);
+                    v
+                },
+            },
             source_seq: 0,
             sampled_now: false,
             ring_next: HashMap::new(),
@@ -1092,17 +1412,31 @@ impl SegmentEncoder {
     }
 
     #[pyo3(signature = (kind, t_ns, payload, tid=None, skip=0))]
-    fn encode_event<'py>(&mut self, py: Python<'py>, kind: &str, t_ns: u64, payload: &Bound<'py, PyAny>, tid: Option<u32>, skip: u64) -> PyResult<Bound<'py, PyBytes>> {
+    fn encode_event<'py>(
+        &mut self,
+        py: Python<'py>,
+        kind: &str,
+        t_ns: u64,
+        payload: &Bound<'py, PyAny>,
+        tid: Option<u32>,
+        skip: u64,
+    ) -> PyResult<Bound<'py, PyBytes>> {
         let value = py_to_value(payload)?;
         self.source_seq += skip;
         if kind == "core.capture.gap" {
             self.stat("gaps", 1);
         }
-        let line = self.event(kind, t_ns, tid, value, 0, &[], None).map_err(err)?;
+        let line = self
+            .event(kind, t_ns, tid, value, 0, &[], None)
+            .map_err(err)?;
         Ok(PyBytes::new(py, &line))
     }
 
-    fn encode_batch<'py>(&mut self, py: Python<'py>, data: &[u8]) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyDict>, Bound<'py, PyDict>)> {
+    fn encode_batch<'py>(
+        &mut self,
+        py: Python<'py>,
+        data: &[u8],
+    ) -> PyResult<(Bound<'py, PyBytes>, Bound<'py, PyDict>, Bound<'py, PyDict>)> {
         let mut artifacts = BTreeMap::new();
         let (lines, batch_seq, records) = self.encode(data, &mut artifacts).map_err(err)?;
         let art = PyDict::new(py);
@@ -1116,12 +1450,29 @@ impl SegmentEncoder {
     }
 
     #[pyo3(signature = (rings, t_ns, no_ring=0))]
-    fn finalize<'py>(&mut self, py: Python<'py>, rings: &Bound<'py, PyList>, t_ns: u64, no_ring: u64) -> PyResult<Bound<'py, PyBytes>> {
+    fn finalize<'py>(
+        &mut self,
+        py: Python<'py>,
+        rings: &Bound<'py, PyList>,
+        t_ns: u64,
+        no_ring: u64,
+    ) -> PyResult<Bound<'py, PyBytes>> {
         let mut rows: Vec<(u16, u64, u64)> = Vec::new();
         for row in rings.iter() {
-            let d = row.cast::<PyDict>().map_err(|_| err("a ring row is a dict"))?;
-            let get = |k: &str| -> PyResult<u64> { Ok(d.get_item(k)?.map(|v| v.extract::<u64>()).transpose()?.unwrap_or(0)) };
-            rows.push((get("ring")?.try_into().map_err(|_| err("ring id"))?, get("attempted")?, get("dropped")?));
+            let d = row
+                .cast::<PyDict>()
+                .map_err(|_| err("a ring row is a dict"))?;
+            let get = |k: &str| -> PyResult<u64> {
+                Ok(d.get_item(k)?
+                    .map(|v| v.extract::<u64>())
+                    .transpose()?
+                    .unwrap_or(0))
+            };
+            rows.push((
+                get("ring")?.try_into().map_err(|_| err("ring id"))?,
+                get("attempted")?,
+                get("dropped")?,
+            ));
         }
         rows.sort_by_key(|r| r.0);
         let mut out = Vec::new();
@@ -1134,16 +1485,26 @@ impl SegmentEncoder {
                 self.ring_next.insert(ring, attempted as u32);
                 self.stat("ring_gaps", 1);
                 self.stat("gaps", 1);
-                let reason = if dropped >= u64::from(missing) { "ring-overflow" } else { "producer-lost" };
+                let reason = if dropped >= u64::from(missing) {
+                    "ring-overflow"
+                } else {
+                    "producer-lost"
+                };
                 let p = json!({"reason": reason, "dropped": missing, "ring": ring, "out_of_band": true,
                     "first_missing_source_seq": first, "last_missing_source_seq": first + u64::from(missing) - 1});
-                out.extend(self.event("core.capture.gap", t_ns, None, p, 0, &[], None).map_err(err)?);
+                out.extend(
+                    self.event("core.capture.gap", t_ns, None, p, 0, &[], None)
+                        .map_err(err)?,
+                );
             }
         }
         if no_ring != 0 {
             self.stat("gaps", 1);
             let p = json!({"reason": "budget", "dropped": no_ring, "out_of_band": true, "detail": "threads past the agent's ring budget"});
-            out.extend(self.event("core.capture.gap", t_ns, None, p, 0, &[], None).map_err(err)?);
+            out.extend(
+                self.event("core.capture.gap", t_ns, None, p, 0, &[], None)
+                    .map_err(err)?,
+            );
         }
         Ok(PyBytes::new(py, &out))
     }
