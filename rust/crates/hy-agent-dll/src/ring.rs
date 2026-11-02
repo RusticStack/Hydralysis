@@ -10,6 +10,8 @@ use std::cell::{Cell, UnsafeCell};
 pub static SECTION: AtomicUsize = AtomicUsize::new(0);
 pub static FLS_INDEX: AtomicU32 = AtomicU32::new(u32::MAX);
 pub static USE_QPC: AtomicU32 = AtomicU32::new(0);
+/// TlsAlloc'd slot (< 64, so the stub can read it straight from the TEB) holding the thread's ring; MAX when none.
+pub static TLS_IDX: AtomicU32 = AtomicU32::new(u32::MAX);
 
 #[inline(always)]
 pub fn section() -> *mut u8 {
@@ -116,7 +118,16 @@ pub fn now() -> u64 {
 /// This thread's ring, claiming a free one on the first hit. Null when every ring is taken (counted).
 #[inline(always)]
 pub unsafe fn my_ring() -> *mut u8 {
-    let r = RING.with(|c| c.get());
+    let idx = TLS_IDX.load(Ordering::Relaxed);
+    let r: usize = if idx < 64 {
+        let v: usize;
+        unsafe {
+            core::arch::asm!("mov {}, gs:[{} * 8 + 0x1480]", out(reg) v, in(reg) idx as usize, options(nostack, readonly, preserves_flags));
+        }
+        v
+    } else {
+        RING.with(|c| c.get())
+    };
     if r != 0 {
         r as *mut u8
     } else {
@@ -148,6 +159,10 @@ unsafe fn claim() -> *mut u8 {
                     (r.add(p::RING_CTR + s * p::CTR_SIZE + 16) as *mut u64).write(0); // next
                 }
                 RING.with(|c| c.set(r as usize));
+                let tls = TLS_IDX.load(Ordering::Relaxed);
+                if tls < 64 {
+                    windows_sys::Win32::System::Threading::TlsSetValue(tls, r as *const _);
+                }
                 let n = a32(sec, p::H_NRINGS);
                 n.fetch_max(i as u32 + 1, Ordering::AcqRel);
                 // A fiber-local-storage slot with a callback retires the ring when the thread exits.
@@ -178,16 +193,21 @@ pub unsafe fn bump32(ring: *mut u8, off: usize) {
     }
 }
 
-/// Reserve `total` bytes (multiple of 8). Returns the write pointer and the head to publish, or null when full.
+/// Reserve `total` bytes (multiple of 8). Returns the write pointer and the head to publish, or null when the record
+/// was dropped. A full ring makes the hit wait, for a bounded time, for the drain; when that budget runs out the ring
+/// sheds (drops at once, counted) until the drain has freed half of it.
 #[inline(always)]
 unsafe fn reserve(ring: *mut u8, total: usize) -> (*mut u8, u32) {
     unsafe {
         let head = a32(ring, p::R_HEAD).load(Ordering::Relaxed);
-        let tail = a32(ring, p::R_TAIL).load(Ordering::Acquire);
         let off = head as usize & (p::RING_DATA - 1);
         let to_end = p::RING_DATA - off;
         let pad = if to_end < total { to_end } else { 0 };
-        if (head.wrapping_sub(tail) as usize) + pad + total > p::RING_DATA {
+        let need = pad + total;
+        let tail = a32(ring, p::R_TAIL).load(Ordering::Acquire);
+        if (head.wrapping_sub(tail) as usize) + need > p::RING_DATA
+            && !wait_for_room(ring, head, need)
+        {
             bump32(ring, p::R_DROPPED);
             return (core::ptr::null_mut(), 0);
         }
@@ -196,9 +216,42 @@ unsafe fn reserve(ring: *mut u8, total: usize) -> (*mut u8, u32) {
             let w = data.add(off);
             (w as *mut u16).write(pad as u16);
             *w.add(2) = p::K_PAD;
-            return (data, head.wrapping_add((pad + total) as u32));
+            return (data, head.wrapping_add(need as u32));
         }
         (data.add(off), head.wrapping_add(total as u32))
+    }
+}
+
+#[cold]
+#[inline(never)]
+unsafe fn wait_for_room(ring: *mut u8, head: u32, need: usize) -> bool {
+    unsafe {
+        let fits = || {
+            (head.wrapping_sub(a32(ring, p::R_TAIL).load(Ordering::Acquire)) as usize) + need
+                <= p::RING_DATA
+        };
+        let shed = a32(ring, p::R_SHED);
+        if shed.load(Ordering::Relaxed) != 0 {
+            let used = head.wrapping_sub(a32(ring, p::R_TAIL).load(Ordering::Acquire)) as usize;
+            if used + need <= p::RING_DATA / 2 {
+                shed.store(0, Ordering::Relaxed);
+                return true;
+            }
+            return false;
+        }
+        let budget = (section().add(p::H_STALL_BUDGET) as *const u64).read_volatile();
+        let t0 = now();
+        bump32(ring, p::R_STALLS);
+        loop {
+            core::hint::spin_loop();
+            if fits() {
+                return true;
+            }
+            if now().wrapping_sub(t0) > budget {
+                shed.store(1, Ordering::Relaxed);
+                return false;
+            }
+        }
     }
 }
 

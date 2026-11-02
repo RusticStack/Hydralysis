@@ -13,6 +13,14 @@ fn last() -> io::Error {
     io::Error::last_os_error()
 }
 
+fn at(stage: &str) -> io::Error {
+    let e = io::Error::last_os_error();
+    if std::env::var_os("HY_DEBUG_INJECT").is_some() {
+        eprintln!("inject: {stage} failed: {e}");
+    }
+    e
+}
+
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
@@ -40,7 +48,7 @@ pub unsafe fn run_remote(
             core::ptr::null_mut(),
         );
         if t.is_null() {
-            return Err(last());
+            return Err(at("CreateRemoteThread"));
         }
         let w = WaitForSingleObject(t, timeout_ms);
         let mut code = 0u32;
@@ -75,7 +83,7 @@ pub unsafe fn load_library(process: HANDLE, pid: u32, dll: &Path) -> io::Result<
             PAGE_READWRITE,
         );
         if remote.is_null() {
-            return Err(last());
+            return Err(at("VirtualAllocEx"));
         }
         if WriteProcessMemory(
             process,
@@ -85,7 +93,7 @@ pub unsafe fn load_library(process: HANDLE, pid: u32, dll: &Path) -> io::Result<
             core::ptr::null_mut(),
         ) == 0
         {
-            return Err(last());
+            return Err(at("WriteProcessMemory"));
         }
         let k32 = GetModuleHandleW(wide("kernel32.dll").as_ptr());
         let ll = GetProcAddress(k32, c"LoadLibraryW".as_ptr().cast()).ok_or_else(last)? as usize;
@@ -102,7 +110,7 @@ pub fn module_base(pid: u32, name: &str) -> io::Result<usize> {
     unsafe {
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
         if snap == INVALID_HANDLE_VALUE {
-            return Err(last());
+            return Err(at("CreateToolhelp32Snapshot"));
         }
         let mut e: MODULEENTRY32W = core::mem::zeroed();
         e.dwSize = core::mem::size_of::<MODULEENTRY32W>() as u32;

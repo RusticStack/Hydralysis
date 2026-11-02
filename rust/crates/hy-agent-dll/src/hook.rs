@@ -9,10 +9,7 @@ use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use hy_agent_proto as p;
 use iced_x86::code_asm::*;
-use iced_x86::{
-    BlockEncoder, BlockEncoderOptions, Code, Decoder, DecoderOptions, FlowControl, Instruction,
-    InstructionBlock,
-};
+use iced_x86::{Decoder, DecoderOptions, FlowControl, Instruction};
 use windows_sys::Win32::System::Diagnostics::Debug::*;
 use windows_sys::Win32::System::Memory::*;
 
@@ -99,60 +96,58 @@ pub unsafe fn prepare(site: u16, cfg: *mut u8, addr: usize) -> Result<Prepared, 
         let stack = flags & p::F_STACK != 0;
         let extra: i32 = if stack { 64 } else { 0 };
 
+        let tls = ring::TLS_IDX.load(Ordering::Relaxed);
         let mut a = enc(CodeAssembler::new(64))?;
-        enc(a.pushfq())?;
-        for r in [rax, rcx, rdx, r8, r9, r10, r11] {
-            enc(a.push(r))?;
-        }
-        if stack {
-            for r in [rbx, rbp, rsi, rdi, r12, r13, r14, r15] {
-                enc(a.push(r))?;
-            }
-        }
-        enc(a.sub(rsp, 104))?;
-        let xs = [xmm0, xmm1, xmm2, xmm3];
-        for (n, x) in xs.iter().enumerate() {
-            enc(a.movups(xmmword_ptr(rsp + 40 + 16 * n as i32), *x))?;
-        }
-        enc(a.mov(rcx, hook))?;
-        enc(a.lea(rdx, qword_ptr(rsp + 104 + extra)))?;
-        if stack {
-            enc(a.lea(r8, qword_ptr(rsp + 104)))?;
+        let mut tail = a.create_label();
+        let mut main_counted = a.create_label();
+        let mut main_plain = a.create_label();
+        if tls < 64 {
+            // Inline gate (no call, no xmm save): count the hit in this thread's ring and skip it when the sampling
+            // policy says so. Only a kept hit, or a thread with no ring yet, takes the full path below.
+            let ctr = (p::RING_CTR + site as usize * p::CTR_SIZE) as i32;
+            let mut keep = a.create_label();
+            let mut slow = a.create_label();
+            enc(a.pushfq())?;
+            enc(a.push(r10))?;
+            enc(a.push(r11))?;
+            enc(a.mov(r10, qword_ptr(0x1480u64 + 8 * tls as u64).gs()))?;
+            enc(a.test(r10, r10))?;
+            enc(a.jz(slow))?;
+            enc(a.inc(qword_ptr(r10 + ctr)))?;
+            enc(a.mov(r11, qword_ptr(r10 + ctr + 16)))?;
+            enc(a.test(r11, r11))?;
+            enc(a.jz(keep))?;
+            enc(a.dec(r11))?;
+            enc(a.mov(qword_ptr(r10 + ctr + 16), r11))?;
+            enc(a.pop(r11))?;
+            enc(a.pop(r10))?;
+            enc(a.popfq())?;
+            enc(a.jmp(tail))?;
+            enc(a.set_label(&mut keep))?;
+            enc(a.pop(r11))?;
+            enc(a.pop(r10))?;
+            enc(a.popfq())?;
+            enc(a.jmp(main_counted))?;
+            enc(a.set_label(&mut slow))?;
+            enc(a.pop(r11))?;
+            enc(a.pop(r10))?;
+            enc(a.popfq())?;
         } else {
-            enc(a.xor(r8d, r8d))?;
+            enc(a.jmp(main_plain))?;
         }
-        enc(a.mov(rax, on_hit as *const () as usize as u64))?;
-        enc(a.call(rax))?;
-        for (n, x) in xs.iter().enumerate() {
-            enc(a.movups(*x, xmmword_ptr(rsp + 40 + 16 * n as i32)))?;
+        enc(a.set_label(&mut main_plain))?;
+        emit_main(&mut a, hook, stack, extra, false)?;
+        enc(a.jmp(tail))?;
+        enc(a.set_label(&mut main_counted))?;
+        emit_main(&mut a, hook, stack, extra, true)?;
+        enc(a.set_label(&mut tail))?;
+        for i in stolen {
+            enc(a.add_instruction(i))?;
         }
-        enc(a.add(rsp, 104))?;
-        if stack {
-            for r in [r15, r14, r13, r12, rdi, rsi, rbp, rbx] {
-                enc(a.pop(r))?;
-            }
-        }
-        for r in [r11, r10, r9, r8, rdx, rcx, rax] {
-            enc(a.pop(r))?;
-        }
-        enc(a.popfq())?;
-        let mut instrs: Vec<Instruction> = a.instructions().to_vec();
-        instrs.extend(stolen);
-        instrs.push(enc(Instruction::with_branch(
-            Code::Jmp_rel32_64,
-            (addr + len) as u64,
-        ))?);
-        let block = enc(BlockEncoder::encode(
-            64,
-            InstructionBlock::new(&instrs, mem as u64),
-            BlockEncoderOptions::NONE,
-        ))?;
-        core::ptr::copy_nonoverlapping(
-            block.code_buffer.as_ptr(),
-            mem as *mut u8,
-            block.code_buffer.len(),
-        );
-        FlushInstructionCache(-1isize as _, mem as *const _, block.code_buffer.len());
+        enc(a.jmp((addr + len) as u64))?;
+        let code = enc(a.assemble(mem as u64))?;
+        core::ptr::copy_nonoverlapping(code.as_ptr(), mem as *mut u8, code.len());
+        FlushInstructionCache(-1isize as _, mem as *const _, code.len());
 
         let rel = i32::try_from(mem as i64 - (addr as i64 + 5)).map_err(|_| p::ERR_NO_STUB_ROOM)?;
         let mut orig = [0u8; 16];
@@ -224,6 +219,54 @@ pub unsafe fn retire(pr: &Prepared) -> Result<(), u32> {
     }
 }
 
+/// The full save / call / restore sequence. `counted`: the inline gate already counted the hit and decided to keep it.
+fn emit_main(
+    a: &mut CodeAssembler,
+    hook: u64,
+    stack: bool,
+    extra: i32,
+    counted: bool,
+) -> Result<(), u32> {
+    enc(a.pushfq())?;
+    for r in [rax, rcx, rdx, r8, r9, r10, r11] {
+        enc(a.push(r))?;
+    }
+    if stack {
+        for r in [rbx, rbp, rsi, rdi, r12, r13, r14, r15] {
+            enc(a.push(r))?;
+        }
+    }
+    enc(a.sub(rsp, 104))?;
+    let xs = [xmm0, xmm1, xmm2, xmm3];
+    for (n, x) in xs.iter().enumerate() {
+        enc(a.movups(xmmword_ptr(rsp + 40 + 16 * n as i32), *x))?;
+    }
+    enc(a.mov(rcx, hook))?;
+    enc(a.lea(rdx, qword_ptr(rsp + 104 + extra)))?;
+    if stack {
+        enc(a.lea(r8, qword_ptr(rsp + 104)))?;
+    } else {
+        enc(a.xor(r8d, r8d))?;
+    }
+    enc(a.mov(r9d, u32::from(counted)))?;
+    enc(a.mov(rax, on_hit as *const () as usize as u64))?;
+    enc(a.call(rax))?;
+    for (n, x) in xs.iter().enumerate() {
+        enc(a.movups(*x, xmmword_ptr(rsp + 40 + 16 * n as i32)))?;
+    }
+    enc(a.add(rsp, 104))?;
+    if stack {
+        for r in [r15, r14, r13, r12, rdi, rsi, rbp, rbx] {
+            enc(a.pop(r))?;
+        }
+    }
+    for r in [r11, r10, r9, r8, rdx, rcx, rax] {
+        enc(a.pop(r))?;
+    }
+    enc(a.popfq())?;
+    Ok(())
+}
+
 pub unsafe fn make_return_stub() -> Result<usize, u32> {
     unsafe {
         let mut a = enc(CodeAssembler::new(64))?;
@@ -280,7 +323,7 @@ unsafe fn read_buf(dst: *mut MaybeUninit<u8>, src: u64, n: usize) -> bool {
 }
 
 /// Called by the stub with the saved registers. `fr[5]` rcx, `fr[4]` rdx, `fr[3]` r8, `fr[2]` r9, `fr[8]` return address.
-unsafe extern "system" fn on_hit(h: *const Hook, fr: *const u64, saved: *const u64) {
+unsafe extern "system" fn on_hit(h: *const Hook, fr: *const u64, saved: *const u64, counted: u64) {
     unsafe {
         let h = &*h;
         let cfg = h.cfg;
@@ -288,14 +331,15 @@ unsafe extern "system" fn on_hit(h: *const Hook, fr: *const u64, saved: *const u
         if ring.is_null() {
             return;
         }
-        ring::bump32(ring, p::R_ATTEMPTED);
         let c = ring::ctr(ring, h.site as usize);
-        c.write_volatile(c.read_volatile() + 1); // hits
         let next = c.add(2);
-        let skip = next.read_volatile();
-        if skip != 0 {
-            next.write_volatile(skip - 1);
-            return;
+        if counted == 0 {
+            c.write_volatile(c.read_volatile() + 1); // hits
+            let skip = next.read_volatile();
+            if skip != 0 {
+                next.write_volatile(skip - 1);
+                return;
+            }
         }
         c.add(1).write_volatile(c.add(1).read_volatile() + 1); // kept
         next.write_volatile((cfg.add(p::S_MASK) as *const u32).read_volatile() as u64);

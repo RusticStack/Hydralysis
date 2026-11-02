@@ -79,6 +79,7 @@ pub struct Counters {
     pub dropped: u64,
     pub read_failed: u64,
     pub unreturned: u64,
+    pub stalls: u64,
     pub no_ring: u64,
     pub bad_records: u64,
     pub events_lost: u64,
@@ -352,26 +353,46 @@ impl Session {
     /// Inject the agent and run its init. Per-site failures are in `site_status`; this fails only when the agent
     /// itself could not start.
     pub fn inject(&mut self, dll: &Path) -> io::Result<()> {
+        fn ctx(stage: &str, e: io::Error) -> io::Error {
+            io::Error::new(e.kind(), format!("{stage}: {e}"))
+        }
         unsafe {
-            let image = std::fs::read(dll)?;
+            let image = std::fs::read(dll).map_err(|e| ctx("reading the agent", e))?;
             let (rva, _) = pe_exports::find_export(&image, "hy_agent_init")
                 .ok_or_else(|| io::Error::other("agent has no hy_agent_init"))?;
             // A process resumed a moment ago may still be starting up; CreateRemoteThread then reports access denied
             // (5) or not-enough-memory (8). Retry for a short, bounded time. A process we spawned suspended never
             // needs this.
+            let retry = |e: &io::Error, tries: u32| {
+                tries < 200 && matches!(e.raw_os_error(), Some(5) | Some(8))
+            };
             let mut tries = 0;
             let base = loop {
                 match inject::load_library(self.process, self.pid, dll) {
                     Ok(b) => break b,
-                    Err(e) if tries < 60 && matches!(e.raw_os_error(), Some(5) | Some(8)) => {
+                    Err(e) if retry(&e, tries) => {
                         tries += 1;
                         std::thread::sleep(Duration::from_millis(50));
                     }
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(ctx("loading the agent", e)),
                 }
             };
-            let code =
-                inject::run_remote(self.process, base + rva as usize, core::ptr::null(), 20_000)?;
+            tries = 0;
+            let code = loop {
+                match inject::run_remote(
+                    self.process,
+                    base + rva as usize,
+                    core::ptr::null(),
+                    20_000,
+                ) {
+                    Ok(c) => break c,
+                    Err(e) if retry(&e, tries) => {
+                        tries += 1;
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(e) => return Err(ctx("running hy_agent_init", e)),
+                }
+            };
             if code != 0 || self.rd32(proto::H_STATUS) != 1 {
                 return Err(io::Error::other(format!(
                     "agent init failed: code {code}, status {}",
@@ -503,6 +524,15 @@ impl Session {
         self.wr32(proto::site_offset(idx) + proto::S_MASK, stride.max(1) - 1);
     }
 
+    /// Run one step of the sampling policy: read the counters, let `sampler` decide, apply the new strides.
+    pub fn sampling_tick(&mut self, sampler: &mut crate::sampling::Sampler) {
+        let c = self.counters();
+        let hits: Vec<u64> = c.sites.iter().map(|s| s.hits).collect();
+        for (site, stride) in sampler.step(Instant::now(), &hits, c.dropped) {
+            self.set_stride(site, stride);
+        }
+    }
+
     /// Read every ring to its head. Each decoded hit is passed to `f`.
     pub fn drain_with(&mut self, mut f: impl FnMut(Hit)) -> u64 {
         use std::sync::atomic::Ordering;
@@ -570,10 +600,10 @@ impl Session {
             for i in 0..claimed {
                 let r = self.view.add(proto::ring_offset(i));
                 let u = |o: usize| (r.add(o) as *const u32).read_volatile() as u64;
-                c.attempted += u(proto::R_ATTEMPTED);
                 c.dropped += u(proto::R_DROPPED);
                 c.read_failed += u(proto::R_READ_FAILED);
                 c.unreturned += u(proto::R_UNRETURNED);
+                c.stalls += u(proto::R_STALLS);
                 for s in 0..proto::MAX_SITES {
                     let p = r.add(proto::RING_CTR + s * proto::CTR_SIZE) as *const u64;
                     c.sites[s].hits += p.read_volatile();
@@ -581,6 +611,7 @@ impl Session {
                 }
             }
         }
+        c.attempted = c.sites.iter().map(|s| s.hits).sum();
         c.no_ring = self.rd32(proto::H_NO_RING) as u64;
         c
     }

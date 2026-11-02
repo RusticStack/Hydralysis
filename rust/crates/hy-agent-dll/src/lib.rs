@@ -235,6 +235,26 @@ pub unsafe extern "system" fn hy_agent_init(_param: *mut core::ffi::c_void) -> u
         (base.add(p::H_QPC0) as *mut u64).write(((q0 + q1) / 2) as u64);
         (base.add(p::H_QPC_FREQ) as *mut u64).write(f as u64);
 
+        // How long a hit may wait for a full ring (200 us), in the record clock's ticks: measured over ~2 ms.
+        {
+            let (mut qa, mut qb) = (0i64, 0i64);
+            QueryPerformanceCounter(&mut qa);
+            let ta = core::arch::x86_64::_rdtsc();
+            Sleep(2);
+            QueryPerformanceCounter(&mut qb);
+            let tb = core::arch::x86_64::_rdtsc();
+            let us = ((qb - qa) as f64 / f as f64 * 1e6).max(1.0);
+            let per_us = if invariant {
+                (tb - ta) as f64 / us
+            } else {
+                f as f64 / 1e6
+            };
+            (base.add(p::H_STALL_BUDGET) as *mut u64).write((per_us * 200.0) as u64);
+        }
+        let tls = TlsAlloc();
+        if tls < 64 {
+            ring::TLS_IDX.store(tls, Ordering::Release);
+        }
         ring::FLS_INDEX.store(FlsAlloc(Some(ring::fls_callback)), Ordering::Release);
         match hook::make_return_stub() {
             Ok(a) => hook::RET_STUB.store(a, Ordering::Release),

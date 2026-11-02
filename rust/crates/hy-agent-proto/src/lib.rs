@@ -14,8 +14,8 @@
 
 pub const MAGIC: u64 = 0x4859_5f41_4745_4e54;
 pub const HEADER_SIZE: usize = 0x10000;
-pub const MAX_RINGS: usize = 64;
-pub const RING_DATA: usize = 1 << 18;
+pub const MAX_RINGS: usize = 32;
+pub const RING_DATA: usize = 1 << 20;
 pub const RING_HDR: usize = 4096;
 pub const RING_SIZE: usize = RING_HDR + RING_DATA;
 pub const SECTION_SIZE: usize = HEADER_SIZE + MAX_RINGS * RING_SIZE;
@@ -36,6 +36,7 @@ pub const H_AGENT_TID: usize = 60; // u32 control thread id (never suspended by 
 pub const H_EVENT_HEAD: usize = 64; // u32 next event slot to claim
 pub const H_WATCH_SEEN: usize = 68; // u32 nonzero once any watch was ever armed (single-steps are ours from then on)
 pub const H_VEH_FOREIGN: usize = 72; // u32 single-steps seen while no watch was armed
+pub const H_STALL_BUDGET: usize = 80; // u64 how long a hit may wait for a full ring, in the record clock's ticks
 
 // Site table.
 pub const SITES_OFF: usize = 0x100;
@@ -152,6 +153,8 @@ pub const R_READ_FAILED: usize = 20;
 pub const R_ATTEMPTED: usize = 24;
 pub const R_SEQ: usize = 28;
 pub const R_UNRETURNED: usize = 32;
+pub const R_STALLS: usize = 36; // times a hit waited for the drain
+pub const R_SHED: usize = 40; // 1 while the ring sheds (drops at once) after a stall ran out of patience
 pub const R_TAIL: usize = 64;
 pub const RING_CTR: usize = 256;
 pub const CTR_SIZE: usize = 32; // hits u64, kept u64, next u64, pad

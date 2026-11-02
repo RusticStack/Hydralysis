@@ -46,9 +46,11 @@ fn fixtures() -> PathBuf {
 }
 
 fn work(name: &str) -> PathBuf {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let d = std::env::temp_dir()
         .join("hy-runtime-tests")
-        .join(format!("{name}-{}", std::process::id()));
+        .join(format!("{name}-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
     d
 }
@@ -572,7 +574,55 @@ fn cas_write_undo_and_refusals() {
         "diverged undo writes nothing"
     );
 
-    s.write_cas(&gate, addr, &v(0x4444), &v(0x3333), "let the target finish")
+    // malformed requests, unmapped spans, a missing undo entry
+    let bad =
+        |r: Result<u32, MemError>| matches!(r, Err(MemError::BadRequest(_)) | Err(MemError::Os(_)));
+    assert!(bad(s.write_cas(
+        &gate,
+        addr,
+        &v(0x4444)[..4],
+        &v(1),
+        "length mismatch case"
+    )));
+    assert!(bad(s.write_cas(
+        &gate,
+        addr,
+        &[],
+        &[],
+        "empty request is refused"
+    )));
+    assert!(bad(s.write_cas(
+        &gate,
+        0x10,
+        &[0],
+        &[1],
+        "an unmapped address"
+    )));
+    assert!(matches!(
+        s.undo_write(&gate, 999),
+        Err(MemError::UnknownUndo(999))
+    ));
+    // undo is range-checked: an authorization that no longer covers the entry refuses it
+    let id3 = s
+        .write_cas(
+            &gate,
+            addr,
+            &v(0x4444),
+            &v(0x5555),
+            "entry for the narrowing case",
+        )
+        .unwrap();
+    let narrowed = Gate::Authorized(auth_for(
+        &exe_name,
+        cell_rva + 0x100,
+        cell_rva + 0x200,
+        &["write"],
+    ));
+    assert!(
+        matches!(s.undo_write(&narrowed, id3), Err(MemError::Refused(r)) if r.code == "outside_authorized_range")
+    );
+    assert_eq!(s.read_memory(addr, 8).unwrap(), v(0x5555));
+    s.write_cas(&gate, addr, &v(0x5555), &v(0x3333), "let the target finish")
         .unwrap();
     wait_exit(&mut s, Duration::from_secs(20), |_| {});
     assert!(text(&out).contains("SAW"));
@@ -584,8 +634,8 @@ fn watch_records_writes_from_old_and_new_threads_and_disarms_clean() {
     let (_, _, _) = fixture_info();
     let out = work("watch").join("out.txt");
     let mut s = Session::spawn_with(&hy_fixture(), &["watch".into()], &[], Some(&out)).unwrap();
-    s.resume();
     s.inject(&agent_dll()).unwrap();
+    s.resume();
     let t = wait_for(&out, "ADDR=", Duration::from_secs(20));
     let addr = u64::from_str_radix(&kv(&t, "ADDR="), 16).unwrap();
     // misuse is refused before anything is armed
@@ -636,8 +686,8 @@ fn watch_records_writes_from_old_and_new_threads_and_disarms_clean() {
 fn disarm_reads_back_every_thread_and_clears() {
     let out = work("disarm").join("out.txt");
     let mut s = Session::spawn_with(&hy_fixture(), &["write".into()], &[], Some(&out)).unwrap();
-    s.resume();
     s.inject(&agent_dll()).unwrap();
+    s.resume();
     let t = wait_for(&out, "ADDR=", Duration::from_secs(20));
     let addr = u64::from_str_radix(&kv(&t, "ADDR="), 16).unwrap();
     let slot = s

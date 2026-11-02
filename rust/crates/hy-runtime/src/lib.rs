@@ -8,6 +8,7 @@ pub mod inject;
 #[cfg(windows)]
 pub mod memory;
 pub mod pe_exports;
+pub mod sampling;
 #[cfg(windows)]
 pub mod session;
 #[cfg(windows)]
