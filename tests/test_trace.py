@@ -285,7 +285,7 @@ prologue = "{prologue}"
             self.assertEqual(calls[0][1], {"path": "C:/x/app.exe"})
             self.assertEqual(calls[1][1]["op"], "start")
             self.assertEqual(calls[1][1]["trace"]["session"], "s1")
-            self.assertEqual(calls[1][1]["trace"]["cap"], "tok")
+            self.assertEqual(calls[1][1]["trace"]["owner"], "tok")
             stopped, _ = run("stop", "s1", {}, engine=engine)
         self.assertEqual([c[0] for c in calls], ["spawn", "capture", "capture", "detach"])
         self.assertEqual(calls[2][1], {"op": "stop", "session": "r" * 32})
