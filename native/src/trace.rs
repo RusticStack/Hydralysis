@@ -10,6 +10,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
+use std::sync::Arc;
 
 const GENESIS: &str = "hydra.trace.segment/1\n";
 const MAGIC: u32 = 0x3142_5448;
@@ -25,17 +26,32 @@ fn err(message: impl Into<String>) -> PyErr {
     PyValueError::new_err(message.into())
 }
 
-fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+fn hex_into(bytes: &[u8], out: &mut Vec<u8>) {
+    out.reserve(bytes.len() * 2);
     for b in bytes {
-        let _ = write!(s, "{b:02x}");
+        out.push(HEX[usize::from(b >> 4)]);
+        out.push(HEX[usize::from(b & 15)]);
     }
-    s
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = Vec::with_capacity(bytes.len() * 2);
+    hex_into(bytes, &mut out);
+    // The bytes are ASCII hex digits.
+    String::from_utf8(out).unwrap_or_default()
 }
 
 // ---- canonical JSON -------------------------------------------------------------------------------------------------
 fn canon_string(s: &str, out: &mut Vec<u8>) {
     out.push(b'"');
+    // Fast path: printable ASCII with nothing to escape is copied as one run.
+    if s.bytes().all(|b| (0x20..=0x7e).contains(&b) && b != b'"' && b != b'\\') {
+        out.extend_from_slice(s.as_bytes());
+        out.push(b'"');
+        return;
+    }
     for c in s.chars() {
         match c {
             '"' => out.extend_from_slice(b"\\\""),
@@ -75,7 +91,13 @@ fn canon_write(value: &Value, out: &mut Vec<u8>) -> Result<(), String> {
             if n.is_f64() {
                 return Err("not canonical: floating point number".into());
             }
-            out.extend_from_slice(n.to_string().as_bytes());
+            if let Some(u) = n.as_u64() {
+                out.extend_from_slice(itoa::Buffer::new().format(u).as_bytes());
+            } else if let Some(i) = n.as_i64() {
+                out.extend_from_slice(itoa::Buffer::new().format(i).as_bytes());
+            } else {
+                return Err("not canonical: number".into());
+            }
         }
         Value::String(s) => canon_string(s, out),
         Value::Array(items) => {
@@ -89,10 +111,10 @@ fn canon_write(value: &Value, out: &mut Vec<u8>) -> Result<(), String> {
             out.push(b']');
         }
         Value::Object(map) => {
-            // Keys are ASCII by contract, so the BTreeMap order is Python's sorted() order.
-            let sorted: BTreeMap<&String, &Value> = map.iter().collect();
+            // `serde_json::Map` is a BTreeMap here (no `preserve_order`; `map_iterates_in_sorted_order` pins it), and keys
+            // are ASCII by contract, so its iteration order is Python's sorted() order: no re-sort, no copy.
             out.push(b'{');
-            for (i, (key, item)) in sorted.into_iter().enumerate() {
+            for (i, (key, item)) in map.iter().enumerate() {
                 if i > 0 {
                     out.push(b',');
                 }
@@ -183,19 +205,95 @@ impl Chain {
         Self { head: hex(&Sha256::digest(format!("{GENESIS}{segment}").as_bytes())), n: 0 }
     }
 
-    fn push(&mut self, mut record: Map<String, Value>) -> Result<Vec<u8>, String> {
-        record.insert("n".into(), Value::from(self.n));
-        record.insert("prev".into(), Value::from(self.head.clone()));
-        let hash = hex(&Sha256::digest(canon_bytes(&Value::Object(record.clone()))?));
-        record.insert("hash".into(), Value::from(hash.clone()));
-        let body = canon_bytes(&Value::Object(record))?;
-        let mut line = format!("{:08x} ", crc32fast::hash(&body)).into_bytes();
-        line.extend_from_slice(&body);
-        line.push(b'\n');
-        self.head = hash;
+    /// Frame one event as a segment line, chained after the previous one. The event is written once, canonical, with
+    /// the keys in sorted order; `hash` covers those bytes without `hash`, and the stored body is the same bytes with
+    /// `"hash"` spliced in at its sorted position (after `confidence`, before `kind`). There is no intermediate map.
+    #[allow(clippy::too_many_arguments)]
+    fn push_event(
+        &mut self, out: &mut Vec<u8>, enc: &EnvelopeStatic, source_seq: u64, kind: &str, t_ns: u64, tid: Option<u32>, payload: &Value,
+        va: u64, callstack: &[u64], module: Option<&str>,
+    ) -> Result<(), String> {
+        const CRC_FIELD: usize = 9; // eight hex digits and a space
+        const HASH_FIELD: usize = 8 + 64 + 2; // "hash":"<64 hex>",
+        let start = out.len();
+        out.reserve(640);
+        let mut num = itoa::Buffer::new();
+        out.extend_from_slice(&[b'0'; CRC_FIELD]);
+        let body = start + CRC_FIELD;
+        out.extend_from_slice(b"{\"acquisition\":\"atomic\",");
+        if !callstack.is_empty() {
+            out.extend_from_slice(b"\"callstack\":[");
+            for (i, v) in callstack.iter().enumerate() {
+                if i > 0 {
+                    out.push(b',');
+                }
+                out.extend_from_slice(num.format(*v).as_bytes());
+            }
+            out.extend_from_slice(b"],");
+        }
+        out.extend_from_slice(b"\"clock_domain\":\"qpc-10mhz\",\"confidence\":\"exact\",");
+        let splice = out.len();
+        out.extend_from_slice(&[b' '; HASH_FIELD]); // the hash field, filled in below
+        let rest = out.len();
+        out.extend_from_slice(b"\"kind\":");
+        canon_string(kind, out);
+        if let Some(m) = module.filter(|m| !m.is_empty()) {
+            out.extend_from_slice(b",\"module\":");
+            canon_string(m, out);
+        }
+        out.extend_from_slice(b",\"n\":");
+        out.extend_from_slice(num.format(self.n).as_bytes());
+        out.extend_from_slice(b",\"payload\":");
+        canon_write(payload, out)?;
+        out.extend_from_slice(b",\"prev\":\"");
+        out.extend_from_slice(self.head.as_bytes());
+        out.extend_from_slice(b"\",\"process_id\":");
+        out.extend_from_slice(num.format(enc.process_id).as_bytes());
+        out.extend_from_slice(b",\"producer_gen\":");
+        out.extend_from_slice(num.format(enc.producer_gen).as_bytes());
+        out.extend_from_slice(b",\"source_id\":");
+        out.extend_from_slice(&enc.source_id_json);
+        out.extend_from_slice(b",\"source_seq\":");
+        out.extend_from_slice(num.format(source_seq).as_bytes());
+        out.extend_from_slice(b",\"t_mono_ns\":");
+        out.extend_from_slice(num.format(t_ns).as_bytes());
+        if let Some(t) = tid {
+            out.extend_from_slice(b",\"thread_id\":");
+            out.extend_from_slice(num.format(t).as_bytes());
+        }
+        if va != 0 {
+            out.extend_from_slice(b",\"va\":");
+            out.extend_from_slice(num.format(va).as_bytes());
+        }
+        out.push(b'}');
+        // The hash covers the canonical bytes without the `hash` field: the text before and after the gap.
+        let mut hasher = Sha256::new();
+        hasher.update(&out[body..splice]);
+        hasher.update(&out[rest..]);
+        let digest = hasher.finalize();
+        let mut hash = Vec::with_capacity(64);
+        hex_into(&digest, &mut hash);
+        out[splice..splice + 8].copy_from_slice(b"\"hash\":\"");
+        out[splice + 8..splice + 72].copy_from_slice(&hash);
+        out[splice + 72..splice + HASH_FIELD].copy_from_slice(b"\",");
+        out.push(b'\n');
+        // CRC-framed line: crc32 (hex), a space, the body, a newline.
+        let crc = crc32fast::hash(&out[body..out.len() - 1]);
+        for (i, slot) in out[start..start + 8].iter_mut().enumerate() {
+            *slot = HEX[usize::try_from((crc >> (28 - 4 * i)) & 15).unwrap_or(0)];
+        }
+        out[start + 8] = b' ';
+        self.head = String::from_utf8(hash).map_err(|_| "hash is not ASCII".to_string())?;
         self.n += 1;
-        Ok(line)
+        Ok(())
     }
+}
+
+/// The parts of an event envelope that never change within one encoder.
+struct EnvelopeStatic {
+    process_id: u32,
+    producer_gen: u32,
+    source_id_json: Vec<u8>,
 }
 
 // ---- the batch ------------------------------------------------------------------------------------------------------
@@ -512,15 +610,14 @@ fn redact_preview(raw: &[u8], wide: bool, limit: usize) -> (String, u64) {
 /// Turns agent batches into chained TRACE-1 events (the twin of `trace_wire.SegmentEncoder`).
 #[pyclass]
 struct SegmentEncoder {
-    source_id: String,
     producer_gen: u32,
-    process_id: u32,
-    sites: HashMap<u16, Site>,
+    sites: HashMap<u16, Arc<Site>>,
     key: Vec<u8>,
     freq: u64,
     payload_ok: bool,
     max_payload: usize,
     chain: Chain,
+    envelope: EnvelopeStatic,
     source_seq: u64,
     ring_next: HashMap<u16, u32>,
     batch_next: Option<u32>,
@@ -540,35 +637,20 @@ impl SegmentEncoder {
         *self.stats.entry(key).or_insert(0) += add;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn event(&mut self, kind: &str, t_ns: u64, tid: Option<u32>, payload: Value, va: u64, callstack: &[u64], module: Option<&str>) -> Result<Vec<u8>, String> {
-        let mut e = Map::new();
-        e.insert("kind".into(), kind.into());
-        e.insert("source_id".into(), self.source_id.clone().into());
-        e.insert("source_seq".into(), self.source_seq.into());
-        e.insert("producer_gen".into(), self.producer_gen.into());
-        e.insert("clock_domain".into(), "qpc-10mhz".into());
-        e.insert("t_mono_ns".into(), t_ns.into());
-        e.insert("process_id".into(), self.process_id.into());
-        e.insert("confidence".into(), "exact".into());
-        e.insert("acquisition".into(), "atomic".into());
-        e.insert("payload".into(), payload);
-        if let Some(t) = tid {
-            e.insert("thread_id".into(), t.into());
-        }
-        if va != 0 {
-            e.insert("va".into(), va.into());
-        }
-        if !callstack.is_empty() {
-            e.insert("callstack".into(), callstack.iter().map(|v| Value::from(*v)).collect::<Vec<_>>().into());
-        }
-        if let Some(m) = module {
-            if !m.is_empty() {
-                e.insert("module".into(), m.into());
-            }
-        }
+        let mut out = Vec::new();
+        self.event_into(&mut out, kind, t_ns, tid, payload, va, callstack, module)?;
+        Ok(out)
+    }
+
+    /// Append one chained event line to OUT.
+    #[allow(clippy::too_many_arguments)]
+    fn event_into(&mut self, out: &mut Vec<u8>, kind: &str, t_ns: u64, tid: Option<u32>, payload: Value, va: u64, callstack: &[u64], module: Option<&str>) -> Result<(), String> {
+        let seq = self.source_seq;
         self.source_seq += 1;
         self.stat("events", 1);
-        self.chain.push(e)
+        self.chain.push_event(out, &self.envelope, seq, kind, t_ns, tid, &payload, va, callstack, module)
     }
 
     fn buffer(&mut self, site: &Site, r: &Rec, artifacts: &mut BTreeMap<String, Vec<u8>>) -> Option<Value> {
@@ -643,10 +725,10 @@ impl SegmentEncoder {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn call(&mut self, r: &Rec, artifacts: &mut BTreeMap<String, Vec<u8>>) -> Result<Vec<u8>, String> {
+    fn call(&mut self, out: &mut Vec<u8>, r: &Rec, artifacts: &mut BTreeMap<String, Vec<u8>>) -> Result<(), String> {
         let t0 = tick_ns(r.qpc, self.freq);
-        let Some(site) = self.sites.get(&r.site).cloned() else {
-            return self.event("core.error", t0, Some(r.tid), json!({"error": "unknown-site", "site": r.site}), 0, &[], None);
+        let Some(site) = self.sites.get(&r.site).map(Arc::clone) else {
+            return self.event_into(out, "core.error", t0, Some(r.tid), json!({"error": "unknown-site", "site": r.site}), 0, &[], None);
         };
         *self.hits.entry(r.site).or_insert(0) += 1;
         let call = format!("{}:{}", r.ring, r.ring_seq);
@@ -654,7 +736,6 @@ impl SegmentEncoder {
         let has_ret = r.flags & F_RET != 0;
         let buf = self.buffer(&site, r, artifacts);
         let t_end = tick_ns(if r.qpc_end != 0 { r.qpc_end } else { r.qpc }, self.freq);
-        let mut out = Vec::new();
         let arg = |i: usize| r.args.get(i).copied();
         let with_call = |mut v: Value| {
             if let Value::Object(m) = &mut v {
@@ -688,10 +769,10 @@ impl SegmentEncoder {
                 if ok {
                     self.handles.insert(r.retval, (rid.clone(), device));
                 }
-                out.extend(self.event("core.resource.open", t_end, Some(r.tid), with_call(payload), site.va, &stack, module)?);
+                self.event_into(out, "core.resource.open", t_end, Some(r.tid), with_call(payload), site.va, &stack, module)?;
                 if device {
                     let p = json!({"api": site.name, "resource_id": rid, "handle": if has_ret { Some(r.retval) } else { None }, "ok": ok});
-                    out.extend(self.event("driver.device_open", t_end, Some(r.tid), with_call(p), site.va, &stack, module)?);
+                    self.event_into(out, "driver.device_open", t_end, Some(r.tid), with_call(p), site.va, &stack, module)?;
                 }
             }
             "ioctl" => {
@@ -706,7 +787,7 @@ impl SegmentEncoder {
                 let ok_v = if has_ret { Value::from(ok) } else { Value::Null };
                 let p = json!({"api": site.name, "handle": handle, "resource_id": rid, "resource_unresolved": unresolved,
                     "op": "ioctl", "bytes_in": in_size, "bytes_out": out_size, "ok": ok_v});
-                out.extend(self.event("core.resource.write", t0, Some(r.tid), with_call(p), site.va, &stack, module)?);
+                self.event_into(out, "core.resource.write", t0, Some(r.tid), with_call(p), site.va, &stack, module)?;
                 let mut p = json!({"api": site.name, "handle": handle, "resource_id": rid, "resource_unresolved": unresolved,
                     "in_size": in_size, "out_size": out_size, "code": code, "device_type": code >> 16,
                     "access": (code >> 14) & 3, "function": (code >> 2) & 0xFFF, "method": code & 3, "ok": ok_v,
@@ -714,7 +795,7 @@ impl SegmentEncoder {
                 if let (Some(b), Value::Object(m)) = (buf, &mut p) {
                     m.insert("in_buffer".into(), b);
                 }
-                out.extend(self.event("driver.ioctl", t0, Some(r.tid), with_call(p), site.va, &stack, module)?);
+                self.event_into(out, "driver.ioctl", t0, Some(r.tid), with_call(p), site.va, &stack, module)?;
             }
             "close" => {
                 let handle = arg(0).unwrap_or(0);
@@ -723,7 +804,7 @@ impl SegmentEncoder {
                     let ok_v = if has_ret { Value::from(ok) } else { Value::Null };
                     let p = json!({"api": site.name, "handle": handle, "resource_id": known.0, "device": known.1,
                         "ok": ok_v, "last_error": r.last_error});
-                    out.extend(self.event("core.resource.close", t_end, Some(r.tid), with_call(p), site.va, &stack, module)?);
+                    self.event_into(out, "core.resource.close", t_end, Some(r.tid), with_call(p), site.va, &stack, module)?;
                 } else {
                     self.stat("close_unknown", 1);
                 }
@@ -743,7 +824,7 @@ impl SegmentEncoder {
                     m.insert("last_error".into(), r.last_error.into());
                 }
                 let kind = site.event.clone().unwrap_or_else(|| "core.function.enter".into());
-                out.extend(self.event(&kind, t0, Some(r.tid), with_call(Value::Object(m)), site.va, &stack, module)?);
+                self.event_into(out, &kind, t0, Some(r.tid), with_call(Value::Object(m)), site.va, &stack, module)?;
             }
             "devquery" => {
                 let family = if site.name.to_lowercase().starts_with("cm_") { "driver.cfgmgr" } else { "driver.setupapi" };
@@ -754,23 +835,23 @@ impl SegmentEncoder {
                     m.insert("query".into(), b.clone());
                     m.insert("resource_id".into(), query_id.clone());
                 }
-                out.extend(self.event("core.resource.open", t0, Some(r.tid), with_call(p), site.va, &stack, module)?);
+                self.event_into(out, "core.resource.open", t0, Some(r.tid), with_call(p), site.va, &stack, module)?;
                 let p = json!({"api": site.name, "ret": ret, "last_error": r.last_error, "query_id": query_id});
-                out.extend(self.event(family, t0, Some(r.tid), with_call(p), site.va, &stack, module)?);
+                self.event_into(out, family, t0, Some(r.tid), with_call(p), site.va, &stack, module)?;
             }
             _ => {
                 let mut p = json!({"site": site.name, "args": r.args});
                 if let (Some(b), Value::Object(m)) = (buf, &mut p) {
                     m.insert("buf".into(), b);
                 }
-                out.extend(self.event("core.function.enter", t0, Some(r.tid), with_call(p), site.va, &stack, module)?);
+                self.event_into(out, "core.function.enter", t0, Some(r.tid), with_call(p), site.va, &stack, module)?;
                 if has_ret {
                     let p = json!({"site": site.name, "ret": r.retval, "last_error": r.last_error});
-                    out.extend(self.event("core.function.exit", t_end, Some(r.tid), with_call(p), site.va, &stack, module)?);
+                    self.event_into(out, "core.function.exit", t_end, Some(r.tid), with_call(p), site.va, &stack, module)?;
                 }
             }
         }
-        Ok(out)
+        Ok(())
     }
 
     fn encode(&mut self, data: &[u8], artifacts: &mut BTreeMap<String, Vec<u8>>) -> Result<(Vec<u8>, u32, usize), String> {
@@ -792,7 +873,7 @@ impl SegmentEncoder {
                 self.stat("transport_gaps", 1);
                 self.stat("gaps", 1);
                 let p = json!({"reason": "producer-lost", "hop": "transport", "batches_missing": lost, "first_missing_batch": next, "out_of_band": false});
-                out.extend(self.event("core.capture.gap", t_flush, None, p, 0, &[], None)?);
+                self.event_into(&mut out, "core.capture.gap", t_flush, None, p, 0, &[], None)?;
             }
         }
         self.batch_next = Some(header.batch_seq.wrapping_add(1));
@@ -833,9 +914,9 @@ impl SegmentEncoder {
                 let p = json!({"reason": reason, "dropped": missing, "ring": r.ring, "out_of_band": false,
                     "first_missing_source_seq": first, "last_missing_source_seq": first + u64::from(missing) - 1,
                     "attributed_to_overflow": ring_part});
-                out.extend(self.event("core.capture.gap", tick_ns(r.qpc, self.freq), Some(r.tid), p, 0, &[], None)?);
+                self.event_into(&mut out, "core.capture.gap", tick_ns(r.qpc, self.freq), Some(r.tid), p, 0, &[], None)?;
             }
-            out.extend(self.call(r, artifacts)?);
+            self.call(&mut out, r, artifacts)?;
         }
         self.stats.insert("last_attempted", header.attempted);
         self.stats.insert("last_dropped", header.dropped);
@@ -877,7 +958,7 @@ impl SegmentEncoder {
             let id: u16 = k.extract()?;
             table.insert(
                 id,
-                Site {
+                Arc::new(Site {
                     name: dict_str(d, "name")?.unwrap_or_default(),
                     kind: dict_str(d, "kind")?.unwrap_or_else(|| "call".into()),
                     module: dict_str(d, "module")?,
@@ -932,7 +1013,7 @@ impl SegmentEncoder {
                         }
                         _ => Vec::new(),
                     },
-                },
+                }),
             );
         }
         let mut stats = BTreeMap::new();
@@ -942,15 +1023,18 @@ impl SegmentEncoder {
             }
         }
         Ok(Self {
-            source_id: source_id.into(),
             producer_gen,
-            process_id,
             sites: table,
             key: key.to_vec(),
             freq: qpc_freq,
             payload_ok: payload_authorized,
             max_payload,
             chain: Chain::new(segment_id),
+            envelope: EnvelopeStatic { process_id, producer_gen, source_id_json: {
+                let mut v = Vec::new();
+                canon_string(source_id, &mut v);
+                v
+            } },
             source_seq: 0,
             ring_next: HashMap::new(),
             batch_next: None,
