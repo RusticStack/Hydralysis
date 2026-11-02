@@ -355,26 +355,28 @@ def from_engine_rows(rows: list[dict], *, names: dict | None = None, symbols: di
     return out
 
 
-def edges_from_dispatch(events: list[dict], dispatch_sites: dict, *, receiver_class=None, ignore=()) -> list[dict]:
+def edges_from_dispatch(events: list[dict], dispatch_sites: dict, *, receiver_class=None, ignore=(), candidates: dict | None = None) -> list[dict]:
     """15.4: observed indirect-call edges from instrumented dispatch sites.
 
     DISPATCH_SITES maps a site (the hook id of a function that makes an indirect call) to {slot}; a dispatch event carries
-    payload.receiver (the object the call goes through). The target is the next instrumented event of the same thread after
-    it (a function that is itself a dispatch site, or in IGNORE, is skipped): this is an observation of order on one thread,
-    not of the jump itself, and each edge says so. RECEIVER_CLASS(receiver) names the class from the object's vtable pointer
-    where that is known, else None."""
+    payload.receiver (the object the call goes through). The target is the very next instrumented event of the same thread
+    (events of IGNORE are skipped); if that is itself a dispatch event there is no observed target. Several source functions
+    can share one site (identical code is folded), so when CANDIDATES ({site: [targets]}) is given the next event only counts
+    when it is one of the site's candidates. This is an observation of order on one thread, not of the jump itself, and each
+    edge says so. RECEIVER_CLASS(receiver) names the class from the object's vtable pointer where that is known, else None."""
     rows = [normalize_event(e) for e in events]
     by_thread: dict = {}
     for row in sorted(rows, key=lambda r: r["seq"] if r["seq"] is not None else 0):
-        by_thread.setdefault(row["thread_gen"], []).append(row)
+        if row["function"] not in ignore:
+            by_thread.setdefault(row["thread_gen"], []).append(row)
     out = []
     for thread in by_thread.values():
-        for index, row in enumerate(thread):
+        for index, row in enumerate(thread[:-1]):
             site = row["function"]
             if site not in dispatch_sites:
                 continue
-            target = next((r for r in thread[index + 1:] if r["function"] not in dispatch_sites and r["function"] not in ignore), None)
-            if target is None:
+            target = thread[index + 1]
+            if target["function"] in dispatch_sites or (candidates and target["function"] not in (candidates.get(site) or ())):
                 continue
             receiver = row["payload"].get("receiver")
             out.append({"event_id": row["event_id"], "kind": "core.function.enter", "seq": row["seq"], "frame": row["frame"],

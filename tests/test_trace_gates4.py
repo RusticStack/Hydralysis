@@ -4,6 +4,7 @@ footprint, hang dumps) of the semantic trace: real fixtures, real engine. Same c
 from __future__ import annotations
 
 import json
+import re
 import unittest
 from pathlib import Path
 
@@ -74,6 +75,18 @@ class M4Checks(Gate):
             self.assertTrue(failed[0]["counterexamples"])
         else:
             self.assertEqual((failed[0]["verdict"], failed[0]["counterexamples"]), ("unknown", []))
+
+    def test_the_discovery_report_lists_the_observation_gaps_of_a_lossy_capture_apart_from_everything_else(self):
+        lossy = dict(ring_bytes=1 << 16, batch_ms=300, counter_ms=100, bp_ms=0.2, window=1)
+        session, cap, _results = self.run_check("discgap", ["--frames=20000"], **lossy)
+        self.assertGreater(cap.health["producer"]["dropped"], 0)
+        reply = self.engine.tool("query", session, report="discovery", kinds=["app.consume"], limit=200,
+                                 params={"candidates": [{"key": "consume"}, {"key": "never_hooked_candidate"}]})
+        result = reply["result"]
+        self.assertGreater(result["observation_gaps"]["count"], 0)
+        self.assertEqual(result["observation_gaps"]["count"], len(self.engine.client().info(session)["gaps"]))
+        self.assertEqual([i["key"] for i in result["unobserved_candidates"]["items"]], ["never_hooked_candidate"])
+        self.assertEqual([i["key"] for i in result["exercised_behavior"]["items"]], ["consume"])
 
     def test_saved_assertions_keep_every_revision_and_their_verdicts(self):
         profile = g.GateProfile(self.fx, "gate-chk-rev/1", ["frameloop.exe"], FRAME_HOOKS)
@@ -217,10 +230,130 @@ class M4FieldWriters(Gate):
         self.assertIn("no scan of this field would have listed it", row["note"])
         self.assertEqual(row["count"], 5)
 
+    def test_the_discovery_report_keeps_exercised_unobserved_and_gaps_apart(self):
+        profile = g.GateProfile(self.fx, "gate-fw-disc/1", ["field_writers.exe"], writer_hooks())
+        cap = g.capture(self.root / "runs", "field_writers.exe", ["--frames=20"], profile.specs(self.root))
+        session = g.unique("m4_disc")
+        self.engine.load(session, cap.lines())
+        candidates = [{"key": name, "static_sites": [r["site"] for r in self.static_sites if self.names[r["function"]] == name]}
+                      for name in sorted({self.names[r["function"]] for r in self.static_sites})]
+        reply = self.engine.tool("query", session, report="discovery", kinds=["core.state.write", "app.escape"], limit=200,
+                                 params={"candidates": candidates})
+        self.assertNotIn("error", reply, reply)
+        result = reply["result"]
+        exercised = {i["key"]: i["count"] for i in result["exercised_behavior"]["items"] if i["kind"] == "core.state.write"}
+        self.assertEqual(exercised, {"fx_reset_thing": 4, "fx_set_level": 20})
+        self.assertEqual([i["key"] for i in result["unobserved_candidates"]["items"]], ["fx_bump_level"])
+        self.assertEqual(result["observation_gaps"]["count"], 0, "this capture lost nothing")
+        self.assertIn("proves nothing", result["observation_gaps"]["meaning"])
+
     def test_running_the_candidate_moves_it_from_may_access_to_observed(self):
         result = self.writers("bump", args=("--bump",))
         self.assertIn("fx_bump_level", [w["site"] for w in result["observed"]])
         self.assertEqual(result["may_access"], [])
+
+
+BYPASS_HOOKS_ROWS = [
+    dict(id="fx_put_slot", event="core.function.enter", symbol="fx_put_slot", nargs=2, capture=["receiver:u64@0"]),
+    dict(id="put_int", event="core.state.write", symbol="?put@Counter@@QEAAXH@Z", nargs=2, const={"key": "Store.value"}),
+    dict(id="put_ll", event="core.state.write", symbol="?put@Counter@@UEAAX_J@Z", nargs=2, const={"key": "Store.value"}),
+]
+BYPASS_HOOKS = hooks("vcall_fixture.exe", BYPASS_HOOKS_ROWS)
+
+
+@unittest.skipUnless(LIVE, "needs a trace engine (HYDRALYSIS_INTEGRATION_*, HYDRA_TRACE_EXE), Frida and MSVC")
+class M4Bypass(Gate):
+    """Section 15.4: a hook on the first overload of Counter::put does not see the write of the second, which is reached
+    through the base pointer's vtable. Receiver classes come from the vtable pointer in the image; static virtual-call
+    candidates that were never observed stay `may call`."""
+
+    FRAMES = 30
+
+    def setUp(self):
+        import build_fixtures
+        from hydralysis import query
+        from hydralysis.pe import Image
+        cls = type(self)
+        if not hasattr(cls, "image"):
+            exe = self.fx / "vcall_fixture.exe"
+            cls.functions, cls.data = build_fixtures.symbols(exe.with_suffix(".map"))
+            cls.image = Image(exe)
+            self.assertNotEqual(self.engine.prepare(exe, "vc_gate")["state"], "failed")
+            scan = json.loads(query.QueryRunner(self.engine.settings).query("vc_gate", "vcalls", "", limit=20, options={"offset": "0x8"}))
+            cls.static_callers = {c["function"] for c in scan["callers"]}
+
+    def vtable_slot_targets(self):
+        """Every class's slot-1 (offset 8) entry, read from the vftables in the image: the static candidates of a call [vptr + 8]."""
+        by_address = {int(a, 16): n for n, a in self.functions.items() if "::" in n and not n.endswith("!direct")}
+        out = []
+        for name, address in sorted(self.data.items()):
+            if not name.endswith("::vftable") or name.startswith("type_info"):
+                continue
+            entry = int.from_bytes(self.image.read_rva(int(address, 16) - self.image.base + 8, 8), "little")
+            out.append(by_address.get(entry, "%#x" % entry))
+        return sorted(set(out))
+
+    def run_report(self):
+        profile = g.GateProfile(self.fx, "gate-bypass/1", ["vcall_fixture.exe"], BYPASS_HOOKS)
+        cap = g.capture(self.root / "runs", "vcall_fixture.exe", [str(self.root / "no-stop-file"), str(self.FRAMES)],
+                        profile.specs(self.root), linger_ms=800)
+        session = g.unique("m4_byp")
+        self.engine.load(session, cap.lines())
+        writes = self.engine.rows(session, kinds=["core.state.write"])
+        enters = self.engine.rows(session, kinds=["core.function.enter"])
+        base = next(r["p"]["base"] for r in self.engine.rows(session, kinds=["core.module.load"])
+                    if r["p"]["name"].lower() == "vcall_fixture.exe")
+        counter_rva = int(self.data["g_counter"], 16) - self.image.base
+        # the receiver's class is the class that defines the method the dispatch reached (the hooked Counter::put override):
+        # the image constructs g_counter in a dynamic initializer, so its vtable pointer is not in the file
+        target_symbol = next(h["symbol"] for h in BYPASS_HOOKS_ROWS if h["id"] == "put_ll")
+        owner = re.fullmatch(r"\?\w+@(\w+)@@.*", target_symbol).group(1)
+        receivers = {base + counter_rva: owner}
+        self.assertIn(base + counter_rva, {r["p"]["receiver"] for r in enters}, "fx_put_slot was reached with g_counter")
+        candidates = self.vtable_slot_targets()
+        # hook ids stand for the hooked functions: Counter::put is the hook put_ll
+        wanted = {"Counter::put": "put_ll"}
+        reply = self.engine.tool("query", session, report="bypass", kinds=["core.state.write", "core.function.enter"], limit=200,
+                                 params={"hook": "put_int", "field": "Store.value", "dispatch_sites": {"fx_put_slot": {"slot": 8}},
+                                         "receivers": receivers,
+                                         "static_candidates": {"fx_put_slot": [wanted.get(c, c) for c in candidates]}})
+        self.assertNotIn("error", reply, reply)
+        return reply["result"], writes, candidates
+
+    def test_the_second_overload_is_reported_as_a_bypass_with_the_observed_path_and_receiver_class(self):
+        result, writes, _c = self.run_report()
+        frames = len(writes) // 2          # the frames the capture saw: both overloads write once per frame
+        self.assertEqual(len(writes), 2 * frames)
+        self.assertGreaterEqual(frames, self.FRAMES - 2)
+        self.assertEqual((result["writes_observed"], result["through_hook"], result["bypassed"]), (2 * frames, frames, frames))
+        self.assertEqual(result["verdict"], "hook_bypassed")
+        self.assertEqual(result["by_class"], {"different-slot": frames})
+        first = result["bypasses"][0]
+        self.assertEqual((first["class"], first["site"] if "site" in first else None), ("different-slot", first["site"]))
+        self.assertEqual(first["receiver_class"], "Counter")
+        self.assertEqual(first["via"], "fx_put_slot")
+        self.assertEqual(first["path"], ["put_ll"])
+        self.assertIn("indirect call at fx_put_slot (slot 8)", first["reached_through"])
+        self.assertTrue(first["event_id"].startswith("ev_"))
+
+    def test_the_observed_edge_is_cited_and_unobserved_slots_stay_may_call(self):
+        result, _w, candidates = self.run_report()
+        edges = result["edges"]
+        self.assertEqual([(e["site"], e["target"], e["receiver_class"], e["count"]) for e in edges["observed"]],
+                         [("fx_put_slot", "put_ll", "Counter", edges["observed"][0]["count"])])
+        self.assertGreaterEqual(edges["observed"][0]["count"], self.FRAMES - 2)
+        self.assertEqual(edges["observed"][0]["relation"], "observed-call")
+        self.assertTrue(edges["observed"][0]["events"])
+        self.assertIn("Counter::put", candidates)
+        self.assertGreater(len(candidates), 3, "other classes' slot-1 methods are static candidates of the same call")
+        self.assertEqual({u["status"] for u in edges["unobserved_candidates"]}, {"may call"})
+        self.assertEqual(sorted(u["target"] for u in edges["unobserved_candidates"]), sorted(c for c in candidates if c != "Counter::put"))
+        self.assertIn("never `does not call`", edges["note"])
+        self.assertNotIn("does not call", json.dumps(edges["unobserved_candidates"]))
+
+    def test_the_static_scan_names_the_dispatch_site(self):
+        self.run_report()
+        self.assertIn(self.functions["fx_put_slot"], self.static_callers)
 
 
 if __name__ == "__main__":

@@ -719,7 +719,8 @@ def _report(client: TraceClient, session: str, options: dict) -> dict:
         receivers = {int(k): v for k, v in (params.get("receivers") or {}).items()}
         edges = trace_reports.edges_from_dispatch(events, _object(params.get("dispatch_sites"), "params.dispatch_sites"),
                                                   receiver_class=lambda address: receivers.get(address),
-                                                  ignore=tuple(params.get("ignore") or ()))
+                                                  ignore=tuple(params.get("ignore") or ()),
+                                                  candidates=params.get("static_candidates"))
         observed = trace_reports.observed_edges(edges, static_candidates=params.get("static_candidates"))
         result = {"edges": observed, **trace_reports.hook_bypass(events, hook=params["hook"], field=params["field"],
                                                                  siblings=params.get("siblings"), observed=observed["observed"])}
