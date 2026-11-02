@@ -84,6 +84,8 @@ mod imp {
 
     // SAFETY: a file HANDLE may be used and closed from any thread.
     unsafe impl Send for Held {}
+    // SAFETY: the handle is only used by Drop, which has exclusive access.
+    unsafe impl Sync for Held {}
 
     impl Drop for Held {
         fn drop(&mut self) {

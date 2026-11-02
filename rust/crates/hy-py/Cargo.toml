@@ -1,0 +1,21 @@
+[package]
+name = "hy-py"
+description = "PyO3 binding of the Rust storage crates (hydralysis_rs); used for differential tests and HYDRALYSIS_IMPL=rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "hydralysis_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+hy-core = { path = "../hy-core" }
+hy-store = { path = "../hy-store" }
+pyo3 = { version = "0.27", features = ["extension-module", "abi3-py313"] }
+serde_json.workspace = true
+
+[lints]
+workspace = true

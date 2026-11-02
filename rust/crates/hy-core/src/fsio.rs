@@ -182,3 +182,37 @@ pub fn read_optional(path: &Path, max_bytes: Option<u64>) -> Result<Option<Vec<u
     }
 }
 
+
+/// `(file id, mtime in ns, size)` of a file, the identity `os.stat` gives Python (`st_ino`, `st_mtime_ns`,
+/// `st_size`); `None` when it does not exist.
+pub fn file_identity(path: &Path) -> Option<(u64, i128, u64)> {
+    let meta = fs::metadata(path).ok()?;
+    let mtime = meta.modified().ok().map_or(0, system_time_ns);
+    Some((file_id(path, &meta), mtime, meta.len()))
+}
+
+pub fn system_time_ns(time: std::time::SystemTime) -> i128 {
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_nanos() as i128,
+        Err(e) => -(e.duration().as_nanos() as i128),
+    }
+}
+
+#[cfg(unix)]
+fn file_id(_path: &Path, meta: &fs::Metadata) -> u64 {
+    std::os::unix::fs::MetadataExt::ino(meta)
+}
+
+#[cfg(windows)]
+fn file_id(path: &Path, _meta: &fs::Metadata) -> u64 {
+    use windows_sys::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle};
+    // Open without access rights so a locked file still answers; a failure yields 0 (identity then rests on mtime and size).
+    let Ok(handle) = fs::OpenOptions::new().access_mode(0).open(path) else { return 0 };
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: the handle is open for the duration of the call and info is a valid out-structure.
+    let ok = unsafe { GetFileInformationByHandle(std::os::windows::io::AsRawHandle::as_raw_handle(&handle) as _, &mut info) };
+    if ok == 0 { 0 } else { (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow) }
+}
+
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;

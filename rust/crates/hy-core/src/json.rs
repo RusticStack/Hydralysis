@@ -166,7 +166,14 @@ pub fn float_repr(f: f64) -> String {
     if f == 0.0 {
         return if f.is_sign_negative() { "-0.0".into() } else { "0.0".into() };
     }
-    let sci = format!("{:e}", f.abs());
+    let mut sci = format!("{:e}", f.abs());
+    // Rust's shortest digits break an exact tie upward; Python's `repr` breaks it to even. The closest decimal with the
+    // same number of digits (exact mode rounds half to even) is the one Python picks, when it round-trips.
+    let places = sci.split_once('e').map_or(0, |(m, _)| m.chars().filter(char::is_ascii_digit).count().saturating_sub(1));
+    let exact = format!("{:.*e}", places, f.abs());
+    if exact != sci && exact.parse::<f64>().is_ok_and(|back| back == f.abs()) {
+        sci = exact;
+    }
     let (mantissa, exponent) = sci.split_once('e').unwrap_or((&sci, "0"));
     let exp10: i32 = exponent.parse().unwrap_or(0);
     let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
@@ -223,7 +230,7 @@ mod tests {
     #[test]
     fn ascii_escapes_like_python() {
         let v = json!("a\u{7f}\u{e9}\u{1F600}\n");
-        assert_eq!(String::from_utf8(dumps(&v, FRAME)).unwrap(), r#""a\u007fé😀\n""#);
+        assert_eq!(String::from_utf8(dumps(&v, FRAME)).unwrap(), r#""a\u007f\u00e9\ud83d\ude00\n""#);
     }
 
     #[test]

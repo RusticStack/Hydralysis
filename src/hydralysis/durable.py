@@ -765,3 +765,9 @@ class AppendLog:
             with _VERIFIED_GUARD:
                 _VERIFIED.pop(self._key, None)
             raise
+
+
+if os.environ.get("HYDRALYSIS_IMPL") == "rust":  # the Rust implementation (rust/crates/hy-core) behind the same surface
+    from hydralysis import _rust_store
+
+    _rust_store.install_durable(sys.modules[__name__])
