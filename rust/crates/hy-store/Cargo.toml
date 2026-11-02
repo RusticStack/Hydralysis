@@ -1,0 +1,22 @@
+[package]
+name = "hy-store"
+description = "Hydralysis storage layer: store log, lineage, backups, evidence ledger and bundles"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+hy-core = { path = "../hy-core" }
+serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+rusqlite.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
