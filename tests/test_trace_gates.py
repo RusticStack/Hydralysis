@@ -308,3 +308,106 @@ class M2Diff(Gate):
         self.assertTrue(classes["not_comparable"] > 0, classes)
         self.assertNotIn("only_a", classes)             # absence in a lossy run is never reported as absence
         self.assertNotIn("different_under_matched_coverage", classes)
+
+
+ROLES_PHASES = """
+[[roles]]
+id = "main"
+resolve = "function"
+value = "frame-begin"
+
+[[roles]]
+id = "worker"
+resolve = "function"
+value = "pool-thread"
+
+[[phases]]
+id = "frame"
+kind = "frame"
+open = "frame-begin"
+close = "frame-end"
+
+[[phases]]
+id = "input"
+kind = "stage"
+parent = "frame"
+open = "stage-begin"
+close = "frame-end"
+
+[[phases]]
+id = "update"
+kind = "stage"
+parent = "frame"
+open = "stage-begin"
+close = "frame-end"
+
+[[phases]]
+id = "render"
+kind = "stage"
+parent = "frame"
+open = "stage-begin"
+close = "frame-end"
+"""
+FRAMELOOP_KEYS = hooks("frameloop.exe", [
+    dict(id="frame-begin", event="core.marker", symbol="fx_frame_begin", nargs=1, capture=["frame:u64@0"]),
+    dict(id="frame-end", event="app.frame", symbol="fx_frame_end", nargs=1, capture=["frame:u64@0"]),
+    dict(id="stage-begin", event="app.stage", symbol="fx_phase_begin", nargs=1, capture=["stage:u32@0"]),
+    dict(id="job-callback", event="app.callback", symbol="fx_job_callback", nargs=1, capture=["frame:u64@0"]),
+    dict(id="pool-thread", event="app.pool", symbol="fx_pool_thread", nargs=1),
+    dict(id="job-physics", event="app.physics", symbol="fx_job_physics", nargs=1, capture=["frame:u64@0"]),
+    dict(id="ours-write", event="core.state.write", symbol="fx_ours_write", nargs=1, capture=["frame:u64@0"], const={"object": 1, "key": "entity.value"}),
+    dict(id="consume", event="core.state.read", symbol="fx_consume", nargs=1, capture=["frame:u64@0"], const={"object": 1, "key": "entity.value"}),
+])
+
+
+class M2Roles(Gate):
+    """Section 15.2: roles and phases on the frame loop are first-class keys, and the checks read them."""
+
+    def run_frameloop(self, *args):
+        from hydralysis import trace_keys
+        profile = g.GateProfile(self.fx, "gate-keys/1", ["frameloop.exe"], FRAMELOOP_KEYS, extra=ROLES_PHASES)
+        specs = profile.specs(self.root)
+        cap = g.capture(self.root / "runs", "frameloop.exe", list(args), specs)
+        loaded = profile.load(self.root)
+        events, report = trace_keys.annotate(cap.lines(), loaded)
+        return events, report
+
+    def verdicts(self, *args):
+        events, report = self.run_frameloop(*args)
+        session = g.unique("m2_roles")
+        self.engine.load(session, events)
+        reply = self.engine.client().check(session, assertions=[
+            {"type": "only_on_role", "name": "callback-on-main", "kind": "app.callback", "role": "main"},
+            {"type": "write_precedes_read_in_frame", "name": "write-before-read"},
+            {"type": "only_on_role", "name": "callback-in-update", "kind": "app.callback", "role": "update", "role_field": "phase"},
+        ])
+        results = {r["assertion"].split("/")[0]: r for r in reply["results"]}
+        return results, report, events
+
+    def test_the_defaults_pass_and_roles_and_phases_are_stamped(self):
+        results, report, events = self.verdicts("--frames=20")
+        for name in ("callback-on-main", "write-before-read", "callback-in-update"):
+            self.assertEqual(results[name]["verdict"], "pass", results[name])
+        self.assertEqual(results["callback-on-main"]["checked"], 20)
+        roles = {tuple(v) for v in report["roles"].values()}
+        self.assertEqual(roles, {("main",), ("worker",)})
+        stamped = [e for e in events if e["kind"] == "app.stage"]
+        self.assertEqual(sorted({e["payload"]["phase"] for e in stamped}), ["input", "render", "update"])
+
+    def test_a_callback_on_a_worker_fails_only_on_main_with_a_cited_event(self):
+        results, _report, _events = self.verdicts("--frames=20", "--callback-on=worker")
+        failed = results["callback-on-main"]
+        self.assertEqual(failed["verdict"], "fail")
+        self.assertTrue(failed["counterexamples"] and failed["counterexamples"][0].startswith("ev_"), failed)
+
+    def test_a_write_one_stage_late_fails_the_ordering_check(self):
+        results, _report, _events = self.verdicts("--frames=20", "--ours-stage=render")
+        self.assertEqual(results["write-before-read"]["verdict"], "fail")
+        self.assertTrue(results["write-before-read"]["counterexamples"])
+
+    def test_a_missing_phase_marker_makes_the_phase_check_unknown_not_pass(self):
+        results, report, events = self.verdicts("--frames=20", "--skip-marker=update")
+        self.assertEqual(results["callback-in-update"]["verdict"], "unknown", results["callback-in-update"])
+        callbacks = [e for e in events if e["kind"] == "app.callback" and e["payload"].get("role") == "main"]
+        self.assertTrue(callbacks)
+        self.assertTrue(all("missing-marker:update" in e["payload"]["unresolved"]["phase"] for e in callbacks))
