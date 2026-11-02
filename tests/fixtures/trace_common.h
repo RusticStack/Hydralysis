@@ -13,6 +13,17 @@
 #define FX __declspec(noinline)
 #define FX_EXPORT __declspec(dllexport) __declspec(noinline)
 
+/* A tracer needs a moment to drain its rings before the process ends: HYDRA_FX_LINGER_MS (default 0, so nothing
+   changes without it) sleeps that long at normal exit. It changes no printed line and no file. */
+static void fx_linger_at_exit(void) {
+    char text[16];
+    DWORD n = GetEnvironmentVariableA("HYDRA_FX_LINGER_MS", text, sizeof text);
+    if (n > 0 && n < sizeof text) Sleep((DWORD)atoi(text));
+}
+static void fx_linger_register(void) { atexit(fx_linger_at_exit); }
+#pragma section(".CRT$XCU", read)
+__declspec(allocate(".CRT$XCU")) static void (*fx_linger_init)(void) = fx_linger_register;
+
 static void say(const char *format, ...) {
     va_list args;
     va_start(args, format);

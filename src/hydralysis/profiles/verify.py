@@ -11,6 +11,9 @@ right bitness, its locator resolves to one site, and the bytes there equal the p
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 from hydralysis.prologue import find_pattern, matches, parse_expect
 
 REASONS = ("module-unknown", "build-not-listed", "bitness-mismatch", "symbol-not-found", "signature-not-found",
@@ -30,7 +33,30 @@ class HookRefused(RuntimeError):
         return {"error": self.code, "message": str(self), "refusals": self.refusals}
 
 
-def _export_rva(image, symbol: str) -> int | None:
+_MAP_LINE = re.compile(r"^\s*[0-9a-f]{4}:[0-9a-f]{8}\s+(\S+)\s+([0-9a-f]{8,16})\s+(f\s)?", re.I)
+
+
+def _map_rva(image, symbol: str) -> int | None:
+    """The RVA of SYMBOL in the linker map (`<image stem>.map`) beside the image. Only a fixtures-only profile may use
+    this: the fixtures are built without a PDB and their map is the ground truth for their internal functions. A shipped
+    program has no map, so a real profile names an export, a signature or a build-bound RVA instead."""
+    path = getattr(image, "path", None)
+    if path is None:
+        return None
+    candidate = Path(path).with_suffix(".map")
+    try:
+        text = candidate.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    base = int(getattr(getattr(image.pe, "OPTIONAL_HEADER", None), "ImageBase", 0) or 0)
+    for line in text.splitlines():
+        match = _MAP_LINE.match(line)
+        if match and match.group(3) and match.group(1).lstrip("_") == symbol:
+            return int(match.group(2), 16) - base
+    return None
+
+
+def _export_rva(image, symbol: str, fixtures_only: bool = False) -> int | None:
     custom = getattr(image, "export_rva", None)
     if callable(custom):
         return custom(symbol)
@@ -40,7 +66,7 @@ def _export_rva(image, symbol: str) -> int | None:
     for item in getattr(directory, "symbols", ()) or ():
         if item.name and item.name.decode("utf-8", "replace") == symbol:
             return int(item.address)
-    return None
+    return _map_rva(image, symbol) if fixtures_only else None
 
 
 def _signature_hits(image, signature: str) -> list[int]:
@@ -54,12 +80,12 @@ def _signature_hits(image, signature: str) -> list[int]:
     return hits
 
 
-def _check_hook(hook: dict, image, build_ok: bool) -> tuple[int | None, str, dict]:
+def _check_hook(hook: dict, image, build_ok: bool, fixtures_only: bool = False) -> tuple[int | None, str, dict]:
     """(rva, reason, detail): reason is "" when the hook verified."""
     if "rva" in hook and not build_ok:
         return None, "build-not-listed", {}
     if "symbol" in hook:
-        rva = _export_rva(image, hook["symbol"])
+        rva = _export_rva(image, hook["symbol"], fixtures_only)
         if rva is None:
             return None, "symbol-not-found", {}
     elif "signature" in hook:
@@ -86,11 +112,15 @@ def _check_hook(hook: dict, image, build_ok: bool) -> tuple[int | None, str, dic
 def verify_profile(profile, images: dict) -> dict:
     """Check every hook. IMAGES maps a module name (case-insensitive) to its `pe.Image`.
 
+    A fixtures-only profile holds one section per fixture program: a hook whose module was not supplied is
+    `not-applicable` (neither verified nor refused). Any other profile refuses it as `module-unknown`.
+
     The result is data: `ok` (no required hook refused), per-hook `status`, `refusals` (required), `limitations`
     (optional, as coverage limitation records) and the ids of the `enabled` hooks. Nothing is modified."""
     by_name = {str(name).lower(): image for name, image in images.items()}
     listed = {(build["module"].lower(), build["image_sha256"]) for build in profile.data["target"]["builds"]}
     bits = profile.data["target"]["bitness"]
+    fixtures_only = bool(profile.data["target"].get("fixtures_only"))
     module_state: dict[str, dict] = {}
     for module in {hook["module"].lower() for hook in profile.data["hooks"]}:
         image = by_name.get(module)
@@ -110,10 +140,14 @@ def verify_profile(profile, images: dict) -> dict:
         state = module_state[hook["module"].lower()]
         row = {"hook": hook["id"], "event": hook["event"], "module": hook["module"], "required": hook["required"],
                "fault": hook["fault"]}
+        if fixtures_only and state.get("reason") == "module-unknown":
+            # the fixtures profile is the union of one section per fixture program; a run supplies the images it uses
+            rows.append({**row, "status": "not-applicable", "reason": "module-not-supplied"})
+            continue
         if "reason" in state:
             reason, rva, detail = state["reason"], None, {}
         else:
-            rva, reason, detail = _check_hook(hook, state["image"], state["build_ok"])
+            rva, reason, detail = _check_hook(hook, state["image"], state["build_ok"], fixtures_only)
         if reason:
             row.update(status="refused", reason=reason, **detail)
             entry = {"hook": hook["id"], "event": hook["event"], "reason": reason, "required": hook["required"]}

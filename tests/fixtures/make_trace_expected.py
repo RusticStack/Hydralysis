@@ -264,7 +264,7 @@ def frameloop() -> None:
 def veh_freeze() -> None:
     write("veh_freeze", {
         "fixture": "veh_freeze", "spec": ["15.1"], "sources": ["veh_freeze.c", "trace_common.h"], "outputs": ["veh_freeze.exe"],
-        "functions": {"handler": "fx_freezing_handler", "read_object": "fx_read_object"},
+        "functions": {"handler": "fx_freezing_handler", "read_object": "fx_read_object", "probe_target": "fx_probe_target"},
         "data": {"heartbeat": "g_heartbeat", "handler_ran": "g_handler_ran", "suspended_threads": "g_suspended_threads"},
         "runs": [
             {"id": "wait", "program": "veh_freeze.exe", "args": ["--seconds=1"], "max_seconds": 20, "exit_code": 0,

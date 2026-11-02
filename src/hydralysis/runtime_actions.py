@@ -106,7 +106,7 @@ class ActionsMixin:
         if getattr(self, "open_capture", None) is None:
             return
         try:
-            self._capture_stop(None)
+            self.capture({"op": "stop"})
         except Exception as exc:  # the detach goes on; the capture stays open and says so when read
             print("capture could not be sealed at detach:", repr(exc), flush=True)
 
@@ -132,7 +132,7 @@ class ActionsMixin:
         if action == "detach":
             self._autostop_capture()
             return self.cleanup()
-        if self.detached:
+        if self.detached and not (action == "capture" and args.get("op") in ("stop", "read", "verify", "list", "counters")):
             raise RuntimeError("target session is detached")
         if action == "resume":
             if not self.paused_spawn:

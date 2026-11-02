@@ -10,7 +10,12 @@
    The field is g_entity.value. Our write fx_ours_write (value 5000+frame) is in update by default, or in render
    after the consumer with --ours-stage=render (one stage too late). The host's own component fx_host_overwrite
    (value 9000+frame) runs at the start of render on every frame except frame % survive-every == survive-every-1,
-   or never with --no-overwrite. The consumer fx_consume runs in render and reads the field. */
+   or never with --no-overwrite. The consumer fx_consume runs in render and reads the field.
+   Benchmark options (they change no printed line): --spin-us=N busy-waits N microseconds of "game work" in every
+   frame (the default 0 is the bare loop, about 5 us a frame); --times=path writes the length of every frame in
+   QueryPerformanceCounter ticks as little-endian u64 after the run, and --ready-file=path creates that file when the
+   loop is about to start (so a tracer attached to the idle process can arm before the first frame);
+   --wait-file=path makes the process wait for that file to exist before the first frame. */
 #include "trace_common.h"
 
 typedef struct Entity { int tag; int value; int writer; int write_frame; } Entity;
@@ -84,28 +89,51 @@ FX void fx_stage_render(int frame, int overwrite, int ours_in_render) {
     if (ours_in_render) fx_ours_write(frame);
 }
 
+static void spin_us(int microseconds) {
+    LARGE_INTEGER frequency, now, end;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&end);
+    end.QuadPart += (long long)microseconds * frequency.QuadPart / 1000000;
+    do QueryPerformanceCounter(&now); while (now.QuadPart < end.QuadPart);
+}
+
 int main(int argc, char **argv) {
     int frames = fx_arg_int(argc, argv, "--frames=", 60), sleep_ms = fx_arg_int(argc, argv, "--sleep-ms=", 0);
     int every = fx_arg_int(argc, argv, "--survive-every=", 10);
     const char *callback = fx_arg(argc, argv, "--callback-on="), *ours = fx_arg(argc, argv, "--ours-stage=");
     const char *skip = fx_arg(argc, argv, "--skip-marker=");
     int on_worker = callback && strcmp(callback, "worker") == 0, ours_in_render = ours && strcmp(ours, "render") == 0;
-    int no_overwrite = fx_flag(argc, argv, "--no-overwrite");
+    int no_overwrite = fx_flag(argc, argv, "--no-overwrite"), spin = fx_arg_int(argc, argv, "--spin-us=", 0);
+    const char *times_path = fx_arg(argc, argv, "--times="), *ready_path = fx_arg(argc, argv, "--ready-file=");
+    const char *wait_path = fx_arg(argc, argv, "--wait-file=");
+    unsigned long long *times = times_path ? (unsigned long long *)calloc((size_t)frames + 1, sizeof *times) : NULL;
+    LARGE_INTEGER tick;
     fx_arm_watchdog(120);
     g_jobs = CreateSemaphoreA(NULL, 0, 2, NULL);
     g_job_done = CreateEventA(NULL, FALSE, FALSE, NULL);
     for (int i = 0; i < 2; ++i) g_pool[i] = CreateThread(NULL, 0, fx_pool_thread, NULL, 0, NULL);
     /* two pool threads share one semaphore; only one job is ever in flight */
+    if (ready_path) { HANDLE ready = CreateFileA(ready_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL); if (ready != INVALID_HANDLE_VALUE) CloseHandle(ready); }
+    while (wait_path && GetFileAttributesA(wait_path) == INVALID_FILE_ATTRIBUTES) Sleep(5);
     for (int frame = 0; frame < frames; ++frame) {
+        if (times) { QueryPerformanceCounter(&tick); times[frame] = (unsigned long long)tick.QuadPart; }
         fx_frame_begin(frame);
         if (!skip || strcmp(skip, "input")) fx_phase_begin(1);
         fx_stage_input(frame);
+        if (spin) spin_us(spin);
         if (!skip || strcmp(skip, "update")) fx_phase_begin(2);
         fx_stage_update(frame, on_worker, ours_in_render);
         if (!skip || strcmp(skip, "render")) fx_phase_begin(3);
         fx_stage_render(frame, !no_overwrite && frame % every != every - 1, ours_in_render);
         fx_frame_end(frame);
         if (sleep_ms) Sleep(sleep_ms);
+    }
+    if (times) {
+        HANDLE out = CreateFileA(times_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        QueryPerformanceCounter(&tick);
+        times[frames] = (unsigned long long)tick.QuadPart;
+        for (int frame = 0; frame < frames; ++frame) times[frame] = times[frame + 1] - times[frame];
+        if (out != INVALID_HANDLE_VALUE) { DWORD written; WriteFile(out, times, (DWORD)(sizeof *times * frames), &written, NULL); CloseHandle(out); }
     }
     g_pool_stop = 1;
     ReleaseSemaphore(g_jobs, 1, NULL);

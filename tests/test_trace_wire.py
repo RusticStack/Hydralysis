@@ -228,5 +228,110 @@ class Encoding(unittest.TestCase):
             self.assertEqual(outs[-1], outs[0])
 
 
+EVENT_SITES = {
+    1: {"name": "CreateFileW", "kind": "open", "module": "KernelBase.dll", "va": 0x7FF800001000, "buf": "id", "preview": 128},
+    2: {"name": "CloseHandle", "kind": "close", "module": "KernelBase.dll", "va": 0x7FF800002000},
+    3: {"name": "fx_read_config", "kind": "event", "module": "trace_app.exe", "va": 0x140001300, "buf": "id", "buf_arg": 0,
+        "event": "app.feature", "hook": "feature-gate",
+        "fields": [{"name": "feature", "type": "key", "source": "0"}, {"name": "enabled", "type": "bool", "source": "ret"},
+                   {"name": "n", "type": "i32", "source": "1"}, {"name": "name", "type": "string", "source": "0"},
+                   {"name": "tag", "type": "hex", "source": "2"}, {"name": "gone", "type": "u8", "source": "7"}]},
+    4: {"name": "fx_frame_begin", "kind": "event", "module": "frameloop.exe", "va": 0x140001000, "event": "app.frame", "hook": "frame-begin",
+        "fields": [{"name": "frame", "type": "u64", "source": "0"}, {"name": "key", "type": "key", "source": "0"}]},
+}
+
+
+def encoders_for(sites, **options):
+    args = ("seg-1", "agent", 3, 4242, sites, KEY, FREQ)
+    out = [tw.SegmentEncoder(*args, **options)]
+    if HAVE_NATIVE:
+        out.append(native.SegmentEncoder(*args, **options))
+    return out
+
+
+class ProfileEvents(unittest.TestCase):
+    """Event sites, handle lifetime, deeper call stacks and redacted previews, identical in the Python and Rust encoders."""
+
+    def records(self):
+        return [
+            {**open_rec(0, 0, 10, "C:\\data\\password=hunter2secret.cfg", 0x88), "stack": [0x7FF800009999, 0x140001234, 0x140005678]},
+            {"site": 3, "ring": 0, "ring_seq": 1, "qpc": 20, "tid": 100, "ret_addr": 0x140002000, "qpc_end": 30, "retval": 1,
+             "flags": tw.F_RET | tw.F_BUF, "args": [0x5000, 0xFFFFFFFE, 0xBEEF], "buf": b"B\0", "buf_addr": 0x5000},
+            {"site": 4, "ring": 1, "ring_seq": 0, "qpc": 25, "tid": 101, "ret_addr": 0x140002100, "args": [41]},
+            {"site": 2, "ring": 0, "ring_seq": 2, "qpc": 40, "tid": 100, "ret_addr": 0x7FF800009999, "qpc_end": 41, "retval": 1,
+             "flags": tw.F_RET, "args": [0x88]},
+            {"site": 2, "ring": 0, "ring_seq": 3, "qpc": 50, "tid": 100, "ret_addr": 0x7FF800009999, "qpc_end": 51, "retval": 1,
+             "flags": tw.F_RET, "args": [0x99]},                   # a handle this capture never saw opened
+        ]
+
+    def run_all(self):
+        batch = tw.build_batch(3, 0, 99, (5, 0, 0, 0), self.records())
+        out = []
+        for enc in encoders_for(EVENT_SITES):
+            lines, _artifacts, _info = enc.encode_batch(batch)
+            out.append((bytes(lines), enc))
+        return out
+
+    def test_every_encoder_gives_the_same_bytes(self):
+        results = self.run_all()
+        for lines, _enc in results[1:]:
+            self.assertEqual(lines, results[0][0])
+
+    def test_a_profile_event_carries_its_declared_fields_and_never_the_text(self):
+        events = self.run_all()
+        text = events[0][0].decode()
+        self.assertNotIn("hunter2", text.replace("***", ""))          # only the redacted preview mentions the word
+        self.assertIn('"kind":"app.feature"', text)
+        self.assertIn('"kind":"app.frame"', text)
+        self.assertIn('"enabled":true', text)
+        self.assertIn('"n":-2', text)                                 # i32 sign
+        self.assertIn('"tag":"0xbeef"', text)
+        self.assertIn('"frame":41', text)
+        self.assertIn('"gone":null', text)                            # an argument the record does not have
+
+    def test_handle_lifetime_closes_only_what_was_seen_opened(self):
+        for _lines, enc in self.run_all():
+            stats = enc.stats() if callable(enc.stats) else enc.stats
+            self.assertEqual(stats["close_unknown"], 1)
+        text = self.run_all()[0][0].decode()
+        self.assertEqual(text.count('"kind":"core.resource.close"'), 1)
+
+    def test_the_call_stack_is_the_whole_unwound_chain(self):
+        text = self.run_all()[0][0].decode()
+        self.assertIn('"callstack":[%d,%d,%d]' % (0x7FF800009999, 0x140001234, 0x140005678), text)
+
+    def test_a_preview_is_redacted_and_bounded(self):
+        text = self.run_all()[0][0].decode()
+        self.assertIn('"preview":"C:\\\\data\\\\password=***"', text)
+        self.assertIn('"redacted":1', text)
+
+    def test_site_hits_count_the_records_per_site(self):
+        for _lines, enc in self.run_all():
+            self.assertEqual(dict(enc.site_hits()), {1: 1, 2: 2, 3: 1, 4: 1})
+
+    def test_redaction_rules(self):
+        cases = [
+            (b"password=hunter2&user=bob", False, "password=***&user=bob"),
+            (b"Authorization: Bearer abc123def456ghi789jkl", False, "Authorization: *** ***"),
+            (b"GET /index.html?sessionid=12345 HTTP", False, "GET /index.html?sessionid=*** HTTP"),
+            (b"key=\"AKIAABCDEFGHIJKLMNOP12\" end", False, "key=\"***\" end"),
+            (b"C:\\Users\\me\\Documents\\app.cfg", False, "C:\\Users\\me\\Documents\\app.cfg"),
+            ("token : abc".encode("utf-16le") + b"\0\0", True, "token : ***"),
+            (b"\x01\x02ok\xff", False, "..ok."),
+            (b"A" * 600, False, "A" * 256),
+        ]
+        for raw, is_wide, want in cases:
+            self.assertEqual(tw.redact_preview(raw, is_wide)[0], want, raw)
+        self.assertEqual(len(tw.redact_preview(b"x" * 600, False, 1000)[0]), 256)
+        self.assertEqual(len(tw.redact_preview(b"x" * 600, False, 10)[0]), 10)
+
+    def test_the_stack_record_layout_round_trips(self):
+        batch = tw.build_batch(3, 0, 99, (1, 0, 0, 0), [{**open_rec(0, 0, 10, "a", 1), "stack": [1, 2, 3, 4]}])
+        header, back = tw.decode_batch(batch)
+        self.assertEqual(back[0]["stack"], [1, 2, 3, 4])
+        if HAVE_NATIVE:
+            self.assertEqual(native.decode_batch(batch)[1][0]["stack"], [1, 2, 3, 4])
+
+
 if __name__ == "__main__":
     unittest.main()

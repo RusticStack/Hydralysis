@@ -296,7 +296,7 @@ argc_offset = 16
 [[bindings]]
 id = "minivm-register"
 kind = "call"
-register = "file-open"
+register = "plugin-load"
 name_arg = 1
 fn_arg = 2
 argc_arg = 3
@@ -402,7 +402,8 @@ fields = [{name = "id", offset = 0, type = "u32"}, {name = "health", offset = 4,
 """)
         items = trace_corpus_diff.dependents_from_profile(profile)
         ids = {item["id"] for item in items}
-        self.assertEqual(ids, {"hook:file-open", "hook:feature-gate", "hook:frame-begin", "hook:frame-end", "codec:actor"})
+        self.assertEqual(ids, {"hook:" + hook["id"] for hook in profile.data["hooks"]} | {"codec:actor"})
+        self.assertIn("hook:frame-begin", ids)
         codec = next(item for item in items if item["id"] == "codec:actor")
         report = trace_corpus_diff.invalidation_report(build(), build(with_field=True), [codec])
         self.assertEqual(report["items"][0]["status"], "moved")

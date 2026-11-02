@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "fixtures"))
 from support import workdir
 from test_pe import image as make_image
 
@@ -321,6 +322,114 @@ sha256 = "%s"
         text = profiles.BASELINE.read_text("utf-8") + '\n[[queries]]\nid = "a.b"\nmodule = "q.py"\nsha256 = "%s"\n' % ("0" * 64)
         with self.assertRaises(ProfileError):
             profiles.load_text(text)
+
+
+FIXTURE_GROUPS = ("trace_app", "frameloop", "interleave", "veh_freeze", "deadlock", "persist")
+
+
+class BaselineAgainstTheRealFixtures(unittest.TestCase):
+    """The shipped baseline names real functions and real prologues of the built fixture images (not stand-ins)."""
+
+    @classmethod
+    def setUpClass(cls):
+        import trace_fixtures
+        if not trace_fixtures.msvc_available():
+            raise unittest.SkipTest("MSVC build tools are not installed")
+        cls.dirs = workdir("baseline-fx")
+        cls.root = Path(cls.dirs.__enter__())
+        cls.manifest = {}
+        for group in FIXTURE_GROUPS:
+            built = trace_fixtures.build_group(group, cls.root, ("x64",))["x64"]
+            cls.manifest.update(built["manifest"])
+        cls.dir = cls.root / "x64"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.dirs.__exit__(None, None, None)
+
+    def images(self, folder=None):
+        from hydralysis.pe import Image
+        folder = Path(folder or self.dir)
+        return {name: Image(folder / name) for name in ("trace_app.exe", "frameloop.exe", "interleave.exe", "veh_freeze.exe",
+                                                        "deadlock.exe", "persist.exe")}
+
+    def test_every_hook_names_a_real_function_and_verifies(self):
+        profile = profiles.load_baseline()
+        result = profiles.verify_profile(profile, self.images())
+        self.assertTrue(result["ok"], result["refusals"])
+        self.assertEqual(result["counts"]["verified"], len(profile.data["hooks"]))
+        self.assertEqual(result["limitations"], [])
+        for hook in profile.data["hooks"]:
+            self.assertIn(hook["symbol"], self.manifest[hook["module"]]["functions"], hook["id"])
+
+    def test_the_fixture_functions_are_internal_not_exports(self):
+        # which is why a fixtures-only profile reads the linker map: the images export none of the hooked functions
+        from hydralysis.pe import Image, pefile
+        image = Image(self.dir / "frameloop.exe")
+        image.pe.parse_data_directories(directories=[pefile().DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_EXPORT"]])
+        exported = {item.name.decode() for item in image.pe.DIRECTORY_ENTRY_EXPORT.symbols if item.name}
+        self.assertEqual(exported, {"g_entity"})
+
+    def test_a_run_supplies_only_its_images_and_the_other_sections_are_not_applicable(self):
+        images = {"frameloop.exe": self.images()["frameloop.exe"]}
+        result = profiles.verify_profile(profiles.load_baseline(), images)
+        self.assertTrue(result["ok"])
+        states = {row["hook"]: row["status"] for row in result["hooks"]}
+        self.assertEqual(states["frame-begin"], "verified")
+        self.assertEqual(states["file-write"], "not-applicable")
+        self.assertEqual(result["limitations"], [])
+
+    def tampered(self, name, symbol, new_byte=0x90):
+        import shutil
+        folder = self.root / ("tampered-" + symbol)
+        folder.mkdir(exist_ok=True)
+        for suffix in (".exe", ".map"):
+            shutil.copy2(self.dir / (name[:-4] + suffix), folder / (name[:-4] + suffix))
+        from hydralysis.pe import Image
+        image = Image(folder / name)
+        rva = profiles.verify_profile(profiles.load_baseline(), {name: image})
+        site = next(row["rva"] for row in rva["hooks"] if row.get("status") == "verified" and symbol in (
+            profiles.load_baseline().hook(row["hook"]) or {}).get("symbol", ""))
+        offset = image.rva_to_offset(int(site.removeprefix("rva:"), 16))
+        data = bytearray((folder / name).read_bytes())
+        data[offset] = new_byte
+        (folder / name).write_bytes(bytes(data))
+        return folder
+
+    def test_a_tampered_prologue_of_a_required_hook_is_refused(self):
+        folder = self.tampered("frameloop.exe", "fx_frame_begin")
+        from hydralysis.pe import Image
+        result = profiles.verify_profile(profiles.load_baseline(), {"frameloop.exe": Image(folder / "frameloop.exe")})
+        self.assertFalse(result["ok"])
+        self.assertEqual([(r["hook"], r["reason"]) for r in result["refusals"]], [("frame-begin", "prologue-mismatch")])
+        with self.assertRaises(HookRefused):
+            profiles.require(result)
+
+    def test_a_tampered_optional_hook_is_a_coverage_limitation_not_a_failure(self):
+        folder = self.tampered("frameloop.exe", "fx_job_callback")
+        from hydralysis.pe import Image
+        result = profiles.verify_profile(profiles.load_baseline(), {"frameloop.exe": Image(folder / "frameloop.exe")})
+        self.assertTrue(result["ok"])
+        self.assertEqual([(l["code"], l["hook"], l["reason"]) for l in result["limitations"]],
+                         [("optional-hook-refused", "job-callback", "prologue-mismatch")])
+        self.assertNotIn("job-callback", result["enabled"])
+
+    def test_without_the_map_a_fixtures_hook_has_no_site(self):
+        import shutil
+        folder = self.root / "nomap"
+        folder.mkdir(exist_ok=True)
+        shutil.copy2(self.dir / "frameloop.exe", folder / "frameloop.exe")
+        from hydralysis.pe import Image
+        result = profiles.verify_profile(profiles.load_baseline(), {"frameloop.exe": Image(folder / "frameloop.exe")})
+        self.assertEqual({r["reason"] for r in result["refusals"]}, {"symbol-not-found"})
+
+    def test_a_non_fixtures_profile_never_reads_a_map(self):
+        text = profiles.BASELINE.read_text("utf-8").replace("fixtures_only = true", "fixtures_only = false")
+        builds = '[[target.builds]]\nmodule = "frameloop.exe"\nimage_sha256 = "%s"\n\n[[hooks]]' % ("0" * 64)
+        text = text.replace("[[hooks]]", builds, 1)
+        profile = profiles.load_text(text)
+        result = profiles.verify_profile(profile, {"frameloop.exe": self.images()["frameloop.exe"]})
+        self.assertIn("build-not-listed", {r["reason"] for r in result["refusals"]} | {r.get("reason") for r in result["hooks"]})
 
 
 if __name__ == "__main__":

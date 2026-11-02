@@ -211,6 +211,7 @@ struct Header {
 }
 
 struct Rec {
+    stack: Vec<u64>,
     flags: u8,
     site: u16,
     ring: u16,
@@ -268,12 +269,15 @@ fn decode(data: &[u8]) -> Result<(Header, Vec<Rec>), String> {
         let size = usize::from(u16_at(data, cursor));
         let nargs = usize::from(u16_at(data, cursor + 52));
         let buflen = usize::from(u16_at(data, cursor + 54));
-        if size != RECORD_BYTES + 8 * nargs + buflen.div_ceil(8) * 8 || cursor + size > data.len() {
+        let depth = usize::from(data[cursor + 2] >> 4);
+        if data[cursor + 2] & 15 != 1 || size != RECORD_BYTES + 8 * nargs + 8 * depth + buflen.div_ceil(8) * 8 || cursor + size > data.len() {
             return Err("record size is inconsistent".into());
         }
         let args = (0..nargs).map(|i| u64_at(data, cursor + RECORD_BYTES + 8 * i)).collect();
-        let start = cursor + RECORD_BYTES + 8 * nargs;
+        let stack = (0..depth).map(|i| u64_at(data, cursor + RECORD_BYTES + 8 * nargs + 8 * i)).collect();
+        let start = cursor + RECORD_BYTES + 8 * nargs + 8 * depth;
         records.push(Rec {
+            stack,
             flags: data[cursor + 3],
             site: u16_at(data, cursor + 4),
             ring: u16_at(data, cursor + 6),
@@ -313,6 +317,7 @@ fn decode_batch<'py>(py: Python<'py>, data: &[u8]) -> PyResult<(Bound<'py, PyDic
     for r in records {
         let d = PyDict::new(py);
         d.set_item("kind", 1)?;
+        d.set_item("stack", r.stack)?;
         d.set_item("flags", r.flags)?;
         d.set_item("site", r.site)?;
         d.set_item("ring", r.ring)?;
@@ -339,6 +344,11 @@ struct Site {
     module: Option<String>,
     va: u64,
     payload_mode: bool,
+    preview: usize,
+    buf_arg: i64,
+    event: Option<String>,
+    hook: Option<String>,
+    fields: Vec<(String, String, String)>,
 }
 
 fn tick_ns(ticks: u64, freq: u64) -> u64 {
@@ -390,6 +400,114 @@ fn is_device_path(units: &[u8]) -> bool {
     !(rest.len() >= 2 && rest[1] == b':' && rest[0].is_ascii_alphabetic())
 }
 
+const PREVIEW_MAX: usize = 256;
+const SECRET_WORDS: [&str; 18] = [
+    "password", "passwd", "pwd", "secret", "token", "apikey", "api_key", "api-key", "authorization", "credential",
+    "private_key", "private-key", "cookie", "session", "signature", "auth", "bearer", "basic",
+];
+
+fn printable(raw: &[u8], wide: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    if wide {
+        let mut i = 0;
+        while i + 1 < raw.len() {
+            let unit = u16::from(raw[i]) | (u16::from(raw[i + 1]) << 8);
+            if unit == 0 {
+                break;
+            }
+            out.push(if (0x20..0x7F).contains(&unit) { u8::try_from(unit).unwrap_or(b'.') } else { b'.' });
+            i += 2;
+        }
+    } else {
+        for &b in raw {
+            if b == 0 {
+                break;
+            }
+            out.push(if (0x20..0x7F).contains(&b) { b } else { b'.' });
+        }
+    }
+    out
+}
+
+fn is_token_char(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || b"+/_.-".contains(&c)
+}
+
+/// The twin of `trace_wire.redact_preview`: `(preview, masked span count)`, hand-written so both give the same bytes.
+fn redact_preview(raw: &[u8], wide: bool, limit: usize) -> (String, u64) {
+    let text = printable(raw, wide);
+    let lower: Vec<u8> = text.iter().map(u8::to_ascii_lowercase).collect();
+    let n = text.len();
+    let mut masked = vec![false; n];
+    for word in SECRET_WORDS {
+        let w = word.as_bytes();
+        let mut from = 0;
+        while from + w.len() <= n {
+            let Some(rel) = lower[from..].windows(w.len()).position(|x| x == w) else { break };
+            let start = from + rel;
+            let mut i = start + w.len();
+            while i < n && (text[i].is_ascii_alphanumeric() || text[i] == b'_' || text[i] == b'-') {
+                i += 1;
+            }
+            while i < n && (text[i] == b'"' || text[i] == b'\'' || text[i] == b' ') {
+                i += 1;
+            }
+            let space_word = (word == "bearer" || word == "basic") && start + w.len() < n && text[start + w.len()] == b' ';
+            if i < n && (text[i] == b':' || text[i] == b'=' || space_word) {
+                if text[i] == b':' || text[i] == b'=' {
+                    i += 1;
+                }
+                while i < n && (text[i] == b'"' || text[i] == b'\'' || text[i] == b' ') {
+                    i += 1;
+                }
+                let mut end = i;
+                while end < n && !b" &;,\"'\t".contains(&text[end]) {
+                    end += 1;
+                }
+                for m in &mut masked[i..end] {
+                    *m = true;
+                }
+            }
+            from = start + 1;
+        }
+    }
+    let mut i = 0;
+    while i < n {
+        if is_token_char(text[i]) {
+            let mut j = i;
+            while j < n && is_token_char(text[j]) {
+                j += 1;
+            }
+            let run = &text[i..j];
+            if j - i >= 20 && run.iter().any(u8::is_ascii_digit) && run.iter().any(u8::is_ascii_alphabetic) {
+                for m in &mut masked[i..j] {
+                    *m = true;
+                }
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    let mut out = String::new();
+    let mut spans = 0;
+    let mut k = 0;
+    while k < n {
+        if masked[k] {
+            while k < n && masked[k] {
+                k += 1;
+            }
+            out.push_str("***");
+            spans += 1;
+        } else {
+            out.push(char::from(text[k]));
+            k += 1;
+        }
+    }
+    out.truncate(limit.min(PREVIEW_MAX));
+    (out, spans)
+}
+
 /// Turns agent batches into chained TRACE-1 events (the twin of `trace_wire.SegmentEncoder`).
 #[pyclass]
 struct SegmentEncoder {
@@ -407,12 +525,13 @@ struct SegmentEncoder {
     batch_next: Option<u32>,
     dropped_seen: u64,
     handles: HashMap<u64, (Option<String>, bool)>,
+    hits: HashMap<u16, u64>,
     stats: BTreeMap<&'static str, u64>,
 }
 
-const STAT_KEYS: [&str; 15] = [
+const STAT_KEYS: [&str; 18] = [
     "batches", "records", "events", "gaps", "ring_gaps", "transport_gaps", "dropped_in_band", "read_failures",
-    "payload_refused", "last_attempted", "last_dropped", "last_read_failed", "last_no_ring", "bad_batches", "dummy",
+    "payload_refused", "previews", "redactions", "close_unknown", "last_attempted", "last_dropped", "last_read_failed", "last_no_ring", "bad_batches", "dummy",
 ];
 
 impl SegmentEncoder {
@@ -467,6 +586,13 @@ impl SegmentEncoder {
         entry.insert("id".into(), keyed(&self.key, raw).into());
         entry.insert("len".into(), raw.len().into());
         entry.insert("truncated".into(), (r.flags & F_TRUNCATED != 0).into());
+        if site.preview > 0 {
+            let (text, spans) = redact_preview(raw, r.flags & F_WIDE != 0, site.preview);
+            entry.insert("preview".into(), text.into());
+            entry.insert("redacted".into(), spans.into());
+            self.stat("previews", 1);
+            self.stat("redactions", spans);
+        }
         if site.payload_mode {
             if self.payload_ok {
                 let kept = &raw[..raw.len().min(self.max_payload)];
@@ -481,14 +607,49 @@ impl SegmentEncoder {
         Some(Value::Object(entry))
     }
 
+    fn field(&self, ftype: &str, source: &str, r: &Rec, site: &Site, buf: Option<&Value>) -> Value {
+        let value = if source == "ret" {
+            if r.flags & F_RET == 0 {
+                return Value::Null;
+            }
+            r.retval
+        } else {
+            let Ok(index) = source.parse::<usize>() else { return Value::Null };
+            match r.args.get(index) {
+                Some(v) => *v,
+                None => return Value::Null,
+            }
+        };
+        let is_buf = source != "ret" && source.parse::<i64>().ok() == Some(site.buf_arg);
+        match ftype {
+            "string" | "bytes" => match buf {
+                Some(b) if is_buf => b.clone(),
+                _ => Value::Null,
+            },
+            "key" => match buf {
+                Some(b) if is_buf => b.get("id").cloned().unwrap_or(Value::Null),
+                _ => keyed(&self.key, &value.to_le_bytes()).into(),
+            },
+            "bool" => Value::from((value & 0xFFFF_FFFF) != 0),
+            "u8" => Value::from(value & 0xFF),
+            "u16" => Value::from(value & 0xFFFF),
+            "u32" => Value::from(value & 0xFFFF_FFFF),
+            "i32" => Value::from(i64::from(i32::from_le_bytes((value as u32).to_le_bytes()))),
+            "i64" => Value::from(i64::from_le_bytes(value.to_le_bytes())),
+            "hex" => Value::from(format!("0x{value:x}")),
+            _ => Value::from(value),
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn call(&mut self, r: &Rec, artifacts: &mut BTreeMap<String, Vec<u8>>) -> Result<Vec<u8>, String> {
         let t0 = tick_ns(r.qpc, self.freq);
         let Some(site) = self.sites.get(&r.site).cloned() else {
             return self.event("core.error", t0, Some(r.tid), json!({"error": "unknown-site", "site": r.site}), 0, &[], None);
         };
+        *self.hits.entry(r.site).or_insert(0) += 1;
         let call = format!("{}:{}", r.ring, r.ring_seq);
-        let stack: Vec<u64> = if r.ret_addr != 0 { vec![r.ret_addr] } else { vec![] };
+        let stack: Vec<u64> = if !r.stack.is_empty() { r.stack.clone() } else if r.ret_addr != 0 { vec![r.ret_addr] } else { vec![] };
         let has_ret = r.flags & F_RET != 0;
         let buf = self.buffer(&site, r, artifacts);
         let t_end = tick_ns(if r.qpc_end != 0 { r.qpc_end } else { r.qpc }, self.freq);
@@ -516,6 +677,13 @@ impl SegmentEncoder {
                     "disposition": arg(4).map(|v| v & 0xFFFF_FFFF),
                     "handle": if has_ret { Some(r.retval) } else { None }, "ok": ok, "last_error": r.last_error,
                     "read_failed": r.flags & F_READ_FAILED != 0, "buf_addr": r.buf_addr});
+                let mut payload = payload;
+                if let (Some(Value::Object(b)), Value::Object(m)) = (&buf, &mut payload) {
+                    if let Some(pv) = b.get("preview") {
+                        m.insert("preview".into(), pv.clone());
+                        m.insert("redacted".into(), b.get("redacted").cloned().unwrap_or(Value::Null));
+                    }
+                }
                 if ok {
                     self.handles.insert(r.retval, (rid.clone(), device));
                 }
@@ -546,6 +714,32 @@ impl SegmentEncoder {
                     m.insert("in_buffer".into(), b);
                 }
                 out.extend(self.event("driver.ioctl", t0, Some(r.tid), with_call(p), site.va, &stack, module)?);
+            }
+            "close" => {
+                let handle = arg(0).unwrap_or(0);
+                if let Some(known) = self.handles.remove(&handle) {
+                    let ok = has_ret && (r.retval & 0xFFFF_FFFF) != 0;
+                    let ok_v = if has_ret { Value::from(ok) } else { Value::Null };
+                    let p = json!({"api": site.name, "handle": handle, "resource_id": known.0, "device": known.1,
+                        "ok": ok_v, "last_error": r.last_error});
+                    out.extend(self.event("core.resource.close", t_end, Some(r.tid), with_call(p), site.va, &stack, module)?);
+                } else {
+                    self.stat("close_unknown", 1);
+                }
+            }
+            "event" => {
+                let mut m = Map::new();
+                m.insert("site".into(), site.name.clone().into());
+                m.insert("hook".into(), site.hook.clone().unwrap_or_else(|| site.name.clone()).into());
+                for (fname, ftype, source) in &site.fields {
+                    m.insert(fname.clone(), self.field(ftype, source, r, &site, buf.as_ref()));
+                }
+                if has_ret {
+                    m.insert("end_ns".into(), t_end.into());
+                    m.insert("last_error".into(), r.last_error.into());
+                }
+                let kind = site.event.clone().unwrap_or_else(|| "core.function.enter".into());
+                out.extend(self.event(&kind, t0, Some(r.tid), with_call(Value::Object(m)), site.va, &stack, module)?);
             }
             "devquery" => {
                 let family = if site.name.to_lowercase().starts_with("cm_") { "driver.cfgmgr" } else { "driver.setupapi" };
@@ -688,6 +882,32 @@ impl SegmentEncoder {
                         _ => 0,
                     },
                     payload_mode: dict_str(d, "buf")?.as_deref() == Some("payload"),
+                    preview: match d.get_item("preview")? {
+                        Some(x) if !x.is_none() => x.extract::<usize>()?,
+                        _ => 0,
+                    },
+                    buf_arg: match d.get_item("buf_arg")? {
+                        Some(x) if !x.is_none() => x.extract::<i64>()?,
+                        _ => -1,
+                    },
+                    event: dict_str(d, "event")?,
+                    hook: dict_str(d, "hook")?,
+                    fields: match d.get_item("fields")? {
+                        Some(x) if !x.is_none() => {
+                            let mut v = Vec::new();
+                            for item in x.try_iter()? {
+                                let f = item?;
+                                let f = f.cast::<PyDict>().map_err(|_| err("a field is a dict"))?;
+                                v.push((
+                                    dict_str(f, "name")?.unwrap_or_default(),
+                                    dict_str(f, "type")?.unwrap_or_default(),
+                                    dict_str(f, "source")?.unwrap_or_default(),
+                                ));
+                            }
+                            v
+                        }
+                        _ => Vec::new(),
+                    },
                 },
             );
         }
@@ -712,6 +932,7 @@ impl SegmentEncoder {
             batch_next: None,
             dropped_seen: 0,
             handles: HashMap::new(),
+            hits: HashMap::new(),
             stats,
         })
     }
@@ -719,6 +940,14 @@ impl SegmentEncoder {
     #[getter]
     fn head(&self) -> String {
         self.chain.head.clone()
+    }
+
+    fn site_hits<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let d = PyDict::new(py);
+        for (k, v) in &self.hits {
+            d.set_item(*k, *v)?;
+        }
+        Ok(d)
     }
 
     #[getter]

@@ -306,19 +306,59 @@ class CaptureMixin:
 
     def capture(self, args: dict) -> dict:
         op = str(args.get("op") or "")
-        unknown = set(args) - {"op", "name", "capture", "after", "limit", "session"}
+        unknown = set(args) - {"op", "name", "capture", "after", "limit", "session", "trace"}
         if unknown:
             raise ValueError("unknown capture options: %s" % ", ".join(sorted(unknown)))
         if op == "start":
-            return self._capture_start(_capture_name(args.get("name")))
+            trace_args = self._trace_option(args["trace"]) if args.get("trace") is not None else None
+            started = self._capture_start(_capture_name(args.get("name")))
+            if trace_args is not None:
+                try:
+                    started["trace"] = self.trace_start(trace_args)
+                except Exception:
+                    self._capture_stop(None)          # no capture is left open without the trace it was asked to run
+                    raise
+            return started
         if op == "stop":
-            return self._capture_stop(args.get("capture"))
+            trace_stopped = None
+            if getattr(self, "trace", None) is not None and not self.trace.finalized:
+                trace_stopped = self.trace_stop({"reason": "capture stopped"})
+            closed = self._capture_stop(args.get("capture"))
+            if trace_stopped is not None:
+                closed["trace"] = trace_stopped
+            return closed
         if op == "counters":
             return {"counters": self.log.counters_copy(), "log": self.log.head_info(), "hooks": self._all_counters()}
         result = capture_host_op(self.directory, self.directory.name, args)
         if result is None:
             raise ValueError("capture op is one of start, stop, read, verify, list, counters")
         return result
+
+    def _trace_option(self, option) -> dict:
+        """The `trace` option of `capture start`: {session, owner?, hooks, probes, ...recorder settings}. The probes are the verified
+        hooks of the profile (see `profiles.probe_specs`); every enabled hook must have one, so a hook is never silently dropped."""
+        if not isinstance(option, dict):
+            raise ValueError("trace is an object {session, owner, hooks, probes}")
+        known = {"session", "owner", "hooks", "probes", "profile", "fault_policy", "builtin", "ring_bytes", "rings", "batch_ms",
+                 "batch_bytes", "counter_ms", "bp_ms", "window", "authorize_payload", "authorize_preview", "producer_gen", "watchdog", "etw"}
+        unknown = set(option) - known
+        if unknown:
+            raise ValueError("unknown trace options: %s" % ", ".join(sorted(unknown)))
+        session = option.get("session")
+        if not isinstance(session, str) or not session:
+            raise ValueError("trace.session is the name of the trace session the capture feeds")
+        hooks = option.get("hooks") or []
+        if not isinstance(hooks, list) or not all(isinstance(h, str) for h in hooks):
+            raise ValueError("trace.hooks is a list of hook ids")
+        probes = [dict(p) for p in option.get("probes") or []]
+        missing = [h for h in hooks if all(p.get("hook", p.get("name")) != h for p in probes)]
+        if missing:
+            raise ValueError("trace.hooks without a probe: %s (pass trace.probes from the verified profile)" % ", ".join(missing))
+        self.trace_owner = option.get("owner")                # kept in memory only; never written to the capture record or logs
+        self.trace_session_name = session
+        out = {key: value for key, value in option.items() if key not in ("session", "owner", "hooks", "profile")}
+        out["probes"] = probes
+        return out
 
     def _capture_start(self, name: str) -> dict:
         if self.open_capture is not None:

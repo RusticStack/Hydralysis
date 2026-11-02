@@ -52,6 +52,10 @@ static DWORD WINAPI heartbeat_main(LPVOID unused) {
 
 FX int fx_read_object(const int *object) { return *object; }
 
+/* Never dereferences OBJECT: it only records the address. A tracer hooking it can ask for OBJECT's bytes (the freed
+   page) and must get a counted read failure, not a fault (spec 15.1). Called in wait mode with the freed address. */
+FX int fx_probe_target(const void *object, int size) { g_sink = (int)(size_t)object ^ size; return size + g_sink * 0; }
+
 int main(int argc, char **argv) {
     const char *mode = fx_arg(argc, argv, "--mode="), *stop = fx_arg(argc, argv, "--stop-file=");
     int seconds = fx_arg_int(argc, argv, "--seconds=", 3), selftest = mode && strcmp(mode, "selftest") == 0;
@@ -81,6 +85,7 @@ int main(int argc, char **argv) {
     LONG start = g_heartbeat;
     for (int waited = 0; waited < seconds * 20; ++waited) {
         if (stop && GetFileAttributesA(stop) != INVALID_FILE_ATTRIBUTES) break;
+        if (waited % 4 == 0) fx_probe_target((const void *)g_freed, 16);
         Sleep(50);
     }
     LONG end = g_heartbeat;

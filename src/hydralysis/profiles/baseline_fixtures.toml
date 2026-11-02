@@ -1,17 +1,23 @@
-# Baseline profile for the Hydralysis trace FIXTURES only (tests/fixtures/trace_app.c and friends).
-# No target-specific profile ships with Hydralysis (spec 5.2): a project keeps its own. This one is bound to
-# the fixtures by name; the fixture build supplies the image hashes, so it is marked fixtures_only and lists none.
-# Hooks sit on the fixtures' own exported probe points (fx_*). Prologues are the exact alternatives that
-# MSVC /O2 x64 emits for those small functions; any other byte sequence refuses the hook.
+# Baseline profile for the Hydralysis trace FIXTURES only (tests/fixtures: trace_app, frameloop, interleave, deadlock,
+# veh_freeze, persist). No target-specific profile ships with Hydralysis (spec 5.2): a project keeps its own. This one is
+# bound to the fixtures by name; the fixture build supplies the image hashes, so it is marked fixtures_only and lists none.
+#
+# Every hook sits on a REAL function of the built fixture images, by its source name (fx_*). The fixtures are built
+# without a PDB and export none of these functions, so a fixtures-only profile resolves a name through the linker map
+# that the fixture build writes beside the image (`<image>.map`); a shipped program has no such map, and a real profile
+# names an export, a signature or a build-bound RVA instead. The prologues are the bytes MSVC /O2 x64 emits for these
+# functions, with the RIP-relative displacements wildcarded; a different byte sequence refuses the hook. The profile is
+# the union of one section per fixture program: a run supplies the images it uses and the other sections are
+# `not-applicable`, not refused.
 
 [profile]
 id = "fixtures-baseline/1"
 domain = "app"
-description = "Fixtures-only baseline: file and registry opens, a feature toggle and a frame loop."
+description = "Fixtures-only baseline: files, registry, a feature toggle, a DLL search-order shadow, a frame loop, request pools, a stalled main loop and a persistent store."
 
 [target]
 bitness = 64
-modules = ["trace_app.exe"]
+modules = ["trace_app.exe", "frameloop.exe", "interleave.exe", "veh_freeze.exe", "deadlock.exe", "persist.exe"]
 fixtures_only = true
 
 [host]
@@ -22,7 +28,7 @@ record_handler_chain = true
 [[event_kinds]]
 name = "app.feature"
 extends = "core.state.write"
-description = "A configuration toggle changed."
+description = "A configuration toggle was read (trace_app: the config name decides precedence and the extra file)."
 [event_kinds.payload]
 feature = "key"
 enabled = "bool"
@@ -30,39 +36,273 @@ enabled = "bool"
 [[event_kinds]]
 name = "app.frame"
 extends = "core.marker"
+description = "The main loop started or finished a frame."
 [event_kinds.payload]
 frame = "u64"
-stage = "string?"
+
+[[event_kinds]]
+name = "app.stage"
+extends = "core.marker"
+description = "A frame stage began (1 input, 2 update, 3 render)."
+[event_kinds.payload]
+stage = "u32"
+
+[[event_kinds]]
+name = "app.registry"
+extends = "core.state.write"
+description = "The registry round trip under HKCU\\Software\\HydraTraceFixture."
+[event_kinds.payload]
+mode = "key"
+
+[[event_kinds]]
+name = "app.plugin"
+extends = "core.module.load"
+description = "The DLL search-order shadow: the same bare name loaded from the winner directory."
+[event_kinds.payload]
+winner = "key"
+
+[[event_kinds]]
+name = "app.request"
+extends = "core.sync.signal"
+description = "interleave: a request handed to or handled by a pool."
+[event_kinds.payload]
+pool = "u32"
+op = "u32"
+
+[[event_kinds]]
+name = "app.store"
+extends = "core.resource.write"
+description = "persist: the save file was written or read."
+[event_kinds.payload]
+path = "key"
+
+# ---- trace_app.exe -----------------------------------------------------------------------------------------------------
+[[hooks]]
+id = "file-write"
+event = "core.resource.write"
+module = "trace_app.exe"
+symbol = "fx_write_file"
+required = true
+prologue = ["48 89 5C 24 ?? 48 89 74 24 ?? 57 48 83 EC ??"]
+nargs = 3
+buf = { arg = 0, max = 128 }
+capture = ["path:string@0", "size:u32@2"]
+stack = 4
 
 [[hooks]]
-id = "file-open"
-event = "core.resource.open"
-symbol = "fx_open"
+id = "file-read"
+event = "core.resource.read"
+module = "trace_app.exe"
+symbol = "fx_read_file"
 required = true
-prologue = ["40 53 48 83 EC ??", "48 89 5C 24 ??", "48 83 EC ??"]
-capture = ["path:string", "status:u32"]
+prologue = ["48 89 5C 24 ?? 48 89 74 24 ?? 57 48 83 EC ??"]
+nargs = 3
+with_leave = true
+buf = { arg = 0, max = 128 }
+capture = ["path:string@0", "size:u32@2", "got:u32@ret"]
+stack = 4
 
 [[hooks]]
 id = "feature-gate"
 event = "app.feature"
-symbol = "fx_feature"
+module = "trace_app.exe"
+symbol = "fx_read_config"
 required = true
-prologue = ["40 53 48 83 EC ??", "48 89 5C 24 ??", "48 83 EC ??"]
-capture = ["feature:key", "enabled:bool"]
+prologue = ["48 89 5C 24 ?? 48 89 74 24 ?? 57 48 81 EC ?? ?? ?? ??"]
+nargs = 3
+with_leave = true
+buf = { arg = 0, fixed = 2, max = 2 }
+capture = ["feature:key@0", "enabled:bool@ret"]
+stack = 4
 
+[[hooks]]
+id = "registry-roundtrip"
+event = "app.registry"
+module = "trace_app.exe"
+symbol = "fx_registry_roundtrip"
+required = true
+prologue = ["4C 8B DC 49 89 5B ?? 49 89 73 ?? 57 48 83 EC ??"]
+nargs = 3
+buf = { arg = 0, fixed = 2, max = 2 }
+capture = ["mode:key@0"]
+stack = 4
+
+[[hooks]]
+id = "registry-cleanup"
+event = "core.resource.close"
+module = "trace_app.exe"
+symbol = "fx_registry_cleanup"
+required = false
+prologue = ["48 8D 15 ?? ?? ?? ?? 48 C7 C1 01 00 00 80"]
+nargs = 0
+
+[[hooks]]
+id = "plugin-load"
+event = "app.plugin"
+module = "trace_app.exe"
+symbol = "fx_load_plugin"
+required = true
+prologue = ["40 53 55 56 57 48 81 EC ?? ?? ?? ??"]
+nargs = 3
+buf = { arg = 0, fixed = 8, max = 8 }
+capture = ["winner:key@0"]
+stack = 4
+
+# ---- frameloop.exe -----------------------------------------------------------------------------------------------------
 [[hooks]]
 id = "frame-begin"
 event = "app.frame"
+module = "frameloop.exe"
 symbol = "fx_frame_begin"
-required = false
-prologue = ["40 53 48 83 EC ??", "48 83 EC ??", "48 89 5C 24 ??"]
+required = true
+prologue = ["89 0D ?? ?? ?? ?? C3"]
+nargs = 1
+capture = ["frame:u64@0"]
 
 [[hooks]]
 id = "frame-end"
 event = "app.frame"
+module = "frameloop.exe"
 symbol = "fx_frame_end"
+required = true
+prologue = ["8D 41 01 89 05 ?? ?? ?? ?? C3"]
+nargs = 1
+capture = ["frame:u64@0"]
+
+[[hooks]]
+id = "stage-begin"
+event = "app.stage"
+module = "frameloop.exe"
+symbol = "fx_phase_begin"
+required = true
+prologue = ["89 0D ?? ?? ?? ?? C3"]
+nargs = 1
+capture = ["stage:u32@0"]
+
+[[hooks]]
+id = "job-callback"
+event = "core.function.enter"
+module = "frameloop.exe"
+symbol = "fx_job_callback"
 required = false
-prologue = ["40 53 48 83 EC ??", "48 83 EC ??", "48 89 5C 24 ??"]
+prologue = ["F0 01 0D ?? ?? ?? ?? 8B C1 C3"]
+nargs = 1
+
+[[hooks]]
+id = "job-physics"
+event = "core.function.enter"
+module = "frameloop.exe"
+symbol = "fx_job_physics"
+required = false
+prologue = ["8D 04 09 F0 01 05 ?? ?? ?? ?? C3"]
+nargs = 1
+
+[[hooks]]
+id = "ours-write"
+event = "core.state.write"
+module = "frameloop.exe"
+symbol = "fx_ours_write"
+required = false
+prologue = ["8D 81 88 13 00 00 C7 05 ?? ?? ?? ?? 01 00 00 00"]
+nargs = 1
+
+[[hooks]]
+id = "host-overwrite"
+event = "core.state.write"
+module = "frameloop.exe"
+symbol = "fx_host_overwrite"
+required = false
+prologue = ["8D 81 28 23 00 00 C7 05 ?? ?? ?? ?? 02 00 00 00"]
+nargs = 1
+
+[[hooks]]
+id = "consume"
+event = "core.state.read"
+module = "frameloop.exe"
+symbol = "fx_consume"
+required = false
+prologue = ["39 0D ?? ?? ?? ?? 8B 05 ?? ?? ?? ?? 75 ?? 8B 0D"]
+nargs = 1
+
+# ---- interleave.exe ----------------------------------------------------------------------------------------------------
+[[hooks]]
+id = "request-submit"
+event = "app.request"
+module = "interleave.exe"
+symbol = "fx_submit"
+required = false
+prologue = ["40 53 55 56 57 48 83 EC ??"]
+nargs = 2
+capture = ["pool:u32@0", "op:u32@1"]
+stack = 4
+
+[[hooks]]
+id = "request-handle"
+event = "app.request"
+module = "interleave.exe"
+symbol = "fx_handle_request"
+required = false
+prologue = ["48 89 5C 24 ?? 57 48 83 EC ?? 8D 1C 51"]
+nargs = 3
+capture = ["pool:u32@0", "op:u32@1"]
+stack = 4
+
+[[hooks]]
+id = "request-complete"
+event = "core.sync.signal"
+module = "interleave.exe"
+symbol = "fx_complete"
+required = false
+prologue = ["B8 01 00 00 00 F0 0F C1 05 ?? ?? ?? ?? FF C0"]
+nargs = 1
+
+# ---- deadlock.exe ------------------------------------------------------------------------------------------------------
+[[hooks]]
+id = "main-frame"
+event = "app.frame"
+module = "deadlock.exe"
+symbol = "fx_main_frame"
+required = true
+prologue = ["8D 41 01 B9 14 00 00 00 87 05 ?? ?? ?? ??"]
+nargs = 1
+capture = ["frame:u64@0"]
+
+# ---- veh_freeze.exe ----------------------------------------------------------------------------------------------------
+# The target of the fault-free probe: it never dereferences its first argument, and the probe asks for 16 bytes of the
+# freed page there. The read must come back as a counted failure, not a fault (spec 15.1).
+[[hooks]]
+id = "probe-target"
+event = "core.function.enter"
+module = "veh_freeze.exe"
+symbol = "fx_probe_target"
+required = true
+fault = "freezes"
+prologue = ["33 CA 89 0D ?? ?? ?? ?? 8B 05 ?? ?? ?? ?? 8B C2"]
+nargs = 2
+buf = { arg = 0, fixed = 16, max = 16 }
+
+# ---- persist.exe -------------------------------------------------------------------------------------------------------
+[[hooks]]
+id = "store-write"
+event = "app.store"
+module = "persist.exe"
+symbol = "fx_write_store"
+required = false
+prologue = ["40 53 48 83 EC ?? 0F B6 05 ?? ?? ?? ??"]
+nargs = 1
+buf = { arg = 0, max = 128 }
+capture = ["path:key@0"]
+
+[[hooks]]
+id = "store-read"
+event = "app.store"
+module = "persist.exe"
+symbol = "fx_read_store"
+required = false
+prologue = ["48 89 5C 24 ?? 55 56 41 56 48 83 EC ??"]
+nargs = 3
+buf = { arg = 0, max = 128 }
+capture = ["path:key@0"]
 
 [identity]
 resource = "path"
@@ -73,11 +313,29 @@ id = "main"
 resolve = "function"
 value = "frame-begin"
 
+[[roles]]
+id = "main-deadlock"
+resolve = "function"
+value = "main-frame"
+
 [[phases]]
 id = "frame"
 kind = "frame"
 open = "frame-begin"
 close = "frame-end"
+
+[[phases]]
+id = "update"
+kind = "stage"
+parent = "frame"
+open = "stage-begin"
+close = "frame-end"
+
+[[phases]]
+id = "deadlock-frame"
+kind = "frame"
+open = "main-frame"
+close = "main-frame"
 
 [diff]
 group_by = ["kind", "resource.key", "function"]
@@ -87,6 +345,16 @@ align = ["phase", "frame_offset"]
 id = "settings"
 kind = "file"
 path = "trace_app.cfg"
+
+[[stores]]
+id = "fixture-registry"
+kind = "registry"
+path = "HKCU\\Software\\HydraTraceFixture"
+
+[[stores]]
+id = "save-file"
+kind = "file"
+path = "persist.sav"
 
 [[queries]]
 id = "app.registry.consumers"
