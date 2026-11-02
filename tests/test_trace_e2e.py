@@ -81,6 +81,15 @@ class M1(unittest.TestCase):
             time.sleep(0.1)
         self.fail("the producer wrote no batches to the segment")
 
+    def stop_quiescent(self, live, attempts=6):
+        # trace_stop proves the callbacks quiescent within a bounded time and, when a loaded machine delays the proof, keeps the
+        # recorder in pass-through and says so (`stopped: false`); a retry is the documented way on (trace_stop is idempotent)
+        for _ in range(attempts):
+            reply = live.stop()["trace"]
+            if reply.get("stopped"):
+                return reply
+        self.fail("the recorder never became quiescent: %r" % ({k: v for k, v in reply.items() if k != "health"},))
+
     def events(self, live):
         return tc.read_events(live.segment, live.segment_id)
 
@@ -173,13 +182,13 @@ class M1(unittest.TestCase):
 
     def test_failure_modes_lose_the_producer_versus_a_clean_stop(self):
         live = self.traced("frameloop.exe", ["--frames=100000", "--spin-us=1000"], wait=False)
-        self.wait_segment(live)
-        stopped_alive = live.stop()["trace"]["health"]
+        self.wait_segment(live, min_bytes=65536)
+        stopped_alive = self.stop_quiescent(live)["health"]
         subprocess.run(["taskkill", "/F", "/PID", str(live.pid)], capture_output=True)
         self.assertEqual(stopped_alive["producer_state"], "final")                          # the producer reported its last counters
         self.assertEqual(stopped_alive["transport"]["batches_missing"], 0)
         killed = self.traced("frameloop.exe", ["--frames=100000", "--spin-us=1000"], wait=False)
-        self.wait_segment(killed)
+        self.wait_segment(killed, min_bytes=65536)      # well past 100 records (about 200 bytes each), whatever the load
         subprocess.run(["taskkill", "/F", "/PID", str(killed.pid)], capture_output=True)
         time.sleep(1.0)
         health = killed.stop()["trace"]["health"]
@@ -195,7 +204,7 @@ class M1(unittest.TestCase):
         self.assertGreater(health["producer"]["dropped"], 0)
         gaps = [e["payload"] for e in self.events(live) if e["kind"] == "core.capture.gap"]
         self.assertTrue(gaps)
-        self.assertTrue({g["reason"] for g in gaps} <= {"ring-overflow", "producer-lost"})
+        self.assertTrue({g["reason"] for g in gaps} <= {"ring-overflow", "producer-lost"}, [g for g in gaps if g["reason"] not in ("ring-overflow", "producer-lost")][:3])
         cited = sum(g["dropped"] for g in gaps if g["reason"] in ("ring-overflow", "producer-lost"))
         self.assertGreaterEqual(cited + health["encoder"]["records"], health["producer"]["attempted"])   # every attempt is a record or cited
 
