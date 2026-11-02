@@ -1,12 +1,14 @@
 {
-  "release": "0.7.0",
-  "testedCommit": "e6c50f28197810a7a1350567570749a47fae7bf2",
-  "date": "2026-11-01",
-  "machine": "Windows 11 Pro 10.0.26300, 24 logical processors, NTFS, Python 3.15, JDK 25.0.4.1 Temurin",
-  "engine": "the published Hydra Engine 12.3-hydra.5 zip (SHA-256 1627dbc59fab78b1d3f64cd861c61ef27c68bd17ec8d9e5b31b4be7240024e13), unzipped",
+  "release": "0.8.0 (prepared, not tagged; the pin still says 12.3-hydra.5 until bump_hydra.py runs on the release zips)",
+  "testedCommit": "c60d6f7c16dc2a1a7733cb4666b64fafbd5c17f9",
+  "date": "2026-11-02",
+  "machine": "Windows 11 Pro 10.0.26300, 24 logical processors, NTFS, Python 3.15, JDK 25.0.4.1 Temurin, Frida 17.24.3; machine shared with other lanes",
+  "engine": "locally assembled 12.3-hydra.6 install (trace/final-eng 9875e54c76, stamped hydra.version=12.3-hydra.6; not the published zip, which does not exist yet), HYDRALYSIS_INTEGRATION_UNPINNED=1",
   "suites": {
-    "unit (tools/run_tests.py)": "1640 test results, 0 failed alone, 0 failed only under load; 1 pre-existing task-plan artefact (test_runtime_scenario_fixture ran 23 tests, 22 planned; all its tests OK and it reproduces on the base) (D:/Projects/Hydra/_logs/rust-round4/release/hy-unit.log)",
-    "unit + real engine (tools/run_tests.py --integration)": "test_engine_integration 17/17 OK against the published 12.3-hydra.5 engine (D:/Projects/Hydra/_logs/rust-round4/release/hy-engine.log)",
-    "bump_hydra.py --check": "exit 0 against the published SHA256SUMS"
+    "unit (tools/run_tests.py -j 4 --strict)": "1996 of 1996, 0 failed alone, 0 failed only under load, 0 task problems (E:/Projects/Hydra/_logs/trace-final/F/hy-unit.log)",
+    "unit + real engine (tools/run_tests.py -j 4 --strict --integration)": "1996 of 1996, 0 failed alone, 1 failed only under load (test_trace_gates3.M3Pairing delay test, passed alone), 0 task problems; includes M3Concurrency (also 3/3 repeated alone) and M4Bypass (F/hy-engine.log, F/m3-rep*.log)",
+    "bump_hydra.py --release 12.3-hydra.6": "not run: it needs the release zips (their SHA-256 is the pin), which the release workflow has not built",
+    "test_runtime_scenario_fixture plan mismatch": "did not reproduce on this tree (0 task problems)",
+    "not met / not established": "trace overhead on a bare-loop microbenchmark (113 %, docs/trace-overhead.md); 2 % sampled-mode target not established"
   }
 }
