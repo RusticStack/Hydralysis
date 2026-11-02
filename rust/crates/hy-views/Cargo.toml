@@ -1,20 +1,25 @@
 [package]
 name = "hy-views"
-version = "0.1.0"
-edition = "2024"
-license = "MIT"
 description = "Hydralysis project-mutation machinery (views, commits, working copies) in Rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
 
 [dependencies]
-sha2 = "0.10"
-hmac = "0.12"
+hy-core = { path = "../hy-core" }
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
 hex = "0.4"
 getrandom = "0.3"
-thiserror = "2"
-serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading", "Win32_Security"] }
+windows-sys.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+
+[lints]
+workspace = true
