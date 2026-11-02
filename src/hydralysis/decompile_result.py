@@ -21,6 +21,8 @@ CLASSES = ("code", "data", "unknown")
 MAX_FRAGMENTS = 4096
 LIMIT_TRUNCATED = "decompile_truncated"
 LIMIT_NON_CODE = "non_code_fragments"
+LIMIT_BUDGET = "decompile_budget_limited"   # the engine's adaptive budget (the caller named no cap) stopped the answer
+LIMIT_PAGED = "decompile_paged"             # this is one page of the text; next_offset says where the rest starts
 
 
 def _address(value):
@@ -67,7 +69,7 @@ def summarize(reply: dict) -> dict:
     if not isinstance(reply, dict):
         return {}
     # `truncated: false` alone is what an engine without the new fields always said: nothing to add then.
-    if not (reply.get("truncated") is True or any(name in reply for name in ("fragments", "bytes_emitted", "reason"))):
+    if not (reply.get("truncated") is True or any(name in reply for name in ("fragments", "bytes_emitted", "reason", "cut", "budget", "next_offset", "partial"))):
         return {}
     kept, note = fragments(reply.get("fragments"))
     # The engine's own `partial` (a body in several pieces, some of it not code) is a partial result even when nothing was cut off.
@@ -77,6 +79,17 @@ def summarize(reply: dict) -> dict:
     emitted = reply.get("bytes_emitted")
     if isinstance(emitted, int) and not isinstance(emitted, bool) and emitted >= 0:
         out["bytes_emitted"] = emitted
+    if isinstance(reply.get("cut"), dict):
+        out["cut"] = {key: reply["cut"][key] for key in ("kind", "response_bytes_read", "c_recovered", "c_chars", "c_lines", "c_returned_chars")
+                      if key in reply["cut"]}
+    if isinstance(reply.get("budget"), dict):
+        out["budget"] = {key: reply["budget"][key] for key in ("mode", "bytes", "mb", "in_flight") if key in reply["budget"]}
+    for name in ("offset", "next_offset"):
+        value = reply.get(name)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            out[name] = value
+    if "next_offset" in out:
+        out["partial"] = True
     if "fragments" in reply:
         totals = {name: 0 for name in CLASSES}
         for item in kept:
@@ -100,10 +113,21 @@ def limitations(reply: dict) -> list[str]:
     summary = summarize(reply)
     codes = []
     if reply.get("truncated") is True:
-        codes.append(LIMIT_TRUNCATED)
+        # A cut by the engine's own adaptive budget (the caller set no cap) is budget-limited; by a cap the caller set, truncated.
+        auto = (reply.get("budget") or {}).get("mode") == "auto" if isinstance(reply.get("budget"), dict) else False
+        codes.append(LIMIT_BUDGET if auto else LIMIT_TRUNCATED)
+    if isinstance(summary.get("next_offset"), int):
+        codes.append(LIMIT_PAGED)
     if (summary.get("fragment_bytes") or {}).get("data") or (summary.get("fragment_bytes") or {}).get("unknown"):
         codes.append(LIMIT_NON_CODE)
     return codes
+
+
+def _coverage_codes(reply: dict) -> list[str]:
+    codes = limitations(reply)
+    if reply.get("truncated") is True:
+        codes = [code for code in codes if code != LIMIT_NON_CODE]   # a cut-off reply is named for the cut, as before
+    return codes or [LIMIT_NON_CODE]
 
 
 def coverage(reply: dict) -> dict:
@@ -115,7 +139,7 @@ def coverage(reply: dict) -> dict:
         return {"status": "unknown", "reason": "the decompile reply carries no truncated/fragments fields"}
     if summary["partial"]:
         # A cut-off reply says so; one that only has pieces of data in its body (nothing cut) says that.
-        return {"status": "partial", "limitations": [LIMIT_TRUNCATED] if reply.get("truncated") is True else (limitations(reply) or [LIMIT_NON_CODE])}
+        return {"status": "partial", "limitations": _coverage_codes(reply)}
     return {"status": "complete"}
 
 
@@ -127,11 +151,13 @@ def merge(response: dict, reply: dict) -> dict:
     RusticQuery failed and the engine decompiled, the engine's text and signature stand in for it."""
     if not isinstance(reply, dict):
         return response
-    carried = {name: reply[name] for name in ("partial", "reason", "fragments", "bytes_emitted") if name in reply}
+    carried = {name: reply[name] for name in ("partial", "reason", "fragments", "bytes_emitted", "cut", "budget", "offset", "next_offset")
+               if name in reply}
     if reply.get("completed") is False and reply.get("truncated") is True:
         keep = {name: response[name] for name in ("id", "program", "sha256", "image_base", "address_kind", "overlay_state", "engine", "function")
                 if name in response}
-        return {**keep, "ok": False, "truncated": True, "error": reply.get("error", "decompile stopped at the size bound"), **carried}
+        text = {name: reply[name] for name in ("c", "signature", "chars") if name in reply}
+        return {**keep, "ok": False, "truncated": True, "error": reply.get("error", "decompile stopped at the size bound"), **text, **carried}
     if reply.get("completed") is not True or not isinstance(reply.get("c"), str):
         return response
     merged = dict(response)
@@ -143,7 +169,11 @@ def merge(response: dict, reply: dict) -> dict:
         merged["total_characters"] = reply.get("chars", len(reply["c"]))
         merged["max_characters"] = len(reply["c"])
     merged.update(carried)
-    merged["truncated"] = bool(response.get("truncated") if response.get("ok") is not False else False) or reply.get("truncated") is True
+    if "offset" in reply:
+        # A page of the text: the engine's page replaces the script's whole (clipped) text.
+        merged.update(c=reply["c"], total_characters=reply.get("chars", len(reply["c"])), max_characters=len(reply["c"]))
+    clipped = bool(response.get("truncated") if response.get("ok") is not False else False) and "offset" not in reply
+    merged["truncated"] = clipped or reply.get("truncated") is True
     return merged
 
 
@@ -154,6 +184,6 @@ def from_error(message: str) -> dict | None:
     except (TypeError, ValueError):
         return None
     if (not isinstance(reply, dict) or reply.get("truncated") is not True
-            or not (isinstance(reply.get("c"), str) or reply.get("fragments") or "bytes_emitted" in reply)):
+            or not (isinstance(reply.get("c"), str) or reply.get("fragments") or "bytes_emitted" in reply or "cut" in reply)):
         return None
     return reply
