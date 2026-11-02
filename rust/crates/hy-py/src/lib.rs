@@ -3,6 +3,9 @@
 //! The Python side (`hydralysis._rust_store`) installs these over `hydralysis.durable` / `hydralysis.storelog`
 //! when `HYDRALYSIS_IMPL=rust`, and the differential tests call them next to the Python implementation.
 
+mod evidence;
+mod lineage;
+
 use hy_core::Error;
 use hy_core::appendlog::{self, AppendLog, Scan};
 use hy_core::{fsio, json, lock, sealed};
@@ -13,7 +16,7 @@ use pyo3::types::{PyBytes, PyDict, PyList};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
-fn instance<'py>(py: Python<'py>, module: &str, class: &str, args: Vec<Bound<'py, PyAny>>) -> PyErr {
+pub(crate) fn instance<'py>(py: Python<'py>, module: &str, class: &str, args: Vec<Bound<'py, PyAny>>) -> PyErr {
     let built = pyo3::types::PyTuple::new(py, args);
     match built.and_then(|tuple| py.import(module)?.getattr(class)?.call1(tuple)) {
         Ok(object) => PyErr::from_value(object),
@@ -21,7 +24,7 @@ fn instance<'py>(py: Python<'py>, module: &str, class: &str, args: Vec<Bound<'py
     }
 }
 
-fn convert(py: Python<'_>, error: Error) -> PyErr {
+pub(crate) fn convert(py: Python<'_>, error: Error) -> PyErr {
     match error {
         Error::Io(e) => PyErr::from(e),
         Error::Value(m) | Error::Json(m) => PyValueError::new_err(m),
@@ -73,15 +76,15 @@ impl<T> PyRes<T> for Result<T, Error> {
     }
 }
 
-fn parse(text: &str) -> PyResult<Value> {
+pub(crate) fn parse(text: &str) -> PyResult<Value> {
     serde_json::from_str(text).map_err(|e| PyValueError::new_err(e.to_string()))
 }
 
-fn to_py<'py>(py: Python<'py>, value: &Value) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn to_py<'py>(py: Python<'py>, value: &Value) -> PyResult<Bound<'py, PyAny>> {
     py.import("json")?.call_method1("loads", (String::from_utf8_lossy(&json::dumps(value, json::FRAME)).into_owned(),))
 }
 
-fn text(value: &Value) -> String {
+pub(crate) fn text(value: &Value) -> String {
     String::from_utf8_lossy(&json::dumps(value, json::FRAME)).into_owned()
 }
 
@@ -374,6 +377,8 @@ fn hydralysis_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(storelog_cache_len, module)?)?;
     module.add_function(wrap_pyfunction!(log_clear_verified, module)?)?;
     module.add_class::<FileLock>()?;
+    evidence::register(module)?;
+    lineage::register(module)?;
     module.add("ABI", "abi3-py313")?;
     Ok(())
 }
