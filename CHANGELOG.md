@@ -19,6 +19,7 @@ Semantic trace (for 0.8.0, which pins engine 12.3-hydra.6; the version is bumped
 - `hydralysis.profiles`: TOML profile loader, validator, build-bound hook verification, query modules; `docs/trace-profiles.md`.
 - `trace_hashes` (FNV, CRC32, Murmur3, profile codecs, dictionary, interpretation revisions), `trace_bindings` (script/native
   tables), `trace_corpus_diff` (corpus diff and invalidation report), `trace_reports` (write survival, hook bypass).
+- Docs: the README links to the engine README's "System requirements" (spec 14.13): minimum, reference, recommended and optional-capability requirements with the recorded i7-13700KF runs, the support matrix and the resource-constrained behaviour (refused or explicitly partial, never different evidence). The 16-agent and multi-project measurements behind the trace daemon-impact gate are in the engine's `docs/release-notes-12.3-hydra.6.md` (four of the 16 agents there are Hydralysis agents).
 
 
 ## 0.7.0
