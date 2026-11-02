@@ -99,7 +99,7 @@ REJECTED = (
 # MCP initialize result under _meta (mcp.py). ghidra_query status is built in query.py and does not carry it.
 # Everything added after epoch 1 rides the free-form `options` objects (see OPTION_BAGS).
 # Epoch 3 adds the `trace` tool (Hydralysis 0.8.0: the 21st tool) and the `from_trace` source of evidence_add.
-CATALOG_EPOCH = 3
+CATALOG_EPOCH = 4
 
 # Which `options` bag carries which feature (PROTOCOL-3.md 7.7). The bags are free-form objects
 # in the schema, so a later package changes a handler, never the schema.
