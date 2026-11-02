@@ -14,6 +14,7 @@ use hy_core::sealed::{self, Kind, backup_path, dumps_sealed, path_key, write_sea
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 pub const SNAPSHOT_EVERY: u64 = 64;
@@ -21,6 +22,22 @@ pub const SNAPSHOT_LOG_BYTES: usize = 4 * 1024 * 1024;
 pub const LIST_FIELDS: [&str; 6] = ["edits", "reverted", "journal", "commits", "archived", "changesets"];
 pub const READ_RETRIES: usize = 8;
 pub const CACHE_ENTRIES: usize = 32;
+
+static EVERY: AtomicU64 = AtomicU64::new(SNAPSHOT_EVERY);
+static LOG_BYTES: AtomicUsize = AtomicUsize::new(SNAPSHOT_LOG_BYTES);
+static ENTRIES: AtomicUsize = AtomicUsize::new(CACHE_ENTRIES);
+
+/// Override the compaction thresholds and the cache bound (the Python module's patchable constants, used by tests).
+pub fn configure(snapshot_every: u64, snapshot_log_bytes: usize, cache_entries: usize) {
+    EVERY.store(snapshot_every, Ordering::Relaxed);
+    LOG_BYTES.store(snapshot_log_bytes, Ordering::Relaxed);
+    ENTRIES.store(cache_entries, Ordering::Relaxed);
+}
+
+/// Number of store paths currently cached by this process.
+pub fn cache_len() -> usize {
+    CACHE.lock().map_or(0, |cache| cache.entries.len())
+}
 
 /// `HYDRALYSIS_STORE_LOG=0` writes whole snapshots again (the reader always honours a log).
 pub fn enabled() -> bool {
@@ -44,11 +61,7 @@ fn rows(path: &Path) -> Result<Vec<Value>> {
     }
     let scan = appendlog::scan_file(&target, 0, true);
     if let Some(corrupt) = scan.corrupt {
-        return Err(Error::store_corrupt(
-            path,
-            &target,
-            vec![(file_name(&target), format!("log corrupt at byte {}", corrupt.offset))],
-        ));
+        return Err(Error::store_corrupt(path, &target, vec![(file_name(&target), format!("log corrupt at byte {}", corrupt.offset))]));
     }
     Ok(scan.records)
 }
@@ -178,7 +191,7 @@ fn remember(key: &str, entry: Cached) {
         cache.seq += 1;
         let seq = cache.seq;
         cache.entries.insert(key.to_string(), (seq, entry));
-        while cache.entries.len() > CACHE_ENTRIES {
+        while cache.entries.len() > ENTRIES.load(Ordering::Relaxed) {
             if let Some(oldest) = cache.entries.iter().min_by_key(|(_, (s, _))| *s).map(|(k, _)| k.clone()) {
                 cache.entries.remove(&oldest);
             }
@@ -333,7 +346,7 @@ fn is_value(error: &Error) -> bool {
 fn upkeep_failed(path: &Path, what: &str, error: &Error) {
     if let Ok(mut map) = UPKEEP_ERRORS.lock() {
         map.insert(path_key(path), format!("{what}: {error}"));
-        while map.len() > CACHE_ENTRIES {
+        while map.len() > ENTRIES.load(Ordering::Relaxed) {
             let Some(first) = map.keys().next().cloned() else { break };
             map.remove(&first);
         }
@@ -432,7 +445,9 @@ fn fits(record: &Value, max_bytes: Option<usize>, too_large: Option<&str>) -> Re
             map.insert("log_prev".into(), Value::String("0".repeat(32)));
         }
         if dumps_sealed(&probe, Some(2))?.len() > limit {
-            return Err(Error::value(too_large.map_or_else(|| format!("record would exceed {limit} bytes; existing file preserved"), str::to_string)));
+            return Err(Error::value(
+                too_large.map_or_else(|| format!("record would exceed {limit} bytes; existing file preserved"), str::to_string),
+            ));
         }
     }
     Ok(())
@@ -466,7 +481,7 @@ pub fn save(path: &Path, record: &Value, max_bytes: Option<usize>, too_large: Op
     }
     let row = Value::Object(row);
     let line_len = frame(&row).len();
-    let due = after >= SNAPSHOT_EVERY || current.since + line_len > SNAPSHOT_LOG_BYTES;
+    let due = after >= EVERY.load(Ordering::Relaxed) || current.since + line_len > LOG_BYTES.load(Ordering::Relaxed);
     // Budget: an upper estimate decides when to measure exactly, so a store that would pass the whole-store writer's limit
     // is refused here too, before the row is appended.
     let estimate = current.size + 4 * line_len as u64;

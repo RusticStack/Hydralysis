@@ -14,6 +14,10 @@ sha2.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
 rusqlite.workspace = true
+crc32fast.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

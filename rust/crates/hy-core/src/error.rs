@@ -16,7 +16,9 @@ pub enum Error {
     #[error("{}", store_corrupt_message(path, backup, reasons))]
     StoreCorrupt { path: String, backup: String, reasons: Vec<(String, String)> },
     /// `durable.LineageCorrupt` (code `lineage_corrupt`).
-    #[error("lineage_corrupt: {path} has an invalid line at byte {offset} followed by a valid line; reads stop at the last good line, appends are refused until it is repaired")]
+    #[error(
+        "lineage_corrupt: {path} has an invalid line at byte {offset} followed by a valid line; reads stop at the last good line, appends are refused until it is repaired"
+    )]
     LineageCorrupt { path: String, offset: u64, records: Vec<serde_json::Value> },
     /// `locks.LockBusy` (a ValueError in Python).
     #[error("{what} is busy ({lock}); retry shortly")]

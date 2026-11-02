@@ -116,14 +116,34 @@ def install_durable(durable) -> None:
     for function in (canonical, dumps_sealed, frame, inspect_file, read_sealed_info, read_sealed, write_sealed,
                      atomic_write, replace_file, scan_file, scan_bytes, file_lock):
         setattr(durable, function.__name__, function)
+    class Verified:
+        """Stands in for the Python module's `_VERIFIED` memo: the tests only clear it."""
+
+        def clear(self):
+            rs.log_clear_verified()
+
     durable.AppendLog = AppendLog
+    durable._VERIFIED = Verified()
     durable.IMPL = "rust"
 
 
 def install_storelog(storelog) -> None:
     from hydralysis import durable
 
+    class Cache:
+        """Stands in for the Python module's `_CACHE` (cleared by tests, measured by `len`)."""
+
+        def clear(self):
+            rs.storelog_clear_cache()
+
+        def __len__(self):
+            return rs.storelog_cache_len()
+
+    def configure():  # the patchable constants of the Python module are honoured at call time
+        rs.storelog_configure(storelog.SNAPSHOT_EVERY, storelog.SNAPSHOT_LOG_BYTES, storelog.CACHE_ENTRIES)
+
     def save(path, record, *, max_bytes, too_large):
+        configure()
         rs.storelog_save(os.fspath(path), _dump(record), max_bytes, too_large)
 
     def read(path, record, reread=None):
@@ -149,5 +169,6 @@ def install_storelog(storelog) -> None:
 
     for function in (save, read, known_edits, diff, chain):
         setattr(storelog, function.__name__, function)
+    storelog._CACHE = Cache()
     storelog.IMPL = "rust"
     assert durable  # the durable module is installed first when HYDRALYSIS_IMPL=rust

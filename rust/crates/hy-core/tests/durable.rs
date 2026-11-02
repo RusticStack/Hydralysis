@@ -202,8 +202,7 @@ fn a_file_that_was_never_written_is_not_corruption() {
     let dir = tmp();
     let error = read_sealed(&dir.path().join("none.json")).unwrap_err();
     assert!(error.is_not_found());
-    let (value, source) =
-        sealed::read_sealed_info(&dir.path().join("none.json"), &ReadOptions::default(), Some(json!({}))).unwrap();
+    let (value, source) = sealed::read_sealed_info(&dir.path().join("none.json"), &ReadOptions::default(), Some(json!({}))).unwrap();
     assert_eq!((value, source), (json!({}), Source::Missing));
 }
 
@@ -228,8 +227,11 @@ fn a_bad_file_never_replaces_the_good_backup_and_is_preserved_aside() {
     std::fs::write(&target, b"{broken").unwrap();
     write_sealed_default(&target, &json!({"v": 3})).unwrap();
     assert_eq!(std::fs::read(backup_path(&target)).unwrap(), good_backup);
-    let asides: Vec<_> =
-        std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| n.contains(".corrupt-")).collect();
+    let asides: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".corrupt-"))
+        .collect();
     assert_eq!(asides.len(), 1, "{asides:?}");
 }
 
@@ -283,7 +285,7 @@ fn the_line_format_is_crc_hex8_space_json_lf_with_zlib_crc32() {
     let (crc, body) = text.trim_end().split_at(8);
     assert_eq!(&body[..1], " ");
     assert_eq!(body[1..].to_string(), r#"{"b":"\u00e9","a":1}"#);
-    assert_eq!(u32::from_str_radix(crc, 16).unwrap(), crc32fast::hash(body[1..].as_bytes()));
+    assert_eq!(u32::from_str_radix(crc, 16).unwrap(), crc32fast::hash(&body.as_bytes()[1..]));
 }
 
 #[test]

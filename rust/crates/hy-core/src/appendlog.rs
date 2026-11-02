@@ -24,6 +24,13 @@ pub const TAIL_WINDOW_MAX: u64 = 8 * 1024 * 1024;
 /// key -> end of the last line this process knows to be valid. An entry only lets a writer skip a scan.
 static VERIFIED: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Forget every "verified up to" memo (tests that rewrite logs behind this process; `durable._VERIFIED.clear()`).
+pub fn clear_verified() {
+    if let Ok(mut map) = VERIFIED.lock() {
+        map.clear();
+    }
+}
+
 /// `crc-hex8 SP json LF` for a record.
 pub fn frame(record: &Value) -> Vec<u8> {
     let body = json::dumps(record, FRAME);
@@ -156,13 +163,9 @@ pub fn scan_chunks<I: IntoIterator<Item = Vec<u8>>>(chunks: I, base: u64, collec
     }
     match bad_from {
         None => Scan { records, valid_end: total, size: total, torn_tail: None, corrupt: None },
-        Some(offset) => Scan {
-            records,
-            valid_end: offset,
-            size: total,
-            torn_tail: Some(Torn { offset, bytes: total - offset }),
-            corrupt: None,
-        },
+        Some(offset) => {
+            Scan { records, valid_end: offset, size: total, torn_tail: Some(Torn { offset, bytes: total - offset }), corrupt: None }
+        }
     }
 }
 

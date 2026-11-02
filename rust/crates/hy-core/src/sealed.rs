@@ -179,12 +179,20 @@ fn keep_previous(path: &Path) -> Result<()> {
 }
 
 /// Seal, keep the previous valid version as `.bak`, then replace atomically. Returns the bytes written.
-pub fn write_sealed(path: &Path, value: &Value, indent: Option<usize>, max_bytes: Option<usize>, too_large: Option<&str>) -> Result<Vec<u8>> {
+pub fn write_sealed(
+    path: &Path,
+    value: &Value,
+    indent: Option<usize>,
+    max_bytes: Option<usize>,
+    too_large: Option<&str>,
+) -> Result<Vec<u8>> {
     let payload = dumps_sealed(value, indent)?;
     if let Some(limit) = max_bytes
         && payload.len() > limit
     {
-        return Err(Error::value(too_large.map_or_else(|| format!("record would exceed {limit} bytes; existing file preserved"), str::to_string)));
+        return Err(Error::value(
+            too_large.map_or_else(|| format!("record would exceed {limit} bytes; existing file preserved"), str::to_string),
+        ));
     }
     crate::fsio::create_parent(path)?;
     keep_previous(path)?;
@@ -199,7 +207,8 @@ pub fn write_sealed_default(path: &Path, value: &Value) -> Result<Vec<u8>> {
 /// Read-modify-write a sealed record under a cross-process lock; no update is lost.
 pub fn update_sealed(path: &Path, update: impl FnOnce(&mut Value) -> Option<Value>, default: Option<Value>) -> Result<Value> {
     let lock_path = with_suffix(path, ".lock");
-    let _guard = lock::lock(&lock_path, LOCK_TIMEOUT_S, &format!("record {}", path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()))?;
+    let _guard =
+        lock::lock(&lock_path, LOCK_TIMEOUT_S, &format!("record {}", path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default()))?;
     let mut current = read_sealed_info(path, &ReadOptions::default(), Some(default.unwrap_or_else(|| Value::Object(Map::new()))))?.0;
     let result = update(&mut current);
     let value = result.unwrap_or(current);

@@ -6,8 +6,8 @@
 use hy_core::Error;
 use hy_core::appendlog::{self, AppendLog, Scan};
 use hy_core::{fsio, json, lock, sealed};
-use pyo3::exceptions::PyValueError;
 use pyo3::IntoPyObjectExt;
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use serde_json::{Value, json};
@@ -30,18 +30,36 @@ fn convert(py: Python<'_>, error: Error) -> PyErr {
             for (k, v) in reasons {
                 let _ = dict.set_item(k, v);
             }
-            instance(py, "hydralysis.durable", "StoreCorrupt", vec![path.into_bound_py_any(py).unwrap(), backup.into_bound_py_any(py).unwrap(), dict.into_any()])
+            instance(
+                py,
+                "hydralysis.durable",
+                "StoreCorrupt",
+                vec![path.into_bound_py_any(py).unwrap(), backup.into_bound_py_any(py).unwrap(), dict.into_any()],
+            )
         }
         Error::LineageCorrupt { path, offset, records } => {
             let list = PyList::empty(py);
             for r in records {
                 let _ = list.append(to_py(py, &r).ok());
             }
-            instance(py, "hydralysis.durable", "LineageCorrupt", vec![path.into_bound_py_any(py).unwrap(), offset.into_bound_py_any(py).unwrap(), list.into_any()])
+            instance(
+                py,
+                "hydralysis.durable",
+                "LineageCorrupt",
+                vec![path.into_bound_py_any(py).unwrap(), offset.into_bound_py_any(py).unwrap(), list.into_any()],
+            )
         }
-        Error::LockBusy { what, path, waited_s, retry_after_ms, .. } => {
-            instance(py, "hydralysis.locks", "LockBusy", vec![what.into_bound_py_any(py).unwrap(), path.into_bound_py_any(py).unwrap(), waited_s.into_bound_py_any(py).unwrap(), retry_after_ms.into_bound_py_any(py).unwrap()])
-        }
+        Error::LockBusy { what, path, waited_s, retry_after_ms, .. } => instance(
+            py,
+            "hydralysis.locks",
+            "LockBusy",
+            vec![
+                what.into_bound_py_any(py).unwrap(),
+                path.into_bound_py_any(py).unwrap(),
+                waited_s.into_bound_py_any(py).unwrap(),
+                retry_after_ms.into_bound_py_any(py).unwrap(),
+            ],
+        ),
         Error::FaultInjected(m) => instance(py, "hydralysis.durable", "FaultInjected", vec![m.into_bound_py_any(py).unwrap()]),
     }
 }
@@ -124,7 +142,13 @@ fn inspect_file(py: Python<'_>, path: PathBuf, max_bytes: Option<u64>, require_s
 /// Returns `(record_json, source)`; `default_json` is returned (source `missing`) when neither file exists.
 #[pyfunction]
 #[pyo3(signature = (path, default_json=None, max_bytes=None, require_seal=false))]
-fn read_sealed_info(py: Python<'_>, path: PathBuf, default_json: Option<String>, max_bytes: Option<u64>, require_seal: bool) -> PyResult<(String, String)> {
+fn read_sealed_info(
+    py: Python<'_>,
+    path: PathBuf,
+    default_json: Option<String>,
+    max_bytes: Option<u64>,
+    require_seal: bool,
+) -> PyResult<(String, String)> {
     let default = default_json.as_deref().map(parse).transpose()?;
     let options = sealed::ReadOptions { max_bytes, require_seal };
     let (value, source) = py.detach(|| sealed::read_sealed_info(&path, &options, default)).py(py)?;
@@ -182,7 +206,15 @@ fn log_of(path: PathBuf, lock_path: Option<PathBuf>, by: Option<String>, timeout
 
 #[pyfunction]
 #[pyo3(signature = (path, record, lock_path=None, by=None, timeout=None, lock_held=false))]
-fn log_append(py: Python<'_>, path: PathBuf, record: &str, lock_path: Option<PathBuf>, by: Option<String>, timeout: Option<f64>, lock_held: bool) -> PyResult<u64> {
+fn log_append(
+    py: Python<'_>,
+    path: PathBuf,
+    record: &str,
+    lock_path: Option<PathBuf>,
+    by: Option<String>,
+    timeout: Option<f64>,
+    lock_held: bool,
+) -> PyResult<u64> {
     let record = parse(record)?;
     let log = log_of(path, lock_path, by, timeout);
     py.detach(|| log.append(&record, lock_held)).py(py)
@@ -190,7 +222,14 @@ fn log_append(py: Python<'_>, path: PathBuf, record: &str, lock_path: Option<Pat
 
 #[pyfunction]
 #[pyo3(signature = (path, lock_path=None, by=None, timeout=None, lock_held=false))]
-fn log_repair(py: Python<'_>, path: PathBuf, lock_path: Option<PathBuf>, by: Option<String>, timeout: Option<f64>, lock_held: bool) -> PyResult<Option<String>> {
+fn log_repair(
+    py: Python<'_>,
+    path: PathBuf,
+    lock_path: Option<PathBuf>,
+    by: Option<String>,
+    timeout: Option<f64>,
+    lock_held: bool,
+) -> PyResult<Option<String>> {
     let log = log_of(path, lock_path, by, timeout);
     Ok(py.detach(|| log.repair(lock_held)).py(py)?.as_ref().map(text))
 }
@@ -288,6 +327,21 @@ fn storelog_known_edits(path: PathBuf) -> Option<String> {
 }
 
 #[pyfunction]
+fn storelog_configure(snapshot_every: u64, snapshot_log_bytes: usize, cache_entries: usize) {
+    hy_store::storelog::configure(snapshot_every, snapshot_log_bytes, cache_entries);
+}
+
+#[pyfunction]
+fn storelog_cache_len() -> usize {
+    hy_store::storelog::cache_len()
+}
+
+#[pyfunction]
+fn log_clear_verified() {
+    appendlog::clear_verified();
+}
+
+#[pyfunction]
 fn storelog_clear_cache() {
     hy_store::storelog::clear_cache();
 }
@@ -316,6 +370,9 @@ fn hydralysis_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(storelog_read, module)?)?;
     module.add_function(wrap_pyfunction!(storelog_known_edits, module)?)?;
     module.add_function(wrap_pyfunction!(storelog_clear_cache, module)?)?;
+    module.add_function(wrap_pyfunction!(storelog_configure, module)?)?;
+    module.add_function(wrap_pyfunction!(storelog_cache_len, module)?)?;
+    module.add_function(wrap_pyfunction!(log_clear_verified, module)?)?;
     module.add_class::<FileLock>()?;
     module.add("ABI", "abi3-py313")?;
     Ok(())

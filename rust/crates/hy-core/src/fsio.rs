@@ -182,7 +182,6 @@ pub fn read_optional(path: &Path, max_bytes: Option<u64>) -> Result<Option<Vec<u
     }
 }
 
-
 /// `(file id, mtime in ns, size)` of a file, the identity `os.stat` gives Python (`st_ino`, `st_mtime_ns`,
 /// `st_size`); `None` when it does not exist.
 pub fn file_identity(path: &Path) -> Option<(u64, i128, u64)> {
