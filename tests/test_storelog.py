@@ -285,6 +285,20 @@ class LoadCache(Base):
         second["edits"][0]["options"]["name"] = "Mutated"
         self.assertEqual(self.load(), first)
 
+    def test_a_file_that_becomes_stable_during_the_load_is_still_cached(self):
+        # the file is young when the load starts (its tail is part of the signature) and past STABLE_AGE_NS when it ends: the
+        # re-check must read the tail too, or the entry is never stored and a loaded machine misses the cache for good
+        store = self.edit(self.load(), 1)
+        workcopy._LOADED.clear()
+        real = workcopy._load_store_uncached
+
+        def ages(*args, **kwargs):
+            durable.STABLE_AGE_NS = 0
+            return real(*args, **kwargs)
+        with patch.object(durable, "STABLE_AGE_NS", 10 ** 15), patch.object(workcopy, "_load_store_uncached", ages):
+            self.load()
+            self.assertEqual(len(workcopy._LOADED), 1)
+
     def test_every_write_and_an_in_place_rewrite_of_the_same_size_are_seen(self):
         store = self.edit(self.load(), 1)
         self.assertEqual(self.load()["revision"], 1)
