@@ -1,15 +1,16 @@
 {
-  "release": "0.8.0 (the pin still says 12.3-hydra.5 until bump_hydra.py runs on the release zips)",
-  "testedCommit": "c60d6f7c16dc2a1a7733cb4666b64fafbd5c17f9",
+  "release": "0.8.0 (pins Hydra Engine 12.3-hydra.6, published 2026-11-02)",
+  "testedCommit": "37fed72f94784fa0304e4ee4808176c7206db569",
   "date": "2026-11-02",
   "machine": "Windows 11 Pro 10.0.26300, 24 logical processors, NTFS, Python 3.15, JDK 25.0.4.1 Temurin, Frida 17.24.3; machine shared with other lanes",
-  "engine": "locally assembled 12.3-hydra.6 install 'final2' (not the published zip, which does not exist yet; the engine's final gates ran on 'final2b'), HYDRALYSIS_INTEGRATION_UNPINNED=1",
+  "engine": "published 12.3-hydra.6 release zips (SHA-256 pinned by bump_hydra.py); suites below ran against the locally assembled identical-tree install 'final2'/'final2b'",
   "suites": {
     "unit + real engine (tools/run_tests.py -j 4 --strict --integration), final pass": "2020 of 2020, 0 failed alone, 2 failed only under load and passed alone (test_trace_e2e.M1 failure_mode_overflow and failure_modes_lose_the_producer...), 0 task problems (_logs/final2/hyd-integration3.log); earlier runs of the same pass: 1 failed alone (hyd-integration.log), 0 failed alone + 2 load-only (hyd-integration2.log); hyd-unit.log: 2019 tests, 3 failed alone (test_durable.WriteGate, test_trace_extras.Watchdog, test_views.Processes), fixed afterwards and not re-run",
-    "bump_hydra.py --release 12.3-hydra.6": "not run: it needs the release zips, which the release workflow has not built",
+    "bump_hydra.py --release 12.3-hydra.6": "run against the published zips; pins written in 6774442",
     "trace overhead (final run, noisy machine)": "paced 200 us frames +0.2% mean (+0.3% p50), tree CPU +14.7%; bare loop +22.6% mean / +10.9% p50, 486603 hits thinned and counted, 0 dropped (_logs/final2/overhead.log); perf-lane run on the bare loop 3.3-4.0% mean (docs/trace-overhead.md)",
     "not met / not established": "bare loop with every hit kept under 5% (exact mode +8.6%, ~70% records dropped and counted); aggregate counters not built; 2% sampled target only for inline-hooked plain call sites",
-    "not run": "hosted CI, soak on the final engine install, reproduction of the issue-6 overflow on the real binary"
+    "not run": "hosted CI, soak on the final engine install, reproduction of the issue-6 overflow on the real binary",
+    "final targeted rerun on the release commit (2026-11-02)": "463 tests over test_durable, test_trace_extras, test_views, test_storelog, test_decompile_*, test_trace_*, test_userscripts, test_release, test_bump_hydra, test_contracts: 461 pass; test_views K11 24-agent and Storm 24-publisher failed with LockBusy while the machine was saturated by other jobs and pass alone (2/2, 31 s); hosted-runner failures test_doctor wedged daemon (host JAVA_HOME) and test_viewpool RealWorker (process-wide pool disabled by an earlier test) were test isolation defects, fixed in 37fed72"
   },
   "note": "testedCommit is the commit of the earlier recorded run; the final-pass suites (E:/Projects/Hydra/_logs/final2/hyd-*.log) ran before the last Hydralysis fixes (trace/final2-hyd a6a09bf) and were not re-run on them"
 }
