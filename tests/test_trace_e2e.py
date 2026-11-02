@@ -69,6 +69,18 @@ class M1(unittest.TestCase):
             time.sleep(0.3)
         return live
 
+    def wait_segment(self, live, min_bytes=8192, timeout=60.0):
+        # readiness, not a fixed sleep: wait until the producer has written real batches to the segment (load-proof)
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            try:
+                if live.segment.stat().st_size >= min_bytes:
+                    return
+            except OSError:
+                pass
+            time.sleep(0.1)
+        self.fail("the producer wrote no batches to the segment")
+
     def events(self, live):
         return tc.read_events(live.segment, live.segment_id)
 
@@ -161,13 +173,13 @@ class M1(unittest.TestCase):
 
     def test_failure_modes_lose_the_producer_versus_a_clean_stop(self):
         live = self.traced("frameloop.exe", ["--frames=100000", "--spin-us=1000"], wait=False)
-        time.sleep(1.5)
+        self.wait_segment(live)
         stopped_alive = live.stop()["trace"]["health"]
         subprocess.run(["taskkill", "/F", "/PID", str(live.pid)], capture_output=True)
         self.assertEqual(stopped_alive["producer_state"], "final")                          # the producer reported its last counters
         self.assertEqual(stopped_alive["transport"]["batches_missing"], 0)
         killed = self.traced("frameloop.exe", ["--frames=100000", "--spin-us=1000"], wait=False)
-        time.sleep(1.5)
+        self.wait_segment(killed)
         subprocess.run(["taskkill", "/F", "/PID", str(killed.pid)], capture_output=True)
         time.sleep(1.0)
         health = killed.stop()["trace"]["health"]
