@@ -1,0 +1,11 @@
+[package]
+name = "hy-pe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zero-copy PE32/PE32+ reader for Hydralysis (replaces pefile)"
+
+[dependencies]
+memmap2.workspace = true
+sha2.workspace = true
+thiserror.workspace = true

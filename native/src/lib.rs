@@ -3,6 +3,7 @@
 
 use pyo3::prelude::*;
 
+mod pe;
 mod trace;
 use pyo3::types::PyBytes;
 
@@ -47,6 +48,7 @@ fn frame_lines(data: &Bound<'_, PyBytes>, start: usize) -> Vec<(usize, usize, bo
 fn hydralysis_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(frame_lines, module)?)?;
     trace::register(module)?;
+    pe::register(module)?;
     module.add("ABI", "abi3-py313")?;
     Ok(())
 }

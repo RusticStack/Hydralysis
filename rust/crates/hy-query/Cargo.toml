@@ -1,0 +1,14 @@
+[package]
+name = "hy-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hydralysis PE-side query tool bodies"
+
+[dependencies]
+hy-pe = { path = "../hy-pe" }
+hy-disasm = { path = "../hy-disasm" }
+regex.workspace = true
+memchr = "2"
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror.workspace = true
