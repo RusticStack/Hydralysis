@@ -8,9 +8,8 @@ Nothing here is a tag: a release is tagged by the owner.
 
 ## 0.8.0
 
-Released 2026-11-02 (the date the release was prepared; the tag is the owner's). 0.8.0 pins Hydra Engine `12.3-hydra.6` (protocol 3);
-the pin statements, version strings and archive hashes are written by `tools/bump_hydra.py` once the engine release zips exist, and are not
-part of this entry's commit.
+Released 2026-11-02. This release (0.8.0) pins Hydra Engine `12.3-hydra.6` (protocol 3), released 2026-11-02; the pin statements, version strings
+and archive hashes were written by `tools/bump_hydra.py` from the published release zips.
 
 Test runs for 0.8.0: unit plus engine-gated suite 2,020 of 2,020 against a locally assembled 12.3-hydra.6 install (the `final2` install, not
 the `final2b` install the engine's last gates ran on, and not the published zip): 0 failed alone, 2 failed only under load and passed alone

@@ -32,7 +32,7 @@ class Daemon:
         self.lock = threading.RLock()
         self.fail_next: dict[str, EngineError] = {}
         # What hello reports; tests change it to model an engine upgrade between syncs.
-        self.release = {"hydraVersion": "12.3-hydra.5", "ghidraVersion": "12.3"}
+        self.release = {"hydraVersion": "12.3-hydra.6", "ghidraVersion": "12.3"}
         self.fork_copy_ms = 7
         # What a real hydra.Engine sees through FakeClientModule (see FakeSession):
         # drops: connection losses to inject, {"command", "when": "before"|"after", "action": a script

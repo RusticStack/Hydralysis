@@ -23,6 +23,7 @@ statements in `README.md` and `THIRD_PARTY.md`.
 | 0.5.0 "qualified" | `12.3-hydra.3` | 2 | client only; the engine's locking is hydra.3's |
 | 0.6.0 (label OD11) | `12.3-hydra.4` | 3 (2 accepted with `hydra_allow_unpinned`) | adoption of the engine's capabilities |
 | 0.7.0 | `12.3-hydra.5` | 3 (2 accepted with `hydra_allow_unpinned`) | publish reliability and warm publish workers |
+| 0.8.0 | `12.3-hydra.6` | 3 (2 accepted with `hydra_allow_unpinned`) | semantic trace, owner-authorized runtime mode, decompile fallback jobs, adaptive trace sampling |
 
 A pinned client refuses an engine whose release stamp differs, unless `hydra_allow_unpinned` is set; then it accepts
 library protocols 2 to 3.
