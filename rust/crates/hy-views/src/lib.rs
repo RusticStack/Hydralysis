@@ -19,5 +19,6 @@ pub mod revisions;
 pub mod settle;
 pub mod store;
 pub mod viewgov;
+pub mod views;
 
 pub use error::{Error, PublishFailure, Result, ViewError};

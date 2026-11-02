@@ -123,7 +123,7 @@ fn is_hex32(id: &str) -> bool {
 }
 
 /// `analysis._edit`: `{id, address, options}` of a record, validated.
-fn edit_of(value: &Map<String, Value>) -> Result<Map<String, Value>> {
+pub fn edit_of(value: &Map<String, Value>) -> Result<Map<String, Value>> {
     if value
         .keys()
         .any(|k| !matches!(k.as_str(), "id" | "address" | "options"))
