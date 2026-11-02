@@ -349,6 +349,7 @@ struct Site {
     event: Option<String>,
     hook: Option<String>,
     fields: Vec<(String, String, String)>,
+    consts: Vec<(String, Value)>,
 }
 
 fn tick_ns(ticks: u64, freq: u64) -> u64 {
@@ -734,6 +735,9 @@ impl SegmentEncoder {
                 for (fname, ftype, source) in &site.fields {
                     m.insert(fname.clone(), self.field(ftype, source, r, &site, buf.as_ref()));
                 }
+                for (cname, cvalue) in &site.consts {
+                    m.insert(cname.clone(), cvalue.clone());
+                }
                 if has_ret {
                     m.insert("end_ns".into(), t_end.into());
                     m.insert("last_error".into(), r.last_error.into());
@@ -904,6 +908,26 @@ impl SegmentEncoder {
                                     dict_str(f, "source")?.unwrap_or_default(),
                                 ));
                             }
+                            v
+                        }
+                        _ => Vec::new(),
+                    },
+                    consts: match d.get_item("const")? {
+                        Some(x) if !x.is_none() => {
+                            let table = x.cast::<PyDict>().map_err(|_| err("const is a dict"))?;
+                            let mut v = Vec::new();
+                            for (k, val) in table.iter() {
+                                let name: String = k.extract()?;
+                                let value = if let Ok(b) = val.extract::<bool>() {
+                                    Value::from(b)
+                                } else if let Ok(n) = val.extract::<i64>() {
+                                    Value::from(n)
+                                } else {
+                                    Value::from(val.extract::<String>()?)
+                                };
+                                v.push((name, value));
+                            }
+                            v.sort_by(|a, b| a.0.cmp(&b.0));
                             v
                         }
                         _ => Vec::new(),

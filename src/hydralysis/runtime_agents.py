@@ -578,6 +578,13 @@ for(const v of verified){const pr=v.probe,t0=Date.now(),b=pr.buf;
   f.site_init(s,shared,pr.id,pr.nargs,flags,b?b.ptr_arg:-1,b&&b.len_arg!==null&&b.len_arg!==undefined?b.len_arg:-1,b&&b.fixed?b.fixed:0,b?b.max:0,pr.stack||1);
   listeners.push(Interceptor.attach(v.site,pr.with_leave?{onEnter:cm.on_enter,onLeave:cm.on_leave}:{onEnter:cm.on_enter},s));
   installed.push({id:pr.id,name:pr.name,address:v.site.toString(),install_ms:Date.now()-t0});}
+// Modules loaded and unloaded while recording: a reload at another base is a new instance (TRACE-1 section 7). The
+// observer reports the modules already mapped first; those are recorded by the worker at start, so they are skipped.
+let moduleObserver=null,observing=false;
+try{moduleObserver=Process.attachModuleObserver({
+  onAdded(m){if(observing)send({event:'trace_module',op:'load',name:m.name,path:m.path,base:m.base.toString(),size:m.size,t:qpcNow().toString()});},
+  onRemoved(m){if(observing)send({event:'trace_module',op:'unload',name:m.name,path:m.path,base:m.base.toString(),size:m.size,t:qpcNow().toString()});}});}catch(e){moduleObserver=null;}
+observing=true;
 f.set_mode(shared,1);
 send({event:'trace_ready',context,qpc_freq:qpcFreq.toString(),producer_gen:P.producer_gen,pid:Process.id,arch:Process.arch,
   rings:P.rings,ring_bytes:P.ring_bytes,batch_ms:P.batch_ms,bp_us:P.bp_us,window:P.window,installed,qpc:qpcNow().toString(),fls_index:fls});
@@ -593,6 +600,7 @@ rpc.exports={
     acked=batchSeq;           // the writer is being closed: drain what is left without waiting for acknowledgements
     for(let i=0;i<64;i++){if(flush()===0)break;acked=batchSeq;}
     for(const l of listeners)l.detach();
+    observing=false;if(moduleObserver!==null){try{moduleObserver.detach();}catch(e){}moduleObserver=null;}
     Interceptor.flush();
     const t0=Date.now();let stable=0,ok=false;
     while(Date.now()-t0<timeoutMs){

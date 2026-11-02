@@ -83,6 +83,7 @@ class TraceSource:
         self.lock = threading.Lock()
         self.sites = sites
         self.lifetimes_done = False
+        self.qpc_freq = int(qpc_freq)
         self.modules_seen: set = set()
         self.notify = notify
         self._fd: int | None = None
@@ -236,6 +237,25 @@ class TraceSource:
                 self._append(self.encoder.encode_event("core.module.load", now, payload))
                 written += 1
         return written
+
+    def on_module(self, message: dict) -> None:
+        """A module loaded or unloaded while recording (the agent's module observer): a lifetime fact with the base it had."""
+        with self.lock:
+            if self.finalized:
+                return
+            try:
+                ticks, base = int(message["t"]), int(str(message["base"]), 0)
+            except (KeyError, ValueError):
+                self.errors.append("module message: %r" % (message,))
+                return
+            t_ns = ticks * 1_000_000_000 // (self.qpc_freq or 10_000_000)
+            load = message.get("op") == "load"
+            payload = {"name": message.get("name"), "path": message.get("path"), "base": base, "size": int(message.get("size") or 0),
+                       "observed": "live"}
+            if load:
+                payload["build"] = None
+                self.modules_seen.add((message.get("name"), message.get("base")))
+            self._append(self.encoder.encode_event("core.module.load" if load else "core.module.unload", t_ns, payload))
 
     def refuse(self, what: str, reason: str, limitation: str | None = None) -> None:
         """A capability that was asked for and not given (an optional hook, ETW without elevation): recorded as a source event."""

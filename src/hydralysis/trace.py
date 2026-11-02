@@ -603,7 +603,8 @@ def _query_fields(options: dict, limit: int) -> dict:
     return {"kinds": _strings(options.get("kinds"), "options.kinds") or None, **{k: flt.get(k) for k in _FILTER_KEYS},
             "group_by": group, "after": options.get("cursor", options.get("after")), "up_to": options.get("up_to"),
             "with_symbols": options.get("with_symbols") or None,
-            "interp": options.get("interpretation", options.get("interp")), "limit": limit}
+            "interp": options.get("interpretation", options.get("interp")), "lifetimes": options.get("lifetimes") or None,
+            "limit": limit}
 
 
 def _query(client: TraceClient, session: str, options: dict, limit: int) -> dict:

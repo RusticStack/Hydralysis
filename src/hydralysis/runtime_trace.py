@@ -93,6 +93,9 @@ class TraceMixin:
         if event == "trace_counters":
             trace.on_counters(payload)
             return True
+        if event == "trace_module":
+            trace.on_module(payload)
+            return True
         if event == "trace_ready":
             self.trace_info["ready"] = payload
             trace.on_ready(payload)
@@ -159,7 +162,7 @@ class TraceMixin:
                 "module_name": module["name"], "base": module["base"], "rva": rva, "expect": expected, "nargs": nargs,
                 "with_leave": bool(spec.get("with_leave")) or any(f["source"] == "ret" for f in fields), "buf": buf,
                 "va": int(address, 16), "module_sha256": module["file_sha256"], "payload": bool(spec.get("payload")),
-                "stack": stack, "event": spec.get("event"), "hook": spec.get("hook"), "fields": fields,
+                "stack": stack, "event": spec.get("event"), "hook": spec.get("hook"), "fields": fields, "const": dict(spec.get("const") or {}),
                 "buf_arg": buf["ptr_arg"] if buf else None}
 
     def _loaded_name(self, name: str) -> str:
@@ -253,7 +256,7 @@ class TraceMixin:
         sites = {p["id"]: {"name": p["name"], "kind": p["kind"], "module": p["module_name"], "va": p["va"],
                            "buf": ("payload" if p["payload"] else ("id" if p["buf"] else None)), "preview": p["preview"],
                            **({"buf_arg": p["buf_arg"]} if p["buf_arg"] is not None else {}),
-                           **({"event": p["event"], "hook": p["hook"] or p["name"], "fields": p["fields"]} if p["kind"] == "event" else {})}
+                           **({"event": p["event"], "hook": p["hook"] or p["name"], "fields": p["fields"], "const": p.get("const") or {}} if p["kind"] == "event" else {})}
                  for p in probes}
         self.trace = TraceSource(self.directory, session=self.directory.name, producer_gen=gen, process_id=self.pid, sites=sites,
                                  qpc_freq=qpc_frequency(), fault_policy=policy, payload_authorized=bool(auth),
