@@ -1,0 +1,96 @@
+# Baseline profile for the Hydralysis trace FIXTURES only (tests/fixtures/trace_app.c and friends).
+# No target-specific profile ships with Hydralysis (spec 5.2): a project keeps its own. This one is bound to
+# the fixtures by name; the fixture build supplies the image hashes, so it is marked fixtures_only and lists none.
+# Hooks sit on the fixtures' own exported probe points (fx_*). Prologues are the exact alternatives that
+# MSVC /O2 x64 emits for those small functions; any other byte sequence refuses the hook.
+
+[profile]
+id = "fixtures-baseline/1"
+domain = "app"
+description = "Fixtures-only baseline: file and registry opens, a feature toggle and a frame loop."
+
+[target]
+bitness = 64
+modules = ["trace_app.exe"]
+fixtures_only = true
+
+[host]
+os = "windows-x64"
+fault_policy = "tolerant"
+record_handler_chain = true
+
+[[event_kinds]]
+name = "app.feature"
+extends = "core.state.write"
+description = "A configuration toggle changed."
+[event_kinds.payload]
+feature = "key"
+enabled = "bool"
+
+[[event_kinds]]
+name = "app.frame"
+extends = "core.marker"
+[event_kinds.payload]
+frame = "u64"
+stage = "string?"
+
+[[hooks]]
+id = "file-open"
+event = "core.resource.open"
+symbol = "fx_open"
+required = true
+prologue = ["40 53 48 83 EC ??", "48 89 5C 24 ??", "48 83 EC ??"]
+capture = ["path:string", "status:u32"]
+
+[[hooks]]
+id = "feature-gate"
+event = "app.feature"
+symbol = "fx_feature"
+required = true
+prologue = ["40 53 48 83 EC ??", "48 89 5C 24 ??", "48 83 EC ??"]
+capture = ["feature:key", "enabled:bool"]
+
+[[hooks]]
+id = "frame-begin"
+event = "app.frame"
+symbol = "fx_frame_begin"
+required = false
+prologue = ["40 53 48 83 EC ??", "48 83 EC ??", "48 89 5C 24 ??"]
+
+[[hooks]]
+id = "frame-end"
+event = "app.frame"
+symbol = "fx_frame_end"
+required = false
+prologue = ["40 53 48 83 EC ??", "48 83 EC ??", "48 89 5C 24 ??"]
+
+[identity]
+resource = "path"
+state = "profile_object_offset"
+
+[[roles]]
+id = "main"
+resolve = "function"
+value = "frame-begin"
+
+[[phases]]
+id = "frame"
+kind = "frame"
+open = "frame-begin"
+close = "frame-end"
+
+[diff]
+group_by = ["kind", "resource.key", "function"]
+align = ["phase", "frame_offset"]
+
+[[stores]]
+id = "settings"
+kind = "file"
+path = "trace_app.cfg"
+
+[[queries]]
+id = "app.registry.consumers"
+description = "Which functions open which resources."
+kinds = ["core.resource.open"]
+group_by = ["resource.key", "function"]
+limit = 50

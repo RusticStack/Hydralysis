@@ -7,6 +7,9 @@ with a file the manifest does not list is refused.
     evidence.jsonl    one line per claim, sorted by evidence_id: {evidence_id, content, meta}
     subjects.json     the games, builds and subject hashes the claims are about, with counts
     captures/<id>.json  bounded captures that claims cite through `from_capture`
+    traces/<session>.json  for every trace session a claim cites through `from_trace`: the pinned revisions, the
+                        events and the authorized artifact ranges (hashes, never bytes) the claim can be re-read
+                        from, or what cannot be reproduced and why (a pin that was not supplied is such a case)
     replay.json       the claims that came from a replay or a capture, with their sources
     environment.json  the exporting environment (volatile)
     limitations.md    the limitation codes in use, in words, and which claim carries which
@@ -45,9 +48,11 @@ MAX_ENCODED_RUN = 8192
 MAX_CAPTURE_BYTES = 1024 * 1024
 MAX_FILE_BYTES = 64 * 1024 * 1024
 MAX_CAPTURES = 256
+MAX_TRACES = 64
+TRACE_PIN_FORMAT = "hydralysis.trace-pin/1"
 _ENCODED = re.compile(r"^[0-9A-Fa-f\s]+$|^[A-Za-z0-9+/=\s_-]+$")
 _NAME = re.compile(r"^(?:manifest\.json|evidence\.jsonl|subjects\.json|replay\.json|environment\.json|limitations\.md|"
-                   r"captures/[A-Za-z0-9_][A-Za-z0-9_.-]{0,79}\.json)$")
+                   r"(?:captures|traces)/[A-Za-z0-9_][A-Za-z0-9_.-]{0,79}\.json)$")
 # Files whose bytes may differ between two exports of the same claims.
 VOLATILE_FILES = ("manifest.json", "environment.json", "evidence.jsonl")
 
@@ -117,18 +122,100 @@ def _subjects(records: list[dict]) -> dict:
                          for (game, build, digest), count in sorted(counts.items())]}
 
 
-def _replay(records: list[dict], captured: set[str]) -> dict:
+def _replay(records: list[dict], captured: set[str], traces: dict | None = None) -> dict:
     scenarios = []
     missing = set()
+    unreproducible = {}
     for record in records:
         content = record["content"]
-        if content["authority"] == "controlled-replay" or content["from_capture"]:
+        trace = content.get("from_trace")
+        if content["authority"] == "controlled-replay" or content["from_capture"] or trace:
             capture = content["from_capture"]
-            scenarios.append({"evidence_id": record["evidence_id"], "authority": content["authority"],
-                              "name": content["name"], "source": content["source"], "from_capture": capture})
+            scenario = {"evidence_id": record["evidence_id"], "authority": content["authority"],
+                        "name": content["name"], "source": content["source"], "from_capture": capture}
+            if trace:
+                scenario["from_trace"] = {"session": trace["session"], "revision": trace["revision"]}
+                pin = (traces or {}).get(trace["session"])
+                if pin is None or not pin.get("reproducible"):
+                    unreproducible[trace["session"]] = (pin or {}).get("cannot_reproduce") or [
+                        {"what": "trace session %s" % trace["session"], "reason": "pin-not-supplied"}]
+            scenarios.append(scenario)
             if capture and capture not in captured:
                 missing.add(capture)
-    return {"scenarios": scenarios, "missing_captures": sorted(missing)}
+    result = {"scenarios": scenarios, "missing_captures": sorted(missing)}
+    if unreproducible:  # only a bundle that cites traces carries this key, so older bundles keep their bytes
+        result["unreproducible_traces"] = {key: unreproducible[key] for key in sorted(unreproducible)}
+    return result
+
+
+def check_pin(pin, session: str) -> dict:
+    """Validate a trace pin (the `traces/<session>.json` member) and return it."""
+    def bad(message: str):
+        return BundleError("trace_pin_invalid", "trace pin %s: %s" % (session, message), session=session)
+    if not isinstance(pin, dict) or pin.get("format") != TRACE_PIN_FORMAT or pin.get("trace_id") != session:
+        raise bad("must be a %s object whose trace_id is the session" % TRACE_PIN_FORMAT)
+    if isinstance(pin.get("revision"), bool) or not isinstance(pin.get("revision"), int) or pin["revision"] < 0:
+        raise bad("revision must be a non-negative integer")
+    if not isinstance(pin.get("reproducible"), bool):
+        raise bad("reproducible must be true or false")
+    for key in ("events", "artifacts", "cannot_reproduce"):
+        if not isinstance(pin.get(key), list):
+            raise bad("%s must be a list" % key)
+    if not all(isinstance(item, str) for item in pin["events"]):
+        raise bad("events are event id strings")
+    for artifact in pin["artifacts"]:
+        if (not isinstance(artifact, dict) or not isinstance(artifact.get("sha256"), str) or len(artifact["sha256"]) != 64
+                or not isinstance(artifact.get("range"), list) or len(artifact["range"]) != 2
+                or artifact.get("authorized") is not True):
+            raise bad("an artifact is {id, sha256, range:[start,end], authorized:true}: unauthorized ranges are listed "
+                      "under cannot_reproduce, never pinned")
+        if "bytes" in artifact or "data" in artifact:
+            raise bad("a pin carries artifact hashes and ranges, not bytes")
+    for item in pin["cannot_reproduce"]:
+        if not isinstance(item, dict) or not isinstance(item.get("what"), str) or not isinstance(item.get("reason"), str):
+            raise bad("cannot_reproduce entries are {what, reason}")
+    if pin["reproducible"] and pin["cannot_reproduce"]:
+        raise bad("reproducible is true but cannot_reproduce is not empty")
+    if not pin["reproducible"] and not pin["cannot_reproduce"]:
+        raise bad("not reproducible without saying what cannot be reproduced")
+    return pin
+
+
+def stub_pin(session: str, revision: int) -> dict:
+    """The member written for a cited session whose pin was not supplied: it lists what cannot be reproduced."""
+    return {"format": TRACE_PIN_FORMAT, "trace_id": session, "session": session, "revision": revision,
+            "interpretation_revision": None, "events": [], "artifacts": [], "reproducible": False,
+            "cannot_reproduce": [{"what": "trace session %s at revision %d" % (session, revision),
+                                  "reason": "pin-not-supplied"}]}
+
+
+def _load_traces(traces_dir: Path | None, records: list[dict]) -> dict[str, dict]:
+    """A pin for every session the claims cite: the supplied one, or a stub that says it cannot be reproduced."""
+    cited: dict[str, int] = {}
+    for record in records:
+        trace = record["content"].get("from_trace")
+        if trace:
+            cited[trace["session"]] = max(cited.get(trace["session"], 0), trace["revision"])
+    if len(cited) > MAX_TRACES:
+        raise BundleError("payload_refused", "too many cited trace sessions (%d, at most %d)" % (len(cited), MAX_TRACES))
+    found: dict[str, dict] = {}
+    for session in sorted(cited):
+        file = Path(traces_dir) / (session + ".json") if traces_dir is not None else None
+        if file is not None and file.is_file():
+            data = file.read_bytes()
+            if len(data) > MAX_CAPTURE_BYTES:
+                raise BundleError("payload_refused", "trace pin %s is %d bytes; at most %d" % (session, len(data), MAX_CAPTURE_BYTES))
+            try:
+                pin = check_pin(json.loads(data.decode("utf-8")), session)
+            except BundleError:
+                raise
+            except ValueError as exc:
+                raise BundleError("trace_pin_invalid", "trace pin %s is not JSON: %s" % (session, exc)) from exc
+            guard_payload(pin, "trace pin %s" % session)
+            found[session] = pin
+        else:
+            found[session] = stub_pin(session, cited[session])
+    return found
 
 
 def _limitations(records: list[dict]) -> dict:
@@ -153,12 +240,16 @@ def _limitations_md(table: dict) -> bytes:
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def bundle_id_of(records: list[dict], subjects: dict, capture_hashes: dict, replay: dict, limitations: dict) -> str:
+def bundle_id_of(records: list[dict], subjects: dict, capture_hashes: dict, replay: dict, limitations: dict,
+                 trace_hashes: dict | None = None) -> str:
     """The identity of what a bundle says; volatile fields never enter it."""
-    return "eb_" + canonical_digest({
+    said = {
         "format": FORMAT, "records": [record["evidence_id"] for record in records], "subjects": subjects,
         "captures": capture_hashes, "replay": replay, "limitations": sorted(limitations),
-    })
+    }
+    if trace_hashes:  # a bundle without trace citations keeps the id it always had
+        said["traces"] = trace_hashes
+    return "eb_" + canonical_digest(said)
 
 
 def _load_captures(captures_dir: Path | None, wanted: set[str]) -> dict[str, bytes]:
@@ -186,7 +277,7 @@ def _load_captures(captures_dir: Path | None, wanted: set[str]) -> dict[str, byt
 
 
 def export_bundle(db_path: Path, out: Path, *, game: str = "", subsystem: str = "", build: str = "",
-                  captures_dir: Path | None = None, overwrite: bool = False) -> dict:
+                  captures_dir: Path | None = None, overwrite: bool = False, traces_dir: Path | None = None) -> dict:
     """Write the selected claims (superseded ones too) as a bundle folder, atomically."""
     out = Path(out)
     if out.exists() and not overwrite:
@@ -203,11 +294,14 @@ def export_bundle(db_path: Path, out: Path, *, game: str = "", subsystem: str = 
     captures = _load_captures(captures_dir, cited)
     if len(captures) > MAX_CAPTURES:
         raise BundleError("payload_refused", "too many captures (%d, at most %d)" % (len(captures), MAX_CAPTURES))
+    pins = _load_traces(traces_dir, records)
+    trace_blobs = {session: _json_bytes(pin) for session, pin in pins.items()}
     subjects = _subjects(records)
-    replay = _replay(records, set(captures))
+    replay = _replay(records, set(captures), pins)
     limitations = _limitations(records)
     capture_hashes = {key: hashlib.sha256(data).hexdigest() for key, data in sorted(captures.items())}
-    bundle_id = bundle_id_of(records, subjects, capture_hashes, replay, limitations)
+    trace_hashes = {key: hashlib.sha256(data).hexdigest() for key, data in sorted(trace_blobs.items())}
+    bundle_id = bundle_id_of(records, subjects, capture_hashes, replay, limitations, trace_hashes)
     from hydralysis import __version__
     exported_at = evidence._now()
     environment = {"hydralysis": __version__, "python": platform.python_version(), "platform": sys.platform,
@@ -216,6 +310,8 @@ def export_bundle(db_path: Path, out: Path, *, game: str = "", subsystem: str = 
              "environment.json": _json_bytes(environment), "limitations.md": _limitations_md(limitations)}
     for key, data in captures.items():
         files["captures/%s.json" % key] = data
+    for key, data in trace_blobs.items():
+        files["traces/%s.json" % key] = data
     manifest = {"format": FORMAT, "bundle_id": bundle_id, "records": len(records),
                 "filter": {"game": game, "subsystem": subsystem, "build": build},
                 "files": {name: {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
@@ -242,8 +338,12 @@ def export_bundle(db_path: Path, out: Path, *, game: str = "", subsystem: str = 
     finally:
         if stage.exists():
             shutil.rmtree(stage, ignore_errors=True)
-    return {"bundle": str(out), "bundle_id": bundle_id, "records": len(records), "captures": len(captures),
-            "missing_captures": replay["missing_captures"], "limitations": sorted(limitations)}
+    result = {"bundle": str(out), "bundle_id": bundle_id, "records": len(records), "captures": len(captures),
+              "missing_captures": replay["missing_captures"], "limitations": sorted(limitations)}
+    if pins:
+        result["traces"] = len(pins)
+        result["unreproducible_traces"] = sorted(session for session, pin in pins.items() if not pin["reproducible"])
+    return result
 
 
 # ---- reading and verifying -----------------------------------------------------------------------------------
@@ -296,7 +396,7 @@ def load_bundle(folder: Path) -> dict:
             raise BundleError("bundle_record_invalid", "evidence.jsonl line %d is not JSON: %s" % (number, exc)) from exc
         if not isinstance(record, dict) or set(record) != {"evidence_id", "content", "meta"} or not isinstance(record["content"], dict):
             raise BundleError("bundle_record_invalid", "evidence.jsonl line %d is not {evidence_id, content, meta}" % number)
-        if set(record["content"]) != set(evidence.CONTENT_KEYS):
+        if not evidence.content_keys_ok(record["content"]):
             raise BundleError("bundle_record_invalid", "evidence.jsonl line %d has content fields that are not those of "
                               "the evidence model" % number)
         try:
@@ -324,22 +424,47 @@ def load_bundle(folder: Path) -> dict:
         if not isinstance(parsed, dict) or parsed.get("capture_id") != capture_id:
             raise BundleError("capture_invalid", "capture %s does not carry its own capture_id" % capture_id)
         guard_payload(parsed, "capture %s" % capture_id)
+    pins = {}
+    for name in sorted(blobs):
+        if name.startswith("traces/"):
+            session = name[len("traces/"):-len(".json")]
+            try:
+                pins[session] = check_pin(json.loads(blobs[name].decode("utf-8")), session)
+            except BundleError:
+                raise
+            except ValueError as exc:
+                raise BundleError("trace_pin_invalid", "trace pin %s is not JSON: %s" % (session, exc)) from exc
+            guard_payload(pins[session], "trace pin %s" % session)
+            if blobs[name] != _json_bytes(pins[session]):
+                raise BundleError("bundle_not_canonical", "%s is not in canonical form" % name, file=name)
+    cited = {record["content"]["from_trace"]["session"] for record in records if record["content"].get("from_trace")}
+    if cited != set(pins):
+        raise BundleError("bundle_derived_mismatch", "the trace members are not the sessions the claims cite (cited: %s, "
+                          "present: %s)" % (", ".join(sorted(cited)) or "none", ", ".join(sorted(pins)) or "none"))
+    for record in records:
+        trace = record["content"].get("from_trace")
+        pin = pins.get(trace["session"]) if trace else None
+        if pin is not None and pin["reproducible"] and (pin["revision"] < trace["revision"]
+                                                        or not set(trace["events"]) <= set(pin["events"])):
+            raise BundleError("trace_pin_invalid", "trace pin %s does not pin revision %d and the events claim %s cites"
+                              % (trace["session"], trace["revision"], record["evidence_id"]), session=trace["session"])
     subjects = _subjects(records)
-    replay = _replay(records, set(captures))
+    replay = _replay(records, set(captures), pins)
     limitations = _limitations(records)
     for name, expected in (("subjects.json", _json_bytes(subjects)), ("replay.json", _json_bytes(replay)),
                            ("limitations.md", _limitations_md(limitations))):
         if blobs[name] != expected:
             raise BundleError("bundle_derived_mismatch", "%s does not say what the records say" % name, file=name)
     capture_hashes = {key: hashlib.sha256(data).hexdigest() for key, data in sorted(captures.items())}
-    bundle_id = bundle_id_of(records, subjects, capture_hashes, replay, limitations)
+    trace_hashes = {key: hashlib.sha256(blobs["traces/%s.json" % key]).hexdigest() for key in sorted(pins)}
+    bundle_id = bundle_id_of(records, subjects, capture_hashes, replay, limitations, trace_hashes)
     if bundle_id != manifest.get("bundle_id"):
         raise BundleError("bundle_id_mismatch", "bundle_id is %s but the contents hash to %s"
                           % (manifest.get("bundle_id"), bundle_id))
     known = {record["evidence_id"] for record in records}
     dangling = sorted({link for record in records for link in record["content"]["evidence_links"] if link not in known})
     return {"bundle_id": bundle_id, "manifest": manifest, "records": records, "subjects": subjects, "replay": replay,
-            "limitations": limitations, "captures": capture_hashes, "files": manifest["files"],
+            "limitations": limitations, "captures": capture_hashes, "traces": pins, "files": manifest["files"],
             "environment": json.loads(blobs["environment.json"].decode("utf-8")), "dangling_links": dangling,
             "capture_blobs": captures}
 
@@ -352,7 +477,10 @@ def verify_bundle(folder: Path) -> dict:
         return {"ok": False, **exc.payload()}
     return {"ok": True, "bundle_id": loaded["bundle_id"], "records": len(loaded["records"]),
             "captures": len(loaded["captures"]), "missing_captures": loaded["replay"]["missing_captures"],
-            "dangling_links": loaded["dangling_links"], "limitations": sorted(loaded["limitations"])}
+            "dangling_links": loaded["dangling_links"], "limitations": sorted(loaded["limitations"]),
+            **({"traces": len(loaded["traces"]),
+                "unreproducible_traces": sorted(loaded["replay"].get("unreproducible_traces", {}))}
+               if loaded["traces"] else {})}
 
 
 # ---- comparing -----------------------------------------------------------------------------------------------
@@ -387,6 +515,12 @@ def compare_bundles(left: Path, right: Path) -> dict:
             changes.append({"entity": "capture", "key": capture_id,
                             "classification": "added" if left_hash is None else "removed" if right_hash is None else "changed",
                             "left_digest": left_hash, "right_digest": right_hash})
+    for session in sorted(set(one["traces"]) | set(two["traces"])):
+        left_pin, right_pin = one["traces"].get(session), two["traces"].get(session)
+        if left_pin != right_pin:
+            changes.append({"entity": "trace", "key": session,
+                            "classification": "added" if left_pin is None else "removed" if right_pin is None else "changed",
+                            "left_revision": (left_pin or {}).get("revision"), "right_revision": (right_pin or {}).get("revision")})
     for code in sorted(set(one["limitations"]) ^ set(two["limitations"])):
         changes.append({"entity": "limitation", "key": code,
                         "classification": "added" if code in two["limitations"] else "removed"})
@@ -438,6 +572,7 @@ def handle(capability: str, request: dict) -> str:
                                    game=str(options.get("target") or options.get("game") or ""),
                                    subsystem=str(options.get("subsystem") or ""), build=str(options.get("build") or ""),
                                    captures_dir=_absolute(options["captures"], "options.captures") if options.get("captures") else None,
+                                   traces_dir=_absolute(options["traces"], "options.traces") if options.get("traces") else None,
                                    overwrite=bool(options.get("overwrite")))
         elif op == "verify":
             result = verify_bundle(_absolute(options.get("bundle"), "options.bundle"))
@@ -463,6 +598,7 @@ def main(argv: list[str] | None = None) -> int:
     export.add_argument("--subsystem", default="")
     export.add_argument("--build", default="")
     export.add_argument("--captures", default="", help="folder with <capture_id>.json files to include")
+    export.add_argument("--traces", default="", help="folder with <session>.json trace pins to include")
     export.add_argument("--overwrite", action="store_true")
     verify = sub.add_parser("verify", help="prove a bundle: file hashes, every evidence id, bundle_id")
     verify.add_argument("bundle")
@@ -479,6 +615,7 @@ def main(argv: list[str] | None = None) -> int:
             result = export_bundle(evidence_path(arguments.db), Path(arguments.out), game=arguments.game,
                                    subsystem=arguments.subsystem, build=arguments.build,
                                    captures_dir=Path(arguments.captures) if arguments.captures else None,
+                                   traces_dir=Path(arguments.traces) if arguments.traces else None,
                                    overwrite=arguments.overwrite)
         elif arguments.command == "verify":
             result = verify_bundle(Path(arguments.bundle))

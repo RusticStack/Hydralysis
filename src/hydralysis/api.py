@@ -65,6 +65,7 @@ TOOL_NAMES = (
     "prepare",
     "job",
     "runtime",
+    "trace",
 )
 
 # Backward-compatible terminal commands; these are not extra MCP tools.
@@ -97,7 +98,8 @@ REJECTED = (
 # Where the catalog is reported: backend status, backend help and backend inspect (api.py), and the
 # MCP initialize result under _meta (mcp.py). ghidra_query status is built in query.py and does not carry it.
 # Everything added after epoch 1 rides the free-form `options` objects (see OPTION_BAGS).
-CATALOG_EPOCH = 2
+# Epoch 3 adds the `trace` tool (Hydralysis 0.8.0: the 21st tool) and the `from_trace` source of evidence_add.
+CATALOG_EPOCH = 3
 
 # Which `options` bag carries which feature (PROTOCOL-3.md 7.7). The bags are free-form objects
 # in the schema, so a later package changes a handler, never the schema.
@@ -111,6 +113,10 @@ OPTION_BAGS = {
                   "of the call, D59)",
     "job": "status/cancel filters (kind, cid) for commit and backup jobs",
     "runtime": "per-action options (exists)",
+    "trace": "per-action options: start (profile, images, scenario, scope, launch, capture), query (kinds, filter, group_by, "
+             "cursor, revision, interpretation, profile_query), diff (against, group_by, align), explain (event_id, depth, "
+             "direction), mark (label, note), export (out, format), check (assertions), import (input), resymbolize; "
+             "offline=true runs import/verify/rebuild/export on files; every action takes limit",
 }
 
 # The handler registry (PROTOCOL-3.md 8.2, D34). A capability name maps to the module that implements it. The module is
@@ -215,7 +221,7 @@ def tool_table() -> list[dict]:
         tool("evidence_add", "Store one proved claim (note and source required), attributed to this client; subsystem groups it; supersedes=<id> replaces an older claim, keeping it.", {
             "target": string, "build": string, "kind": string, "name": string,
             "note": string, "source": string, "address": string, "prologue": string, "db": string,
-            "subsystem": string, "supersedes": integer,
+            "subsystem": string, "supersedes": integer, "from_trace": options,
         }, ["target", "build", "kind", "name", "note", "source"]),
         tool("evidence_list", "Claims, newest first, by target/subsystem/address/build; superseded ones on request. export=<path.md> writes a subsystem (and .jsonl).", {
             "target": string, "limit": integer, "db": string, "subsystem": string, "address": string, "build": string,
@@ -247,6 +253,10 @@ def tool_table() -> list[dict]:
         tool("runtime", "Own-process debugging/instrumentation sessions: spawn/attach, modules, memory, verified probes/breakpoints, registers, continue and detach. Use backend help for options.", {
             "action": string, "options": options,
         }, ["action"]),
+        tool("trace", "Semantic traces: what a running or recorded program did, cited and bounded. Actions start/stop (capture via runtime), status, query, diff, explain, mark, export, check, import, resymbolize. Replies carry counts, event ids, revision and coverage gaps. See backend help.", {
+            "action": {"type": "string", "enum": ["start", "stop", "status", "query", "diff", "explain", "mark", "export", "check", "import", "resymbolize"]},
+            "session": string, "options": options,
+        }, ["action"]),
     ]
 
 
@@ -271,6 +281,9 @@ def call(name: str, args: dict | None) -> str:
         return image.header() + "\n" + json.dumps(image.fingerprint(), indent=2)
     if name in ("backend", "prepare", "job", "runtime"):
         return _workflow(name, args)
+    if name == "trace":
+        from hydralysis import trace
+        return trace.call(args, _settings())
     if name == "sections":
         return _image(args).sections_text()
     if name == "imports":
@@ -347,6 +360,7 @@ def call(name: str, args: dict | None) -> str:
             prologue=str(args.get("prologue") or ""),
             subsystem=str(args.get("subsystem") or ""),
             supersedes=int(args["supersedes"]) if args.get("supersedes") is not None else None,
+            from_trace=args.get("from_trace") or None,
         )
     if name == "evidence_list":
         path = evidence_path(str(args.get("db") or ""))
@@ -414,7 +428,7 @@ def call(name: str, args: dict | None) -> str:
 
 def instructions() -> str:
     return (
-        "Hydralysis %s. Twenty tools for any PE you own. prepare adopts an analysed project in place, "
+        "Hydralysis %s. Twenty-one tools for any PE you own. prepare adopts an analysed project in place, "
         "or imports/analyses a new executable exactly once as a durable job, and registers its build; "
         "backend discovers/installs the engines, never their MCPs. job reports progress. "
         "runtime manages verified debugging/instrumentation sessions. inspect is the function "
@@ -425,6 +439,7 @@ def instructions() -> str:
         "one warm engine serves CLI, MCP and script clients; export writes bulk artifacts as a job. "
         "Addresses there are VAs or explicit rva:/va:. "
         "For PE addresses use rva:0x... or va:0x... when the interpretation is ambiguous. "
+        "trace records and queries what a program did (cited, bounded, with coverage gaps); capture itself is runtime. "
         "Do not re-import the binary. evidence_add stores a claim only with a source."
         % __version__
     )

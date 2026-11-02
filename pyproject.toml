@@ -27,4 +27,4 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-hydralysis = ["scripts/*.java"]
+hydralysis = ["scripts/*.java", "trace_schema/*.json", "profiles/*.toml"]

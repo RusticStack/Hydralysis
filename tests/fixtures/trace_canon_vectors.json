@@ -1,0 +1,92 @@
+{
+ "genesis": {
+  "seg-1": "fc2532ac3a8270ed4e587c7c12c03cc0a58d7062c573f5c4bc837e8a094c8e74",
+  "": "77f31b229a9db4102f2b371c2ecdedbf96a9d5acc21b7affdfa194d385afedc1"
+ },
+ "canonical": [
+  {
+   "value": {
+    "b": 1,
+    "a": [
+     "x",
+     "\u00e9",
+     "\ud83d\ude00",
+     "\u007f"
+    ],
+    "c": null
+   },
+   "canonical": "{\"a\":[\"x\",\"\\u00e9\",\"\\ud83d\\ude00\",\"\\u007f\"],\"b\":1,\"c\":null}"
+  },
+  {
+   "value": {
+    "kind": "core.marker",
+    "payload": {
+     "label": "a\"b\\c\n\t\r\b\f\u0001",
+     "z": [],
+     "y": {}
+    },
+    "t_mono_ns": 18446744073709551615
+   },
+   "canonical": "{\"kind\":\"core.marker\",\"payload\":{\"label\":\"a\\\"b\\\\c\\n\\t\\r\\b\\f\\u0001\",\"y\":{},\"z\":[]},\"t_mono_ns\":18446744073709551615}"
+  },
+  {
+   "value": {
+    "neg": -9223372036854775808,
+    "t": true,
+    "f": false,
+    "e": "",
+    "k_B": 1,
+    "k_a": 2,
+    "A": 3
+   },
+   "canonical": "{\"A\":3,\"e\":\"\",\"f\":false,\"k_B\":1,\"k_a\":2,\"neg\":-9223372036854775808,\"t\":true}"
+  },
+  {
+   "value": "plain",
+   "canonical": "\"plain\""
+  },
+  {
+   "value": [
+    1,
+    [
+     2,
+     [
+      3
+     ]
+    ]
+   ],
+   "canonical": "[1,[2,[3]]]"
+  }
+ ],
+ "segment": {
+  "id": "seg-1",
+  "records": [
+   {
+    "kind": "core.session.start",
+    "source_id": "s",
+    "source_seq": 0,
+    "producer_gen": 1,
+    "clock_domain": "qpc",
+    "t_mono_ns": 10,
+    "confidence": "exact"
+   },
+   {
+    "kind": "core.marker",
+    "source_id": "s",
+    "source_seq": 1,
+    "producer_gen": 1,
+    "clock_domain": "qpc",
+    "t_mono_ns": 20,
+    "confidence": "exact",
+    "payload": {
+     "label": "\u00e9\ud83d\ude00"
+    }
+   }
+  ],
+  "lines": [
+   "522933e1 {\"clock_domain\":\"qpc\",\"confidence\":\"exact\",\"hash\":\"03c116ab3719a4a51006b0c3c750a6302642a5daf07a38a20476364cd0645527\",\"kind\":\"core.session.start\",\"n\":0,\"prev\":\"fc2532ac3a8270ed4e587c7c12c03cc0a58d7062c573f5c4bc837e8a094c8e74\",\"producer_gen\":1,\"source_id\":\"s\",\"source_seq\":0,\"t_mono_ns\":10}\n",
+   "cce58bb2 {\"clock_domain\":\"qpc\",\"confidence\":\"exact\",\"hash\":\"0f15f9d0968072c0b07c370f2881b76982f2387189c4f2bacf2e90f49ac0128b\",\"kind\":\"core.marker\",\"n\":1,\"payload\":{\"label\":\"\\u00e9\\ud83d\\ude00\"},\"prev\":\"03c116ab3719a4a51006b0c3c750a6302642a5daf07a38a20476364cd0645527\",\"producer_gen\":1,\"source_id\":\"s\",\"source_seq\":1,\"t_mono_ns\":20}\n"
+  ],
+  "head": "0f15f9d0968072c0b07c370f2881b76982f2387189c4f2bacf2e90f49ac0128b"
+ }
+}

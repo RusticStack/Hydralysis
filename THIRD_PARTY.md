@@ -1,6 +1,6 @@
 # What was taken, and what was left out
 
-The server registers twenty operations. They are the ones session logs showed agents using, under names that do not belong to one program. The upstream trees were not vendored.
+The server registers twenty-one operations. They are the ones session logs showed agents using, under names that do not belong to one program. The upstream trees were not vendored.
 
 ## The analysis engine
 

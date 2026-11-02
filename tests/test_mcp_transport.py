@@ -346,7 +346,7 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(leaked, [])
 
     def test_lane_classification_matches_the_tool_table(self):
-        self.assertEqual(ENGINE_TOOLS, {"ghidra_run", "ghidra_query", "backend", "prepare", "job", "runtime"})
+        self.assertEqual(ENGINE_TOOLS, {"ghidra_run", "ghidra_query", "backend", "prepare", "job", "runtime", "trace"})
         self.assertTrue(ENGINE_TOOLS <= set(TOOL_NAMES))
         for name in set(TOOL_NAMES) - ENGINE_TOOLS:
             self.assertEqual(lane_of(name), "fast")

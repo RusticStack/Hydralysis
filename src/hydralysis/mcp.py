@@ -50,9 +50,11 @@ MAX_OUTPUT_BYTES = 128 * 1024
 RETRY_AFTER_MS = 2000
 # Tools that talk to the engine (directly or through a workflow). Everything else is
 # local/offline (PE-only tools and the evidence store) and runs on the fast lane.
-ENGINE_TOOLS = frozenset({"ghidra_run", "ghidra_query", "backend", "prepare", "job", "runtime"})
+ENGINE_TOOLS = frozenset({"ghidra_run", "ghidra_query", "backend", "prepare", "job", "runtime", "trace"})
 # The engine tools that can hold the engine for minutes: a user script, an adopt or import. They get their own lane.
 LONG_TOOLS = frozenset({"ghidra_run", "prepare"})
+# `trace` is a short engine-lane tool except for the actions that are jobs on the engine (export, import, resymbolize).
+LONG_TRACE_ACTIONS = frozenset({"export", "import", "resymbolize"})
 # The engine runs at most this many parallel requests per client connection (hydra-engine Connection.MAX_PARALLEL);
 # more get BUSY. On hydra.4 every engine call of this process goes through one shared connection, so the engine and
 # long lanes together stay within it.
@@ -151,9 +153,12 @@ def _environment() -> dict:
     return _ENVIRONMENT
 
 
-def lane_of(name) -> str:
+def lane_of(name, arguments=None) -> str:
     if not isinstance(name, str) or name not in ENGINE_TOOLS:
         return "fast"
+    if name == "trace":
+        action = arguments.get("action") if isinstance(arguments, dict) else None
+        return "long" if action in LONG_TRACE_ACTIONS else "engine"
     return "long" if name in LONG_TOOLS else "engine"
 
 
@@ -292,7 +297,8 @@ class Server:
                         cancelled(message.get("params"))
                     continue
                 if message["method"] == "tools/call":
-                    lane = lane_of(message["params"].get("name") if "params" in message else None)
+                    params = message.get("params") if isinstance(message.get("params"), dict) else {}
+                    lane = lane_of(params.get("name"), params.get("arguments"))
                     if slots[lane].acquire(blocking=False):
                         token = cancel.Token()
                         key = _request_key(message["id"])

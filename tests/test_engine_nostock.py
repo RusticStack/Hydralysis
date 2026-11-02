@@ -468,7 +468,7 @@ class AuditHarnessTool(unittest.TestCase):
         catalog = report["configs"][-1]["servers"][0]["catalog"]
         self.assertTrue(catalog["launched"], catalog)
         self.assertEqual(catalog["server_info"]["name"], "hydralysis")
-        self.assertEqual(catalog["tool_count"], 20)
+        self.assertEqual(catalog["tool_count"], 21)
 
     def test_this_repository_skills_have_matching_names_and_no_stock_names(self):
         code, report = self.audit("--no-launch", "--skills", str(REPOSITORY / "skills"))

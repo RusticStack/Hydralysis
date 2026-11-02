@@ -65,7 +65,7 @@ class EvidenceTests(unittest.TestCase):
 class SurfaceTests(unittest.TestCase):
     def test_the_server_is_the_used_subset(self):
         names = list(TOOL_NAMES)
-        self.assertLessEqual(len(names), 20)
+        self.assertLessEqual(len(names), 21)
         for banned in ("hash", "addr", "systems", "games", "funcof"):
             self.assertNotIn(banned, names)
         self.assertIn("inspect", names)
@@ -87,7 +87,7 @@ class McpTests(unittest.TestCase):
         listed = server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
         names = [item["name"] for item in listed["result"]["tools"]]
         self.assertEqual(names, list(TOOL_NAMES))
-        self.assertLessEqual(len(names), 20)
+        self.assertLessEqual(len(names), 21)
         blob = json.dumps(tool_table()).lower()
         for banned in REJECTED:
             self.assertNotIn(banned, blob)

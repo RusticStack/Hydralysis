@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "hydra.trace.event/1",
+  "title": "Hydra trace event as written by a producer (TRACE-1 section 5)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "source_id", "source_seq", "producer_gen", "clock_domain", "t_mono_ns", "confidence"],
+  "properties": {
+    "kind": {
+      "type": "string",
+      "pattern": "^(core\\.(session\\.(start|end)|process\\.(start|exit)|module\\.(load|unload)|thread\\.(start|exit)|function\\.(enter|exit)|resource\\.(open|close|read|write|missing)|object\\.(create|destroy)|state\\.(read|write)|sync\\.(wait|signal)|error|marker|capture\\.(source|gap))|(?!core\\.)[a-z0-9_]+\\.[a-z0-9_]+)$"
+    },
+    "source_id": {"type": "string", "minLength": 1},
+    "source_seq": {"type": "integer", "minimum": 0},
+    "producer_gen": {"type": "integer", "minimum": 0},
+    "clock_domain": {"type": "string", "minLength": 1},
+    "t_mono_ns": {"type": "integer", "minimum": 0},
+    "t_wall_ns": {"type": "integer", "minimum": 0},
+    "process_id": {"type": "integer", "minimum": 0},
+    "thread_id": {"type": "integer", "minimum": 0},
+    "process_gen": {"type": "integer", "minimum": 0},
+    "thread_gen": {"type": "integer", "minimum": 0},
+    "module": {"type": "string"},
+    "module_instance": {"type": "integer", "minimum": 0},
+    "confidence": {"enum": ["exact", "inferred", "sampled"]},
+    "acquisition": {"enum": ["atomic", "bracketed", "snapshot", "inferred"]},
+    "va": {"type": "integer", "minimum": 0},
+    "callstack": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+    "payload": {"type": "object"},
+    "n": {"type": "integer", "minimum": 0},
+    "prev": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}
