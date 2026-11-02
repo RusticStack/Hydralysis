@@ -45,9 +45,27 @@ exports, strings, sigscan, disasm, callees, callers, xrefs, inspect, function_of
 rva_to_offset, available, loaded_bytes (relocations applied), parse_expect, find_pattern, parse_rva; exceptions are
 compared by type and message.
 
-## Not yet ported (TODO, black-box unless noted)
+## Stage 2: pure-logic ports (decompile_result.py, analysis.validate_options)
 
-test_query.py, test_query_script.py, test_exporting.py, test_export_worker.py, test_crossbuild.py, test_doctor.py,
-test_backends.py, test_decompile_e2e.py, test_decompile_partial.py, test_output_size.py, test_cli.py (query verbs),
-test_client.py, test_proc.py, test_analysis.py, test_engine_* (real engine; run with HYDRALYSIS_IMPL=rust once the
-query/export crates exist), test_sigscan (no such file; covered in test_pe/test_prologue_table).
+| Python test | Class | Status |
+|---|---|---|
+| test_decompile_partial.py (15) | BB | passes unchanged with `HYDRALYSIS_IMPL=rust` (merge/summarize/coverage/from_error run in Rust) |
+| test_decompile_e2e.py (13) | BB | passes unchanged with `HYDRALYSIS_IMPL=rust` |
+| test_analysis.py (18) | BB | passes unchanged with `HYDRALYSIS_IMPL=rust` (validate_options in Rust except the documented fallbacks) |
+| test_output_size.py (15, 2 skipped) | BB | passes unchanged with `HYDRALYSIS_IMPL=rust` (does not exercise the ported code much) |
+| test_query_script.py (9) | BB | passes unchanged with `HYDRALYSIS_IMPL=rust` |
+| test_query.py | BB | runs past a 40 s cap under both implementations here (threads / engine stand-ins); not completed in either, so no claim |
+| new: tests/test_rust_parity_logic.py | PAR | about 100 hand-written option cases, 1500 seeded random mutations, 700 random replies/merges: Python and Rust agree on value or exception type+message |
+| new: crates/hy-query/tests/logic.rs | WB | Rust cases for py_int0, summarize/coverage/limitations/merge/from_error and option validation |
+
+`validate_options` returns `Invalid::Fallback` (Python implementation runs) for: `diff`, batch `file`, `import_types`,
+`import_archive`, `scan` with `regex` (Python `re` decides compile errors), an unhashable `kind`, and a function range
+wider than 128 bits.
+
+## Not yet ported (blocked or TODO)
+
+QueryRunner/open_program (query.py), client.py, proc.py, backends.py, doctor.py, export_worker.py, exporting.py,
+crossbuild.py, decompile_job.py: all sit on `hydra.Engine` (hydra.py, the hyd-client lane), `settings`, `locks`,
+`workcopy`/`views` (views lane), `durable`/`evidence` (storage lane), or on process/OS probing. They need those crates
+first; their tests (test_query, test_client, test_proc, test_backends, test_doctor, test_exporting, test_export_worker,
+test_crossbuild, test_cli query verbs, test_engine_*) stay Python-only and are unchanged.

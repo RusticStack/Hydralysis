@@ -119,10 +119,74 @@ fn parse_rva_rs(text: &str, image_base: u64) -> PyResult<i64> {
     prologue::parse_rva(text, image_base).map_err(py)
 }
 
+fn parse_json(text: &str) -> PyResult<serde_json::Value> {
+    serde_json::from_str(text).map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
+/// `decompile_result.summarize` on a JSON object text; returns the summary object text.
+#[pyfunction]
+fn decompile_summarize_rs(reply: &str) -> PyResult<String> {
+    Ok(serde_json::Value::Object(hy_query::decompile::summarize(&parse_json(reply)?)).to_string())
+}
+
+#[pyfunction]
+fn decompile_fragments_rs(value: &str) -> PyResult<String> {
+    let v = parse_json(value)?;
+    let (kept, note) = hy_query::decompile::fragments(Some(&v));
+    Ok(serde_json::json!([kept, note]).to_string())
+}
+
+#[pyfunction]
+fn decompile_limitations_rs(reply: &str) -> PyResult<Vec<String>> {
+    Ok(hy_query::decompile::limitations(&parse_json(reply)?).into_iter().map(String::from).collect())
+}
+
+#[pyfunction]
+fn decompile_coverage_rs(reply: &str) -> PyResult<String> {
+    Ok(hy_query::decompile::coverage(&parse_json(reply)?).to_string())
+}
+
+#[pyfunction]
+fn decompile_merge_rs(response: &str, reply: &str) -> PyResult<Option<String>> {
+    Ok(hy_query::decompile::merge(&parse_json(response)?, &parse_json(reply)?).map(|v| v.to_string()))
+}
+
+#[pyfunction]
+fn decompile_from_error_rs(message: &str) -> Option<String> {
+    hy_query::decompile::from_error(message).map(|v| v.to_string())
+}
+
+/// `analysis.validate_options`: the validated options as JSON text; ValueError with the exact message, or
+/// NotImplementedError when this input needs the Python implementation.
+#[pyfunction]
+#[pyo3(signature = (action, options=None, record=false))]
+fn validate_options_rs(action: &str, options: Option<&str>, record: bool) -> PyResult<String> {
+    use hy_query::analysis::{Invalid, validate_options};
+    let parsed = match options {
+        None => None,
+        Some(t) => match parse_json(t)? {
+            serde_json::Value::Object(m) => Some(m),
+            _ => return Err(pyo3::exceptions::PyNotImplementedError::new_err("options is not an object")),
+        },
+    };
+    match validate_options(action, parsed.as_ref(), record) {
+        Ok(v) => Ok(v.to_string()),
+        Err(Invalid::Value(m)) => Err(PyValueError::new_err(m)),
+        Err(Invalid::Fallback) => Err(pyo3::exceptions::PyNotImplementedError::new_err("python only")),
+    }
+}
+
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeImage>()?;
     module.add_function(wrap_pyfunction!(parse_expect_rs, module)?)?;
     module.add_function(wrap_pyfunction!(find_pattern_rs, module)?)?;
     module.add_function(wrap_pyfunction!(parse_rva_rs, module)?)?;
+    module.add_function(wrap_pyfunction!(decompile_summarize_rs, module)?)?;
+    module.add_function(wrap_pyfunction!(decompile_fragments_rs, module)?)?;
+    module.add_function(wrap_pyfunction!(decompile_limitations_rs, module)?)?;
+    module.add_function(wrap_pyfunction!(decompile_coverage_rs, module)?)?;
+    module.add_function(wrap_pyfunction!(decompile_merge_rs, module)?)?;
+    module.add_function(wrap_pyfunction!(decompile_from_error_rs, module)?)?;
+    module.add_function(wrap_pyfunction!(validate_options_rs, module)?)?;
     Ok(())
 }
