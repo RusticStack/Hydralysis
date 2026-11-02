@@ -5,6 +5,7 @@
 //! See `TESTMAP.md` for the test map and what remains.
 
 pub mod classify;
+pub mod commits;
 pub mod error;
 pub mod gens;
 pub mod jobowner;
