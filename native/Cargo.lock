@@ -88,11 +88,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hydra-client"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "hydralysis-native"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
  "hmac",
+ "hydra-client",
  "itoa",
  "memchr",
  "pyo3",

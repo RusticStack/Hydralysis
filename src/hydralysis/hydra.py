@@ -232,13 +232,30 @@ def inspect_engine(directory: str | Path, allow_unpinned: bool = False) -> dict:
     return {**report, "ready": True, "pinned": release == RELEASE}
 
 
-# (path as given, allow_unpinned) -> (mtime_ns, size, module): the stamps of a file that has not changed are not read again.
+# (path as given, allow_unpinned, native allowed) -> (mtime_ns, size, module): the stamps of a file that has not changed are
+# not read again.
 _CLIENTS: dict[tuple, tuple] = {}
 
 
+def _import_library(path: Path):
+    """The engine's own ghidra_session.py, imported (once per path)."""
+    name = "rusticre_hydra_client_" + hashlib.sha256(str(path).encode()).hexdigest()[:12]
+    module = sys.modules.get(name)
+    if module is None:
+        import importlib.util   # lazy: only loading the engine client needs it
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return module
+
+
 def load_client(path: str | Path, allow_unpinned: bool = False):
-    """Import the release's ghidra_session.py from its install, after checking its stamps."""
-    memo = (str(path), bool(allow_unpinned))
+    """The release's client library, after checking its stamps: the native client (`hydralysis.engine_client`, Rust) when the
+    extension is built and the library is the 1.1.0 library of protocol 3, else ghidra_session.py imported from the install
+    (`HYDRALYSIS_NATIVE=0` forces the latter; both give the same results)."""
+    from hydralysis import engine_client
+    memo = (str(path), bool(allow_unpinned), engine_client.enabled())
     try:
         found = os.stat(path)
     except OSError:
@@ -259,14 +276,10 @@ def load_client(path: str | Path, allow_unpinned: bool = False):
     if not allow_unpinned and (stamps["HYDRA_RELEASE"] != RELEASE or stamps["CLIENT_VERSION"] != CLIENT_VERSION):
         raise ValueError("Hydra client %s is release %s / client %s; this Hydralysis pins %s / %s"
                          % (path, stamps["HYDRA_RELEASE"], stamps["CLIENT_VERSION"], RELEASE, CLIENT_VERSION))
-    name = "rusticre_hydra_client_" + hashlib.sha256(str(path).encode()).hexdigest()[:12]
-    module = sys.modules.get(name)
-    if module is None:
-        import importlib.util   # lazy: only loading the engine client needs it
-        spec = importlib.util.spec_from_file_location(name, path)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
+    if engine_client.usable(stamps["PROTOCOL"], stamps["CLIENT_VERSION"], (PROTOCOL, PROTOCOL_MIN, CLIENT_VERSION)):
+        module = engine_client.NativeClient(path, _import_library)
+    else:
+        module = _import_library(path)
     if found is not None:
         _CLIENTS[memo] = (found.st_mtime_ns, found.st_size, module)
     return module

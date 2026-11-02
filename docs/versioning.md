@@ -51,6 +51,15 @@ hydra.4 a missing capability still fails them. The hydra.3 run sets `HYDRALYSIS_
 hydra.3 install and its own `ghidra_session.py` (library 1.0.0) as `HYDRALYSIS_INTEGRATION_ENGINE` and `_CLIENT`, and
 must otherwise end green.
 
+## Which engine client runs
+
+`hydra.load_client` checks the library's `PROTOCOL`, `CLIENT_VERSION` and `HYDRA_RELEASE` stamps against the pin (see above) and then returns one of two clients that give the same results:
+
+- `hydralysis.engine_client.NativeClient` (Rust, `hydralysis_native.Session`) when the extension is built, `HYDRALYSIS_NATIVE` is not `0`, and the library is `CLIENT_VERSION` 1.1.0 of protocol 3 (the pins in `hydra.py` must equal `hydralysis_native.client_pins()`, else the Python client is used);
+- the engine's own `ghidra_session.py`, imported from the install, otherwise: a library 1.0.0 (hydra.2/3, deadlines through the worker-thread helper), no extension, or `HYDRALYSIS_NATIVE=0`.
+
+Both are checked by the same tests: `tests/test_engine_client.py` (a scripted daemon; with `HYDRALYSIS_INTEGRATION_CLIENT` set it also compares the native session with the library's `SocketSession` reply for reply), and the real-engine classes of `test_deadline.py` and `test_engine_integration.py`, which run unchanged under either client (`HYDRALYSIS_NATIVE=0` selects the Python one).
+
 ## Rolling back a pin
 
 1. Check out the Hydralysis release that carries the older pin (`git checkout vX.Y.Z`), or run

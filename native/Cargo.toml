@@ -17,6 +17,7 @@ sha2 = "0.10"
 hmac = "0.12"
 serde_json = "1"
 itoa = "1"
+hydra-client = { path = "vendor/hydra-client" }
 
 [profile.release]
 lto = true

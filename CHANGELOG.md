@@ -6,6 +6,8 @@ Nothing here is a tag: a release is tagged by the owner.
 
 ## Unreleased
 
+- The engine client is native by default. With the optional `hydralysis_native` extension built (`native/`, `maturin develop --release`), `hydra.load_client` returns `hydralysis.engine_client.NativeClient` instead of importing the engine's `ghidra_session.py`: the request framing, ids, `hello` negotiation, deadlines (library 1.1.0 semantics), the pinned-release and protocol 3/2 checks and the mapping of an engine answer to `SessionError` run in Rust (a vendored copy of the engine's `hydra-client` session core), with the GIL released for every wait. A running daemon is joined without the library; a daemon that must be started, a wedged one and every launcher error still go through `ghidra_session.py`, which is then imported. `HYDRALYSIS_NATIVE=0`, a missing extension, or a library that is not 1.1.0 of protocol 3 keeps the Python client, with the same results (`tests/test_engine_client.py` runs the same script through both). Measured on one agent process against a running daemon: private bytes after connecting 13.9 MB -> 11.0 MB (median of 8), 40 fewer imported modules, connect CPU 39 ms -> 16 ms; per-call cost is the daemon's and does not change. The interpreter itself (8.4 MB) is what remains until the MCP host is native.
+
 ## 0.8.0
 
 Released 2026-11-02 (the date the release was prepared; the tag is the owner's). 0.8.0 pins Hydra Engine `12.3-hydra.6` (protocol 3);
