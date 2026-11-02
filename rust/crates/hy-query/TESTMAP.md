@@ -82,3 +82,13 @@ QueryRunner/open_program (query.py), backends.py, doctor.py, decompile_job.py, t
 job orchestration and `export_worker.run` (they use `locks`, `workcopy`, `targets`, `preparation` and `hydra.Engine`);
 their tests (test_query, test_backends, test_doctor, test_exporting's job tests, test_cli query verbs, test_engine_*)
 stay Python-only and are unchanged.
+
+## Stage 3: backends and doctor leaves (`system.rs`)
+
+| Python | Rust | Test |
+|---|---|---|
+| `backends._properties`, `_children`, `_native_compatible`, `_machine` | `system::properties/children/native_compatible/machine` | `tests/system.rs`; parity `tests/test_rust_parity_system.py` |
+| `doctor._read_json`, `_instances`, `_dir_size`, `_count_key` | `system::read_json_object/instances/dir_size/count_key` | same |
+| `tests/test_backends.py`, `tests/test_doctor.py` | black-box, unchanged | pass under `HYDRALYSIS_IMPL=python` and `rust` (14 + 14 each) |
+
+Not ported (stay Python, they sit on `hydra`, `durable`, `locks`, `urllib`, `zipfile`, daemon probes): `backends.inspect/resolved/_stamp/ensure/_download/_extract/_ignored/_engine_candidates/_client_candidates`, `read_json/write_json`, and all `doctor` sections and `diagnose/handle`. `backends.sha256` is covered by `export::sha256_file`.

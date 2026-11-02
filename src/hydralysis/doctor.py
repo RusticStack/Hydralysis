@@ -587,3 +587,44 @@ def handle(capability: str, request: dict) -> str:
     if options.get("verbose"):
         out["sections"] = {name: section["data"] for name, section in report.sections.items()}
     return json.dumps(out, indent=2, default=str)
+
+
+# ---- optional Rust implementation of the filesystem leaves (HYDRALYSIS_IMPL=rust) -------------------------------------
+
+def _native_system():
+    if os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() != "rust":
+        return None
+    try:
+        import hydralysis_native as native
+    except ImportError:
+        return None
+    return native if hasattr(native, "system_properties_rs") else None
+
+
+_python_read_json, _python_instances = _read_json, _instances
+_python_dir_size, _python_count_key = _dir_size, _count_key
+
+
+def _read_json(path: Path) -> dict:
+    native = _native_system()
+    return json.loads(native.system_read_json_object_rs(str(path))) if native is not None else _python_read_json(path)
+
+
+def _instances(state: Path) -> list[str]:
+    native = _native_system()
+    return native.system_instances_rs(str(state)) if native is not None else _python_instances(state)
+
+
+def _dir_size(folder: Path) -> int:
+    native = _native_system()
+    return native.system_dir_size_rs(str(folder)) if native is not None else _python_dir_size(folder)
+
+
+def _count_key(value, key: str) -> int:
+    native = _native_system()
+    if native is not None:
+        try:
+            return native.system_count_key_rs(json.dumps(value), key)
+        except (TypeError, ValueError):
+            pass
+    return _python_count_key(value, key)

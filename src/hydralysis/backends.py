@@ -363,3 +363,46 @@ def ensure(settings: dict, install: bool = False, cancelled=lambda: False) -> di
         return result
     finally:
         lock.release()
+
+
+# ---- optional Rust implementation of the filesystem leaves (HYDRALYSIS_IMPL=rust) -------------------------------------
+
+def _native_system():
+    if os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() != "rust":
+        return None
+    try:
+        import hydralysis_native as native
+    except ImportError:
+        return None
+    return native if hasattr(native, "system_properties_rs") else None
+
+
+_python_properties, _python_children = _properties, _children
+_python_native_compatible, _python_machine = _native_compatible, _machine
+
+
+def _properties(path: Path) -> dict:
+    native = _native_system()
+    return dict(native.system_properties_rs(str(path))) if native is not None else _python_properties(path)
+
+
+def _children(root: Path, pattern: str) -> list[Path]:
+    native = _native_system()
+    if native is not None and pattern in ("jdk*", "hydra-[0-9]*"):
+        return [Path(item) for item in native.system_children_rs(str(root), pattern)]
+    return _python_children(root, pattern)
+
+
+def _native_compatible(path: Path) -> bool:
+    native = _native_system()
+    return native.system_native_compatible_rs(str(path)) if native is not None else _python_native_compatible(path)
+
+
+def _machine() -> str:
+    native = _native_system()
+    found = native.system_machine_rs() if native is not None else None
+    return found if found else _python_machine()
+
+
+for _name in ("_properties", "_children", "_native_compatible", "_machine"):
+    globals()[_name].__doc__ = globals()["_python" + _name].__doc__

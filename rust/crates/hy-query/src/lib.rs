@@ -7,6 +7,7 @@ pub mod decompile;
 pub mod export;
 pub mod proc;
 pub mod prologue;
+pub mod system;
 pub mod tools;
 
 pub use hy_pe::{Image, PeError, Result};

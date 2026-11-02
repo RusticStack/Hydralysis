@@ -368,6 +368,50 @@ fn proc_terminate_tree_rs(pid: u32) -> PyResult<()> {
     hy_query::proc::terminate_tree(pid).map_err(pyo3::exceptions::PyRuntimeError::new_err)
 }
 
+#[pyfunction]
+fn system_properties_rs(path: &str) -> Vec<(String, String)> {
+    hy_query::system::properties(std::path::Path::new(path)).into_iter().collect()
+}
+
+#[pyfunction]
+fn system_children_rs(root: &str, pattern: &str) -> Vec<String> {
+    hy_query::system::children(std::path::Path::new(root), pattern)
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect()
+}
+
+#[pyfunction]
+fn system_native_compatible_rs(path: &str) -> bool {
+    hy_query::system::native_compatible(std::path::Path::new(path))
+}
+
+#[pyfunction]
+fn system_machine_rs() -> Option<String> {
+    hy_query::system::machine()
+}
+
+#[pyfunction]
+fn system_read_json_object_rs(path: &str) -> String {
+    hy_query::system::read_json_object(std::path::Path::new(path)).to_string()
+}
+
+#[pyfunction]
+fn system_instances_rs(state: &str) -> Vec<String> {
+    hy_query::system::instances(std::path::Path::new(state))
+}
+
+#[pyfunction]
+fn system_dir_size_rs(folder: &str) -> u64 {
+    hy_query::system::dir_size(std::path::Path::new(folder))
+}
+
+#[pyfunction]
+fn system_count_key_rs(value: &str, key: &str) -> PyResult<u64> {
+    let parsed: serde_json::Value = serde_json::from_str(value).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(hy_query::system::count_key(&parsed, key))
+}
+
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeImage>()?;
     module.add_class::<NativeClient>()?;
@@ -394,5 +438,13 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(proc_identity_rs, module)?)?;
     module.add_function(wrap_pyfunction!(proc_stop_rs, module)?)?;
     module.add_function(wrap_pyfunction!(proc_terminate_tree_rs, module)?)?;
+    module.add_function(wrap_pyfunction!(system_properties_rs, module)?)?;
+    module.add_function(wrap_pyfunction!(system_children_rs, module)?)?;
+    module.add_function(wrap_pyfunction!(system_native_compatible_rs, module)?)?;
+    module.add_function(wrap_pyfunction!(system_machine_rs, module)?)?;
+    module.add_function(wrap_pyfunction!(system_read_json_object_rs, module)?)?;
+    module.add_function(wrap_pyfunction!(system_instances_rs, module)?)?;
+    module.add_function(wrap_pyfunction!(system_dir_size_rs, module)?)?;
+    module.add_function(wrap_pyfunction!(system_count_key_rs, module)?)?;
     Ok(())
 }
