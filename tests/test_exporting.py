@@ -135,6 +135,36 @@ class ExportTests(unittest.TestCase):
         self.assertNotIn("c", public)
         self.assertTrue(Path(public["imports_path"]).exists())
 
+    def test_a_decompile_the_engine_stopped_is_a_partial_row_not_a_failure(self):
+        partial = {"c": "int first(void) {", "truncated": True, "bytes_emitted": 1048576, "reason": "max_result_mb",
+                   "fragments": [{"start": "0x401000", "end": "0x401004", "class": "code"},
+                                 {"start": "0x401004", "end": "0x401008", "class": "data"}]}
+
+        class Stopped(FakeRunner):
+            def query(self, target, action, **options):
+                if action == "decompile" and options["address"] == "0x401000":
+                    self.calls.append((action, options))
+                    raise RuntimeError(json.dumps({"ok": False, **partial}))
+                return super().query(target, action, **options)
+
+        path = self.make()
+        instances = []
+        def factory(settings):
+            instances.append(Stopped(settings))
+            return instances[0]
+        with patch("hydralysis.export_worker.Image", return_value=None), redirect_stdout(io.StringIO()):
+            export_worker.run(path, "test", runner_factory=factory)
+        record, rows = read_json(path), self.rows(path)
+        self.assertEqual((record["state"], record["failed"], record["truncated"]), ("done", 0, 1))
+        self.assertEqual((rows[0]["state"], rows[0]["truncated"]), ("done", True))
+        self.assertEqual(rows[0]["coverage"], {"status": "partial", "limitations": ["decompile_truncated"]})
+        self.assertEqual(rows[0]["limitations"], ["decompile_truncated", "non_code_fragments"])
+        self.assertEqual(rows[0]["decompile"]["reason"], "max_result_mb")
+        self.assertEqual(rows[0]["result"]["fragments"], partial["fragments"])
+        self.assertEqual(rows[0]["c_sha256"], hashlib.sha256(partial["c"].encode()).hexdigest())
+        self.assertEqual(rows[1]["state"], "done")
+        self.assertNotIn("coverage", rows[1])           # an engine reply without the fields adds nothing
+
     def test_limit_in_the_middle_of_a_page_is_not_claimed_complete(self):
         path = self.make(limit=1)
         record, _ = self.run_job(path)

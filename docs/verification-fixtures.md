@@ -86,7 +86,8 @@ runs a real export.
 
 ## Not covered
 
-- Hardware data watchpoints: the runtime backend does not supply them; item 13 uses the
+- Hardware data watchpoints on a build that is neither a fixture nor owner-authorized
+  (`runtime_authorized_targets`, see runtime-memory-policy.md): refused; item 13 uses the
   static write sites plus probes on them, and states what that does not cover.
 - A probe over a call instruction is refused: in testing it could not be released again.
 - `receiver_type` verification of virtual calls needs a typed receiver (an imported type

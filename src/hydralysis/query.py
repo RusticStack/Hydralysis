@@ -20,6 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from hydralysis import hydra, lineage, targets, viewgov, views, workcopy
+from hydralysis import decompile_result
 from hydralysis.analysis import ADVANCED_ACTIONS, BULK_KINDS, validate_options
 from hydralysis.locks import LockBusy
 
@@ -56,6 +57,19 @@ _lineage_ids: dict[str, tuple[str | None, float]] = {}
 _NO_LINEAGE_S = 5.0
 # Edits that make no new record: a view is not created, and its record is not made, by these.
 _NO_NEW_RECORDS = ("revert", "commit", "commit_revert", "commit_abort", "publish", "rebase")
+
+
+def accepted(action: str, response: dict) -> dict:
+    """The engine's answer as the caller gets it: an error raises; a decompile the engine stopped on purpose is a partial
+    result (it keeps `c`, `fragments`, `truncated`, `bytes_emitted`, `reason`) and gains a `decompile` summary."""
+    if not response.get("ok"):
+        partial = decompile_result.from_error(json.dumps(response)) if action == "decompile" else None
+        if partial is None:
+            raise RuntimeError(json.dumps(_public(response), ensure_ascii=False))
+        response = {**partial, "ok": True, "engine_ok": False}
+    if action == "decompile":
+        decompile_result.annotate(response)
+    return response
 
 
 def _public(value):
@@ -688,8 +702,7 @@ class QueryRunner:
         started = time.monotonic()
         response = self._ask(selected, request, timeout_s, ctx["trace"])
         response.update(target=selected["name"], view=view, query_s=round(time.monotonic() - started, 3))
-        if not response.get("ok"):
-            raise RuntimeError(json.dumps(_public(response), ensure_ascii=False))
+        response = accepted(action, response)
         if ctx.get("followed") is False:
             response["follow"] = {"followed": False, "reason": "the view holds records the head would conflict with; rebase it"}
         return json.dumps(_public(self._stamp(response, ctx)), ensure_ascii=False)
