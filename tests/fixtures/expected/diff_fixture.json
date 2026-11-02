@@ -1,0 +1,142 @@
+{
+ "fixture": "diff_fixture",
+ "spec": [
+  "15.10",
+  "diff (existing)"
+ ],
+ "sources": [
+  "diff_fixture.c"
+ ],
+ "outputs": [
+  "diff1.exe",
+  "diff2.exe"
+ ],
+ "functions": {
+  "codec": "df_decode_amount",
+  "moved_hook": "df_render",
+  "moved_hook_2": "df_mix",
+  "removed": "df_removed",
+  "added": "df_added",
+  "changed_limit": "df_limit",
+  "changed_banner": "df_banner"
+ },
+ "runs": [
+  {
+   "id": "build_A",
+   "program": "diff1.exe",
+   "args": [],
+   "max_seconds": 10,
+   "exit_code": 0,
+   "stdout_lines": [
+    "<regex>^-?[0-9]+$",
+    "FX amount=907 offset=8 size=12"
+   ]
+  },
+  {
+   "id": "build_B",
+   "program": "diff2.exe",
+   "args": [],
+   "max_seconds": 10,
+   "exit_code": 0,
+   "stdout_lines": [
+    "<regex>^-?[0-9]+$",
+    "FX amount=907 offset=12 size=16"
+   ]
+  }
+ ],
+ "answers": {
+  "builds": {
+   "A": "diff1.exe",
+   "B": "diff2.exe (-DV2)"
+  },
+  "corpus_diff": {
+   "type": "Record",
+   "A": [
+    [
+     "id",
+     "int",
+     0
+    ],
+    [
+     "version",
+     "int",
+     4
+    ],
+    [
+     "amount",
+     "int",
+     8
+    ]
+   ],
+   "B": [
+    [
+     "id",
+     "int",
+     0
+    ],
+    [
+     "version",
+     "int",
+     4
+    ],
+    [
+     "inserted",
+     "int",
+     8
+    ],
+    [
+     "amount",
+     "int",
+     12
+    ]
+   ],
+   "changes": [
+    {
+     "field": "inserted",
+     "status": "added"
+    },
+    {
+     "field": "amount",
+     "status": "moved",
+     "from": 8,
+     "to": 12
+    }
+   ],
+   "sizeof": {
+    "A": 12,
+    "B": 16
+   }
+  },
+  "invalidation": {
+   "moved": [
+    "codec layout decoding Record.amount (offset 8 -> 12), implemented by df_decode_amount"
+   ],
+   "candidate": [
+    "hook-table row on df_render (identical code, placed elsewhere in B)"
+   ],
+   "unplaced": [
+    "evidence on df_removed (exists in A only)"
+   ],
+   "carried": [
+    "df_parse",
+    "df_checksum",
+    "df_format",
+    "df_scale",
+    "df_lookup",
+    "df_walk",
+    "(identical bytes)"
+   ],
+   "changed_functions": [
+    "df_limit",
+    "df_banner",
+    "df_decode_amount"
+   ],
+   "new_in_B": [
+    "df_added"
+   ],
+   "promotion": "nothing is promoted to B automatically"
+  },
+  "decoded_amount": 907,
+  "note": "df_decode_amount returns amount (900) + df_parse(\"7\"); the same value in both builds only because the codec follows the layout"
+ }
+}

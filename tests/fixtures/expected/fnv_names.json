@@ -1,0 +1,450 @@
+{
+ "fixture": "fnv_names",
+ "spec": [
+  "15.6"
+ ],
+ "sources": [
+  "fnv_names.c",
+  "gen_fnv_names.py",
+  "find_fnv_collision.c",
+  "trace_common.h"
+ ],
+ "outputs": [
+  "fnv_names.exe"
+ ],
+ "functions": {
+  "hash": "fx_fnv1a64",
+  "dispatch": "fx_dispatch_record"
+ },
+ "data": {
+  "names": "g_names"
+ },
+ "runs": [
+  {
+   "id": "default",
+   "program": "fnv_names.exe",
+   "args": [],
+   "max_seconds": 10,
+   "exit_code": 0,
+   "stdout_lines": [
+    "FX record name=player.health hash=0xc5c4191b5a4187c0 id=1",
+    "FX record name=player.armor hash=0x451d9cfc7b646621 id=2",
+    "FX record name=player.speed hash=0x29fb1b14f07c1b6d id=3",
+    "FX record name=player.damage hash=0x79f8552e60cc16e7 id=4",
+    "FX record name=player.mana hash=0x34d2b57ede478ec5 id=5",
+    "FX record name=player.level hash=0x74022cc62e7692e8 id=6",
+    "FX record name=player.xp hash=0x6c1e9300f6e4c7d2 id=7",
+    "FX record name=player.gold hash=0x845cd2b49ab177f8 id=8",
+    "FX record name=player.range hash=0x6d99fc8d8dfa48b7 id=9",
+    "FX record name=player.cooldown hash=0x366fcb886571737b id=10",
+    "FX record name=player.weight hash=0x92e761ee4f575412 id=11",
+    "FX record name=player.value hash=0x3d8bbf6145225cb3 id=12",
+    "FX record name=player.state hash=0x33221a33c23b73bf id=13",
+    "FX record name=player.target hash=0x75a216b67a6c900b id=14",
+    "FX record name=player.timer hash=0x998b493309adae1b id=15",
+    "FX record name=player.flags hash=0x1ea1d394809a5725 id=16",
+    "FX record name=enemy.health hash=0xccb21611ae4628f9 id=17",
+    "FX record name=enemy.armor hash=0x3b8942cf21c802b6 id=18",
+    "FX record name=enemy.speed hash=0xc3b080ef01b37d9a id=19",
+    "FX record name=enemy.damage hash=0xd58140b6cfbb978e id=20",
+    "FX record name=enemy.mana hash=0x4a2858b0c1a656e0 id=21",
+    "FX record name=enemy.level hash=0x14ccb3680b2da87f id=22",
+    "FX record name=enemy.xp hash=0x64760496100a644f id=23",
+    "FX record name=enemy.gold hash=0xa317a3e0485ae75d id=24",
+    "FX record name=enemy.range hash=0x7763db753d054ff4 id=25",
+    "FX record name=enemy.cooldown hash=0x23e2b780c349166a id=26",
+    "FX record name=enemy.weight hash=0xcf8e8e312618f0db id=27",
+    "FX record name=enemy.value hash=0x34a0cc9d4d7f63d4 id=28",
+    "FX record name=enemy.state hash=0x103439cb473b5c30 id=29",
+    "FX record name=enemy.target hash=0x05fbf2801f0dc8c2 id=30",
+    "FX record name=enemy.timer hash=0xee87674d26d16614 id=31",
+    "FX record name=enemy.flags hash=0xcf09846f7194ce56 id=32",
+    "FX record name=item.health hash=0xb0a14092afefe6ae id=33",
+    "FX record name=item.armor hash=0x6bf5ef21ca8eb2cf id=34",
+    "FX record name=item.speed hash=0xc231f8b857aa6053 id=35",
+    "FX record name=item.damage hash=0xaea50c469a402b99 id=36",
+    "FX record name=item.mana hash=0x6d3b00b23c8d12b7 id=37",
+    "FX record name=item.level hash=0xbd2b96cde6cf9a8e id=38",
+    "FX record name=item.xp hash=0xcb7d9f6b5bbd2670 id=39",
+    "FX record name=item.gold hash=0x55aee20568f9b10e id=40",
+    "FX record name=item.range hash=0x8a989043f8d7ea2d id=41",
+    "FX record name=item.cooldown hash=0xb5699d5c41089cb9 id=42",
+    "FX record name=item.weight hash=0x70e16685639cd758 id=43",
+    "FX record name=item.value hash=0xace3c4aeedf43209 id=44",
+    "FX record name=item.state hash=0xc8cc3fd7273efabd id=45",
+    "FX record name=item.target hash=0xfca0a4d055168b21 id=46",
+    "FX record name=item.timer hash=0x3eaaf2dd1ed5dcd9 id=47",
+    "FX record name=item.flags hash=0x1e16266ebf691a8b id=48",
+    "FX record name=quest.health hash=0xea02decf6fcec50b id=49",
+    "FX record name=quest.armor hash=0x6be8499130eff760 id=50",
+    "FX record name=quest.speed hash=0x711be371a1dd72d4 id=51",
+    "FX record name=quest.damage hash=0x262c1fa40f8defa4 id=52",
+    "FX record name=quest.mana hash=0x7cccb16d0226b64e id=53",
+    "FX record name=quest.level hash=0x6f20cb717abb2b41 id=54",
+    "FX record name=quest.xp hash=0xc0a8c69c849b3b69 id=55",
+    "FX record name=quest.gold hash=0x85e1f8c0407c7ff7 id=56",
+    "FX record name=quest.range hash=0x53ea983ae6b848d6 id=57",
+    "FX record name=quest.cooldown hash=0xc5b48dcc57c92044 id=58",
+    "FX record name=quest.weight hash=0x8509a0d729a616fd id=59",
+    "FX record name=quest.value hash=0x0596beb853b5ae36 id=60",
+    "FX record name=quest.state hash=0x23154c52a939b0ca id=61",
+    "FX record name=quest.target hash=0x53a50990c3a74d7c id=62",
+    "FX record name=quest.timer hash=0xb1ae34905bc6a116 id=63",
+    "FX record name=quest.flags hash=0x84479ae2430052e0 id=64",
+    "FX collision a=rec_L9qap7cOoK1 b=rec_EQI_EyPfCio hash_a=0xb5ba218326b11cdd hash_b=0xb5ba218326b11cdd same=1 id=100",
+    "FX known=64"
+   ]
+  }
+ ],
+ "answers": {
+  "algorithm": {
+   "name": "FNV-1a 64",
+   "offset_basis": "0xcbf29ce484222325",
+   "prime": "0x100000001b3",
+   "test_vector": {
+    "": "0xcbf29ce484222325",
+    "a": "0xaf63dc4c8601ec8c",
+    "foobar": "0x85944171f73967e8"
+   }
+  },
+  "records": [
+   {
+    "name": "player.health",
+    "hash": "0xc5c4191b5a4187c0",
+    "id": 1
+   },
+   {
+    "name": "player.armor",
+    "hash": "0x451d9cfc7b646621",
+    "id": 2
+   },
+   {
+    "name": "player.speed",
+    "hash": "0x29fb1b14f07c1b6d",
+    "id": 3
+   },
+   {
+    "name": "player.damage",
+    "hash": "0x79f8552e60cc16e7",
+    "id": 4
+   },
+   {
+    "name": "player.mana",
+    "hash": "0x34d2b57ede478ec5",
+    "id": 5
+   },
+   {
+    "name": "player.level",
+    "hash": "0x74022cc62e7692e8",
+    "id": 6
+   },
+   {
+    "name": "player.xp",
+    "hash": "0x6c1e9300f6e4c7d2",
+    "id": 7
+   },
+   {
+    "name": "player.gold",
+    "hash": "0x845cd2b49ab177f8",
+    "id": 8
+   },
+   {
+    "name": "player.range",
+    "hash": "0x6d99fc8d8dfa48b7",
+    "id": 9
+   },
+   {
+    "name": "player.cooldown",
+    "hash": "0x366fcb886571737b",
+    "id": 10
+   },
+   {
+    "name": "player.weight",
+    "hash": "0x92e761ee4f575412",
+    "id": 11
+   },
+   {
+    "name": "player.value",
+    "hash": "0x3d8bbf6145225cb3",
+    "id": 12
+   },
+   {
+    "name": "player.state",
+    "hash": "0x33221a33c23b73bf",
+    "id": 13
+   },
+   {
+    "name": "player.target",
+    "hash": "0x75a216b67a6c900b",
+    "id": 14
+   },
+   {
+    "name": "player.timer",
+    "hash": "0x998b493309adae1b",
+    "id": 15
+   },
+   {
+    "name": "player.flags",
+    "hash": "0x1ea1d394809a5725",
+    "id": 16
+   },
+   {
+    "name": "enemy.health",
+    "hash": "0xccb21611ae4628f9",
+    "id": 17
+   },
+   {
+    "name": "enemy.armor",
+    "hash": "0x3b8942cf21c802b6",
+    "id": 18
+   },
+   {
+    "name": "enemy.speed",
+    "hash": "0xc3b080ef01b37d9a",
+    "id": 19
+   },
+   {
+    "name": "enemy.damage",
+    "hash": "0xd58140b6cfbb978e",
+    "id": 20
+   },
+   {
+    "name": "enemy.mana",
+    "hash": "0x4a2858b0c1a656e0",
+    "id": 21
+   },
+   {
+    "name": "enemy.level",
+    "hash": "0x14ccb3680b2da87f",
+    "id": 22
+   },
+   {
+    "name": "enemy.xp",
+    "hash": "0x64760496100a644f",
+    "id": 23
+   },
+   {
+    "name": "enemy.gold",
+    "hash": "0xa317a3e0485ae75d",
+    "id": 24
+   },
+   {
+    "name": "enemy.range",
+    "hash": "0x7763db753d054ff4",
+    "id": 25
+   },
+   {
+    "name": "enemy.cooldown",
+    "hash": "0x23e2b780c349166a",
+    "id": 26
+   },
+   {
+    "name": "enemy.weight",
+    "hash": "0xcf8e8e312618f0db",
+    "id": 27
+   },
+   {
+    "name": "enemy.value",
+    "hash": "0x34a0cc9d4d7f63d4",
+    "id": 28
+   },
+   {
+    "name": "enemy.state",
+    "hash": "0x103439cb473b5c30",
+    "id": 29
+   },
+   {
+    "name": "enemy.target",
+    "hash": "0x05fbf2801f0dc8c2",
+    "id": 30
+   },
+   {
+    "name": "enemy.timer",
+    "hash": "0xee87674d26d16614",
+    "id": 31
+   },
+   {
+    "name": "enemy.flags",
+    "hash": "0xcf09846f7194ce56",
+    "id": 32
+   },
+   {
+    "name": "item.health",
+    "hash": "0xb0a14092afefe6ae",
+    "id": 33
+   },
+   {
+    "name": "item.armor",
+    "hash": "0x6bf5ef21ca8eb2cf",
+    "id": 34
+   },
+   {
+    "name": "item.speed",
+    "hash": "0xc231f8b857aa6053",
+    "id": 35
+   },
+   {
+    "name": "item.damage",
+    "hash": "0xaea50c469a402b99",
+    "id": 36
+   },
+   {
+    "name": "item.mana",
+    "hash": "0x6d3b00b23c8d12b7",
+    "id": 37
+   },
+   {
+    "name": "item.level",
+    "hash": "0xbd2b96cde6cf9a8e",
+    "id": 38
+   },
+   {
+    "name": "item.xp",
+    "hash": "0xcb7d9f6b5bbd2670",
+    "id": 39
+   },
+   {
+    "name": "item.gold",
+    "hash": "0x55aee20568f9b10e",
+    "id": 40
+   },
+   {
+    "name": "item.range",
+    "hash": "0x8a989043f8d7ea2d",
+    "id": 41
+   },
+   {
+    "name": "item.cooldown",
+    "hash": "0xb5699d5c41089cb9",
+    "id": 42
+   },
+   {
+    "name": "item.weight",
+    "hash": "0x70e16685639cd758",
+    "id": 43
+   },
+   {
+    "name": "item.value",
+    "hash": "0xace3c4aeedf43209",
+    "id": 44
+   },
+   {
+    "name": "item.state",
+    "hash": "0xc8cc3fd7273efabd",
+    "id": 45
+   },
+   {
+    "name": "item.target",
+    "hash": "0xfca0a4d055168b21",
+    "id": 46
+   },
+   {
+    "name": "item.timer",
+    "hash": "0x3eaaf2dd1ed5dcd9",
+    "id": 47
+   },
+   {
+    "name": "item.flags",
+    "hash": "0x1e16266ebf691a8b",
+    "id": 48
+   },
+   {
+    "name": "quest.health",
+    "hash": "0xea02decf6fcec50b",
+    "id": 49
+   },
+   {
+    "name": "quest.armor",
+    "hash": "0x6be8499130eff760",
+    "id": 50
+   },
+   {
+    "name": "quest.speed",
+    "hash": "0x711be371a1dd72d4",
+    "id": 51
+   },
+   {
+    "name": "quest.damage",
+    "hash": "0x262c1fa40f8defa4",
+    "id": 52
+   },
+   {
+    "name": "quest.mana",
+    "hash": "0x7cccb16d0226b64e",
+    "id": 53
+   },
+   {
+    "name": "quest.level",
+    "hash": "0x6f20cb717abb2b41",
+    "id": 54
+   },
+   {
+    "name": "quest.xp",
+    "hash": "0xc0a8c69c849b3b69",
+    "id": 55
+   },
+   {
+    "name": "quest.gold",
+    "hash": "0x85e1f8c0407c7ff7",
+    "id": 56
+   },
+   {
+    "name": "quest.range",
+    "hash": "0x53ea983ae6b848d6",
+    "id": 57
+   },
+   {
+    "name": "quest.cooldown",
+    "hash": "0xc5b48dcc57c92044",
+    "id": 58
+   },
+   {
+    "name": "quest.weight",
+    "hash": "0x8509a0d729a616fd",
+    "id": 59
+   },
+   {
+    "name": "quest.value",
+    "hash": "0x0596beb853b5ae36",
+    "id": 60
+   },
+   {
+    "name": "quest.state",
+    "hash": "0x23154c52a939b0ca",
+    "id": 61
+   },
+   {
+    "name": "quest.target",
+    "hash": "0x53a50990c3a74d7c",
+    "id": 62
+   },
+   {
+    "name": "quest.timer",
+    "hash": "0xb1ae34905bc6a116",
+    "id": 63
+   },
+   {
+    "name": "quest.flags",
+    "hash": "0x84479ae2430052e0",
+    "id": 64
+   }
+  ],
+  "constants_live_in": "fx_dispatch_record (64-bit immediates of the switch; on x86 each splits into two 32-bit immediates)",
+  "name_search": {
+   "query": "player.health",
+   "hash": "0xc5c4191b5a4187c0",
+   "finds_function": "fx_dispatch_record"
+  },
+  "annotation": "each immediate equal to a record hash is annotated with its name and the dictionary source (the name strings in g_names)",
+  "collision": {
+   "names": [
+    "rec_L9qap7cOoK1",
+    "rec_EQI_EyPfCio"
+   ],
+   "hash": "0xb5ba218326b11cdd",
+   "id": 100,
+   "expected_report": "ambiguous: two names, one hash; never silently resolved",
+   "found_with": "find_fnv_collision.c (rho search)"
+  }
+ }
+}

@@ -1,0 +1,222 @@
+{
+ "fixture": "replica",
+ "spec": [
+  "15.5",
+  "14.3"
+ ],
+ "sources": [
+  "replica_a.c",
+  "replica_b.c",
+  "replica_common.h",
+  "trace_common.h"
+ ],
+ "outputs": [
+  "replica_a.exe",
+  "replica_b.exe"
+ ],
+ "functions": {
+  "truth": "fx_truth_publish",
+  "truth_create": "fx_truth_create",
+  "send": "fx_send_message",
+  "send_sync": "fx_send_sync",
+  "mirror": "fx_mirror_apply",
+  "extrapolate": "fx_mirror_extrapolate",
+  "receive_sync": "fx_receive_sync"
+ },
+ "runs": [
+  {
+   "id": "pair",
+   "program": "replica_b.exe",
+   "args": [
+    "{tag}",
+    "{work}/replica.jsonl",
+    "250"
+   ],
+   "max_seconds": 30,
+   "exit_code": 0,
+   "stdout_lines": [
+    "FX replica applied=100 extrapolated=1"
+   ],
+   "companion": {
+    "program": "replica_a.exe",
+    "args": [
+     "{tag}",
+     "{work}/owner.jsonl"
+    ],
+    "exit_code": 0,
+    "stdout_lines": [
+     "FX owner listening",
+     "FX owner sent=100 skipped=100 objects=2"
+    ]
+   }
+  }
+ ],
+ "answers": {
+  "roles": {
+   "owner": "replica_a.exe",
+   "replica": "replica_b.exe",
+   "correlation_key": "obj (logical object id)",
+   "transport": "named pipe \\\\.\\pipe\\hydra_replica_<tag>"
+  },
+  "events": {
+   "truth": "fx_truth_publish(obj, seq, value) on the owner",
+   "mirror": "fx_mirror_apply(obj, seq, value) on the replica",
+   "extrapolated": "fx_mirror_extrapolate(obj, last_seq, value) on the replica",
+   "schema": "obj, seq, value (same fields on both sides)"
+  },
+  "objects": {
+   "1": {
+    "present_on": [
+     "owner",
+     "replica"
+    ],
+    "value_of_seq": "seq * 7",
+    "ticks": 200,
+    "tick_ms": 20
+   },
+   "2": {
+    "present_on": [
+     "owner"
+    ],
+    "created_at_seq": 30,
+    "expected_report": "object created only on the owner"
+   }
+  },
+  "delay_ms": 100,
+  "delay_tolerance_ms": [
+   100,
+   160
+  ],
+  "delay_note": "applied delay is 100 ms plus up to a tick and poll of jitter (the replica polls the pipe and ticks every 20 ms)",
+  "outage": {
+   "owner_ticks": [
+    60,
+    160
+   ],
+   "duration_ms": 2000,
+   "messages_not_sent": 100,
+   "expected_mirror_seqs_missing": [
+    60,
+    160
+   ],
+   "expected_report": "interval unknown (replica stopped reporting), not agreement; extrapolated replica ticks cover it"
+  },
+  "mirror_seqs_expected": [
+   0,
+   1,
+   2,
+   3,
+   4,
+   5,
+   6,
+   7,
+   8,
+   9,
+   10,
+   11,
+   12,
+   13,
+   14,
+   15,
+   16,
+   17,
+   18,
+   19,
+   20,
+   21,
+   22,
+   23,
+   24,
+   25,
+   26,
+   27,
+   28,
+   29,
+   30,
+   31,
+   32,
+   33,
+   34,
+   35,
+   36,
+   37,
+   38,
+   39,
+   40,
+   41,
+   42,
+   43,
+   44,
+   45,
+   46,
+   47,
+   48,
+   49,
+   50,
+   51,
+   52,
+   53,
+   54,
+   55,
+   56,
+   57,
+   58,
+   59,
+   160,
+   161,
+   162,
+   163,
+   164,
+   165,
+   166,
+   167,
+   168,
+   169,
+   170,
+   171,
+   172,
+   173,
+   174,
+   175,
+   176,
+   177,
+   178,
+   179,
+   180,
+   181,
+   182,
+   183,
+   184,
+   185,
+   186,
+   187,
+   188,
+   189,
+   190,
+   191,
+   192,
+   193,
+   194,
+   195,
+   196,
+   197,
+   198,
+   199
+  ],
+  "mirror_count": 100,
+  "extrapolated_ticks_min": 80,
+  "clock": {
+   "replica_offset_ms": 250,
+   "calibration": "replica sync receive time minus owner send time = offset + latency",
+   "offset_range_ms": [
+    250,
+    290
+   ],
+   "markers": 3,
+   "marker_kind": "sync",
+   "units": "ms",
+   "domain": "QueryPerformanceCounter, one machine"
+  },
+  "log_format": "JSON lines with side, kind, t_ms, obj, seq, value"
+ }
+}

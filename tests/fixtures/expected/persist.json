@@ -1,0 +1,127 @@
+{
+ "fixture": "persist",
+ "spec": [
+  "15.8"
+ ],
+ "sources": [
+  "persist.c",
+  "trace_common.h"
+ ],
+ "outputs": [
+  "persist.exe"
+ ],
+ "functions": {
+  "write_store": "fx_write_store",
+  "read_store": "fx_read_store",
+  "poke": "fx_instrument_poke",
+  "defaults": "fx_defaults"
+ },
+ "sequence": [
+  {
+   "id": "save_baseline",
+   "program": "persist.exe",
+   "args": [
+    "{work}",
+    "save"
+   ],
+   "max_seconds": 10,
+   "exit_code": 0,
+   "stdout_lines": [
+    "FX saved id=1 type=1 value=100 tag=hp",
+    "FX saved id=2 type=1 value=1 tag=flags",
+    "FX saved id=3 type=1 value=250 tag=gold",
+    "FX saved id=4 type=2 value=0 tag=boss01",
+    "FX saved_count=4 poke=0"
+   ],
+   "files": {
+    "persist_before.dat": {
+     "hex": "4850535601000000040000000100000001000000640000006870000000000000020000000100000001000000666c6167730000000300000001000000fa000000676f6c6400000000040000000200000000000000626f737330310000"
+    },
+    "persist_save.dat": {
+     "hex": "4850535601000000040000000100000001000000640000006870000000000000020000000100000001000000666c6167730000000300000001000000fa000000676f6c6400000000040000000200000000000000626f737330310000"
+    }
+   }
+  },
+  {
+   "id": "save_with_intervention",
+   "program": "persist.exe",
+   "args": [
+    "{work}",
+    "save",
+    "--poke"
+   ],
+   "max_seconds": 10,
+   "exit_code": 0,
+   "stdout_lines": [
+    "FX saved id=1 type=1 value=100 tag=hp",
+    "FX saved id=2 type=1 value=0 tag=flags",
+    "FX saved id=3 type=1 value=250 tag=gold",
+    "FX saved id=4 type=2 value=0 tag=boss01",
+    "FX saved_count=4 poke=1"
+   ],
+   "files": {
+    "persist_before.dat": {
+     "hex": "4850535601000000040000000100000001000000640000006870000000000000020000000100000001000000666c6167730000000300000001000000fa000000676f6c6400000000040000000200000000000000626f737330310000"
+    },
+    "persist_save.dat": {
+     "hex": "4850535601000000040000000100000001000000640000006870000000000000020000000100000000000000666c6167730000000300000001000000fa000000676f6c6400000000040000000200000000000000626f737330310000"
+    }
+   }
+  },
+  {
+   "id": "fresh_load",
+   "program": "persist.exe",
+   "args": [
+    "{work}",
+    "load"
+   ],
+   "max_seconds": 10,
+   "exit_code": 0,
+   "stdout_lines": [
+    "FX dropped id=4 type=2",
+    "FX loaded id=1 type=1 value=100 tag=hp",
+    "FX loaded id=2 type=1 value=0 tag=flags",
+    "FX loaded id=3 type=1 value=250 tag=gold",
+    "FX loaded_count=3 dropped=1"
+   ],
+   "files": {
+    "persist_save.dat": {
+     "hex": "4850535601000000040000000100000001000000640000006870000000000000020000000100000000000000666c6167730000000300000001000000fa000000676f6c6400000000040000000200000000000000626f737330310000"
+    }
+   }
+  }
+ ],
+ "answers": {
+  "store": "persist_save.dat in the work dir; before-image persist_before.dat",
+  "record_layout": "20 bytes: u32 id, u32 type, i32 value, char tag[8]; header 'HPSV', u32 version=1, u32 count",
+  "intervention": {
+   "function": "fx_instrument_poke(2, 0)",
+   "record": {
+    "id": 2,
+    "name": "flags",
+    "before": 1,
+    "after": 0,
+    "byte_offset_of_value": 40
+   },
+   "classification": "intervention-caused, survives removing the intervention (it is in the file)",
+   "attribution": "the write is observed at fx_instrument_poke; unattributed if no write was observed"
+  },
+  "ordinary_changes": "none: the other records and the header are byte-identical between persist_before.dat and persist_save.dat",
+  "round_trip": {
+   "present_after_reload": [
+    1,
+    2,
+    3
+   ],
+   "did_not_round_trip": [
+    {
+     "id": 4,
+     "type": 2,
+     "tag": "boss01",
+     "report": "did not round-trip"
+    }
+   ]
+  },
+  "removal_check": "after the intervention is removed a plain load still sees flags=0"
+ }
+}

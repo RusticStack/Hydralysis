@@ -1,0 +1,112 @@
+{
+ "fixture": "deadlock",
+ "spec": [
+  "15.9"
+ ],
+ "sources": [
+  "deadlock.c",
+  "trace_common.h"
+ ],
+ "outputs": [
+  "deadlock.exe"
+ ],
+ "functions": {
+  "main_frame": "fx_main_frame",
+  "main_lock_sequence": "fx_main_lock_a_then_b",
+  "handler": "fx_suspend_all_handler"
+ },
+ "data": {
+  "frame_counter": "g_frame"
+ },
+ "runs": [
+  {
+   "id": "deadlock",
+   "program": "deadlock.exe",
+   "args": [
+    "--mode=deadlock",
+    "--hold=1",
+    "--state-file={work}/state.txt",
+    "--dump={work}/deadlock.dmp"
+   ],
+   "max_seconds": 30,
+   "exit_code": 0,
+   "stdout_lines": [
+    "FX frames=20",
+    "FX state=deadlocked",
+    "FX frames_before_freeze=1",
+    "FX dump_written=1",
+    "FX reaper exit"
+   ],
+   "files": {
+    "state.txt": {
+     "text": "deadlocked frame=20\n"
+    },
+    "deadlock.dmp": {
+     "prefix_hex": "4d444d50"
+    }
+   }
+  },
+  {
+   "id": "suspend_all",
+   "program": "deadlock.exe",
+   "args": [
+    "--mode=suspend-all",
+    "--hold=1",
+    "--state-file={work}/state.txt",
+    "--dump={work}/suspend.dmp"
+   ],
+   "max_seconds": 30,
+   "exit_code": 0,
+   "stdout_lines": [
+    "FX frames=20",
+    "FX state=suspended_all",
+    "FX frames_before_freeze=1",
+    "FX dump_written=1",
+    "FX reaper exit"
+   ],
+   "files": {
+    "suspend.dmp": {
+     "prefix_hex": "4d444d50"
+    }
+   },
+   "state_file_regex": {
+    "state.txt": "^suspended_all frame=(2[0-9]|[3-9][0-9])$"
+   }
+  }
+ ],
+ "answers": {
+  "main_loop": {
+   "counter": "g_frame",
+   "function": "fx_main_frame",
+   "period_ms": 20,
+   "frames_before_freeze": {
+    "deadlock": 20,
+    "suspend-all": ">=20"
+   },
+   "watchdog": "g_frame stops advancing when the bad state is reached"
+  },
+  "deadlock": {
+   "threads": {
+    "main": "holds lock A (g_lock_a), waits for lock B inside fx_main_lock_a_then_b",
+    "worker": "fx_worker_b_then_a: holds lock B (g_lock_b), waits for lock A"
+   },
+   "locks": "two CRITICAL_SECTIONs; each waiter's blocker is the other thread (owner resolvable from OwningThread)",
+   "pattern": "N=2 threads waiting on locks held by each other",
+   "state_file": "deadlocked frame=20",
+   "hold_seconds": 1
+  },
+  "suspend_all": {
+   "handler": "fx_suspend_all_handler (vectored, first in chain)",
+   "suspended_by": "the faulting worker thread (fx_faulting_worker)",
+   "worker_state": "waits inside the fault handler (thread inside the host's fault handler)",
+   "survivors": [
+    "reaper thread",
+    "fixture watchdog thread"
+   ],
+   "pattern": "all threads suspended by thread T (T = the worker in the handler)",
+   "fault": "read of a decommitted page at g_freed"
+  },
+  "dump": "--dump writes a minidump of the process itself (MDMP magic) from the reaper thread while the bad state holds",
+  "exit": "the reaper ends the process with exit code 0 after --hold seconds; the safety watchdog exits 99 after hold+40 s"
+ }
+}

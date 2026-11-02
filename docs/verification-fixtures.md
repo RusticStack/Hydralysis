@@ -12,7 +12,9 @@ ground truth for every address. Builds are reproducible (`/Brepro`).
 | --- | --- |
 | `tests/fixtures/flow_fixture.c` | `fx_flow` stores `0x2A` into `Config.limit` two calls away (`fx_relay` -> `fx_store`) and reads it back with `fx_read`; exactly `fx_store`, `fx_reset` and `fx_clamp` write `Config.limit`; at start the program writes a `jmp` from `fx_hooked` to `fx_detour`; `fx_tick(Config *, float dt)` runs once per ~50 ms frame with `dt` in {0.25, 0.375, 0.5, 0.625}. |
 | `tests/fixtures/vcall_fixture.cpp` | `Shape` and `Gadget` both have a virtual method in slot 1; calls through it with receivers known by construction (a global object, a factory's result, a parameter). |
-| `tests/fixtures/diff_fixture.c` | Two builds (`-DV2`): identical functions (some moved), two changed ones (`df_limit`, `df_banner`), one added (`df_added`), one removed (`df_removed`). |
+| `tests/fixtures/diff_fixture.c` | Two builds (`-DV2`): identical functions (some moved), two changed ones (`df_limit`, `df_banner`), one added (`df_added`), one removed (`df_removed`); build 2 also inserts a `Record` field that shifts what `df_decode_amount` reads. |
+
+The semantic-trace fixtures (`trace_app`, `interleave`, `layouts`, `frameloop`, `veh_freeze`, `replica_a/b`, `fnv_names`, `minivm`, `persist`, `deadlock`, `ioctl_client`, plus extensions of `vcall_fixture` and `diff_fixture`) are described in `docs/trace-fixtures.md`.
 
 The linker folds identical code (`/OPT:ICF`), as it does in shipped games: on x86
 `fx_pair` shares `fx_store`'s bytes, and `fx_sides_of`/`fx_gadget_run` are one

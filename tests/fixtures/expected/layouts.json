@@ -1,0 +1,282 @@
+{
+ "fixture": "layouts",
+ "spec": [
+  "14.5"
+ ],
+ "sources": [
+  "layouts.c",
+  "trace_common.h"
+ ],
+ "outputs": [
+  "layouts.exe"
+ ],
+ "functions": {
+  "encode_v1": "fx_encode_v1",
+  "encode_v2": "fx_encode_v2",
+  "encode_negotiation": "fx_encode_negotiation",
+  "negotiate": "fx_negotiate",
+  "send": "fx_send",
+  "receive": "fx_receive"
+ },
+ "runs": [
+  {
+   "id": "default",
+   "program": "layouts.exe",
+   "args": [
+    "{work}/layouts.bin"
+   ],
+   "max_seconds": 10,
+   "exit_code": 0,
+   "stdout_lines": [
+    "FX recv v1 id=100 amount=1000",
+    "FX recv v1 id=101 amount=1007",
+    "FX recv v1 id=102 amount=1014",
+    "FX recv negotiated version=2",
+    "FX recv v2 id=5000000000 amount=2000 flags=0x8001 ext=e0e1e2",
+    "FX recv v2 id=5000000001 amount=2013 flags=0x8002 ext=e0e1e2",
+    "FX recv v2 id=5000000002 amount=2026 flags=0x8003 ext=e0e1e2",
+    "FX stream_bytes=105"
+   ],
+   "files": {
+    "layouts.bin": {
+     "hex": "01000c0064000000e803000001000c0065000000ef03000001000c0066000000f6030000f000060002000200150000f2052a01000000d00700000180e0e1e20200150001f2052a01000000dd0700000280e0e1e20200150002f2052a01000000ea0700000380e0e1e2"
+    }
+   }
+  }
+ ],
+ "answers": {
+  "layouts": {
+   "1": {
+    "type": 1,
+    "length": 12,
+    "fields": [
+     [
+      "type",
+      "u16",
+      0
+     ],
+     [
+      "length",
+      "u16",
+      2
+     ],
+     [
+      "id",
+      "u32",
+      4
+     ],
+     [
+      "amount",
+      "u32",
+      8
+     ]
+    ]
+   },
+   "negotiation": {
+    "type": 240,
+    "length": 6,
+    "fields": [
+     [
+      "type",
+      "u16",
+      0
+     ],
+     [
+      "length",
+      "u16",
+      2
+     ],
+     [
+      "version",
+      "u16",
+      4
+     ]
+    ]
+   },
+   "2": {
+    "type": 2,
+    "length": 21,
+    "fields": [
+     [
+      "type",
+      "u16",
+      0
+     ],
+     [
+      "length",
+      "u16",
+      2
+     ],
+     [
+      "id",
+      "u64",
+      4
+     ],
+     [
+      "amount",
+      "u32",
+      12
+     ],
+     [
+      "flags",
+      "u16",
+      16
+     ],
+     [
+      "ext",
+      "u8[3]",
+      18
+     ]
+    ]
+   }
+  },
+  "stream_bytes": 105,
+  "stream_hex": "01000c0064000000e803000001000c0065000000ef03000001000c0066000000f6030000f000060002000200150000f2052a01000000d00700000180e0e1e20200150001f2052a01000000dd0700000280e0e1e20200150002f2052a01000000ea0700000380e0e1e2",
+  "messages": [
+   {
+    "index": 0,
+    "kind": "v1",
+    "layout": 1,
+    "offset": 0,
+    "length": 12,
+    "hex": "01000c0064000000e8030000",
+    "fields": {
+     "id": 100,
+     "amount": 1000
+    }
+   },
+   {
+    "index": 1,
+    "kind": "v1",
+    "layout": 1,
+    "offset": 12,
+    "length": 12,
+    "hex": "01000c0065000000ef030000",
+    "fields": {
+     "id": 101,
+     "amount": 1007
+    }
+   },
+   {
+    "index": 2,
+    "kind": "v1",
+    "layout": 1,
+    "offset": 24,
+    "length": 12,
+    "hex": "01000c0066000000f6030000",
+    "fields": {
+     "id": 102,
+     "amount": 1014
+    }
+   },
+   {
+    "index": 3,
+    "kind": "negotiation",
+    "layout": 1,
+    "offset": 36,
+    "length": 6,
+    "hex": "f00006000200",
+    "fields": {
+     "version": 2
+    }
+   },
+   {
+    "index": 4,
+    "kind": "v2",
+    "layout": 2,
+    "offset": 42,
+    "length": 21,
+    "hex": "0200150000f2052a01000000d00700000180e0e1e2",
+    "fields": {
+     "id": 5000000000,
+     "amount": 2000,
+     "flags": 32769,
+     "ext": "e0e1e2"
+    }
+   },
+   {
+    "index": 5,
+    "kind": "v2",
+    "layout": 2,
+    "offset": 63,
+    "length": 21,
+    "hex": "0200150001f2052a01000000dd0700000280e0e1e2",
+    "fields": {
+     "id": 5000000001,
+     "amount": 2013,
+     "flags": 32770,
+     "ext": "e0e1e2"
+    }
+   },
+   {
+    "index": 6,
+    "kind": "v2",
+    "layout": 2,
+    "offset": 84,
+    "length": 21,
+    "hex": "0200150002f2052a01000000ea0700000380e0e1e2",
+    "fields": {
+     "id": 5000000002,
+     "amount": 2026,
+     "flags": 32771,
+     "ext": "e0e1e2"
+    }
+   }
+  ],
+  "context_intervals": [
+   {
+    "layout": 1,
+    "byte_range": [
+     0,
+     36
+    ],
+    "messages": [
+     0,
+     1,
+     2
+    ]
+   },
+   {
+    "event": "context change by negotiation message",
+    "byte_range": [
+     36,
+     42
+    ],
+    "function": "fx_negotiate",
+    "to_version": 2
+   },
+   {
+    "layout": 2,
+    "byte_range": [
+     42,
+     105
+    ],
+    "messages": [
+     4,
+     5,
+     6
+    ]
+   }
+  ],
+  "unconsumed": {
+   "scenario": "a codec revision that decodes layout 2 only up to flags (18 bytes)",
+   "ranges": [
+    [
+     60,
+     63
+    ],
+    [
+     81,
+     84
+    ],
+    [
+     102,
+     105
+    ]
+   ],
+   "bytes_each": 3
+  },
+  "corrected_codec": "reads ext as u8[3] and consumes all 21 bytes; reprocessing both layouts gives two interpretation revisions and keeps the original byte observations",
+  "round_trip": "fx_encode_* of the decoded fields reproduces the bytes exactly"
+ }
+}

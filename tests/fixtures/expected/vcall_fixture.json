@@ -1,0 +1,105 @@
+{
+ "fixture": "vcall_fixture",
+ "spec": [
+  "15.4",
+  "static vcalls (existing)"
+ ],
+ "sources": [
+  "vcall_fixture.cpp"
+ ],
+ "outputs": [
+  "vcall_fixture.exe"
+ ],
+ "functions": {
+  "direct_wrapper": "fx_put_direct",
+  "slot_wrapper": "fx_put_slot",
+  "get": "fx_store_get",
+  "direct_overload": "Counter::put!direct",
+  "slot_overload": "Counter::put",
+  "get_impl": "Store::get"
+ },
+ "data": {
+  "counter_vftable": "Counter::vftable",
+  "counter": "g_counter"
+ },
+ "runs": [
+  {
+   "id": "three_frames",
+   "program": "vcall_fixture.exe",
+   "args": [
+    "{work}/no-stop-file",
+    "3"
+   ],
+   "max_seconds": 20,
+   "exit_code": 0,
+   "stdout_lines": [
+    "FX frame=0 direct=2",
+    "FX frame=0 slot=3",
+    "FX frame=1 direct=4",
+    "FX frame=1 slot=6",
+    "FX frame=2 direct=6",
+    "FX frame=2 slot=9"
+   ]
+  }
+ ],
+ "answers": {
+  "field": {
+   "class": "Store",
+   "name": "value",
+   "type": "int",
+   "offset": {
+    "x64": 8,
+    "x86": 4
+   },
+   "note": "after the vftable pointer"
+  },
+  "writers": {
+   "Counter::put(int)": {
+    "symbol_key": "Counter::put!direct",
+    "reached_by": "fx_put_direct, a direct (non-virtual) call",
+    "writes": "value = v * 2"
+   },
+   "Counter::put(long long)": {
+    "symbol_key": "Counter::put",
+    "virtual": true,
+    "slot": {
+     "x64": "0x8",
+     "x86": "0x4"
+    },
+    "slot_index": 1,
+    "reached_by": "fx_put_slot through Store::put (vtable slot 1) on a Counter receiver",
+    "writes": "value = (int)v * 3"
+   }
+  },
+  "hook_bypass": {
+   "hooked": "Counter::put!direct",
+   "bypassed_by": "Counter::put",
+   "observed_path": [
+    "main",
+    "fx_put_slot",
+    "[indirect call, slot 1]",
+    "Counter::put"
+   ],
+   "receiver_class": "Counter",
+   "kind": "sibling overload reached through a vtable slot"
+  },
+  "values_per_frame": [
+   {
+    "frame": 0,
+    "direct": 2,
+    "slot": 3
+   },
+   {
+    "frame": 1,
+    "direct": 4,
+    "slot": 6
+   },
+   {
+    "frame": 2,
+    "direct": 6,
+    "slot": 9
+   }
+  ],
+  "static_vs_observed": "static vcalls lists fx_put_slot (slot 1) as a candidate; only the runtime shows Counter::put ran; an unobserved slot stays 'may call'"
+ }
+}

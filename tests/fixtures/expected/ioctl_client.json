@@ -1,0 +1,116 @@
+{
+ "fixture": "ioctl_client",
+ "spec": [
+  "decision 6",
+  "user-mode driver-boundary events"
+ ],
+ "sources": [
+  "ioctl_client.c",
+  "trace_common.h"
+ ],
+ "outputs": [
+  "ioctl_client.exe"
+ ],
+ "functions": {
+  "open": "fx_open_device",
+  "nul_write": "fx_nul_write",
+  "nul_read": "fx_nul_read",
+  "nul_ioctl": "fx_nul_ioctl",
+  "beep_stop": "fx_beep_stop",
+  "beep_bad": "fx_beep_bad"
+ },
+ "runs": [
+  {
+   "id": "default",
+   "program": "ioctl_client.exe",
+   "args": [],
+   "max_seconds": 20,
+   "exit_code": 0,
+   "stdout_lines": [
+    "FX nul_open ok=1",
+    "FX nul_write ok=1 written=16",
+    "<regex>FX nul_read ok=[01] got=0",
+    "FX nul_ioctl code=0x00152000 ok=0 error=1 returned=0",
+    "<regex>FX beep_open ok=[01]",
+    "<optional>FX beep_stop code=0x00010000 ok=[01] error=[0-9]+",
+    "<optional>FX beep_bad code=0x00010000 ok=[01] error=[0-9]+",
+    "FX done"
+   ]
+  }
+ ],
+ "answers": {
+  "devices": [
+   {
+    "path": "\\\\.\\NUL",
+    "always_present": true
+   },
+   {
+    "path": "\\\\.\\Beep",
+    "always_present": false,
+    "note": "the open may fail; the result is printed, never asserted"
+   }
+  ],
+  "calls": [
+   {
+    "api": "CreateFileW",
+    "path": "\\\\.\\NUL",
+    "function": "fx_open_device"
+   },
+   {
+    "api": "WriteFile",
+    "handle": "NUL",
+    "bytes": 16,
+    "payload_ascii": "HYDRA-IOCTL-NUL!",
+    "result": "16 written",
+    "function": "fx_nul_write"
+   },
+   {
+    "api": "ReadFile",
+    "handle": "NUL",
+    "bytes_requested": 16,
+    "result": "0 bytes",
+    "function": "fx_nul_read"
+   },
+   {
+    "api": "DeviceIoControl",
+    "handle": "NUL",
+    "code": "0x00152000",
+    "device_type": "0x15",
+    "function_number": "0x800",
+    "method": "buffered",
+    "in_bytes": 8,
+    "in_payload_ascii": "HYDRAIOC",
+    "out_bytes": 8,
+    "result": "failure, ERROR_INVALID_FUNCTION (1)",
+    "function": "fx_nul_ioctl"
+   },
+   {
+    "api": "CreateFileW",
+    "path": "\\\\.\\Beep",
+    "function": "fx_open_device",
+    "environment_dependent": true
+   },
+   {
+    "api": "DeviceIoControl",
+    "handle": "Beep",
+    "code": "0x00010000",
+    "in_bytes": 8,
+    "in_payload_hex": "0000000000000000",
+    "meaning": "IOCTL_BEEP_SET with frequency 0 duration 0: silence",
+    "function": "fx_beep_stop",
+    "environment_dependent": true
+   },
+   {
+    "api": "DeviceIoControl",
+    "handle": "Beep",
+    "code": "0x00010000",
+    "in_bytes": 4,
+    "meaning": "short input, rejected",
+    "function": "fx_beep_bad",
+    "environment_dependent": true
+   }
+  ],
+  "no_driver_of_ours": true,
+  "boundary_events": "user-mode only: CreateFile, DeviceIoControl, WriteFile, ReadFile and CloseHandle with code, buffer sizes and status"
+ }
+}

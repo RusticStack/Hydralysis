@@ -1,0 +1,80 @@
+{
+ "fixture": "veh_freeze",
+ "spec": [
+  "15.1"
+ ],
+ "sources": [
+  "veh_freeze.c",
+  "trace_common.h"
+ ],
+ "outputs": [
+  "veh_freeze.exe"
+ ],
+ "functions": {
+  "handler": "fx_freezing_handler",
+  "read_object": "fx_read_object"
+ },
+ "data": {
+  "heartbeat": "g_heartbeat",
+  "handler_ran": "g_handler_ran",
+  "suspended_threads": "g_suspended_threads"
+ },
+ "runs": [
+  {
+   "id": "wait",
+   "program": "veh_freeze.exe",
+   "args": [
+    "--seconds=1"
+   ],
+   "max_seconds": 20,
+   "exit_code": 0,
+   "stdout_lines": [
+    "<regex>FX debugger=[01]",
+    "<regex>FX freed_object=0x[0-9A-Fa-f]{8,16}",
+    "FX ready",
+    "FX handler_ran=0 heartbeat_advanced=1",
+    "FX done"
+   ]
+  },
+  {
+   "id": "selftest",
+   "program": "veh_freeze.exe",
+   "args": [
+    "--mode=selftest"
+   ],
+   "max_seconds": 20,
+   "exit_code": 0,
+   "stdout_lines": [
+    "<regex>FX debugger=[01]",
+    "<regex>FX freed_object=0x[0-9A-Fa-f]{8,16}",
+    "FX ready",
+    "FX faulted=1 handler_ran=1 heartbeat_frozen=1",
+    "FX done"
+   ]
+  }
+ ],
+ "answers": {
+  "handler": {
+   "registration": "AddVectoredExceptionHandler(first=1, fx_freezing_handler) in main",
+   "actions": [
+    "thread suspension of every other thread on the first first-chance EXCEPTION_ACCESS_VIOLATION"
+   ],
+   "fault_policy": "freezes"
+  },
+  "freed_object": "VirtualAlloc'd page, decommitted (reserved): any read faults; its address is printed as freed_object",
+  "non_faulting_probe": {
+   "expected_result": "read failure counted and cited, no exception raised",
+   "g_handler_ran": 0,
+   "process": "keeps running; the heartbeat advances; exit code 0",
+   "fault_free_claim": true
+  },
+  "faulting_probe": {
+   "expected_result": "handler runs (g_handler_ran >= 1) and suspends other threads: this is the fixture's selftest mode, not a thing a probe may do",
+   "selftest_lines": [
+    "faulted=1 handler_ran=1 heartbeat_frozen=1"
+   ]
+  },
+  "debugger_note": "the debugger line records IsDebuggerPresent; under a debugger the session context must record the difference",
+  "refusal": "a probe that cannot be made non-faulting under fault policy 'freezes' is refused, not armed"
+ }
+}
