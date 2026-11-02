@@ -9,6 +9,7 @@ asserts the fixture's known answer (tests/fixtures/expected/*.json). Runs only w
 from __future__ import annotations
 
 import json
+import shutil
 import unittest
 from collections import Counter
 from pathlib import Path
@@ -36,6 +37,26 @@ INTERLEAVE = hooks("interleave.exe", [
     dict(id="free", event="core.object.destroy", module="KERNELBASE.dll", symbol="VirtualFree", nargs=3,
          capture=["object:u64@0", "freetype:u32@2"]),
 ])
+
+
+TRACE_APP = hooks("trace_app.exe", [
+    dict(id="file-write", event="core.resource.write", symbol="fx_write_file", nargs=3, capture=["key:key@0", "size:u32@2"],
+         buf={"arg": 0, "max": 128, "cstr": True}),
+    dict(id="file-read", event="core.resource.read", symbol="fx_read_file", nargs=3, with_leave=True,
+         capture=["key:key@0", "size:u32@2", "got:u32@ret"], buf={"arg": 0, "max": 128, "cstr": True}),
+    dict(id="config", event="core.state.read", symbol="fx_read_config", nargs=3, with_leave=True, buf={"arg": 0, "fixed": 2, "max": 2},
+         capture=["value:key@0", "enabled:bool@ret"], const={"object": "config", "key": "active"}),
+    dict(id="registry", event="core.state.write", symbol="fx_registry_roundtrip", nargs=3, buf={"arg": 0, "fixed": 2, "max": 2},
+         capture=["value:key@0"], const={"object": "registry", "key": "Mode"}),
+    dict(id="plugin", event="app.plugin", symbol="fx_load_plugin", nargs=3, buf={"arg": 0, "fixed": 8, "max": 8},
+         capture=["winner:key@0"]),
+])
+FRAMELOOP = hooks("frameloop.exe", [
+    dict(id="frame-begin", event="app.frame", symbol="fx_frame_begin", nargs=1, capture=["frame:u64@0"], const={"edge": "begin"}),
+    dict(id="frame-end", event="app.frame", symbol="fx_frame_end", nargs=1, capture=["frame:u64@0"], const={"edge": "end"}),
+    dict(id="stage-begin", event="app.stage", symbol="fx_phase_begin", nargs=1, capture=["stage:u32@0"]),
+])
+SHARED_SCOPE = {"scope": "gates-shared", "scope_key": "5a" * 32}
 
 
 class Gate(unittest.TestCase):
@@ -184,3 +205,106 @@ class M2Interleave(Gate):
         # the relations are not temporal: nothing was ordered because it arrived first
         self.assertTrue(all(e["relation"] != "temporal-only" for e in client.explain(
             delayed, done["event_id"], direction="upstream", max_depth=8)["edges"]))
+
+
+class M2Diff(Gate):
+    """Section 14.7: two configurations of trace_app, aligned before they are compared."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.work_dir = cls.root / "app-work"
+        cls.runs = {}
+        profile = g.GateProfile(cls.fx, "gate-app/1", ["trace_app.exe"], TRACE_APP)
+        specs = profile.specs(cls.root)
+        for config in ("A", "B"):
+            shutil.rmtree(cls.work_dir, ignore_errors=True)
+            cls.work_dir.mkdir()
+            cls.runs[config] = g.capture(cls.root / "runs", "trace_app.exe", [str(cls.work_dir), config], specs, **SHARED_SCOPE)
+
+    def test_two_configurations_differ_in_resources_state_and_functions_not_in_addresses_or_timing(self):
+        engine = self.engine
+        a, b = g.unique("m2_a"), g.unique("m2_b")
+        engine.load(a, self.runs["A"].lines())
+        engine.load(b, self.runs["B"].lines())
+        client = engine.client()
+        d = client.diff(a, b, align={"keys": ["kind", "resource", "state", "payload:value", "payload:winner"],
+                                     "kinds": ["core.resource.write", "core.resource.read", "core.state.read", "core.state.write", "app.plugin"]})
+        aligned = d["aligned"]
+        entries = {e["key"]: e for e in aligned["entries"]}
+        by_class = Counter(e["class"] for e in aligned["entries"])
+        # the real differences, and only those: B's extra file (read and write), the config and registry values, the plugin winner
+        self.assertEqual(by_class, {"same": 4, "only_a": 3, "only_b": 5})
+        self.assertEqual(aligned["unmatched_a"], 3)
+        self.assertEqual(aligned["unmatched_b"], 5)
+        extra = [e for e in aligned["entries"] if e["class"] == "only_b" and e["key"].startswith("core.resource.")]
+        self.assertEqual(sorted(e["key"].split("|")[0] for e in extra), ["core.resource.read", "core.resource.write"])
+        for state in ("core.state.read|-|config:active", "core.state.write|-|registry:Mode"):
+            sides = {e["class"] for k, e in entries.items() if k.startswith(state)}
+            self.assertEqual(sides, {"only_a", "only_b"}, state)
+        winners = {e["class"] for k, e in entries.items() if k.startswith("app.plugin")}
+        self.assertEqual(winners, {"only_a", "only_b"})
+        # addresses, pids, threads and timing differ between the runs and none of them is a key
+        rows_a, rows_b = engine.rows(a), engine.rows(b)
+        self.assertNotEqual({r["process_id"] for r in rows_a}, {r["process_id"] for r in rows_b})
+        self.assertNotEqual([r["t_mono_ns"] for r in rows_a], [r["t_mono_ns"] for r in rows_b])
+        self.assertIn("event ids, sequence numbers, timestamps, pids, tids and addresses are never keys", aligned["normalizations"])
+        self.assertEqual((aligned["gaps_a"], aligned["gaps_b"], aligned["ambiguous"]), (0, 0, 0))
+        # the same diff twice is byte-identical
+        again = client.diff(a, b, align={"keys": ["kind", "resource", "state", "payload:value", "payload:winner"],
+                                         "kinds": ["core.resource.write", "core.resource.read", "core.state.read", "core.state.write", "app.plugin"]})
+        self.assertEqual(json.dumps(d, sort_keys=True), json.dumps(again, sort_keys=True))
+
+    def test_symbolization_against_the_real_program_in_the_live_daemon_and_a_function_diff(self):
+        engine = self.engine
+        prepared = engine.prepare(self.fx / "trace_app.exe", "trace-app-gates")
+        self.assertEqual(prepared["state"], "done", prepared)
+        program, project = prepared["project"]["program"], prepared["project"]["gpr"]
+        sessions = {}
+        for config in ("A", "B"):
+            name = g.unique("m2_sym_" + config.lower())
+            opened = engine.load(name, self.runs[config].lines(), program=program, project=project)
+            sessions[config] = name
+            self.assertGreater(opened["opened"]["symbols"]["functions"], 100, opened)
+        info = engine.client().info(sessions["A"])
+        counts = info["symbolization"]
+        # every event with a mapped code address is symbolized by the engine's own program, not a test-side table
+        with_address = counts["total"] - counts["no_stack"] - counts["not_code"]
+        self.assertGreaterEqual(counts["symbolized"] / with_address, 0.95, counts)
+        d = engine.client().diff(sessions["A"], sessions["B"], align={
+            "keys": ["kind", "function"], "kinds": ["core.resource.write", "core.resource.read"]})["aligned"]
+        self.assertTrue(all(e["class"] == "different_under_matched_coverage" for e in d["entries"]), d["entries"])
+        self.assertEqual(sorted(e["key"].split("|")[0] for e in d["entries"]), ["core.resource.read", "core.resource.write"])
+        self.assertTrue(all((e["count_a"], e["count_b"]) == (2, 3) for e in d["entries"]))
+        self.assertTrue(all(e["key"].split("|")[1].startswith("FUN_") for e in d["entries"]))
+        # a re-symbolization through the live daemon is a new interpretation revision and leaves the old one readable
+        before = engine.client().info(sessions["A"])
+        again = engine.tool("resymbolize", sessions["A"], program=program, project=project, cap=engine.caps[sessions["A"]])
+        self.assertNotIn("error", again, again)
+        after = engine.client().info(sessions["A"])
+        self.assertGreater(after["interpretations"], before["interpretations"])
+        self.assertEqual(after["symbolization"]["symbolized"], before["symbolization"]["symbolized"])
+        pinned = engine.client().query(sessions["A"], kinds=["core.resource.write"], with_symbols=True, interp=before["symbolization"]["interp"])
+        latest = engine.client().query(sessions["A"], kinds=["core.resource.write"], with_symbols=True)
+        self.assertEqual(pinned["symbols"]["interp"], before["symbolization"]["interp"])
+        self.assertGreater(latest["symbols"]["interp"], pinned["symbols"]["interp"])
+        self.assertEqual([r["function"] for r in pinned["symbols"]["rows"]], [r["function"] for r in latest["symbols"]["rows"]])
+
+    def test_an_overlapping_capture_gap_makes_the_comparison_unknown_and_keeps_the_rest(self):
+        """B overflowed its ring (a real loss, cited by core.capture.gap): what it lacks is unknown, not absent."""
+        profile = g.GateProfile(self.fx, "gate-frame/1", ["frameloop.exe"], FRAMELOOP)
+        specs = profile.specs(self.root)
+        clean = g.capture(self.root / "runs", "frameloop.exe", ["--frames=60"], specs, **SHARED_SCOPE)
+        lossy = g.capture(self.root / "runs", "frameloop.exe", ["--frames=20000"], specs, ring_bytes=1 << 16, batch_ms=300,
+                          counter_ms=100, bp_ms=0.2, window=1, **SHARED_SCOPE)
+        self.assertGreater(lossy.health["producer"]["dropped"], 0)
+        a, b = g.unique("m2_clean"), g.unique("m2_lossy")
+        self.engine.load(a, clean.lines())
+        self.engine.load(b, lossy.lines())
+        d = self.engine.client().diff(a, b, align={"keys": ["kind", "payload:stage"], "kinds": ["app.frame", "app.stage"]})["aligned"]
+        self.assertEqual(d["gaps_a"], 0)
+        self.assertGreater(d["gaps_b"], 0)
+        classes = Counter(e["class"] for e in d["entries"])
+        self.assertTrue(classes["not_comparable"] > 0, classes)
+        self.assertNotIn("only_a", classes)             # absence in a lossy run is never reported as absence
+        self.assertNotIn("different_under_matched_coverage", classes)

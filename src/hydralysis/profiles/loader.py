@@ -300,12 +300,12 @@ def _validate(data: dict, directory: Path | None, files: dict[str, str], errors:
             else:
                 entry["stack"] = row["stack"]
         if "buf" in row:
-            buf = _table(row["buf"], where + ".buf", errors, {"arg", "len_arg", "wide", "fixed", "max"}, {"arg"})
+            buf = _table(row["buf"], where + ".buf", errors, {"arg", "len_arg", "wide", "cstr", "fixed", "max"}, {"arg"})
             bad = [k for k in ("arg", "len_arg", "fixed", "max") if k in buf and (isinstance(buf[k], bool) or not isinstance(buf[k], int))]
-            if bad or not 0 <= buf.get("arg", -1) < 8 or not 0 <= buf.get("len_arg", 0) < 8 or not 0 <= buf.get("max", 64) <= 256                     or not 0 <= buf.get("fixed", 0) <= 256 or not isinstance(buf.get("wide", False), bool):
+            if bad or not 0 <= buf.get("arg", -1) < 8 or not 0 <= buf.get("len_arg", 0) < 8 or not 0 <= buf.get("max", 64) <= 256                     or not 0 <= buf.get("fixed", 0) <= 256 or not isinstance(buf.get("wide", False), bool) or not isinstance(buf.get("cstr", False), bool):
                 errors.add(where + ".buf", "arg and len_arg are argument indexes 0..7, max and fixed are at most 256, wide is true or false")
             else:
-                entry["buf"] = {"arg": buf["arg"], "len_arg": buf.get("len_arg"), "wide": bool(buf.get("wide", False)),
+                entry["buf"] = {"arg": buf["arg"], "len_arg": buf.get("len_arg"), "wide": bool(buf.get("wide", False)), "cstr": bool(buf.get("cstr", False)),
                                 "fixed": buf.get("fixed", 0), "max": buf.get("max", 64)}
         for item in row.get("capture", []) if isinstance(row.get("capture", []), list) else [None]:
             name, _, kind = str(item).partition(":")

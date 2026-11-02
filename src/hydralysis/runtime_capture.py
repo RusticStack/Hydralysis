@@ -340,7 +340,8 @@ class CaptureMixin:
         if not isinstance(option, dict):
             raise ValueError("trace is an object {session, owner, hooks, probes}")
         known = {"session", "owner", "hooks", "probes", "profile", "fault_policy", "builtin", "ring_bytes", "rings", "batch_ms",
-                 "batch_bytes", "counter_ms", "bp_ms", "window", "authorize_payload", "authorize_preview", "producer_gen", "watchdog", "etw"}
+                 "batch_bytes", "counter_ms", "bp_ms", "window", "authorize_payload", "authorize_preview", "producer_gen", "watchdog", "etw",
+                 "scope", "scope_key"}
         unknown = set(option) - known
         if unknown:
             raise ValueError("unknown trace options: %s" % ", ".join(sorted(unknown)))

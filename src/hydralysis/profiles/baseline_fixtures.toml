@@ -85,7 +85,7 @@ symbol = "fx_write_file"
 required = true
 prologue = ["48 89 5C 24 ?? 48 89 74 24 ?? 57 48 83 EC ??"]
 nargs = 3
-buf = { arg = 0, max = 128 }
+buf = { arg = 0, max = 128, cstr = true }
 capture = ["path:string@0", "size:u32@2"]
 stack = 4
 
@@ -98,7 +98,7 @@ required = true
 prologue = ["48 89 5C 24 ?? 48 89 74 24 ?? 57 48 83 EC ??"]
 nargs = 3
 with_leave = true
-buf = { arg = 0, max = 128 }
+buf = { arg = 0, max = 128, cstr = true }
 capture = ["path:string@0", "size:u32@2", "got:u32@ret"]
 stack = 4
 
@@ -290,7 +290,7 @@ symbol = "fx_write_store"
 required = false
 prologue = ["40 53 48 83 EC ?? 0F B6 05 ?? ?? ?? ??"]
 nargs = 1
-buf = { arg = 0, max = 128 }
+buf = { arg = 0, max = 128, cstr = true }
 capture = ["path:key@0"]
 
 [[hooks]]
@@ -301,7 +301,7 @@ symbol = "fx_read_store"
 required = false
 prologue = ["48 89 5C 24 ?? 55 56 41 56 48 83 EC ??"]
 nargs = 3
-buf = { arg = 0, max = 128 }
+buf = { arg = 0, max = 128, cstr = true }
 capture = ["path:key@0"]
 
 [identity]

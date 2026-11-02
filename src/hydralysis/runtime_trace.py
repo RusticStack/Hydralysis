@@ -145,7 +145,7 @@ class TraceMixin:
         buf = spec.get("buf")
         if buf is not None:
             buf = {"ptr_arg": int(buf["ptr_arg"]), "len_arg": buf.get("len_arg"), "fixed": int(buf.get("fixed", 0)),
-                   "max": min(256, int(buf.get("max", 64))), "wide": bool(buf.get("wide"))}
+                   "max": min(256, int(buf.get("max", 64))), "wide": bool(buf.get("wide")), "cstr": bool(buf.get("cstr"))}
             if not 0 <= buf["ptr_arg"] < 8 or (buf["len_arg"] is not None and not 0 <= int(buf["len_arg"]) < 8):
                 raise TraceRefused("%s: buffer argument index must be 0..7" % name)
         nargs = int(spec.get("nargs", 0))
@@ -172,6 +172,22 @@ class TraceMixin:
             if item["name"].lower() == str(name).lower() or item["path"].lower() == str(name).lower():
                 return item["path"]
         return name
+
+    @staticmethod
+    def _shared_scope(args: dict) -> dict:
+        """An explicitly shared correlation scope (spec 14.6): sessions captured under the same `scope` name and 32-byte
+        `scope_key` (hex) give the same keyed ids to the same value, so two runs can be compared. Without it every
+        session has its own key and its ids cannot be linked to any other session's."""
+        key = args.get("scope_key")
+        if key in (None, ""):
+            return {}
+        try:
+            raw = bytes.fromhex(str(key))
+        except ValueError:
+            raw = b""
+        if len(raw) != 32 or not str(args.get("scope") or ""):
+            raise ValueError("a shared scope is scope (a name) with scope_key (64 hex digits)")
+        return {"key": raw, "scope": str(args["scope"])}
 
     def trace_plan(self, args: dict) -> tuple:
         """(probes, refusals) for a start request. A refused required probe raises; an optional one is a coverage limitation."""
@@ -260,7 +276,7 @@ class TraceMixin:
                  for p in probes}
         self.trace = TraceSource(self.directory, session=self.directory.name, producer_gen=gen, process_id=self.pid, sites=sites,
                                  qpc_freq=qpc_frequency(), fault_policy=policy, payload_authorized=bool(auth),
-                                 max_payload=max(1, max_payload or 256))
+                                 max_payload=max(1, max_payload or 256), **self._shared_scope(args))
         self.trace_info = {"script_id": script_id, "refusals": refusals, "probes": [{k: p[k] for k in ("id", "name", "kind", "module_name", "rva", "module_sha256")} for p in probes]}
         self._trace_ready.clear()
         parameters = {"probes": [{k: p[k] for k in ("id", "name", "kind", "module", "base", "rva", "expect", "nargs", "with_leave", "buf", "stack")} for p in probes],

@@ -276,6 +276,7 @@ static void read_buf(Site *s, Inv *inv, Ring *r) {
   inv->buf_addr = p;
   inv->bflags = 16;
   if (s->flags & 2) { want = s->buf_max; inv->bflags |= 8; }
+  else if (s->flags & 4) { want = s->buf_max; }
   else if (s->buf_len_arg >= 0) { want = (gsize)(inv->args[s->buf_len_arg] & 0xFFFFFFFFu); if (want > s->buf_max) { want = s->buf_max; inv->bflags |= 4; } }
   else { want = s->buf_fixed > s->buf_max ? s->buf_max : s->buf_fixed; }
   if (want == 0) return;
@@ -285,6 +286,11 @@ static void read_buf(Site *s, Inv *inv, Ring *r) {
   if (s->flags & 2) {
     for (i = 0; i + 1 < got; i += 2) if (inv->buf[i] == 0 && inv->buf[i + 1] == 0) { got = i + 2; want = got; break; }
     if (got == want && !(want >= 2 && inv->buf[want - 2] == 0 && inv->buf[want - 1] == 0)) inv->bflags |= 4;
+  }
+  if ((s->flags & 4) && !(s->flags & 2)) {
+    /* a NUL-terminated byte string: the id is of the characters, not of what follows them in memory */
+    for (i = 0; i < got; i++) if (inv->buf[i] == 0) break;
+    if (i == got && got == want) inv->bflags |= 4; else got = i;
   }
   inv->buflen = (guint32)got;
 }
@@ -573,7 +579,7 @@ const counterTimer=setInterval(()=>counterMessage(false),P.counter_ms);
 // ---- attach (everything is verified above) -----------------------------------------------------------------------------
 const listeners=[],installed=[];
 for(const v of verified){const pr=v.probe,t0=Date.now(),b=pr.buf;
-  const flags=(pr.with_leave?1:0)|(b&&b.wide?2:0);
+  const flags=(pr.with_leave?1:0)|(b&&b.wide?2:0)|(b&&b.cstr?4:0);
   const s=siteMem.add(siteSize*installed.length);
   f.site_init(s,shared,pr.id,pr.nargs,flags,b?b.ptr_arg:-1,b&&b.len_arg!==null&&b.len_arg!==undefined?b.len_arg:-1,b&&b.fixed?b.fixed:0,b?b.max:0,pr.stack||1);
   listeners.push(Interceptor.attach(v.site,pr.with_leave?{onEnter:cm.on_enter,onLeave:cm.on_leave}:{onEnter:cm.on_enter},s));

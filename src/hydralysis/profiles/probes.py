@@ -38,7 +38,7 @@ def probe_specs(profile, verification: dict) -> list[dict]:
                 "fields": [dict(field) for field in hook["fields"]], "const": dict(hook.get("const") or {})}
         if hook["buf"]:
             buf = hook["buf"]
-            spec["buf"] = {"ptr_arg": buf["arg"], "len_arg": buf["len_arg"], "wide": buf["wide"], "fixed": buf["fixed"],
+            spec["buf"] = {"ptr_arg": buf["arg"], "len_arg": buf["len_arg"], "wide": buf["wide"], "cstr": buf.get("cstr", False), "fixed": buf["fixed"],
                            "max": buf["max"]}
         specs.append(spec)
     return specs
