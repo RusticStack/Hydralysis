@@ -115,5 +115,62 @@ class Accepted(unittest.TestCase):
         self.assertNotIn("decompile", query.accepted("xrefs", {"ok": True, "truncated": True}))
 
 
+class EngineCommand(unittest.TestCase):
+    """The engine's own `decompile` answer folded into RusticQuery's (real-engine behaviour of the issues-eng fixture)."""
+    FAILED = {"id": "x", "program": "p", "sha256": "ab", "ok": False, "error": "decompile refused: Bad instruction count exceeded"}
+    PIECES = {"completed": True, "name": "entry", "entry": "0x140001000", "signature": "int entry(void);", "chars": 5, "c": "int x;",
+              "truncated": False, "partial": True, "reason": "non_contiguous_body",
+              "fragments": [{"start": "0x140001000", "end": "0x140001038", "class": "code", "decompiled": True},
+                            {"start": "0x140001200", "end": "0x14000121f", "class": "data", "decompiled": False}]}
+    CAPPED = {"completed": False, "truncated": True, "bytes_emitted": 1024, "reason": "response_buffer",
+              "error": "Response buffer size exceeded for: x"}
+
+    def test_a_body_in_pieces_is_partial_with_the_non_code_limitation(self):
+        reply = query.accepted("decompile", dr.merge(self.FAILED, self.PIECES))
+        self.assertTrue(reply["ok"])
+        self.assertEqual(reply["c"], "int x;")
+        self.assertTrue(reply["decompile"]["partial"])
+        self.assertEqual(reply["decompile"]["reason"], "non_contiguous_body")
+        self.assertEqual(dr.coverage(reply), {"status": "partial", "limitations": [dr.LIMIT_NON_CODE]})
+        self.assertEqual(dr.limitations(reply), [dr.LIMIT_NON_CODE])
+        self.assertIs(reply["fragments"][1]["decompiled"], False)
+
+    def test_a_reply_cut_at_the_bound_is_partial_with_the_truncated_limitation(self):
+        ok = {"id": "x", "ok": True, "c": "text", "truncated": False, "function": {"address": "0x1"}}
+        reply = query.accepted("decompile", dr.merge(ok, self.CAPPED))
+        self.assertTrue(reply["ok"])
+        self.assertFalse(reply["engine_ok"])
+        self.assertEqual((reply["reason"], reply["bytes_emitted"]), ("response_buffer", 1024))
+        self.assertEqual(dr.limitations(reply), [dr.LIMIT_TRUNCATED])
+        self.assertEqual(dr.coverage(reply), {"status": "partial", "limitations": [dr.LIMIT_TRUNCATED]})
+
+    def test_a_complete_contiguous_reply_is_unchanged(self):
+        ok = {"id": "x", "ok": True, "c": "text", "truncated": False}
+        self.assertEqual(dr.merge(ok, {"completed": True, "c": "text", "truncated": False, "chars": 4}), ok)
+
+    def test_the_command_is_asked_only_when_needed_and_a_refusal_keeps_the_script_answer(self):
+        calls = []
+
+        class Engine:
+            def call(self, command, **fields):
+                calls.append((command, fields))
+                if self.refuse:
+                    raise query.hydra.EngineError("bad_request", "no")
+                return TestReply
+
+        TestReply = self.PIECES
+        eng, program = Engine(), {"key": "k"}
+        eng.refuse = False
+        good = {"ok": True, "c": "t"}
+        self.assertIs(query.engine_decompile(eng, program, {"action": "decompile", "address": "0x1", "options": {}}, 5, good), good)
+        self.assertIs(query.engine_decompile(eng, program, {"action": "xrefs", "address": "0x1", "options": {"max_result_mb": 1}}, 5, good), good)
+        self.assertEqual(calls, [])
+        merged = query.engine_decompile(eng, program, {"action": "decompile", "address": "0x1", "options": {"max_result_mb": 2}}, 5, good)
+        self.assertEqual(calls[0][1]["maxResultMb"], 2)
+        self.assertEqual(merged["reason"], "non_contiguous_body")
+        eng.refuse = True
+        self.assertIs(query.engine_decompile(eng, program, {"action": "decompile", "address": "0x1", "options": {"max_result_mb": 2}}, 5, good), good)
+
+
 if __name__ == "__main__":
     unittest.main()
