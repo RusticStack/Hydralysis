@@ -116,7 +116,8 @@ OPTION_BAGS = {
     "trace": "per-action options: start (profile, images, scope, launch, program), query (kinds, filter, group_by, "
              "cursor, up_to, interpretation, profile_query), diff (against, group_by, align), explain (event_id, depth, "
              "direction), mark (label, phase), export (name, overwrite), check (assertions), import (input), resymbolize "
-             "(program); writes use the cap that start returned; offline=true runs import/verify/rebuild/export on files; "
+             "(program), reprocess (codecs, context|contexts, kinds, note), relations (op), evict (to_quota), bundle (path); "
+             "start also takes meta fields (target, scenario, capture_options, shared_scope); writes use the cap that start returned; offline=true runs import/verify/rebuild/export on files; "
              "every action takes limit",
 }
 
@@ -254,8 +255,8 @@ def tool_table() -> list[dict]:
         tool("runtime", "Own-process debugging/instrumentation sessions: spawn/attach, modules, memory, verified probes/breakpoints, registers, continue and detach. Use backend help for options.", {
             "action": string, "options": options,
         }, ["action"]),
-        tool("trace", "Semantic traces: what a running or recorded program did, cited and bounded. Actions start/stop (capture via runtime), status, query, diff, explain, mark, export, check, import, resymbolize. Replies carry counts, event ids, revision and coverage gaps. See backend help.", {
-            "action": {"type": "string", "enum": ["start", "stop", "status", "query", "diff", "explain", "mark", "export", "check", "import", "resymbolize"]},
+        tool("trace", "Semantic traces: what a running or recorded program did, cited and bounded. Actions start/stop (capture via runtime), status, query, diff, explain, mark, export, check, import, resymbolize, reprocess, relations, evict, bundle. Replies carry counts, event ids, revision and coverage gaps. See backend help.", {
+            "action": {"type": "string", "enum": ["start", "stop", "status", "query", "diff", "explain", "mark", "export", "check", "import", "resymbolize", "reprocess", "relations", "evict", "bundle"]},
             "session": string, "options": options,
         }, ["action"]),
     ]
