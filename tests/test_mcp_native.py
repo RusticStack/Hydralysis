@@ -206,7 +206,7 @@ class CatalogFile(unittest.TestCase):
             import gen_mcp_catalog
         finally:
             sys.path.pop(0)
-        current = gen_mcp_catalog.TARGET.read_text(encoding="utf-8")
+        current = gen_mcp_catalog.TARGET.read_text(encoding="utf-8").replace("\r\n", "\n")   # autocrlf checkouts
         self.assertEqual(current, gen_mcp_catalog.render(), "run python tools/gen_mcp_catalog.py")
 
     def test_catalog_epoch_and_budget_are_unchanged(self):

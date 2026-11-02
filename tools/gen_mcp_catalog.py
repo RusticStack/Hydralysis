@@ -49,7 +49,7 @@ def render() -> str:
 def main(argv: list[str]) -> int:
     text = render()
     if "--check" in argv:
-        current = TARGET.read_text(encoding="utf-8") if TARGET.is_file() else ""
+        current = TARGET.read_text(encoding="utf-8").replace("\r\n", "\n") if TARGET.is_file() else ""
         if current != text:
             print("%s is stale; run python tools/gen_mcp_catalog.py" % TARGET, file=sys.stderr)
             return 1
