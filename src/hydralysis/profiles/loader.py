@@ -235,7 +235,7 @@ def _validate(data: dict, directory: Path | None, files: dict[str, str], errors:
     for index, row in enumerate(_rows(data, "hooks", errors, MAX_HOOKS)):
         where = "hooks[%d]" % index
         row = _table(row, where, errors, {"id", "event", "module", "required", "symbol", "rva", "signature", "prologue",
-                                          "prologue_offset", "fault", "capture", "note", "nargs", "with_leave", "buf", "stack"}, {"id", "event", "prologue"})
+                                          "prologue_offset", "fault", "capture", "note", "nargs", "with_leave", "buf", "stack", "const"}, {"id", "event", "prologue"})
         hook_id = _ident(row.get("id"), where + ".id", errors)
         if hook_id in hook_ids:
             errors.add(where + ".id", "%s is declared twice" % hook_id)
@@ -251,7 +251,12 @@ def _validate(data: dict, directory: Path | None, files: dict[str, str], errors:
         entry = {"id": hook_id, "event": row.get("event"), "module": module, "required": True,
                  "prologue": _prologues(row.get("prologue"), where + ".prologue", errors),
                  "prologue_offset": 0, "fault": row.get("fault", default_fault), "capture": [], "note": str(row.get("note", ""))[:500],
-                 "nargs": 0, "with_leave": False, "buf": None, "stack": 1, "fields": []}
+                 "nargs": 0, "with_leave": False, "buf": None, "stack": 1, "fields": [], "const": {}}
+        constants = row.get("const", {})
+        if not isinstance(constants, dict) or len(constants) > 8 or not all(_FIELD.match(str(k)) and (isinstance(v, (bool, int)) or (isinstance(v, str) and len(v) <= 64)) for k, v in constants.items()):
+            errors.add(where + ".const", "is a table of at most 8 constants (names like capture fields; values true/false, an integer or a short string) added to every event of the hook")
+        else:
+            entry["const"] = dict(sorted(constants.items()))
         if not isinstance(row.get("required", True), bool):
             errors.add(where + ".required", "must be true or false")
         else:
@@ -295,12 +300,12 @@ def _validate(data: dict, directory: Path | None, files: dict[str, str], errors:
             else:
                 entry["stack"] = row["stack"]
         if "buf" in row:
-            buf = _table(row["buf"], where + ".buf", errors, {"arg", "len_arg", "wide", "fixed", "max"}, {"arg"})
+            buf = _table(row["buf"], where + ".buf", errors, {"arg", "len_arg", "wide", "cstr", "fixed", "max"}, {"arg"})
             bad = [k for k in ("arg", "len_arg", "fixed", "max") if k in buf and (isinstance(buf[k], bool) or not isinstance(buf[k], int))]
-            if bad or not 0 <= buf.get("arg", -1) < 8 or not 0 <= buf.get("len_arg", 0) < 8 or not 0 <= buf.get("max", 64) <= 256                     or not 0 <= buf.get("fixed", 0) <= 256 or not isinstance(buf.get("wide", False), bool):
+            if bad or not 0 <= buf.get("arg", -1) < 8 or not 0 <= buf.get("len_arg", 0) < 8 or not 0 <= buf.get("max", 64) <= 256                     or not 0 <= buf.get("fixed", 0) <= 256 or not isinstance(buf.get("wide", False), bool) or not isinstance(buf.get("cstr", False), bool):
                 errors.add(where + ".buf", "arg and len_arg are argument indexes 0..7, max and fixed are at most 256, wide is true or false")
             else:
-                entry["buf"] = {"arg": buf["arg"], "len_arg": buf.get("len_arg"), "wide": bool(buf.get("wide", False)),
+                entry["buf"] = {"arg": buf["arg"], "len_arg": buf.get("len_arg"), "wide": bool(buf.get("wide", False)), "cstr": bool(buf.get("cstr", False)),
                                 "fixed": buf.get("fixed", 0), "max": buf.get("max", 64)}
         for item in row.get("capture", []) if isinstance(row.get("capture", []), list) else [None]:
             name, _, kind = str(item).partition(":")

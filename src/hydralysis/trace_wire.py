@@ -622,6 +622,7 @@ class SegmentEncoder:
             payload = {"site": name, "hook": site.get("hook", name)}
             for field in site.get("fields", ()):
                 payload[field["name"]] = self._field(field, r, site, buf)
+            payload.update(site.get("const") or {})
             if has_ret:
                 payload["end_ns"] = _tick_ns(r["qpc_end"] or r["qpc"], self.freq)
                 payload["last_error"] = r["last_error"]

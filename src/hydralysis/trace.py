@@ -484,7 +484,7 @@ def _verify_profile(profile, options: dict) -> dict:
 
 
 TRACE_CAPTURE_KEYS = ("ring_bytes", "rings", "batch_ms", "batch_bytes", "counter_ms", "bp_ms", "window", "authorize_payload",
-                      "authorize_preview", "builtin", "watchdog", "etw", "fault_policy", "producer_gen")
+                      "authorize_preview", "builtin", "watchdog", "etw", "fault_policy", "producer_gen", "scope", "scope_key")
 
 
 def _trace_option(session: str, profile, verification, capture_options: dict) -> dict:
@@ -525,6 +525,16 @@ def _watchdog_option(profile, requested) -> dict | None:
     return {"hook": hook, "stall_s": float(requested.get("stall_s", 2.0)), "after_s": float(requested.get("after_s", 0.0))}
 
 
+def _open_program(client: TraceClient, options: dict) -> dict:
+    """The program a trace is symbolized against is read through a project this connection has open (read-only: a trace never
+    writes into it). Given a project folder or .gpr and a program path, open both and name them as the engine keys them."""
+    if not (options.get("program") and options.get("project")):
+        return options
+    project = client.engine.call("open_project", path=str(options["project"]))
+    info = client.engine.call("open_program", path=str(options["program"]), project=project["id"])
+    return {**options, "project": project["id"], "program": info["key"]}
+
+
 def _start(client: TraceClient, session: str | None, options: dict, settings: dict) -> dict:
     from hydralysis import profiles
     profile = _load_profile(options)
@@ -535,6 +545,7 @@ def _start(client: TraceClient, session: str | None, options: dict, settings: di
     limitations = list((verification or {}).get("limitations", []))
     # The engine keeps events, not session metadata: the profile, scope and limitations are answered back to the caller
     # (and written into events by the producer); only the fields of `trace_open` reach the engine.
+    options = _open_program(client, options)
     opened = client.begin(
         session=session, create=True, mode="write", max_events=options.get("max_events"), max_bytes=options.get("max_bytes"),
         preview=options.get("preview"), program=options.get("program"), project=options.get("project"),
@@ -603,7 +614,8 @@ def _query_fields(options: dict, limit: int) -> dict:
     return {"kinds": _strings(options.get("kinds"), "options.kinds") or None, **{k: flt.get(k) for k in _FILTER_KEYS},
             "group_by": group, "after": options.get("cursor", options.get("after")), "up_to": options.get("up_to"),
             "with_symbols": options.get("with_symbols") or None,
-            "interp": options.get("interpretation", options.get("interp")), "limit": limit}
+            "interp": options.get("interpretation", options.get("interp")), "lifetimes": options.get("lifetimes") or None,
+            "limit": limit}
 
 
 def _query(client: TraceClient, session: str, options: dict, limit: int) -> dict:
@@ -736,6 +748,7 @@ def handle_action(action: str, session: str | None, options: dict, settings: dic
                               authorized_artifacts=_strings(options.get("authorized_artifacts"), "options.authorized_artifacts") or None,
                               exported_at=options.get("exported_at"))
         return shape(reply, session=session, command="trace_export", limit=limit)
+    options = _open_program(client, options)
     return shape(client.resymbolize(session, program=options.get("program"), project=options.get("project"),
                                     modules=_strings(options.get("modules"), "options.modules") or None,
                                     cap=options.get("cap") or _TOKENS.get(session)),
