@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import tempfile
 from pathlib import Path
 
@@ -25,7 +24,8 @@ class DumpError(RuntimeError):
 
 
 def _run(tool: str, *args: str, timeout: float = 120.0) -> dict:
-    done = subprocess.run([tool, *args], capture_output=True, text=True, timeout=timeout)
+    from hydralysis import proc
+    done = proc.run([tool, *args], capture_output=True, text=True, timeout=timeout)
     if done.returncode != 0:
         raise DumpError("hydra-trace %s failed (%d): %s" % (args[0] if args else "", done.returncode, (done.stderr or done.stdout).strip()))
     return json.loads(done.stdout)
@@ -110,7 +110,8 @@ def analyse(tool: str, dump: Path, *, directories: list[Path], names: dict[str, 
             continue
         modules[name] = module_table(path, rvas, named=(names or {}).get(name))
     table = work / "symbols.json"
-    table.write_text(json.dumps({"modules": modules}), encoding="utf-8")
+    from hydralysis import durable
+    durable.atomic_write(table, json.dumps({"modules": modules}).encode("utf-8"))
     args = ["dump", str(dump), "--symbols", str(table), "--source", source]
     for name in waits or []:
         args += ["--wait", name]
