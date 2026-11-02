@@ -59,6 +59,23 @@ def _rva_of(memory, pointer: int | None, pointer_size: int) -> int | None:
     return rva
 
 
+def _name(memory, rva: int, limit: int = 128) -> str | None:
+    """A NUL-terminated printable name at RVA of any length: a script native can be called `add` or `sq` (the image's own
+    string finder ignores anything shorter than four characters, which suits string listings, not binding names)."""
+    try:
+        raw = memory.read_rva(rva, 1)
+        size = 1
+        while b"\0" not in raw and size < limit:
+            size += 1
+            raw = memory.read_rva(rva, size)
+    except (ValueError, OSError):
+        return None
+    text = raw.split(b"\0", 1)[0]
+    if not text or b"\0" not in raw or any(byte < 32 or byte > 126 for byte in text):
+        return None
+    return text.decode("ascii")
+
+
 def extract_table(memory, spec: dict, *, pointer_size: int = 8) -> dict:
     """Read a `kind = "table"` binding. SPEC: {id, table_rva, stride, name_offset, fn_offset, count?, argc_offset?,
     argc_size?}. Without `count` the table ends at the first row whose name pointer is null."""
@@ -81,7 +98,7 @@ def extract_table(memory, spec: dict, *, pointer_size: int = 8) -> dict:
         row = {"index": index, "site": _site(row_rva), "source": "table %s at %s, row %d" % (spec["id"], _site(base), index),
                "argc": argc}
         name_rva = _rva_of(memory, name_ptr, pointer_size)
-        name = memory.string_at(name_rva, 128) if name_rva is not None else None
+        name = _name(memory, name_rva) if name_rva is not None else None
         native_rva = _rva_of(memory, fn_ptr, pointer_size)
         problems = []
         if not name:
@@ -109,7 +126,7 @@ def bindings_from_call_sites(spec: dict, sites: list[dict], memory=None) -> dict
         args = {arg.get("index"): arg for arg in site.get("args", []) if isinstance(arg, dict)}
         name = (args.get(spec["name_arg"]) or {}).get("string")
         if name is None and memory is not None and (args.get(spec["name_arg"]) or {}).get("rva") is not None:
-            name = memory.string_at(args[spec["name_arg"]]["rva"], 128)
+            name = _name(memory, args[spec["name_arg"]]["rva"])
         fn = args.get(spec["fn_arg"]) or {}
         native = fn.get("rva")
         if native is None and fn.get("constant") and memory is not None:

@@ -725,6 +725,14 @@ def _report(client: TraceClient, session: str, options: dict) -> dict:
         result = {"edges": observed, **trace_reports.hook_bypass(events, hook=params["hook"], field=params["field"],
                                                                  siblings=params.get("siblings"), observed=observed["observed"])}
     elif kind == "links":
+        field = params.get("script_field")
+        if field:      # the called script function is the first word of the script line the VM hook captured
+            for event in events:
+                line = event["payload"]
+                for part in field.split("."):      # "buf.preview": the redacted preview an authorized probe recorded
+                    line = line.get(part) if isinstance(line, dict) else None
+                if isinstance(line, str) and line.split() and "script_function" not in event["payload"]:
+                    event["payload"]["script_function"] = line.split()[0]
         result = trace_bindings.link_events(events, params["table"], window=int(params.get("window", 8)))
     elif kind == "names":
         from hydralysis import trace_hashes

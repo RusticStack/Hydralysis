@@ -478,5 +478,100 @@ class SHashedNames(Gate):
         self.assertEqual(after, raw, "the trace itself still holds the raw values")
 
 
+NATIVES = ["add", "sub", "mul", "neg", "min", "max", "clamp", "abs", "sq", "avg3", "dist2", "select"]
+PARAMS = {"add": 2, "sub": 2, "mul": 2, "neg": 1, "min": 2, "max": 2, "clamp": 3, "abs": 1, "sq": 1, "avg3": 3, "dist2": 4, "select": 3}
+VM_TABLE = {"id": "minivm-table", "kind": "table", "table_rva": None, "stride": 24, "name_offset": 0, "fn_offset": 8,
+            "argc_offset": 16, "argc_size": 4, "count": 10}
+VM_CALLS = {"id": "minivm-register", "kind": "call", "register": "fx_vm_register", "name_arg": 0, "fn_arg": 1, "argc_arg": 2}
+
+
+@unittest.skipUnless(LIVE, "needs a trace engine (HYDRALYSIS_INTEGRATION_*, HYDRA_TRACE_EXE), Frida and MSVC")
+class SScriptNatives(Gate):
+    """Section 15.7: the script VM's natives from the table and from registration calls, and a traced script call linked
+    to the native event it invoked."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        import build_fixtures
+        from hydralysis import query, trace_bindings
+        from hydralysis.pe import Image
+        cls.exe = cls.fx / "minivm.exe"
+        cls.image = Image(cls.exe)
+        cls.functions, cls.data = build_fixtures.symbols(cls.exe.with_suffix(".map"))
+        assert cls.engine.prepare(cls.exe, "vm_gate")["state"] != "failed"
+        register = int(cls.functions["fx_vm_register"], 16)
+        refs = json.loads(query.QueryRunner(cls.engine.settings).query("vm_gate", "xrefs", hex(register), limit=50, options={}))
+        cls.call_sites = sorted(int(r["from"], 16) for r in refs["references"] if "CALL" in str(r.get("type", "")).upper())
+        VM = dict(VM_TABLE, table_rva=int(cls.data["g_native_table"], 16) - cls.image.base)
+        sites = [trace_bindings.x64_call_site_args(cls.image, va) for va in cls.call_sites]
+        cls.table = trace_bindings.collect(cls.image, [VM, VM_CALLS], {"minivm-register": sites})
+
+    def test_the_registration_calls_are_found_by_the_engine_and_the_loader_loop_is_one_of_them(self):
+        loader = int(self.functions["fx_vm_load_table"], 16)
+        self.assertEqual(len(self.call_sites), 3, [hex(v) for v in self.call_sites])
+        self.assertEqual(sum(1 for v in self.call_sites if loader <= v < loader + 0x40), 1)
+
+    def test_twelve_natives_have_names_addresses_and_parameter_counts(self):
+        resolved = {r["script_name"]: r for r in self.table["rows"] if r["status"] == "resolved"}
+        self.assertEqual(sorted(resolved), sorted(NATIVES))
+        for name, row in resolved.items():
+            self.assertEqual(row["argc"], PARAMS[name], name)
+            self.assertEqual(row["native_va"], "va:%#x" % int(self.functions["fx_nat_" + name], 16), name)
+        self.assertEqual(sorted(r["binding"] for r in resolved.values()).count("minivm-table"), 10)
+        self.assertEqual(sorted(name for name, r in resolved.items() if r["binding"] == "minivm-register"), ["dist2", "select"])
+        loop = [r for r in self.table["rows"] if r["status"] != "resolved"]
+        self.assertEqual(len(loop), 1, "the loop in the table loader passes values it loads from memory")
+        self.assertIn("argument 0 (name) was not a constant", loop[0]["unresolved"])
+        self.assertEqual(self.table["counts"], {"rows": 13, "resolved": 12, "unresolved": 1})
+
+    def test_the_binding_table_becomes_a_cited_corpus(self):
+        from hydralysis import trace_bindings
+        records, body = trace_bindings.to_corpus(self.table, build_sha256=self.image.fingerprint() if hasattr(self.image, "fingerprint")
+                                                 else "00" * 32, source="fixture minivm")
+        self.assertEqual(sorted(r["name"] for r in records), sorted("vm_native_" + n for n in NATIVES))
+        sq = next(r for r in records if r["name"] == "vm_native_sq")
+        self.assertIn("1 parameter(s)", sq["comment"])
+        self.assertIn("table minivm-table", sq["comment"])
+        self.assertEqual(body["counts"]["resolved"], 12)
+
+    def run_links(self, skip=None, key="vm"):
+        rows = [dict(id="line", event="app.script", symbol="fx_vm_run_line", nargs=1, capture=["script:string@0"], buf={"arg": 0, "cstr": True, "max": 64})]
+        for name in NATIVES:
+            if name != skip:
+                rows.append(dict(id="nat_" + name, event="core.function.enter", symbol="fx_nat_" + name, nargs=1,
+                                 capture=["result:u32@ret"], const={"rva": int(self.functions["fx_nat_" + name], 16) - self.image.base}))
+        profile = g.GateProfile(self.fx, "gate-vm-%s/1" % key, ["minivm.exe"], hooks("minivm.exe", rows))
+        cap = g.capture(self.root / "runs", "minivm.exe", [], profile.specs(self.root),
+                        authorize_preview={"scope": "minivm-gate", "sites": ["line"], "max_bytes": 64})
+        session = g.unique("s_vm_" + key)
+        self.engine.load(session, cap.lines())
+        slim = {"rows": [{k: v for k, v in r.items() if k in ("binding", "script_name", "argc", "native_rva", "implementation_rva",
+                                                               "status")} for r in self.table["rows"]]}
+        reply = self.engine.tool("query", session, report="links", kinds=["app.script", "core.function.enter"], limit=200,
+                                 params={"table": slim, "script_field": "script.preview", "window": 8})
+        self.assertNotIn("error", reply, reply)
+        return session, reply["result"]
+
+    def test_each_traced_script_call_links_to_the_native_event_it_invoked(self):
+        session, result = self.run_links()
+        self.assertEqual(len(result["links"]), 12)
+        self.assertEqual(result["unlinked"], [])
+        rows = {r["event_id"]: r for r in self.engine.rows(session)}
+        sq = next(l for l in result["links"] if l["script_function"] == "sq")
+        self.assertEqual(rows[sq["from"]]["p"]["script"]["preview"], "sq 12")
+        self.assertEqual((rows[sq["to"]]["p"]["site"], rows[sq["to"]]["p"]["result"]), ("nat_sq", 144))
+        self.assertEqual(sq["relation"], "observed-call")
+        self.assertIn("binding-table", sq["basis"])
+        for link in result["links"]:
+            self.assertEqual(rows[link["to"]]["p"]["site"], "nat_" + link["script_function"])
+
+    def test_a_script_call_whose_native_was_not_instrumented_is_unlinked_not_dropped(self):
+        _session, result = self.run_links(skip="sq", key="skip")
+        self.assertEqual(len(result["links"]), 11)
+        self.assertEqual([u["script_function"] for u in result["unlinked"]], ["sq"])
+        self.assertIn("not observed, or not instrumented", result["unlinked"][0]["reason"])
+
+
 if __name__ == "__main__":
     unittest.main()

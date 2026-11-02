@@ -351,7 +351,8 @@ def from_engine_rows(rows: list[dict], *, names: dict | None = None, symbols: di
                     "thread_gen": (row.get("process_gen"), row.get("thread_gen")) if row.get("thread_gen") is not None else None,
                     "function": rename(known.get("function")) or payload.get("site"),
                     "stack": [rename(n) for n in known.get("stack") or [] if n], "va": row.get("va"),
-                    "ours": bool(payload.get("ours", False)), "payload": payload})
+                    "ours": bool(payload.get("ours", False)), "payload": payload,
+                    "rva": int(str(payload["rva"]), 0) if payload.get("rva") is not None else None})
     return out
 
 
