@@ -31,7 +31,7 @@ fn put(d: &mut [u8], at: usize, bytes: &[u8]) {
 
 /// Port of `image()` in tests/test_pe.py: two sections, virtual .text tail would alias .data on disk.
 #[allow(clippy::type_complexity)]
-fn image(spec: Spec) -> Image {
+fn image_bytes(spec: Spec) -> Vec<u8> {
     let default_text: Vec<u8> = [vec![0x90u8; 31], vec![0xC3]].concat();
     let text = if spec.text.is_empty() {
         &default_text[..]
@@ -80,7 +80,11 @@ fn image(spec: Spec) -> Image {
     t.resize(spec.text_raw as usize, 0x90);
     put(&mut d, 0x200, &t);
     put(&mut d, data_off, &b"DATA".repeat(8));
-    Image::from_vec("fixture.exe", d).unwrap()
+    d
+}
+
+fn image(spec: Spec) -> Image {
+    Image::from_vec("fixture.exe", image_bytes(spec)).unwrap()
 }
 
 fn value_err<T: std::fmt::Debug>(r: Result<T, PeError>) -> String {
@@ -423,4 +427,39 @@ fn parse_rva_matches_python() {
     assert!(prologue::parse_rva("va:0x10", base).is_err());
     assert!(prologue::parse_rva("zz:1", base).is_err());
     assert!(prologue::parse_rva("-3", base).is_err());
+}
+
+// ---- tests/test_client.py::ImportSlots (white-box: patched pefile objects) ----
+
+#[test]
+fn each_import_names_its_iat_slot_and_a_pattern_filters() {
+    // import descriptor at 0x1000, ILT at 0x1040, hint/names at 0x1060/0x1070, DLL name at 0x1080, IAT slots at 0x2010
+    let mut text = vec![0u8; 0x100];
+    let w32 = |t: &mut Vec<u8>, at: usize, v: u32| t[at..at + 4].copy_from_slice(&v.to_le_bytes());
+    w32(&mut text, 0, 0x1040); // OriginalFirstThunk
+    w32(&mut text, 12, 0x1080); // Name
+    w32(&mut text, 16, 0x2010); // FirstThunk
+    w32(&mut text, 0x40, 0x1060);
+    w32(&mut text, 0x44, 0x1070);
+    w32(&mut text, 0x48, 0x8000_0007); // by ordinal 7
+    text[0x62..0x6a].copy_from_slice(b"glClear ");
+    text[0x72..0x7a].copy_from_slice(b"glFlush ");
+    text[0x80..0x8c].copy_from_slice(b"OPENGL32.dll");
+    let mut bytes = image_bytes(Spec {
+        text: &text,
+        text_raw: 0x100,
+        ..Spec::default()
+    });
+    // data directory 1 (imports) of the PE32 optional header at 0x98: directories start at +96, entry 1 at +104
+    bytes[0x98 + 104..0x98 + 108].copy_from_slice(&0x1000u32.to_le_bytes());
+    bytes[0x98 + 108..0x98 + 112].copy_from_slice(&40u32.to_le_bytes());
+    let pe = Image::from_vec("fixture.exe", bytes).unwrap();
+    let listed = tools::imports_text(&pe, 10, "").unwrap();
+    assert!(
+        listed.contains("rva:0x2010 OPENGL32.dll glClear"),
+        "{listed}"
+    );
+    assert!(listed.contains("rva:0x2018 OPENGL32.dll ord:7"), "{listed}");
+    let filtered = tools::imports_text(&pe, 10, "glclear").unwrap();
+    assert!(!filtered.contains("glFlush"));
 }

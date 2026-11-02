@@ -203,3 +203,54 @@ def worker_path(*first: str) -> str:
     dependencies = sorted({str(Path(module.__file__).resolve().parent.parent) if module.__name__ == "capstone"
                            else str(Path(module.__file__).resolve().parent) for module in (capstone, pefile)})
     return os.pathsep.join([*first, package, *dependencies])
+
+
+# --- HYDRALYSIS_IMPL=rust ----------------------------------------------------------------------------------------
+# rust/crates/hy-query/src/proc.rs answers identity / stop / the kill half of terminate_tree. Spawning stays Python
+# (the Popen handles belong to Python callers); the Windows-only hosts are the target of the Rust port.
+
+def _native_proc():
+    if os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() != "rust":
+        return None
+    try:
+        import hydralysis_native as native
+    except ImportError:
+        return None
+    return native if hasattr(native, "proc_identity_rs") else None
+
+
+_python_identity, _python_stop, _python_terminate_tree = identity, stop, terminate_tree
+
+
+def identity(pid: int, started_ms: int) -> bool:
+    native = _native_proc()
+    if native is not None and os.name == "nt" and 0 <= pid < 2 ** 32:
+        return native.proc_identity_rs(pid, int(started_ms))
+    return _python_identity(pid, started_ms)
+
+
+identity.__doc__ = _python_identity.__doc__
+
+
+def stop(ready: dict) -> None:
+    native = _native_proc()
+    if native is not None and os.name == "nt":
+        pid, started = int(ready.get("pid", 0)), int(ready.get("started_ms", 0))
+        if 0 <= pid < 2 ** 32:
+            return native.proc_stop_rs(pid, started)
+    return _python_stop(ready)
+
+
+stop.__doc__ = _python_stop.__doc__
+
+
+def terminate_tree(child: subprocess.Popen) -> None:
+    native = _native_proc()
+    if native is not None and os.name == "nt":
+        native.proc_terminate_tree_rs(child.pid)
+        child.wait(timeout=30)
+        return
+    return _python_terminate_tree(child)
+
+
+terminate_tree.__doc__ = _python_terminate_tree.__doc__

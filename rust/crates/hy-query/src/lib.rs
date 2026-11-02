@@ -1,7 +1,11 @@
 //! Hydralysis PE-side query tool bodies (port of `hydralysis.pe` text tools and `hydralysis.prologue`).
 
 pub mod analysis;
+pub mod client;
+pub mod crossbuild;
 pub mod decompile;
+pub mod export;
+pub mod proc;
 pub mod prologue;
 pub mod tools;
 

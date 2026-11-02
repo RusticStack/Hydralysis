@@ -152,3 +152,51 @@ class Client:
 
     def evidence(self, **args):
         return self.call("evidence_list", **args)
+
+
+# --- HYDRALYSIS_IMPL=rust ----------------------------------------------------------------------------------------
+# rust/crates/hy-query/src/client.rs is the same facade over the same dispatch (`api.call`). With the switch on, each
+# method hands its arguments to hydralysis_native.NativeClient, whose dispatch calls back into `api.call`.
+
+def _native_client(client: "Client"):
+    if os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() != "rust":
+        return None
+    try:
+        import hydralysis_native as native
+    except ImportError:
+        return None
+    if not hasattr(native, "NativeClient"):
+        return None
+    return native
+
+
+def _rust_method(name, build):
+    python_impl = getattr(Client, name)
+
+    def method(self, *args, **kwargs):
+        native = _native_client(self)
+        if native is None:
+            return python_impl(self, *args, **kwargs)
+        try:
+            handle = native.NativeClient(lambda tool, text: api.call(tool, json.loads(text)))
+            with self._environment():
+                return build(handle, *args, **kwargs)
+        except native.ClientRefusal as refusal:
+            message, result = refusal.args
+            raise RusticError(message, json.loads(result) if result else None) from refusal.__cause__
+    method.__name__ = name
+    method.__doc__ = python_impl.__doc__
+    setattr(Client, name, method)
+
+
+_rust_method("call", lambda h, tool, **args: json.loads(h.call(tool, json.dumps({k: v for k, v in args.items() if v is not None}))))
+_rust_method("try_query", lambda h, target, action, address="", **options: json.loads(h.try_query(target, action, address, json.dumps(options))))
+_rust_method("fingerprint", lambda h, exe: json.loads(h.fingerprint(exe)))
+_rust_method("read", lambda h, exe, address, size=32: h.read(exe, address, size))
+_rust_method("check_prologues", lambda h, exe, rows, sha256=None: json.loads(h.check_prologues(exe, json.dumps(rows), sha256)))
+_rust_method("disasm", lambda h, exe, address, count=40: json.loads(h.disasm(exe, address, count)))
+_rust_method("inspect", lambda h, exe, address: json.loads(h.inspect(exe, address)))
+_rust_method("sigscan", lambda h, exe, pattern, limit=20: json.loads(h.sigscan(exe, pattern, limit)))
+_rust_method("query", lambda h, target, action, address="", **options: json.loads(h.query(target, action, address, json.dumps(options))))
+_rust_method("runtime", lambda h, action, **options: json.loads(h.runtime(action, json.dumps(options))))
+_rust_method("evidence", lambda h, **args: json.loads(h.evidence(json.dumps(args))))

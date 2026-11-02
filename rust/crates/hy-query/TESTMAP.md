@@ -62,10 +62,23 @@ compared by type and message.
 `import_archive`, `scan` with `regex` (Python `re` decides compile errors), an unhashable `kind`, and a function range
 wider than 128 bits.
 
+## Stage 3: export, crossbuild, client, proc
+
+| Python test | Class | Status |
+|---|---|---|
+| test_client.py (28) except ImportSlots | BB | passes unchanged with `HYDRALYSIS_IMPL=rust` (the Client methods run in `hy-query::client` over `api.call`) |
+| test_client.py::ImportSlots | WB (patches the pefile object) | re-expressed as `each_import_names_its_iat_slot_and_a_pattern_filters` in tests/ported.rs; it fails under `HYDRALYSIS_IMPL=rust` by construction (nothing to patch), so it is excluded from rust-mode runs |
+| test_proc.py (5) | BB | passes unchanged with `HYDRALYSIS_IMPL=rust` (identity/stop/terminate_tree in Rust; spawn + reaper stay Python) |
+| test_crossbuild.py (18) | BB | passes unchanged with `HYDRALYSIS_IMPL=rust` (`match` in Rust) |
+| test_exporting.py (40) | BB | slow (4-5 min). Python: 1 failure (`test_job_json_is_not_rewritten_for_every_row`, a timing assertion); Rust mode: the same 1 failure when rerun alone. A first full rust run also failed `test_cancel_latency_is_one_bounded_query` while the machine was compiling; it passes on rerun together with the Python-baseline failure above |
+| test_export_worker.py | does not exist in the repo (the export worker is covered by test_exporting.py and test_engine_export.py) | n/a |
+| new: tests/test_rust_parity_export.py | PAR | replay (21 file shapes + 3000-row parallel file), body_hash on a PE, decompile_row/partial/keys_sha256/parity, 60 random crossbuild.match builds in dict order |
+| new: tests/test_rust_parity_client.py | PAR | scripted dispatch through both Clients: answers, exception type/message/result/__cause__, exact calls and argument order, 450-row paging with mismatches |
+| new: crates/hy-query/src/proc.rs unit tests | WB | identity tolerance and stop on a real child (Windows) |
+
 ## Not yet ported (blocked or TODO)
 
-QueryRunner/open_program (query.py), client.py, proc.py, backends.py, doctor.py, export_worker.py, exporting.py,
-crossbuild.py, decompile_job.py: all sit on `hydra.Engine` (hydra.py, the hyd-client lane), `settings`, `locks`,
-`workcopy`/`views` (views lane), `durable`/`evidence` (storage lane), or on process/OS probing. They need those crates
-first; their tests (test_query, test_client, test_proc, test_backends, test_doctor, test_exporting, test_export_worker,
-test_crossbuild, test_cli query verbs, test_engine_*) stay Python-only and are unchanged.
+QueryRunner/open_program (query.py), backends.py, doctor.py, decompile_job.py, the `exporting.start/normalized/provenance`
+job orchestration and `export_worker.run` (they use `locks`, `workcopy`, `targets`, `preparation` and `hydra.Engine`);
+their tests (test_query, test_backends, test_doctor, test_exporting's job tests, test_cli query verbs, test_engine_*)
+stay Python-only and are unchanged.

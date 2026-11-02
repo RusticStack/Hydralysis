@@ -10,5 +10,9 @@ hy-pe = { path = "../hy-pe" }
 hy-disasm = { path = "../hy-disasm" }
 regex.workspace = true
 memchr = "2"
+indexmap = "2"
+memmap2.workspace = true
+rayon.workspace = true
+sha2.workspace = true
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror.workspace = true
