@@ -573,5 +573,91 @@ class SScriptNatives(Gate):
         self.assertIn("not observed, or not instrumented", result["unlinked"][0]["reason"])
 
 
+SAME_CODE = ["df_parse", "df_checksum", "df_format", "df_scale", "df_lookup", "df_walk"]
+
+
+@unittest.skipUnless(LIVE, "needs a trace engine (HYDRALYSIS_INTEGRATION_*, HYDRA_TRACE_EXE), Frida and MSVC")
+class SBuildInvalidation(Gate):
+    """Section 15.10 over two real builds of one program (diff1.exe, diff2.exe -DV2): the layout the codec depends on
+    moved, a hook row on a moved function is a candidate, a removed function is unplaced, the rest is carried."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        import re
+        import subprocess
+        import build_fixtures
+        from hydralysis import trace_corpus_diff
+        from hydralysis.pe import Image
+        cls.images, cls.functions, cls.layout, cls.sizes = {}, {}, {}, {}
+        for build, name in (("A", "diff1"), ("B", "diff2")):
+            exe = cls.fx / (name + ".exe")
+            cls.images[build] = Image(exe)
+            cls.functions[build] = {k: int(v, 16) - cls.images[build].base
+                                    for k, v in build_fixtures.symbols(exe.with_suffix(".map"))[0].items() if k.startswith("df_")}
+            # a function's extent: up to the next symbol of the linker map (the padding between functions is identical in both builds)
+            starts = sorted({int(m.group(1), 16) - cls.images[build].base for m in re.finditer(
+                r"^\s*0001:[0-9a-f]+\s+\S+\s+([0-9a-f]{16}) f", exe.with_suffix(".map").read_text(errors="replace"), re.M)})
+            cls.sizes[build] = {k: min((s for s in starts if s > v), default=v + 16) - v for k, v in cls.functions[build].items()}
+            out = subprocess.run([str(exe)], capture_output=True, text=True, timeout=30, cwd=str(cls.fx)).stdout
+            found = re.search(r"FX amount=(\d+) offset=(\d+) size=(\d+)", out)
+            assert found, out
+            cls.layout[build] = {"amount": int(found.group(1)), "offset": int(found.group(2)), "size": int(found.group(3))}
+
+        def corpus(build):
+            fields = [{"name": "id", "offset": 0, "type": "int32"}, {"name": "version", "offset": 4, "type": "int32"}]
+            if cls.layout[build]["size"] == 16:
+                fields.append({"name": "inserted", "offset": 8, "type": "int32"})
+            fields.append({"name": "amount", "offset": cls.layout[build]["offset"], "type": "int32"})
+            records = [{"kind": "struct", "name": "Record", "size": cls.layout[build]["size"], "fields": fields}]
+            records += [{"kind": "function", "name": k, "address": "rva:%#x" % v, "size": cls.sizes[build][k]} for k, v in cls.functions[build].items()]
+            return trace_corpus_diff.load_corpus(records)
+        cls.a, cls.b = corpus("A"), corpus("B")
+
+    def readers(self):
+        from hydralysis import trace_corpus_diff
+        return (trace_corpus_diff.position_independent_reader(self.images["A"]),
+                trace_corpus_diff.position_independent_reader(self.images["B"]))
+
+    def report(self):
+        from hydralysis import trace_corpus_diff
+        base = self.images["A"].base
+        dependents = [
+            {"id": "codec:record-amount", "kind": "codec", "refs": [{"type": "Record", "field": "amount"}]},
+            {"id": "codec:record-id", "kind": "codec", "refs": [{"type": "Record", "field": "id"}]},
+            {"id": "hook:df_render", "kind": "hook", "refs": [{"function": "df_render", "rva": "%#x" % self.functions["A"]["df_render"]}]},
+            {"id": "claim:df_removed", "kind": "evidence", "refs": [{"function": "df_removed"}]},
+            {"id": "claim:df_decode_amount", "kind": "evidence", "refs": [{"function": "df_decode_amount"}]},
+        ] + [{"id": "claim:" + name, "kind": "evidence", "refs": [{"function": name}]} for name in SAME_CODE]
+        self.assertGreater(base, 0)
+        return trace_corpus_diff.invalidation_report(self.a, self.b, dependents, readers=self.readers(), build_a="diff1.exe", build_b="diff2.exe")
+
+    def test_the_programs_report_the_layouts_the_corpora_are_built_from(self):
+        self.assertEqual({k: (v["offset"], v["size"]) for k, v in self.layout.items()}, {"A": (8, 12), "B": (12, 16)})
+        self.assertEqual(self.layout["A"]["amount"], self.layout["B"]["amount"], "the codec follows the layout: the decoded value is the same")
+
+    def test_the_corpus_diff_names_the_inserted_field_and_the_moved_one(self):
+        from hydralysis import trace_corpus_diff
+        diff = trace_corpus_diff.diff_corpora(self.a, self.b)
+        self.assertEqual({(c["field"], c["change"]) for c in diff["fields"]}, {("inserted", "added"), ("amount", "moved")})
+        self.assertEqual(diff["types"]["resized"], [{"type": "Record", "change": "resized", "a": 12, "b": 16}])
+        self.assertEqual(diff["functions"]["added"], ["df_added"])
+        self.assertEqual(diff["functions"]["removed"], ["df_removed"])
+
+    def test_the_layout_codec_is_moved_the_hook_row_a_candidate_the_removed_function_unplaced_and_the_rest_carried(self):
+        report = self.report()
+        status = {item["id"]: item["status"] for item in report["items"]}
+        self.assertEqual(status["codec:record-amount"], "moved")
+        self.assertEqual(status["codec:record-id"], "carried", "the unmoved field keeps its codec")
+        self.assertEqual(status["hook:df_render"], "candidate")
+        self.assertEqual(status["claim:df_removed"], "unplaced")
+        self.assertEqual(status["claim:df_decode_amount"], "candidate", "the codec function changed bytes")
+        self.assertEqual({n: status["claim:" + n] for n in SAME_CODE}, {n: "carried" for n in SAME_CODE})
+        self.assertEqual(report["counts"], {"carried": 7, "candidate": 2, "moved": 1, "unplaced": 1})
+        self.assertEqual(report["promoted"], 0)
+        self.assertIn("Nothing is promoted", report["policy"])
+        self.assertEqual([m["dependents"] for m in report["moved_layouts"]], [["codec:record-amount"]])
+
+
 if __name__ == "__main__":
     unittest.main()
