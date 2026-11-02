@@ -24,6 +24,13 @@ pub const TAIL_WINDOW_MAX: u64 = 8 * 1024 * 1024;
 /// key -> end of the last line this process knows to be valid. An entry only lets a writer skip a scan.
 static VERIFIED: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+static SCANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many log scans (`scan_file`) this process has made; tests use it to prove a check scanned nothing.
+pub fn scan_count() -> u64 {
+    SCANS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Forget every "verified up to" memo (tests that rewrite logs behind this process; `durable._VERIFIED.clear()`).
 pub fn clear_verified() {
     if let Ok(mut map) = VERIFIED.lock() {
@@ -193,6 +200,7 @@ fn file_chunks(mut handle: File, start: u64, stop: u64) -> impl Iterator<Item = 
 
 /// Scan a log by streaming from byte `start` (a line start) to its size at the moment it was opened.
 pub fn scan_file(path: &Path, start: u64, collect: bool) -> Scan {
+    SCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let Ok(handle) = File::open(path) else { return Scan::default() };
     let stop = handle.metadata().map(|m| m.len()).unwrap_or(0);
     let start = if start > stop { 0 } else { start };
@@ -320,6 +328,11 @@ impl AppendLog {
 
     fn file_name(&self) -> String {
         self.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+    }
+
+    /// The end of the last line this process knows to be valid (`None` when it must scan before the next append).
+    pub fn verified_end(&self) -> Option<u64> {
+        self.known()
     }
 
     fn known(&self) -> Option<u64> {

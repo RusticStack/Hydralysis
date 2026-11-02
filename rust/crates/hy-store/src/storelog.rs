@@ -123,12 +123,22 @@ pub fn chain(record: &mut Value, rows: &[Value]) -> Position {
 /// The store at PATH: RECORD (its snapshot, as the caller read it) with the log applied. `reread` reads the snapshot
 /// again; it is used to retry when the snapshot file was replaced while the log was read.
 pub fn read(path: &Path, record: Option<Value>, reread: Option<&dyn Fn() -> Result<Option<Value>>>) -> Result<Option<Value>> {
+    read_with(path, record, reread, &|p| file_identity(p))
+}
+
+/// [`read`] with the snapshot-identity probe injectable (tests feign a snapshot replaced while the log was read).
+pub fn read_with(
+    path: &Path,
+    record: Option<Value>,
+    reread: Option<&dyn Fn() -> Result<Option<Value>>>,
+    identity: &dyn Fn(&Path) -> Option<fsio::FileIdentity>,
+) -> Result<Option<Value>> {
     let mut record = record;
-    let mut before = file_identity(path);
+    let mut before = identity(path);
     let mut log_rows = Vec::new();
     for attempt in 0..=READ_RETRIES {
         if attempt > 0 {
-            before = file_identity(path);
+            before = identity(path);
             record = match reread {
                 Some(f) => f()?,
                 None => record,
@@ -139,7 +149,7 @@ pub fn read(path: &Path, record: Option<Value>, reread: Option<&dyn Fn() -> Resu
             return Ok(record);
         }
         log_rows = rows(path)?;
-        if reread.is_none() || file_identity(path) == before {
+        if reread.is_none() || identity(path) == before {
             break;
         }
     }

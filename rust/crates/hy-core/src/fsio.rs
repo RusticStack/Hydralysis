@@ -77,20 +77,27 @@ pub fn is_permission_error(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::PermissionDenied || matches!(error.raw_os_error(), Some(5 | 32 | 33))
 }
 
+/// The retry delays of `replace_file`: 50 ms doubling to a 500 ms cap, while the total wait stays within 10 s.
+pub fn retry_delays() -> Vec<f64> {
+    let (mut delay, mut waited, mut out) = (RETRY_FIRST_S, 0.0, Vec::new());
+    while waited + delay <= RETRY_TOTAL_S {
+        out.push(delay);
+        waited += delay;
+        delay = (delay * 2.0).min(RETRY_MAX_DELAY_S);
+    }
+    out
+}
+
 /// Replace `destination` with `source`, retrying a permission error with backoff.
 pub fn replace_file(source: &Path, destination: &Path) -> Result<()> {
-    let (mut delay, mut waited) = (RETRY_FIRST_S, 0.0);
+    let mut delays = retry_delays().into_iter();
     loop {
         match replace_once(source, destination) {
             Ok(()) => return Ok(()),
-            Err(error) if is_permission_error(&error) => {
-                if waited + delay > RETRY_TOTAL_S {
-                    return Err(error.into());
-                }
-                std::thread::sleep(Duration::from_secs_f64(delay));
-                waited += delay;
-                delay = (delay * 2.0).min(RETRY_MAX_DELAY_S);
-            }
+            Err(error) if is_permission_error(&error) => match delays.next() {
+                Some(delay) => std::thread::sleep(Duration::from_secs_f64(delay)),
+                None => return Err(error.into()),
+            },
             Err(error) => return Err(error.into()),
         }
     }
@@ -182,9 +189,12 @@ pub fn read_optional(path: &Path, max_bytes: Option<u64>) -> Result<Option<Vec<u
     }
 }
 
+/// `(file id, mtime in ns, size)`.
+pub type FileIdentity = (u64, i128, u64);
+
 /// `(file id, mtime in ns, size)` of a file, the identity `os.stat` gives Python (`st_ino`, `st_mtime_ns`,
 /// `st_size`); `None` when it does not exist.
-pub fn file_identity(path: &Path) -> Option<(u64, i128, u64)> {
+pub fn file_identity(path: &Path) -> Option<FileIdentity> {
     let meta = fs::metadata(path).ok()?;
     let mtime = meta.modified().ok().map_or(0, system_time_ns);
     Some((file_id(path, &meta), mtime, meta.len()))

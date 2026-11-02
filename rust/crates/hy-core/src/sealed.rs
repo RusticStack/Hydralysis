@@ -72,6 +72,11 @@ pub fn classify(raw: Option<&[u8]>) -> (Kind, Option<Value>, String) {
         Ok(v) => v,
         Err(error) => {
             let text = error.to_string();
+            // Python parses a lone surrogate escape and then fails to canonicalise a sealed body; serde refuses it at parse
+            // time. A sealed-looking file with that escape reports Python's reason.
+            if (text.contains("surrogate") || text.contains("hex escape")) && raw.windows(6).any(|w| w == b"\"seal\"") {
+                return (Kind::Invalid, None, "body cannot be canonicalised".into());
+            }
             return (Kind::Invalid, None, format!("unparseable ({})", text.chars().take(80).collect::<String>()));
         }
     };

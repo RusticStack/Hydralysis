@@ -35,6 +35,23 @@ def _load(text):
     return None if text is None else json.loads(text)
 
 
+def _has_surrogate(value) -> bool:
+    if isinstance(value, str):
+        return any(0xD800 <= ord(ch) <= 0xDFFF for ch in value)
+    if isinstance(value, dict):
+        return any(_has_surrogate(k) or _has_surrogate(v) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(_has_surrogate(v) for v in value)
+    return False
+
+
+def _refuse_surrogate(value, exc):
+    """Python's canonical form refuses an unpaired surrogate (PROTOCOL-3.md 3.4); serde_json refuses it earlier."""
+    if _has_surrogate(value):
+        raise ValueError("canonical form refuses an unpaired surrogate (PROTOCOL-3.md 3.4): %s" % exc) from exc
+    raise exc
+
+
 def install_durable(durable) -> None:
     original_log = durable.AppendLog
     original_scan = durable.Scan
@@ -43,12 +60,15 @@ def install_durable(durable) -> None:
         try:
             return rs.canonical(_dump(value))
         except ValueError as exc:
-            raise ValueError("canonical form refuses an unpaired surrogate (PROTOCOL-3.md 3.4): %s" % exc) from exc
+            _refuse_surrogate(value, exc)
 
     def dumps_sealed(value, indent=2) -> bytes:
         if not isinstance(value, dict):
             raise ValueError("a sealed record must be a JSON object")
-        return rs.dumps_sealed(_dump(value), indent)
+        try:
+            return rs.dumps_sealed(_dump(value), indent)
+        except ValueError as exc:
+            _refuse_surrogate(value, exc)
 
     def frame(record) -> bytes:
         return rs.frame(_dump(record))
@@ -68,7 +88,12 @@ def install_durable(durable) -> None:
     def write_sealed(path, value, *, indent=2, max_bytes=None, too_large=None):
         if not isinstance(value, dict):
             raise ValueError("a sealed record must be a JSON object")
-        return rs.write_sealed(os.fspath(path), _dump(value), indent, max_bytes, too_large)
+        try:
+            return rs.write_sealed(os.fspath(path), _dump(value), indent, max_bytes, too_large)
+        except ValueError as exc:
+            if _has_surrogate(value):
+                _refuse_surrogate(value, exc)
+            raise
 
     def atomic_write(path, data, *, point="atomic", sync=True):
         rs.atomic_write(os.fspath(path), bytes(data), point, sync)
