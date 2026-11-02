@@ -32,8 +32,8 @@ def load(name: str) -> dict:
 
 
 def digest(name: str) -> str:
-    """SHA-256 of the schema file's bytes, as recorded with a session or an interpretation."""
-    return hashlib.sha256((DIRECTORY / name).read_bytes()).hexdigest()
+    """SHA-256 of the schema file's bytes with LF line ends (a checkout may convert them), as recorded with a session or an interpretation."""
+    return hashlib.sha256((DIRECTORY / name).read_bytes().replace(b"\r\n", b"\n")).hexdigest()
 
 
 def _is(kind: str, value) -> bool:

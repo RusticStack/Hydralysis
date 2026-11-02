@@ -113,10 +113,11 @@ OPTION_BAGS = {
                   "of the call, D59)",
     "job": "status/cancel filters (kind, cid) for commit and backup jobs",
     "runtime": "per-action options (exists)",
-    "trace": "per-action options: start (profile, images, scenario, scope, launch, capture), query (kinds, filter, group_by, "
-             "cursor, revision, interpretation, profile_query), diff (against, group_by, align), explain (event_id, depth, "
-             "direction), mark (label, note), export (out, format), check (assertions), import (input), resymbolize; "
-             "offline=true runs import/verify/rebuild/export on files; every action takes limit",
+    "trace": "per-action options: start (profile, images, scope, launch, program), query (kinds, filter, group_by, "
+             "cursor, up_to, interpretation, profile_query), diff (against, group_by, align), explain (event_id, depth, "
+             "direction), mark (label, phase), export (name, overwrite), check (assertions), import (input), resymbolize "
+             "(program); writes use the cap that start returned; offline=true runs import/verify/rebuild/export on files; "
+             "every action takes limit",
 }
 
 # The handler registry (PROTOCOL-3.md 8.2, D34). A capability name maps to the module that implements it. The module is

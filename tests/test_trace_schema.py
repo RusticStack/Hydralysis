@@ -36,7 +36,9 @@ class VendoredSchemas(unittest.TestCase):
         theirs = sorted(path.name for path in source.glob("*.json"))
         self.assertEqual(trace_schema.names(), theirs, "vendored schema set differs from the engine's")
         for name in theirs:
-            self.assertEqual((trace_schema.DIRECTORY / name).read_bytes(), (source / name).read_bytes(), name)
+            # A checkout may convert line ends; the content, and so the digest, is what must be identical.
+            ours = (trace_schema.DIRECTORY / name).read_bytes().replace(b"\r\n", b"\n")
+            self.assertEqual(ours, (source / name).read_bytes().replace(b"\r\n", b"\n"), name)
 
     def test_every_schema_is_json_with_an_id_and_a_digest(self):
         self.assertIn("event.schema.json", trace_schema.names())
