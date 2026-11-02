@@ -145,6 +145,8 @@ There is no GUI. Hydra Engine is headless only; projects it writes cannot be ope
 
 Numbers here come from the owner's KotOR baseline and depend on the function and the machine; treat them as examples, not guarantees. The baseline corpus is KotOR 1: `function_counts` total 8,966, internal 8,616, thunks 60. A warm decompile measured 0.7-2.1 ms for a 1-byte function and 35-45 ms for a 6.7 KB function: native decompile about 1 to 45 ms by function size; through Hydralysis about 25 ms on a small program and about 60 ms on KotOR (single runs). The tool counts in [the tool mapping](docs/tool-mapping.md) are sourced there, with what is still unverified marked.
 
+**System requirements.** What the engine and the semantic trace need, with the reference machine (Intel Core i7-13700KF) and the recorded runs behind each row, is in the engine README: [System requirements](https://github.com/RusticStack/hydra-engine#system-requirements). It lists the minimum, reference, recommended and optional-capability requirements (capture needs an elevated process for the kernel ETW consumer, Frida for in-process hooks), the support matrix, and how a smaller machine is refused or answered with an explicit partial result rather than different evidence.
+
 ## Verify runtime evidence
 
 ```text
