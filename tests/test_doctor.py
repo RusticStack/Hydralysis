@@ -108,9 +108,16 @@ class Doctor(World, unittest.TestCase):
 
     def test_a_wedged_daemon_is_an_error_finding(self):
         FakeDaemonHandle.alive = True
+        # The JDK check reads the host's JAVA_HOME; the hosted runner's is a JDK 17, a second (correct) error finding.
+        # Name a JDK of the required major so the wedged daemon is the only error here.
+        home = self.root / "jdk25"
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "release").write_text('JAVA_VERSION="%d.0.1"\n' % doctor.REQUIRED_JDK, encoding="utf-8")
+        self.settings["java_home"] = str(home)
         with patch.object(FakeDaemonHandle, "attach", side_effect=FakeModule.LaunchError("no_answer")):
             reply = self.run_doctor()
         self.assertIn("daemon_no_answer", [item["id"] for item in reply["findings"]])
+        self.assertEqual([item["id"] for item in reply["findings"] if item["level"] == "error"], ["daemon_no_answer"])
         self.assertEqual(reply["summary"]["errors"], 1)
 
     def test_leftover_tmp_files_are_reported_and_never_deleted(self):

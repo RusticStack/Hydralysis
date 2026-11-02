@@ -257,6 +257,16 @@ class RunJobLifecycle(Base):
 class RealWorker(Base):
     """`python -m hydralysis.viewpool --serve` with the real `views.run_job`, on a job whose target does not exist."""
 
+    def setUp(self):
+        super().setUp()
+        # `viewpool` keeps process-wide state (`_POOL`, `_DISABLED`). A test elsewhere in the same process that reaches the real
+        # `views.start_job` with `proc.popen` patched out leaves the pool disabled for good (a worker without pipes is a broken
+        # pool, by design), so `unittest discover` made `dispatch` answer False here. This test owns a fresh pool.
+        for name, value in (("_POOL", None), ("_DISABLED", False)):
+            patcher = patch.object(viewpool, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def job(self, job_id, name):
         folder = self.root / "overlay-jobs" / job_id
         folder.mkdir(parents=True)
