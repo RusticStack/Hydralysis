@@ -1,7 +1,17 @@
-//! Hydralysis project-mutation machinery, ported from `hydralysis.{locks,jobowner,viewgov,...}`.
+//! Hydralysis project-mutation machinery, ported from `hydralysis.{locks,jobowner,viewgov,views,...}`.
 //!
-//! Ported so far: [`locks`], [`jobowner`], [`viewgov`]. See `TESTMAP.md` for the test map and what remains.
+//! Ported so far: [`locks`], [`jobowner`], [`viewgov`], and the stage-1 record formats: [`layout`] (paths, ids),
+//! [`records`] (view records), [`queue`] (changeset queue records and status), [`options`] (option validation).
+//! See `TESTMAP.md` for the test map and what remains.
 
+pub mod error;
 pub mod jobowner;
+pub mod layout;
 pub mod locks;
+pub mod options;
+pub mod proc;
+pub mod queue;
+pub mod records;
 pub mod viewgov;
+
+pub use error::{Error, PublishFailure, Result, ViewError};
