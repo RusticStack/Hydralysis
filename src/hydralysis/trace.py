@@ -30,6 +30,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 from hydralysis import evidence, proc, trace_canon, trace_schema
@@ -51,9 +52,13 @@ MAX_IMPORT_BYTES = 64 * 1024 * 1024
 BATCH_EVENTS = 500
 _SESSION = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,79}$")
 _EVENT_ID = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,119}$")
-_LIST_KEYS = ("groups", "events", "rows", "items", "results", "counterexamples", "sessions", "only_a", "only_b",
-              "different_under_matched_coverage", "not_comparable", "paths", "marks", "unresolved", "assertions", "jobs")
-_TOKENS: dict[str, str] = {}      # session -> the owner capability this process was given by trace_open
+# The list-valued fields of the engine's replies (PROTOCOL-3.md 8.20): query rows and groups, explain nodes, edges and
+# boundaries, check results, list sessions, info sources, export files, and the entries of a diff or an aligned diff.
+_LIST_KEYS = ("rows", "groups", "nodes", "edges", "boundaries", "results", "sessions", "sources", "files", "entries",
+              "unmatched_a", "unmatched_b", "rejected", "events", "items", "counterexamples", "only_a", "only_b",
+              "different_under_matched_coverage", "not_comparable", "paths", "unresolved", "assertions", "jobs")
+_NESTED = ("diff", "aligned", "symbols")   # reply members that hold lists of their own
+_TOKENS: dict[str, str] = {}      # session -> the writer capability (`cap`) this process was given by trace_open
 _LINKS: dict[str, str] = {}       # trace session -> the runtime session capturing into it
 
 # TRACE-1 section 15: the wire codes are hyphenated; evidence stores the same code with underscores.
@@ -120,7 +125,7 @@ def _collect_ids(value, found: list, depth: int = 0) -> None:
         return
     if isinstance(value, dict):
         for key, item in value.items():
-            if key in ("event_id", "from_event", "to_event", "representative", "first_event", "last_event") and isinstance(item, str):
+            if key in ("event_id", "from_event", "to_event", "representative", "first_event", "last_event", "first_a", "first_b", "root") and isinstance(item, str):
                 found.append(item)
             elif key in ("event_ids", "counterexamples", "representatives", "events") and isinstance(item, list):
                 for entry in item:
@@ -146,19 +151,29 @@ def shape(reply, *, session: str | None, command: str, limit: int, requested_rev
     MAX_REPLY_BYTES the largest lists are halved until it fits, saying so in `bounds.truncated`."""
     out = dict(reply) if isinstance(reply, dict) else {"result": reply}
     truncated: dict[str, int] = {}
-    for key in _LIST_KEYS:
-        if isinstance(out.get(key), list) and len(out[key]) > limit:
-            truncated[key] = len(out[key]) - limit
-            out[key] = out[key][:limit]
+    for key in _NESTED:
+        if isinstance(out.get(key), dict):
+            out[key] = dict(out[key])
+    for holder, name in [(out, "")] + [(out[key], key + ".") for key in _NESTED if isinstance(out.get(key), dict)]:
+        for key in _LIST_KEYS:
+            if isinstance(holder.get(key), list) and len(holder[key]) > limit:
+                truncated[name + key] = len(holder[key]) - limit
+                holder[key] = holder[key][:limit]
     coverage = out.get("coverage") if isinstance(out.get("coverage"), dict) else None
     gaps = (coverage or {}).get("gaps", out.get("gaps"))
+    reported = coverage is not None or isinstance(gaps, list)
+    nested_gaps = out["diff"] if isinstance(out.get("diff"), dict) and "gaps_a" in out["diff"] else None
     gaps = gaps if isinstance(gaps, list) else []
+    if nested_gaps is not None:
+        reported = True
     if len(gaps) > limit:
         truncated["gaps"] = len(gaps) - limit
         gaps = gaps[:limit]
     revision = out.get("revision", requested_revision)
-    out["coverage"] = {"revision": (coverage or {}).get("revision", out.get("coverage_revision")), "gaps": gaps,
-                       "reported": coverage is not None or "coverage_revision" in out}
+    out["coverage"] = {"revision": revision, "gaps": gaps, "reported": reported}
+    if nested_gaps is not None:
+        out["coverage"].update(gaps_a=nested_gaps.get("gaps_a"), gaps_b=nested_gaps.get("gaps_b"),
+                               revision_a=nested_gaps.get("revision_a"), revision_b=nested_gaps.get("revision_b"))
     out.pop("coverage_revision", None)
     out.pop("gaps", None)
     if not out["coverage"]["reported"]:
@@ -174,13 +189,15 @@ def shape(reply, *, session: str | None, command: str, limit: int, requested_rev
         truncated["citations"] = len(unique) - MAX_CITATIONS
     out["revision"] = revision
     while _size(out) > MAX_REPLY_BYTES:
-        sized = [(key, len(out[key])) for key in _LIST_KEYS if isinstance(out.get(key), list) and len(out[key]) > 1]
+        holders = [(out, "")] + [(out[key], key + ".") for key in _NESTED if isinstance(out.get(key), dict)]
+        sized = [(holder, name + key, key, len(holder[key])) for holder, name in holders for key in _LIST_KEYS
+                 if isinstance(holder.get(key), list) and len(holder[key]) > 1]
         if not sized:
             break
-        key = max(sized, key=lambda item: (_size(out[item[0]]), item[0]))[0]
-        keep = max(1, len(out[key]) // 2)
-        truncated[key] = truncated.get(key, 0) + len(out[key]) - keep
-        out[key] = out[key][:keep]
+        holder, label, key, _ = max(sized, key=lambda item: (_size(item[0][item[2]]), item[1]))
+        keep = max(1, len(holder[key]) // 2)
+        truncated[label] = truncated.get(label, 0) + len(holder[key]) - keep
+        holder[key] = holder[key][:keep]
     if _size(out) > MAX_REPLY_BYTES:
         out = {"error": "reply_too_large", "message": "the engine's answer to %s does not fit %d bytes even cut to its "
                "heads; narrow the filter" % (command, MAX_REPLY_BYTES), "revision": revision}
@@ -216,7 +233,7 @@ class TraceClient:
             raise
         return reply if isinstance(reply, dict) else {"result": reply}
 
-    def open(self, **fields) -> dict:
+    def begin(self, **fields) -> dict:
         return self.call("trace_open", **fields)
 
     def append(self, session: str, events: list, **fields) -> dict:
@@ -231,8 +248,8 @@ class TraceClient:
     def explain(self, session: str, event_id: str, **fields) -> dict:
         return self.call("trace_explain", session=session, event_id=event_id, **fields)
 
-    def diff(self, session_a: str, session_b: str, **fields) -> dict:
-        return self.call("trace_diff", session_a=session_a, session_b=session_b, **fields)
+    def diff(self, a: str, b: str, **fields) -> dict:
+        return self.call("trace_diff", a=a, b=b, **fields)
 
     def check(self, session: str, **fields) -> dict:
         return self.call("trace_check", session=session, **fields)
@@ -327,10 +344,11 @@ def segment_from_events(events: list[dict], segment_id: str) -> bytes:
 
 # ---- the offline tool -----------------------------------------------------------------------------------------
 
-# The `hydra-trace` verbs and their argument order, as this module calls them. `gen` and `verify <segment> <id>` exist
-# today; the others are the store lane's (import, rebuild, export) and are not advertised until it ships them.
-OFFLINE_VERBS = {"import": ("store", "session", "input"), "rebuild": ("store", "session"),
-                 "export": ("store", "session", "output"), "check": ("store", "session")}
+# The `hydra-trace` command line (crates/hydra-trace/src/main.rs): `import <root> <session> <file.jsonl|file.dmp>`,
+# `rebuild <root> <session>`, `export <root> <session> <outdir> [--overwrite]`, `verify <root> <session>` (a folder
+# as the first argument; `verify <segment-file> <segment-id>` checks one segment) and `gen <recipe> <seed> <events>
+# <outdir>`.
+OFFLINE_VERBS = ("import", "rebuild", "export", "verify")
 
 
 def find_tool(settings: dict | None = None) -> Path | None:
@@ -363,7 +381,7 @@ def run_tool(settings: dict | None, verb: str, arguments: list[str], *, timeout_
 
 
 def offline_verify(directory: Path, segments: list[str] | None = None) -> dict:
-    """Verify every `*.trace` segment under DIRECTORY with the Python twin; the five outcomes are kept apart."""
+    """Verify every `*.trace` segment under DIRECTORY (a session's `segments` folder) with the Python twin."""
     directory = Path(directory)
     if not directory.is_dir():
         return {"outcome": "missing", "segments": [], "reason": "%s is not a folder" % directory}
@@ -379,37 +397,61 @@ def offline_verify(directory: Path, segments: list[str] | None = None) -> dict:
             "segments": rows}
 
 
+def _tool_json(result: dict) -> dict:
+    """The JSON line the tool printed, when it printed one."""
+    for line in reversed(str(result.get("stdout", "")).splitlines()):
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
 def _offline(action: str, options: dict, settings: dict) -> dict:
     store = Path(str(options.get("store") or Path(settings.get("root", ".")) / "traces"))
     verb = str(options.get("op") or ("import" if action == "import" else action))
+    if verb not in OFFLINE_VERBS:
+        raise ValueError("offline op must be one of: " + ", ".join(OFFLINE_VERBS))
+    name = _session(options.get("session") or options.get("name") or "", "options.session")
     if verb == "verify":
-        session = _session(options.get("session") or options.get("name") or "", "options.session")
-        return {"offline": True, "op": "verify", **offline_verify(store / session, _strings(options.get("segments"), "options.segments"))}
-    if action == "import" and verb == "import":
-        name = _session(options.get("session") or "", "options.session")
+        python = offline_verify(store / name / "segments", _strings(options.get("segments"), "options.segments"))
+        reply = {"offline": True, "op": "verify", **python}
+        if options.get("engine") and find_tool(settings):
+            reply["engine"] = run_tool(settings, "verify", [str(store), name])
+            reply["engine"]["report"] = _tool_json(reply["engine"])
+        return reply
+    if verb == "import":
         source = Path(str(options.get("input") or options.get("file") or ""))
+        if source.suffix.lower() == ".dmp":
+            return {"offline": True, "op": "import", **run_tool(settings, "import", [str(store), name, str(source)])}
         read = read_jsonl(source)
         summary = {key: read[key] for key in ("outcome", "lines", "damage", "lost_producers", "reason") if key in read}
         if not read["events"]:
             return {"offline": True, "op": "import", "imported": 0, **summary}
-        target = store / name
-        target.mkdir(parents=True, exist_ok=True)
-        segment_id = _session(options.get("source_id") or read["events"][0]["source_id"], "source_id")
-        path = target / (segment_id + ".trace")
-        if path.exists():
-            raise TraceError("segment_exists", "%s exists; a segment is append-only and is not replaced" % path)
-        from hydralysis import durable
-        durable.atomic_write(path, segment_from_events(read["events"], segment_id))
-        result = {"offline": True, "op": "import", "imported": len(read["events"]), "segment": str(path),
-                  "verified": offline_verify(target, [segment_id])["outcome"], **summary}
-        if options.get("rebuild", True) and find_tool(settings):
-            result["rebuild"] = run_tool(settings, "rebuild", [str(store), name])
-        return result
-    if verb in OFFLINE_VERBS:
-        fields = {"store": str(store), "session": _session(options.get("session") or "", "options.session"),
-                  "input": str(options.get("input") or ""), "output": str(options.get("output") or options.get("out") or "")}
-        return {"offline": True, "op": verb, **run_tool(settings, verb, [fields[name] for name in OFFLINE_VERBS[verb]])}
-    raise ValueError("offline op must be verify, import, rebuild, export or check")
+        if not find_tool(settings):
+            raise TraceError("tool_missing", "an offline import is done by hydra-trace.exe (it keeps the batch manifest next to the "
+                             "segments); set HYDRA_TRACE_EXE or install the engine that ships it", verb="import")
+        # The tool reads a clean JSONL file; the valid prefix of a damaged input is written to a scratch file for it.
+        with tempfile.TemporaryDirectory(prefix="hydralysis-trace-import-") as scratch:
+            clean = Path(scratch) / "events.jsonl"
+            from hydralysis import durable
+            durable.atomic_write(clean, b"".join(json.dumps(event, sort_keys=True, ensure_ascii=False).encode("utf-8") + b"\n"
+                                       for event in read["events"]))
+            ran = run_tool(settings, "import", [str(store), name, str(clean)])
+        return {"offline": True, "op": "import", "imported": len(read["events"]) if ran["ok"] else 0,
+                "report": _tool_json(ran), **summary, **{k: ran[k] for k in ("ok", "exit_code", "stderr")}}
+    arguments = [str(store), name]
+    if verb == "export":
+        output = options.get("output") or options.get("out")
+        if not output:
+            raise ValueError("options.output (an export folder) is required for an offline export")
+        arguments.append(str(output))
+        if options.get("overwrite"):
+            arguments.append("--overwrite")
+    ran = run_tool(settings, verb, arguments)
+    return {"offline": True, "op": verb, "report": _tool_json(ran), **ran}
 
 
 # ---- the actions ----------------------------------------------------------------------------------------------
@@ -449,17 +491,19 @@ def _start(client: TraceClient, session: str | None, options: dict, settings: di
     if scope.get("add") and not options.get("owner_token"):
         raise TraceError("scope_expansion_needs_owner", "adding processes or services to the scope needs the owner token")
     limitations = list((verification or {}).get("limitations", []))
-    opened = client.open(
-        session=session, profile=profile.session_record() if profile else None, scenario=str(options.get("scenario") or ""),
-        scope=scope or {"process_tree": True}, capture=_object(options.get("capture"), "options.capture") or None,
-        watchpoints=options.get("watchpoints"), limitations=limitations or None,
-        enabled_hooks=(verification or {}).get("enabled"), label=options.get("label"))
+    # The engine keeps events, not session metadata: the profile, scope and limitations are answered back to the caller
+    # (and written into events by the producer); only the fields of `trace_open` reach the engine.
+    opened = client.begin(
+        session=session, create=True, mode="write", max_events=options.get("max_events"), max_bytes=options.get("max_bytes"),
+        preview=options.get("preview"), program=options.get("program"), project=options.get("project"),
+        modules=_strings(options.get("modules"), "options.modules") or None)
     name = str(opened.get("session") or session or "")
-    if opened.get("owner"):
-        _TOKENS[name] = str(opened["owner"])
+    cap = (opened.get("lease") or {}).get("cap")
+    if cap:
+        _TOKENS[name] = str(cap)
     result = {"session": name, "opened": opened, "profile": verification and {k: verification[k] for k in
               ("profile", "profile_sha256", "counts", "limitations", "enabled")},
-              "owner": opened.get("owner")}
+              "scope": scope or {"process_tree": True}, "limitations": limitations, "cap": cap}
     launch = _object(options.get("launch"), "options.launch")
     if launch:
         from hydralysis.runtime import RuntimeRunner
@@ -471,11 +515,11 @@ def _start(client: TraceClient, session: str | None, options: dict, settings: di
             started = runner.call(action, {key: value for key, value in launch.items() if key != "action"})
             runtime_session = str(started.get("session") or "")
             capture = runner.call("capture", {"op": "start", "session": runtime_session, "trace": {
-                "session": name, "owner": _TOKENS.get(name), "hooks": (verification or {}).get("enabled", [])},
+                "session": name, "cap": _TOKENS.get(name), "hooks": (verification or {}).get("enabled", [])},
                 **_object(options.get("capture_options"), "options.capture_options")})
         except Exception as exc:  # noqa: BLE001 - the session was opened; close it so no orphan keeps a writer lease
             try:
-                client.close(name, reason="launch failed: %s" % exc, owner=_TOKENS.pop(name, None))
+                client.close(name, cap=_TOKENS.pop(name, None))
             except Exception:  # noqa: BLE001
                 pass
             raise
@@ -494,16 +538,34 @@ def _stop(client: TraceClient, session: str, options: dict, settings: dict) -> d
             "capture", {"op": "stop", "session": runtime_session})}
         if options.get("detach", True):
             result["runtime"]["detach"] = runner.call("detach", {"session": runtime_session})
-    result["closed"] = client.close(session, owner=options.get("owner") or _TOKENS.get(session), reason=options.get("reason"))
+    result["closed"] = client.close(session, cap=options.get("cap") or _TOKENS.get(session))
     _TOKENS.pop(session, None)
     _LINKS.pop(session, None)
     return result
 
 
+_FILTER_KEYS = ("resource_key", "state_key", "corr", "process_gen")
+
+
+def _query_fields(options: dict, limit: int) -> dict:
+    """The `trace_query` request fields (PROTOCOL-3.md 8.20) for the tool's options."""
+    flt = _object(options.get("filter"), "options.filter")
+    unknown = sorted(set(flt) - set(_FILTER_KEYS))
+    if unknown:
+        raise ValueError("options.filter takes %s; not %s" % (", ".join(_FILTER_KEYS), ", ".join(unknown)))
+    group = options.get("group_by")
+    if isinstance(group, list):
+        if len(group) > 1:
+            raise ValueError("options.group_by is one of kind, resource, state, module, source (one grouping per query)")
+        group = group[0] if group else None
+    return {"kinds": _strings(options.get("kinds"), "options.kinds") or None, **{k: flt.get(k) for k in _FILTER_KEYS},
+            "group_by": group, "after": options.get("cursor", options.get("after")), "up_to": options.get("up_to"),
+            "with_symbols": options.get("with_symbols") or None,
+            "interp": options.get("interpretation", options.get("interp")), "limit": limit}
+
+
 def _query(client: TraceClient, session: str, options: dict, limit: int) -> dict:
-    fields = {"kinds": _strings(options.get("kinds"), "options.kinds") or None, "filter": _object(options.get("filter"), "options.filter") or None,
-              "group_by": _strings(options.get("group_by"), "options.group_by", 8) or None, "cursor": options.get("cursor"),
-              "revision": options.get("revision"), "interpretation": options.get("interpretation"), "limit": limit}
+    fields = _query_fields(options, limit)
     if options.get("profile_query"):
         from hydralysis import profiles
         profile = _load_profile(options)
@@ -513,21 +575,26 @@ def _query(client: TraceClient, session: str, options: dict, limit: int) -> dict
         if query is None:
             raise ValueError("profile %s has no query %s" % (profile.id, options["profile_query"]))
         if "module" in query:
-            rows = client.query(session, **{**fields, "kinds": options.get("kinds"), "limit": limit})
-            module_rows = rows.get("events") or rows.get("groups") or rows.get("rows") or []
+            rows = client.query(session, **{**fields, "limit": limit})
+            module_rows = rows.get("rows") or rows.get("groups") or []
             return {**rows, "module": query["id"], "module_result": profiles.run_module(
                 profile, query["id"], module_rows[:limit], _object(options.get("params"), "options.params"))}
-        fields.update({k: v for k, v in profiles.compile_query(profile, query["id"], session=session, limit=limit).items()
-                       if k not in ("session",) and fields.get(k) is None})
+        compiled = _query_fields({**profiles.compile_query(profile, query["id"], session=session, limit=limit),
+                                  "cursor": options.get("cursor")}, limit)
+        fields.update({k: v for k, v in compiled.items() if fields.get(k) is None})
     return client.query(session, **fields)
 
 
 def _check(client: TraceClient, session: str, options: dict, limit: int) -> dict:
     assertions = options.get("assertions")
-    if assertions is not None and (not isinstance(assertions, list) or not all(isinstance(a, dict) for a in assertions) or len(assertions) > 64):
-        raise ValueError("options.assertions is a list of at most 64 assertion objects")
-    return client.check(session, assertions=assertions, assertion=options.get("assertion"), revision=options.get("revision"),
-                        limit=limit, save=options.get("save"))
+    if assertions is None and isinstance(options.get("assertion"), dict):
+        assertions = [options["assertion"]]
+    if not isinstance(assertions, list) or not assertions or not all(isinstance(a, dict) for a in assertions) or len(assertions) > 64:
+        raise ValueError("options.assertions is a list of 1..64 assertion objects ({type, name, ...}: request_completion, cardinality, "
+                         "forbidden, ordered_transitions, required_transition, forbidden_transition, only_on_role, "
+                         "write_precedes_read_in_frame, at_most_once_per_frame, no_frame_without, round_trip)")
+    return client.check(session, assertions=assertions, persist=options.get("persist"),
+                        cap=options.get("cap") or _TOKENS.get(session))
 
 
 def _import(client: TraceClient, session: str | None, options: dict) -> dict:
@@ -536,16 +603,18 @@ def _import(client: TraceClient, session: str | None, options: dict) -> dict:
     summary = {key: read[key] for key in ("outcome", "lines", "damage", "lost_producers", "reason") if key in read}
     if not read["events"]:
         return {"imported": 0, "session": session, **summary}
-    opened = client.open(session=session, scenario=str(options.get("scenario") or "import"), imported=True,
-                         label=options.get("label"), scope={"process_tree": False, "import": str(source.name)})
+    opened = client.begin(session=session, create=True, mode="write")
     name = str(opened.get("session") or session or "")
+    cap = (opened.get("lease") or {}).get("cap")
     appended = 0
     last = {}
     for start in range(0, len(read["events"]), BATCH_EVENTS):
         batch = read["events"][start:start + BATCH_EVENTS]
-        last = client.append(name, batch, owner=opened.get("owner"))
-        appended += len(batch)
-    closed = client.close(name, owner=opened.get("owner"), reason="import complete") if not options.get("keep_open") else None
+        last = client.append(name, batch, cap=cap)
+        appended += int(last.get("accepted", len(batch)))
+    closed = client.close(name, cap=cap) if not options.get("keep_open") else None
+    if options.get("keep_open") and cap:
+        _TOKENS[name] = str(cap)
     return {"session": name, "imported": appended, "damaged_input_ignored_after": summary.get("damage"), **summary,
             "last_append": last, "closed": closed}
 
@@ -556,7 +625,7 @@ def handle_action(action: str, session: str | None, options: dict, settings: dic
         raise ValueError("trace action must be one of: " + ", ".join(ACTIONS))
     limit = _limit(options)
     if options.get("offline"):
-        return _offline(action, options, settings)
+        return _offline(action, {**options, "session": options.get("session") or session}, settings)
     client = client or TraceClient(_engine(settings))
     if not client.available():
         return {"not_available": CAPABILITY, "message": "this engine does not advertise the trace capability (it needs "
@@ -591,38 +660,43 @@ def handle_action(action: str, session: str | None, options: dict, settings: dic
         return shape(reply, session=session, command="trace_query", limit=limit, requested_revision=options.get("revision"))
     if action == "diff":
         other = _session(options.get("against") or options.get("session_b"), "options.against")
-        reply = client.diff(session, other, group_by=_strings(options.get("group_by"), "options.group_by", 8) or None,
-                            limit=limit, align=options.get("align"), cursor=options.get("cursor"),
-                            budget=options.get("budget"))
+        group = options.get("group_by")
+        group = group[0] if isinstance(group, list) and len(group) == 1 else group
+        if group is not None and not isinstance(group, str):
+            raise ValueError("options.group_by is one of kind, resource, state, module, source")
+        reply = client.diff(session, other, group_by=group, kinds=_strings(options.get("kinds"), "options.kinds") or None,
+                            align=options.get("align"), background=options.get("background"))
         return shape(reply, session=session, command="trace_diff", limit=limit)
     if action == "explain":
         event_id = options.get("event_id")
         if not isinstance(event_id, str) or not _EVENT_ID.match(event_id):
             raise ValueError("options.event_id must be an event id")
-        depth = options.get("depth", 4)
+        depth = options.get("depth", options.get("max_depth", 4))
         if isinstance(depth, bool) or not isinstance(depth, int) or not 1 <= depth <= 16:
             raise ValueError("options.depth must be 1..16")
-        reply = client.explain(session, event_id, direction=str(options.get("direction") or "upstream"), depth=depth,
-                               max_events=min(int(options.get("max_events", 200)), 1000), limit=limit,
-                               revision=options.get("revision"))
+        if options.get("direction") not in (None, "upstream", "downstream"):
+            raise ValueError("options.direction must be upstream or downstream")
+        reply = client.explain(session, event_id, direction=str(options.get("direction") or "upstream"), max_depth=depth,
+                               max_events=min(int(options.get("max_events", 200)), 1000))
         return shape(reply, session=session, command="trace_explain", limit=limit)
     if action == "mark":
         label = options.get("label")
         if not isinstance(label, str) or not label.strip() or len(label) > 200:
             raise ValueError("options.label is required (1..200 characters)")
-        reply = client.mark(session, label, note=str(options.get("note") or "")[:2000] or None,
-                            event_range=options.get("event_range"), owner=options.get("owner") or _TOKENS.get(session))
+        reply = client.mark(session, label, phase=options.get("phase"), frame=options.get("frame"),
+                            cap=options.get("cap") or _TOKENS.get(session))
         return shape(reply, session=session, command="trace_mark", limit=limit)
     if action == "check":
         return shape(_check(client, session, options, limit), session=session, command="trace_check", limit=limit)
     if action == "export":
-        reply = client.export(session, out=str(options.get("out") or "") or None, format=str(options.get("format") or "jsonl"),
-                              filter=_object(options.get("filter"), "options.filter") or None,
-                              include_artifacts=bool(options.get("include_artifacts", False)),
-                              artifact_authorization=options.get("artifact_authorization"))
+        # The engine chooses the folder (<root>/<session>/export/<name>); the caller names only the export.
+        reply = client.export(session, name=options.get("name"), overwrite=options.get("overwrite"),
+                              authorized_artifacts=_strings(options.get("authorized_artifacts"), "options.authorized_artifacts") or None,
+                              exported_at=options.get("exported_at"))
         return shape(reply, session=session, command="trace_export", limit=limit)
-    return shape(client.resymbolize(session, program=options.get("program"), symbol_revision=options.get("symbol_revision"),
-                                    owner=options.get("owner") or _TOKENS.get(session)),
+    return shape(client.resymbolize(session, program=options.get("program"), project=options.get("project"),
+                                    modules=_strings(options.get("modules"), "options.modules") or None,
+                                    cap=options.get("cap") or _TOKENS.get(session)),
                  session=session, command="trace_resymbolize", limit=limit)
 
 

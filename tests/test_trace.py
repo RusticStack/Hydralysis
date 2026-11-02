@@ -112,12 +112,12 @@ class Routing(unittest.TestCase):
             self.assertEqual(engine.commands(), [command], action)
 
     def test_fields_reach_the_engine_and_empty_ones_do_not(self):
-        _, engine = run("query", "s1", {"kinds": ["core.state.write"], "revision": 9, "limit": 7})
+        _, engine = run("query", "s1", {"kinds": ["core.state.write"], "up_to": 9, "limit": 7})
         command, fields = engine.calls[0]
-        self.assertEqual(fields, {"session": "s1", "kinds": ["core.state.write"], "revision": 9, "limit": 7})
-        _, engine = run("diff", "s1", {"against": "s2", "align": ["phase"]})
-        self.assertEqual(engine.calls[0][1]["session_b"], "s2")
-        self.assertEqual(engine.calls[0][1]["align"], ["phase"])
+        self.assertEqual(fields, {"session": "s1", "kinds": ["core.state.write"], "up_to": 9, "limit": 7})
+        _, engine = run("diff", "s1", {"against": "s2", "align": {"keys": ["phase"]}})
+        self.assertEqual((engine.calls[0][1]["a"], engine.calls[0][1]["b"]), ("s1", "s2"))
+        self.assertEqual(engine.calls[0][1]["align"], {"keys": ["phase"]})
 
     def test_bad_arguments_are_refused_before_the_engine_is_asked(self):
         bad = [("query", None, {}), ("query", "bad id!", {}), ("query", "s1", {"limit": 0}), ("query", "s1", {"limit": 999}),
@@ -143,11 +143,11 @@ class Routing(unittest.TestCase):
         self.assertEqual(answer["command"], "trace_mark")
 
     def test_the_mark_carries_the_owner_the_session_was_opened_with(self):
-        engine = FakeEngine({"trace_open": {"session": "s9", "owner": "tok"}})
+        engine = FakeEngine({"trace_open": {"session": "s9", "lease": {"cap": "tok"}}})
         run("start", "s9", {}, engine=engine)
         engine.calls.clear()
         run("mark", "s9", {"label": "x"}, engine=engine)
-        self.assertEqual(engine.calls[0][1]["owner"], "tok")
+        self.assertEqual(engine.calls[0][1]["cap"], "tok")
         trace._TOKENS.pop("s9", None)
 
 
@@ -239,15 +239,17 @@ prologue = "{prologue}"
         img = self.images({"Gate": 0x1000})
         with workdir("trace-start") as folder:
             path = self.profile_file(folder, img.fingerprint()["sha256"], prologue="55 8B EC 83 EC 11", required=False)
-            engine = FakeEngine({"trace_open": {"session": "s1", "owner": "t"}})
+            engine = FakeEngine({"trace_open": {"session": "s1", "lease": {"cap": "t"}}})
             with patch("hydralysis.pe.Image", return_value=img):
                 result, _ = run("start", "s1", {"profile": str(path), "images": {"main.exe": "x.exe"}}, engine=engine)
         command, fields = engine.calls[0]
         self.assertEqual(command, "trace_open")
-        self.assertEqual(fields["limitations"][0]["code"], "optional-hook-refused")
-        self.assertEqual(fields["enabled_hooks"], [])
-        self.assertEqual(fields["profile"]["id"], "t/1")
-        self.assertEqual(len(fields["profile"]["sha256"]), 64)
+        self.assertEqual((fields["create"], fields["mode"]), (True, "write"))
+        self.assertNotIn("profile", fields)
+        self.assertEqual(result["limitations"][0]["code"], "optional-hook-refused")
+        self.assertEqual(result["profile"]["enabled"], [])
+        self.assertEqual(result["profile"]["profile"], "t/1")
+        self.assertEqual(len(result["profile"]["profile_sha256"]), 64)
         self.assertEqual(result["profile"]["counts"]["refused_optional"], 1)
 
     def test_a_build_bound_profile_needs_its_images(self):
@@ -275,7 +277,7 @@ prologue = "{prologue}"
                 calls.append((action, dict(args or {})))
                 return {"session": "r" * 32} if action in ("spawn", "attach") else {"ok": True, "action": action}
 
-        engine = FakeEngine({"trace_open": {"session": "s1", "owner": "tok"}, "trace_close": {"closed": True, "revision": 77}})
+        engine = FakeEngine({"trace_open": {"session": "s1", "lease": {"cap": "tok"}}, "trace_close": {"closed": True, "revision": 77}})
         with patch("hydralysis.runtime.RuntimeRunner", Runner):
             started, _ = run("start", "s1", {"launch": {"action": "spawn", "path": "C:/x/app.exe"}}, engine=engine)
             self.assertEqual(started["runtime"]["session"], "r" * 32)
@@ -283,12 +285,12 @@ prologue = "{prologue}"
             self.assertEqual(calls[0][1], {"path": "C:/x/app.exe"})
             self.assertEqual(calls[1][1]["op"], "start")
             self.assertEqual(calls[1][1]["trace"]["session"], "s1")
-            self.assertEqual(calls[1][1]["trace"]["owner"], "tok")
+            self.assertEqual(calls[1][1]["trace"]["cap"], "tok")
             stopped, _ = run("stop", "s1", {}, engine=engine)
         self.assertEqual([c[0] for c in calls], ["spawn", "capture", "capture", "detach"])
         self.assertEqual(calls[2][1], {"op": "stop", "session": "r" * 32})
         self.assertEqual(engine.commands(), ["trace_open", "trace_close"])
-        self.assertEqual(engine.calls[1][1]["owner"], "tok")
+        self.assertEqual(engine.calls[1][1]["cap"], "tok")
         self.assertEqual(stopped["closed"]["revision"], 77)
         self.assertNotIn("s1", trace._LINKS)
 
@@ -300,12 +302,12 @@ prologue = "{prologue}"
             def call(self, action, args=None):
                 raise RuntimeError("no such file")
 
-        engine = FakeEngine({"trace_open": {"session": "s1", "owner": "tok"}})
+        engine = FakeEngine({"trace_open": {"session": "s1", "lease": {"cap": "tok"}}})
         with patch("hydralysis.runtime.RuntimeRunner", Runner):
             with self.assertRaises(RuntimeError):
                 run("start", "s1", {"launch": {"path": "nope"}}, engine=engine)
         self.assertEqual(engine.commands(), ["trace_open", "trace_close"])
-        self.assertIn("launch failed", engine.calls[1][1]["reason"])
+        self.assertEqual(engine.calls[1][1]["cap"], "tok")
 
     def test_status_includes_the_runtime_session_it_is_linked_to(self):
         trace._LINKS["s1"] = "r" * 32
@@ -359,12 +361,13 @@ class Importing(unittest.TestCase):
     def test_online_import_opens_appends_in_batches_and_closes(self):
         with workdir("trace-in") as folder:
             path = self.write(folder, [event(i) for i in range(1200)])
-            engine = FakeEngine({"trace_open": {"session": "imp1", "owner": "o"}, "trace_append": {"appended": 500}})
+            engine = FakeEngine({"trace_open": {"session": "imp1", "lease": {"cap": "o"}}, "trace_append": {"appended": 500}})
             result, _ = run("import", None, {"input": str(path)}, engine=engine)
         self.assertEqual(engine.commands(), ["trace_open"] + ["trace_append"] * 3 + ["trace_close"])
         self.assertEqual([len(f["events"]) for c, f in engine.calls if c == "trace_append"], [500, 500, 200])
         self.assertEqual(result["imported"], 1200)
-        self.assertEqual(engine.calls[0][1]["imported"], True)
+        self.assertEqual((engine.calls[0][1]["create"], engine.calls[0][1]["mode"]), (True, "write"))
+        self.assertTrue(all(f["cap"] == "o" for c, f in engine.calls if c != "trace_open"))
 
     def test_a_damaged_file_imports_its_valid_prefix_and_says_where_it_stopped(self):
         with workdir("trace-in") as folder:
@@ -383,29 +386,39 @@ class Importing(unittest.TestCase):
 
 
 class Offline(unittest.TestCase):
-    def test_import_makes_a_verifiable_segment_without_the_engine(self):
+    def test_import_hands_the_valid_prefix_to_the_tool_and_needs_it(self):
+        calls = []
+
+        class Done:
+            returncode = 0
+            stdout = b'{"accepted":4,"dropped_budget":0,"recovered_batches":0,"rejected":0}\n'
+            stderr = b""
+
+        def fake(command, **kw):
+            calls.append((command, Path(command[4]).read_bytes()))
+            return Done()
+
         with workdir("trace-off") as folder:
             source = Path(folder) / "in.jsonl"
-            source.write_bytes(b"".join(json.dumps(event(i)).encode() + b"\n" for i in range(4)))
-            store = Path(folder) / "store"
+            source.write_bytes(b"".join(json.dumps(event(i)).encode() + b"\n" for i in range(4)) + b"{torn")
+            exe = Path(folder) / "hydra-trace.exe"
+            exe.write_bytes(b"")
+            options = {"offline": True, "session": "off1", "input": str(source), "store": str(Path(folder) / "store")}
             with patch.dict("os.environ", {"HYDRA_TRACE_EXE": ""}):
-                result, engine = run("import", None, {"offline": True, "session": "off1", "input": str(source),
-                                                      "store": str(store)})
-            self.assertEqual(engine.calls, [])
-            self.assertEqual((result["imported"], result["verified"]), (4, "clean"))
-            segment = store / "off1" / "s.trace"
-            scan = trace_canon.scan(segment.read_bytes(), "s")
-            self.assertTrue(scan.clean)
-            self.assertEqual(len(scan.records), 4)
-            self.assertEqual(scan.records[2]["source_seq"], 2)
-            verified, _ = run("status", None, {"offline": True, "op": "verify", "session": "off1", "store": str(store)})
-            self.assertEqual(verified["outcome"], "clean")
-            with self.assertRaises(TraceError):
-                run("import", None, {"offline": True, "session": "off1", "input": str(source), "store": str(store)})
+                with self.assertRaises(TraceError) as caught:
+                    run("import", None, options)
+            self.assertEqual(caught.exception.code, "tool_missing")
+            with patch.dict("os.environ", {"HYDRA_TRACE_EXE": str(exe)}):
+                with patch("hydralysis.proc.run", side_effect=fake):
+                    result, engine = run("import", None, options)
+        self.assertEqual(engine.calls, [])
+        self.assertEqual((calls[0][0][1], calls[0][0][3]), ("import", "off1"))
+        self.assertEqual(len(calls[0][1].splitlines()), 4)
+        self.assertEqual((result["imported"], result["outcome"], result["report"]["accepted"]), (4, "torn_tail", 4))
 
     def test_verify_keeps_torn_corrupt_and_chain_break_apart(self):
         with workdir("trace-off") as folder:
-            session = Path(folder) / "store" / "v1"
+            session = Path(folder) / "store" / "v1" / "segments"
             session.mkdir(parents=True)
             def segment(name):
                 chain = trace_canon.Chain(name)

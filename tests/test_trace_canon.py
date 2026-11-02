@@ -124,6 +124,10 @@ class Chaining(unittest.TestCase):
                 segment = Path(path)
                 result = canon.scan(segment.read_bytes(), segment.stem)
                 self.assertTrue(result.clean, (path, result.damage))
+                # The twin writes the same bytes the Rust generator wrote.
+                events = [{k: v for k, v in r.items() if k not in ("hash", "n", "prev")} for r in result.records]
+                chain = canon.Chain(segment.stem)
+                self.assertEqual(b"".join(chain.push(e) for e in events), segment.read_bytes())
 
 
 if __name__ == "__main__":
