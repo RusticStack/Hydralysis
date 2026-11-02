@@ -50,7 +50,10 @@ const L: &str = "L-0000abcd";
 #[test]
 fn python_view_record_and_changeset_are_read_by_rust() {
     let Some(py) = python() else { return };
-    let dir = tempfile::Builder::new().prefix("hv").tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("hv")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
     let root = dir.path().to_str().unwrap();
     let code = r#"
 import sys, json
@@ -94,7 +97,10 @@ print(json.dumps({"name": who["name"], "boot": views.BOOT_ID}))
 #[test]
 fn rust_written_records_are_byte_identical_and_read_by_python() {
     let Some(py) = python() else { return };
-    let dir = tempfile::Builder::new().prefix("hv").tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let dir = tempfile::Builder::new()
+        .prefix("hv")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
     let root = dir.path().to_str().unwrap();
     let s: Settings = json!({"root": root}).as_object().unwrap().clone();
     let body = json!({"format": 1, "csid": "c-0000000000000bbb", "lineage": L, "view": "bob", "ids": ["e1", "\u{e9}"], "records": [{"id": "e1", "after": 1.5}],

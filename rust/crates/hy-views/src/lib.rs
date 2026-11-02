@@ -4,7 +4,9 @@
 //! [`records`] (view records), [`queue`] (changeset queue records and status), [`options`] (option validation).
 //! See `TESTMAP.md` for the test map and what remains.
 
+pub mod classify;
 pub mod error;
+pub mod gens;
 pub mod jobowner;
 pub mod layout;
 pub mod locks;
