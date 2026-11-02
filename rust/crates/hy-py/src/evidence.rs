@@ -25,11 +25,11 @@ fn raise(py: Python<'_>, error: EvidenceError) -> PyErr {
         EvidenceError::Bundle(e) => {
             let detail = Value::Object(e.detail.clone());
             build(py, "hydralysis.evidence_bundle", "BundleError", &[e.code, e.message], |kw| {
-                if let Ok(obj) = py.import("json").and_then(|j| j.call_method1("loads", (text(&detail),))) {
-                    if let Ok(map) = obj.cast::<PyDict>() {
-                        for (k, v) in map.iter() {
-                            let _ = kw.set_item(k, v);
-                        }
+                if let Ok(obj) = py.import("json").and_then(|j| j.call_method1("loads", (text(&detail),)))
+                    && let Ok(map) = obj.cast::<PyDict>()
+                {
+                    for (k, v) in map.iter() {
+                        let _ = kw.set_item(k, v);
                     }
                 }
             })

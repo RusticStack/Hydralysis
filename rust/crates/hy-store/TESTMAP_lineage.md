@@ -125,3 +125,28 @@ test that builds `settings["root"]`). Rust unit tests: `config::tests::gmtime_ep
 | current_log_is_readable_and_appendable_by_both | `ensure`, alternate `append_current` Rust/Python/Rust/Python (prevHash chain), `history`, `head` |
 | event_logs_cross_verify_and_counters_match | each side verifies the other's events.log; counters equal; record shapes and key order equal (ignoring wall-clock `t`) |
 | a_rust_backup_verifies_in_python_and_lists_the_same | Python `backups.verify` / `listing` / `policy` on a Rust-made backup equal the Rust results |
+
+## Under HYDRALYSIS_IMPL=rust (PyO3 binding run)
+
+`src/hydralysis/_rust_lineage.py` (hooks at the bottom of `lineage.py`, `backups.py`, `runtime_events.py`; bindings in
+`rust/crates/hy-py/src/lineage.rs`) routes the public surface through the Rust ports. Run:
+`RS_DIR=<dir with hydralysis_rs.pyd> bash _logs/r/hy-storage/runtests.sh rust tests.test_lineage tests.test_backups ...`.
+
+Routed: all of `lineage` except `lineages_root` / `lineage_dir` / `generation_dir` / `current_log` / `intent_log` /
+`backups_log` / `commit_lock_path` / `register` (Python; the root comes from `paths`, the logs are the already-routed
+`durable.AppendLog`, `register` mirrors into `targets.json`); `backups`: `policy`, `size_of`, `backup_id`, `logged`,
+`cumulative`, `preview`, `manifest_files`, `read_backup`, `verify`, `usable`, `listing`, `remove`, and
+`protected_generations` (Python when `selected_stores` is passed); `runtime_events`: `genesis_hash`, `record_hash`,
+`_frame`, `iter_records`, `read_events`, `verify_log`, and the `EventLog` class (Rust object behind the same attributes).
+Stays Python: everything that drives a `hydra.Engine` (`make`, `_make_one`, `_make_engine`, `_fork_into`, `seal`,
+`adopt_legacy`, `handle`).
+
+| Python test set | Result under rust | Note |
+|---|---|---|
+| tests.test_lineage (all 4 classes + SharedVector) | pass (unchanged) | black-box |
+| tests.test_backups.Backups, RemoveAndHandler, CommitHygiene | pass (unchanged) | black-box (the `_fork_into` / `_make_one` patches hit the Python engine path, which is not routed) |
+| tests.test_runtime_capture.EventChain (14 tests) | 13 pass | |
+| EventChain.test_a_failed_write_leaves_a_hole_the_chain_reports | FAIL under rust, white-box | patches `hydralysis.runtime_events.os.write`; Rust writes through `std::fs`. Covered by `events_log` (uses `EventLog::inject_write_failure`) |
+| tests.test_lineage.CanonicalForm.test_an_unpaired_surrogate_... | pass | wrapper re-runs the Python `canonical` on a Rust refusal so `UnicodeEncodeError` is raised |
+| tests.test_backups.EngineBackups (+ FaultMatrixOnE2, 22 tests) | 21 pass | fake-engine path stays Python |
+| FaultMatrixOnE2.test_publish_torn_then_a_successful_new_commit_with_the_same_cid (test_commit) | FAIL under rust, white-box | patches `durable.AppendLog._raw_append` to measure the CURRENT.log line; with the Rust `AppendLog` the Python hook is never called. Torn CURRENT.log appends are covered by `lineage_log` (`log.torn_append:torn:30` child) |

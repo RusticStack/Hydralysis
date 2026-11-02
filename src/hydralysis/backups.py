@@ -572,3 +572,13 @@ def handle(capability: str, request: dict) -> str:
     except (BackupError, lineage.LineageError) as error:
         return json.dumps(error.payload(), indent=2)
     return json.dumps({"op": op, **result}, indent=2, default=str)
+
+
+import os as _os  # noqa: E402
+
+if _os.environ.get("HYDRALYSIS_IMPL") == "rust":  # the Rust implementation (rust/crates/hy-store) behind the same surface
+    import sys as _sys
+
+    from hydralysis import _rust_lineage
+
+    _rust_lineage.install_backups(_sys.modules[__name__])
