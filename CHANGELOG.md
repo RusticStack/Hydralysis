@@ -6,9 +6,22 @@ Nothing here is a tag: a release is tagged by the owner.
 
 ## Unreleased
 
-Test runs for 0.8.0 (prepared 2026-11-02, nothing tagged): unit suite 1,996 of 1,996 and engine-gated suite 1,996 of 1,996
-against a locally assembled 12.3-hydra.6 install (one `M3Pairing` timing test failed under load and passed alone); `bump_hydra.py` was not run
-because the release zips do not exist yet. Details in `.github/local-test-record.json` and the engine's `docs/release-notes-12.3-hydra.6.md`.
+## 0.8.0
+
+Released 2026-11-02 (the date the release was prepared; the tag is the owner's). 0.8.0 pins Hydra Engine `12.3-hydra.6` (protocol 3);
+the pin statements, version strings and archive hashes are written by `tools/bump_hydra.py` once the engine release zips exist, and are not
+part of this entry's commit.
+
+Test runs for 0.8.0: unit plus engine-gated suite 2,020 of 2,020 against a locally assembled 12.3-hydra.6 install (the `final2` install, not
+the `final2b` install the engine's last gates ran on, and not the published zip): 0 failed alone, 2 failed only under load and passed alone
+(`test_trace_e2e.M1` failure-mode tests); two earlier runs of the same suite on the same install had 1 failed alone and 0 failed alone with
+2 load-only failures, and the unit run `hyd-unit.log` had 3 failed alone (`test_durable.WriteGate`, `test_trace_extras.Watchdog`,
+`test_views.Processes`); fixes followed (store-load cache, phantom budget gap, decompile job write gate, test readiness) and the suite was not
+re-run on the final commit. `bump_hydra.py` was not run because the release zips do not exist yet. Details in `.github/local-test-record.json`
+and the engine's `docs/release-notes-12.3-hydra.6.md`.
+
+Not met or not run: the bare-loop trace overhead with every hit kept; aggregate counters (not built); hosted CI; reproduction of the
+issue-6 overflow on the reporter's real binary; the soak on the final engine install. See `docs/trace-overhead.md`.
 
 Semantic trace (for 0.8.0, which pins engine 12.3-hydra.6; the version is bumped at release with `tools/bump_hydra.py`).
 
