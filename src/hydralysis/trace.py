@@ -588,7 +588,7 @@ def _stop(client: TraceClient, session: str, options: dict, settings: dict) -> d
         from hydralysis.runtime import RuntimeRunner
         runner = RuntimeRunner(settings)
         result["runtime"] = {"session": runtime_session, "capture": runner.call(
-            "capture", {"op": "stop", "session": runtime_session})}
+            "capture", {"op": "stop", "session": runtime_session, "owner": options.get("cap") or _TOKENS.get(session)})}
         if options.get("detach", True):
             result["runtime"]["detach"] = runner.call("detach", {"session": runtime_session})
     result["closed"] = client.close(session, cap=options.get("cap") or _TOKENS.get(session))
@@ -649,6 +649,32 @@ def _check(client: TraceClient, session: str, options: dict, limit: int) -> dict
                          "write_precedes_read_in_frame, at_most_once_per_frame, no_frame_without, round_trip)")
     return client.check(session, assertions=assertions, persist=options.get("persist"),
                         cap=options.get("cap") or _TOKENS.get(session))
+
+
+def _rows(client: TraceClient, session: str, kinds: list[str], cap: int = 200_000) -> list[dict]:
+    """Every row of KINDS of a session on one pinned snapshot, payload decoded (a paired comparison reads whole sessions)."""
+    out, after, up_to = [], None, None
+    while len(out) < cap:
+        reply = client.query(session, kinds=kinds, limit=1000, after=after, up_to=up_to)
+        for row in reply.get("rows") or []:
+            payload = row.get("payload")
+            out.append({"event_id": row["event_id"], "kind": row["kind"], "t_mono_ns": row["t_mono_ns"], "seq": row.get("seq"),
+                        "payload": json.loads(payload) if isinstance(payload, str) else (payload or {})})
+        after, up_to = reply.get("next"), reply.get("up_to")
+        if not after:
+            break
+    return out
+
+
+def _pair(client: TraceClient, owner: str, replica: str, options: dict) -> dict:
+    """Spec 15.5 as a diff mode: SESSION is the owner, options.against the replica; options.pair names the event kinds."""
+    from hydralysis import trace_pairing
+    spec = {**trace_pairing.DEFAULT_SPEC, **_object(options.get("pair"), "options.pair")}
+    owner_kinds = [spec[k] for k in ("owner_sync", "truth", "create")]
+    replica_kinds = [spec[k] for k in ("replica_sync", "mirror", "extrapolated")]
+    report = trace_pairing.pair_report(_rows(client, owner, owner_kinds), _rows(client, replica, replica_kinds), spec)
+    return {**report, "owner": {"session": owner, "revision": client.info(owner).get("revision")},
+            "replica": {"session": replica, "revision": client.info(replica).get("revision")}}
 
 
 def _import(client: TraceClient, session: str | None, options: dict) -> dict:
@@ -714,6 +740,8 @@ def handle_action(action: str, session: str | None, options: dict, settings: dic
         return shape(reply, session=session, command="trace_query", limit=limit, requested_revision=options.get("revision"))
     if action == "diff":
         other = _session(options.get("against") or options.get("session_b"), "options.against")
+        if options.get("mode") == "pair":
+            return shape(_pair(client, session, other, options), session=session, command="trace_diff", limit=limit)
         group = options.get("group_by")
         group = group[0] if isinstance(group, list) and len(group) == 1 else group
         if group is not None and not isinstance(group, str):

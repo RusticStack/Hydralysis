@@ -264,7 +264,7 @@ def _validate(data: dict, directory: Path | None, files: dict[str, str], errors:
         if entry["fault"] not in FAULT_POLICIES:
             errors.add(where + ".fault", "must be one of %s" % ", ".join(FAULT_POLICIES))
         if "symbol" in row:
-            if not isinstance(row["symbol"], str) or not re.match(r"^[A-Za-z_][A-Za-z0-9_@?$.]{0,255}$", row["symbol"]):
+            if not isinstance(row["symbol"], str) or not re.match(r"^[A-Za-z_?][A-Za-z0-9_@?$.]{0,255}$", row["symbol"]):
                 errors.add(where + ".symbol", "must be an exported symbol name")
             entry["symbol"] = row["symbol"]
         if "rva" in row:
