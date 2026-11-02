@@ -145,6 +145,8 @@ There is no GUI. Hydra Engine is headless only; projects it writes cannot be ope
 
 Numbers here come from the owner's KotOR baseline and depend on the function and the machine; treat them as examples, not guarantees. The baseline corpus is KotOR 1: `function_counts` total 8,966, internal 8,616, thunks 60. A warm decompile measured 0.7-2.1 ms for a 1-byte function and 35-45 ms for a 6.7 KB function: native decompile about 1 to 45 ms by function size; through Hydralysis about 25 ms on a small program and about 60 ms on KotOR (single runs). The tool counts in [the tool mapping](docs/tool-mapping.md) are sourced there, with what is still unverified marked.
 
+**System requirements.** What the engine and the semantic trace need, with the reference machine (Intel Core i7-13700KF) and the recorded runs behind each row, is in the engine README: [System requirements](https://github.com/RusticStack/hydra-engine#system-requirements). It lists the minimum, reference, recommended and optional-capability requirements (capture needs an elevated process for the kernel ETW consumer, Frida for in-process hooks), the support matrix, and how a smaller machine is refused or answered with an explicit partial result rather than different evidence.
+
 ## Verify runtime evidence
 
 ```text
@@ -179,7 +181,7 @@ Hooks require the module's full hash and **matching exact live bytes** before in
 | `ghidra_query`, `ghidra_run` | Saved analysis, overlays, diffs, exports and deliberate scripts |
 | `runtime` | Controlled local runtime sessions |
 
-The CLI retains `sections`, `exports`, `ghidra-scripts` and `ghidra-jobs` aliases. They are not advertised as additional MCP tools. The catalog has regression budgets for tool count, total JSON bytes and individual schemas: 21 tools in about 9 KB of schema (8,796 bytes as the catalog test counts them; the limit is 9,216). `tests/test_claims.py` checks these numbers against the catalog. [Client setup](docs/clients.md) explains registration, the terminal path and the Python API (`hydralysis.client`, `hydralysis call <tool> --args`). No client configuration or other MCP registration is changed automatically.
+The CLI retains `sections`, `exports`, `ghidra-scripts` and `ghidra-jobs` aliases. They are not advertised as additional MCP tools. The catalog has regression budgets for tool count, total JSON bytes and individual schemas: 21 tools in about 9 KB of schema (8,878 bytes as the catalog test counts them; the limit is 9,216). `tests/test_claims.py` checks these numbers against the catalog. [Client setup](docs/clients.md) explains registration, the terminal path and the Python API (`hydralysis.client`, `hydralysis call <tool> --args`). No client configuration or other MCP registration is changed automatically.
 
 `ghidra-run` is an escape hatch for deliberate trusted local scripts. The script is staged into Hydralysis's script folder and runs contained on the warm engine: its changes are rolled back and never saved, but while it runs, other clients can see them. Scripts that use the headless API run unchanged; extensions that need an interactive window do not apply. Engine containment does not stop a script from writing other files. Use the query actions for routine work.
 

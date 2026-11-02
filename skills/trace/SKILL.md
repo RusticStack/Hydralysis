@@ -18,7 +18,7 @@ read at, the coverage revision and the gaps that matter, and what was cut.
 3. Compare: `diff` (options.against, group_by). Output classes are `only_a`, `only_b`, `different_under_matched_coverage` and
    `not_comparable`. Absence in one run is not unreachability.
 4. Assert: `check` (options.assertions, each {type, name, ...}: cardinality, forbidden, request_completion, ordered_transitions and the rest of TRACE-1 section 14.8) returns pass, fail or unknown. Zero eligible cases, a missing observer or an overlapping gap is `unknown`.
-5. Keep: `export` (the engine writes `<session>/export/<name>`; you do not choose the folder), `resymbolize` and `import` are long requests. Cite a finding with `evidence_add` and
+5. Keep: `export` (the engine writes `<session>/export/<name>`; you do not choose the folder), `resymbolize`, `reprocess` (decode event bytes under a corrected codec as a new revision; `query decoded=true` reads it, unconsumed bytes stay visible), `relations op=materialize`, `evict` and `import` are long requests; `bundle path=...` says whether an export can still be reproduced. Cite a finding with `evidence_add` and
    `from_trace={session, events, revision}`; an evidence bundle then carries `traces/<session>.json` with the pinned revision
    and authorized artifact ranges, or lists what cannot be reproduced.
 

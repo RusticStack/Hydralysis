@@ -9,7 +9,7 @@
   },
   "numbers": [
     {"id": "catalog_tools", "value": 21, "source": "tool_count"},
-    {"id": "catalog_bytes", "value": 8796, "source": "tool_table_bytes"},
+    {"id": "catalog_bytes", "value": 8878, "source": "tool_table_bytes"},
     {"id": "catalog_limit", "value": 9216, "source": "test_limit", "path": "tests/test_contracts.py",
      "pattern": "assertLess\\(len\\(json\\.dumps\\(catalog\\)\\.encode\\(\"utf-8\"\\)\\), (\\d+)\\)"},
     {"id": "kotor_functions_total", "value": 8966, "source": "file_number", "path": "README.md",

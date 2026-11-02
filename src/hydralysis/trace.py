@@ -35,13 +35,16 @@ from pathlib import Path
 
 from hydralysis import evidence, proc, trace_canon, trace_schema
 
-ACTIONS = ("start", "stop", "status", "query", "diff", "explain", "mark", "export", "check", "import", "resymbolize")
+ACTIONS = ("start", "stop", "status", "query", "diff", "explain", "mark", "export", "check", "import", "resymbolize",
+           "reprocess", "relations", "evict", "bundle")
 # Actions that are jobs on the engine and so take the long lane of the MCP server.
-LONG_ACTIONS = frozenset({"export", "import", "resymbolize"})
+LONG_ACTIONS = frozenset({"export", "import", "resymbolize", "reprocess", "relations", "evict"})
 COMMANDS = ("trace_open", "trace_append", "trace_mark", "trace_query", "trace_explain", "trace_diff", "trace_check",
-            "trace_export", "trace_close", "trace_list", "trace_info", "trace_resymbolize")
+            "trace_export", "trace_close", "trace_list", "trace_info", "trace_resymbolize", "trace_reprocess",
+            "trace_relations", "trace_artifact", "trace_evict", "trace_bundle")
 # Read commands the engine answers the same however often they are sent; a lost reply may be sent again.
-IDEMPOTENT_COMMANDS = frozenset({"trace_list", "trace_info", "trace_query", "trace_explain", "trace_diff", "trace_check"})
+IDEMPOTENT_COMMANDS = frozenset({"trace_list", "trace_info", "trace_query", "trace_explain", "trace_diff", "trace_check",
+                                 "trace_bundle"})
 CAPABILITY = "trace"
 
 DEFAULT_LIMIT, MAX_LIMIT = 25, 200
@@ -56,8 +59,9 @@ _EVENT_ID = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,119}$")
 # boundaries, check results, list sessions, info sources, export files, and the entries of a diff or an aligned diff.
 _LIST_KEYS = ("rows", "groups", "nodes", "edges", "boundaries", "results", "sessions", "sources", "files", "entries",
               "unmatched_a", "unmatched_b", "rejected", "events", "items", "counterexamples", "only_a", "only_b",
-              "different_under_matched_coverage", "not_comparable", "paths", "unresolved", "assertions", "jobs")
-_NESTED = ("diff", "aligned", "symbols")   # reply members that hold lists of their own
+              "different_under_matched_coverage", "not_comparable", "paths", "unresolved", "assertions", "jobs", "decodings",
+              "evicted", "reasons")
+_NESTED = ("diff", "aligned", "symbols", "decoded")   # reply members that hold lists of their own
 _TOKENS: dict[str, str] = {}      # session -> the writer capability (`cap`) this process was given by trace_open
 _LINKS: dict[str, str] = {}       # trace session -> the runtime session capturing into it
 
@@ -269,6 +273,21 @@ class TraceClient:
     def resymbolize(self, session: str, **fields) -> dict:
         return self.call("trace_resymbolize", session=session, **fields)
 
+    def reprocess(self, session: str, **fields) -> dict:
+        return self.call("trace_reprocess", session=session, **fields)
+
+    def relations(self, session: str, **fields) -> dict:
+        return self.call("trace_relations", session=session, **fields)
+
+    def artifact(self, session: str, **fields) -> dict:
+        return self.call("trace_artifact", session=session, **fields)
+
+    def evict(self, **fields) -> dict:
+        return self.call("trace_evict", **fields)
+
+    def bundle(self, path: str, **fields) -> dict:
+        return self.call("trace_bundle", path=path, **fields)
+
 
 def _engine(settings: dict):
     from hydralysis import hydra
@@ -426,6 +445,19 @@ def _offline(action: str, options: dict, settings: dict) -> dict:
         source = Path(str(options.get("input") or options.get("file") or ""))
         if source.suffix.lower() == ".dmp":
             return {"offline": True, "op": "import", **run_tool(settings, "import", [str(store), name, str(source)])}
+        too_large = source.is_file() and source.stat().st_size > MAX_IMPORT_BYTES
+        if options.get("stream") or too_large:
+            # A file past the in-memory bound (or asked for with stream): the tool reads it line by line in chunks, so memory
+            # stays flat however large it is, and reports the same distinct outcomes itself. Nothing is parsed here.
+            if not find_tool(settings):
+                raise TraceError("tool_missing", "a streamed import is done by hydra-trace.exe (HYDRA_TRACE_EXE)", verb="import")
+            ran = run_tool(settings, "import", [str(store), name, str(source)], timeout_s=int(options.get("timeout_s", 3600)))
+            report = _tool_json(ran)
+            return {"offline": True, "op": "import", "streamed": True, "imported": int(report.get("accepted", 0)),
+                    "outcome": report.get("outcome", "failed"), "lines": report.get("lines"), "report": report,
+                    **({"damage": {"kind": report["outcome"], "line": report.get("damage_line"), "reason": report.get("reason")}}
+                       if report.get("outcome") in ("torn_tail", "corrupt") else {}),
+                    **{k: ran[k] for k in ("ok", "exit_code", "stderr")}}
         read = read_jsonl(source)
         summary = {key: read[key] for key in ("outcome", "lines", "damage", "lost_producers", "reason") if key in read}
         if not read["events"]:
@@ -543,13 +575,23 @@ def _start(client: TraceClient, session: str | None, options: dict, settings: di
     if scope.get("add") and not options.get("owner_token"):
         raise TraceError("scope_expansion_needs_owner", "adding processes or services to the scope needs the owner token")
     limitations = list((verification or {}).get("limitations", []))
-    # The engine keeps events, not session metadata: the profile, scope and limitations are answered back to the caller
-    # (and written into events by the producer); only the fields of `trace_open` reach the engine.
+    # The session metadata (profile id and hash, scope, limitations, target, capture configuration, scenario) is persisted
+    # by the engine next to the session, so it survives a reopen and `status` reads it back from `trace_info`.
     options = _open_program(client, options)
+    meta = {"profile": verification and {"id": verification.get("profile"), "sha256": verification.get("profile_sha256"),
+                                         "counts": verification.get("counts"), "enabled": verification.get("enabled")},
+            "scope": scope or {"process_tree": True}, "limitations": limitations,
+            "target": options.get("target") or {k: options[k] for k in ("program", "project", "modules") if options.get(k)} or None,
+            "capture": _object(options.get("capture_options"), "options.capture_options") or None,
+            "scenario": options.get("scenario")}
+    shared = _object(options.get("shared_scope"), "options.shared_scope") or None
+    if shared is not None and not (isinstance(shared.get("name"), str) and isinstance(shared.get("key"), str)):
+        raise ValueError("options.shared_scope is {name, key}: the key is 64 hex digits, provisioned out of band")
     opened = client.begin(
         session=session, create=True, mode="write", max_events=options.get("max_events"), max_bytes=options.get("max_bytes"),
         preview=options.get("preview"), program=options.get("program"), project=options.get("project"),
-        modules=_strings(options.get("modules"), "options.modules") or None)
+        modules=_strings(options.get("modules"), "options.modules") or None,
+        meta={k: v for k, v in meta.items() if v is not None}, shared_scope=shared)
     name = str(opened.get("session") or session or "")
     cap = (opened.get("lease") or {}).get("cap")
     if cap:
@@ -613,7 +655,8 @@ def _query_fields(options: dict, limit: int) -> dict:
         group = group[0] if group else None
     return {"kinds": _strings(options.get("kinds"), "options.kinds") or None, **{k: flt.get(k) for k in _FILTER_KEYS},
             "group_by": group, "after": options.get("cursor", options.get("after")), "up_to": options.get("up_to"),
-            "with_symbols": options.get("with_symbols") or None,
+            "with_symbols": options.get("with_symbols") or None, "decoded": options.get("decoded") or None,
+            "decode_interp": options.get("decode_interpretation", options.get("decode_interp")),
             "interp": options.get("interpretation", options.get("interp")), "lifetimes": options.get("lifetimes") or None,
             "limit": limit}
 
@@ -787,6 +830,35 @@ def _import(client: TraceClient, session: str | None, options: dict) -> dict:
             "last_append": last, "closed": closed}
 
 
+def ship_artifacts(client: TraceClient, session: str, cap: str, events: list[dict], artifact_dir: Path, *, scope: str,
+                   max_bytes: int = 4096) -> tuple[list[dict], dict]:
+    """Payload mode, engine side: the exact bytes the recorder kept for an authorized range (`artifact_dir/<sha256>`, named by
+    the digest in the event) are stored in the session as private artifacts, and each event that named one then references the
+    engine's artifact id. Returns (events with the references rewritten, {stored, missing}). An event whose file is gone keeps
+    no reference and is counted under `missing` (limitation `artifact-evicted`); nothing is guessed."""
+    stored: dict[str, str] = {}
+    missing: list[str] = []
+
+    def rewrite(value):
+        if isinstance(value, dict):
+            ref = value.get("artifact")
+            if isinstance(ref, dict) and isinstance(ref.get("sha256"), str):
+                digest = ref["sha256"]
+                if digest not in stored:
+                    path = Path(artifact_dir) / digest
+                    if not path.is_file():
+                        missing.append(digest)
+                        return {k: rewrite(v) for k, v in value.items() if k != "artifact"} | {"artifact_missing": digest}
+                    reply = client.artifact(session, cap=cap, scope=scope, max_bytes=max_bytes, data_hex=path.read_bytes().hex())
+                    stored[digest] = str(reply["artifact"])
+                return {k: rewrite(v) for k, v in value.items() if k != "artifact"} | {"artifact": stored[digest]}
+            return {k: rewrite(v) for k, v in value.items()}
+        return value
+
+    out = [{**event, "payload": rewrite(event["payload"])} if isinstance(event.get("payload"), dict) else event for event in events]
+    return out, {"stored": len(stored), "missing": sorted(set(missing))}
+
+
 def handle_action(action: str, session: str | None, options: dict, settings: dict, client: TraceClient | None = None) -> dict:
     """Run one action and return the shaped reply (a dict). `client` is injectable for tests."""
     if action not in ACTIONS:
@@ -819,6 +891,16 @@ def handle_action(action: str, session: str | None, options: dict, settings: dic
                      session=session, command="trace_info", limit=limit)
     if action == "import":
         return shape(_import(client, session, options), session=None, command="trace_import", limit=limit)
+    if action == "evict":
+        if not (session or options.get("to_quota")):
+            raise ValueError("trace evict requires session (a closed session) or options.to_quota")
+        return shape(client.evict(session=session, to_quota=options.get("to_quota") or None, reason=options.get("reason")),
+                     session=None, command="trace_evict", limit=limit)
+    if action == "bundle":
+        path = options.get("path")
+        if not isinstance(path, str) or not path:
+            raise ValueError("trace bundle requires options.path (an export folder)")
+        return shape(client.bundle(path), session=None, command="trace_bundle", limit=limit)
     if session is None:
         raise ValueError("trace %s requires session" % action)
     if action == "stop":
@@ -866,6 +948,21 @@ def handle_action(action: str, session: str | None, options: dict, settings: dic
                               authorized_artifacts=_strings(options.get("authorized_artifacts"), "options.authorized_artifacts") or None,
                               exported_at=options.get("exported_at"))
         return shape(reply, session=session, command="trace_export", limit=limit)
+    if action == "reprocess":
+        codecs = options.get("codecs")
+        if not isinstance(codecs, dict) or not codecs:
+            raise ValueError("options.codecs is {layout name: {name, fields: [{name, offset, len, type, endian?}]}}")
+        reply = client.reprocess(session, codecs=codecs, context=options.get("context"), contexts=options.get("contexts"),
+                                 kinds=_strings(options.get("kinds"), "options.kinds") or None,
+                                 bytes_field=options.get("bytes_field"), note=options.get("note"),
+                                 cap=options.get("cap") or _TOKENS.get(session))
+        return shape(reply, session=session, command="trace_reprocess", limit=limit)
+    if action == "relations":
+        op = options.get("op", "materialize")
+        if op not in ("materialize", "status"):
+            raise ValueError("options.op is materialize or status")
+        reply = client.relations(session, op=op, cap=(options.get("cap") or _TOKENS.get(session)) if op == "materialize" else None)
+        return shape(reply, session=session, command="trace_relations", limit=limit)
     options = _open_program(client, options)
     return shape(client.resymbolize(session, program=options.get("program"), project=options.get("project"),
                                     modules=_strings(options.get("modules"), "options.modules") or None,

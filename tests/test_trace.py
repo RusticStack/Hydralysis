@@ -68,7 +68,8 @@ class Catalog(unittest.TestCase):
     def test_trace_reads_may_be_sent_again_after_a_lost_reply_and_writes_may_not(self):
         for command in trace.IDEMPOTENT_COMMANDS:
             self.assertTrue(hydra.idempotent(command), command)
-        for command in ("trace_open", "trace_append", "trace_mark", "trace_export", "trace_close", "trace_resymbolize"):
+        for command in ("trace_open", "trace_append", "trace_mark", "trace_export", "trace_close", "trace_resymbolize", "trace_reprocess",
+                        "trace_relations", "trace_artifact", "trace_evict"):
             self.assertFalse(hydra.idempotent(command), command)
 
     def test_the_tool_rejects_a_missing_or_unknown_action(self):
