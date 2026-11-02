@@ -48,7 +48,10 @@ def fragments(value) -> tuple[list[dict], str]:
         if start is None or end is None or end < start or item.get("class") not in CLASSES:
             bad += 1
             continue
-        kept.append({"start": item["start"], "end": item["end"], "class": item["class"]})
+        row = {"start": item["start"], "end": item["end"], "class": item["class"]}
+        if isinstance(item.get("decompiled"), bool):
+            row["decompiled"] = item["decompiled"]
+        kept.append(row)
     note = []
     if bad:
         note.append("%d malformed fragment(s) dropped" % bad)
@@ -67,7 +70,8 @@ def summarize(reply: dict) -> dict:
     if not (reply.get("truncated") is True or any(name in reply for name in ("fragments", "bytes_emitted", "reason"))):
         return {}
     kept, note = fragments(reply.get("fragments"))
-    out: dict = {"partial": reply.get("truncated") is True}
+    # The engine's own `partial` (a body in several pieces, some of it not code) is a partial result even when nothing was cut off.
+    out: dict = {"partial": reply.get("truncated") is True or reply.get("partial") is True}
     if isinstance(reply.get("reason"), str) and reply["reason"]:
         out["reason"] = reply["reason"][:200]
     emitted = reply.get("bytes_emitted")
@@ -95,7 +99,7 @@ def annotate(reply: dict) -> dict:
 def limitations(reply: dict) -> list[str]:
     summary = summarize(reply)
     codes = []
-    if summary.get("partial"):
+    if reply.get("truncated") is True:
         codes.append(LIMIT_TRUNCATED)
     if (summary.get("fragment_bytes") or {}).get("data") or (summary.get("fragment_bytes") or {}).get("unknown"):
         codes.append(LIMIT_NON_CODE)
@@ -110,8 +114,37 @@ def coverage(reply: dict) -> dict:
     if not summary:
         return {"status": "unknown", "reason": "the decompile reply carries no truncated/fragments fields"}
     if summary["partial"]:
-        return {"status": "partial", "limitations": [LIMIT_TRUNCATED]}
+        # A cut-off reply says so; one that only has pieces of data in its body (nothing cut) says that.
+        return {"status": "partial", "limitations": [LIMIT_TRUNCATED] if reply.get("truncated") is True else (limitations(reply) or [LIMIT_NON_CODE])}
     return {"status": "complete"}
+
+
+def merge(response: dict, reply: dict) -> dict:
+    """RESPONSE (RusticQuery's answer) with the engine's `decompile` REPLY folded in.
+
+    The engine's `partial`, `reason`, `fragments`, `bytes_emitted` and `truncated` win. A reply that did not complete because of
+    the size bound is a partial result without text (`ok` false, `truncated` true: `from_error` turns it into one). When
+    RusticQuery failed and the engine decompiled, the engine's text and signature stand in for it."""
+    if not isinstance(reply, dict):
+        return response
+    carried = {name: reply[name] for name in ("partial", "reason", "fragments", "bytes_emitted") if name in reply}
+    if reply.get("completed") is False and reply.get("truncated") is True:
+        keep = {name: response[name] for name in ("id", "program", "sha256", "image_base", "address_kind", "overlay_state", "engine", "function")
+                if name in response}
+        return {**keep, "ok": False, "truncated": True, "error": reply.get("error", "decompile stopped at the size bound"), **carried}
+    if reply.get("completed") is not True or not isinstance(reply.get("c"), str):
+        return response
+    merged = dict(response)
+    if response.get("ok") is False:
+        merged = {name: response[name] for name in ("id", "program", "sha256", "image_base", "address_kind", "overlay_state", "engine")
+                  if name in response}
+        merged.update(ok=True, c=reply["c"], function={"address": reply.get("entry"), "name": reply.get("name"),
+                                                       "signature": reply.get("signature")})
+        merged["total_characters"] = reply.get("chars", len(reply["c"]))
+        merged["max_characters"] = len(reply["c"])
+    merged.update(carried)
+    merged["truncated"] = bool(response.get("truncated") if response.get("ok") is not False else False) or reply.get("truncated") is True
+    return merged
 
 
 def from_error(message: str) -> dict | None:

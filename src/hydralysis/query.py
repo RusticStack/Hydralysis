@@ -307,6 +307,29 @@ def run_script(engine: hydra.Engine, program: dict, request: dict, timeout_s: in
     return json.loads(lines[-1]), result
 
 
+def engine_decompile(engine: hydra.Engine, program: dict, request: dict, timeout_s: int, response: dict) -> dict:
+    """RESPONSE of a decompile, completed with the engine's own `decompile` answer where that carries more.
+
+    RusticQuery decompiles on its own and knows neither the engine's whole-reply bound (`max_result_mb`) nor its fragment
+    report for a body in several pieces. So the engine's command is asked too when the caller set `max_result_mb`, or when
+    the script could not decompile at all (a non-contiguous body fails there). Its fields are merged by
+    `decompile_result.merge`; an engine that refuses the command leaves RESPONSE as it was."""
+    if request.get("action") != "decompile":
+        return response
+    options = request.get("options") or {}
+    bound = options.get("max_result_mb")
+    if bound is None and response.get("ok") is not False:
+        return response
+    fields = {"maxChars": int(options.get("max_characters", 32000))}
+    if bound is not None:
+        fields["maxResultMb"] = bound
+    try:
+        reply = engine.call("decompile", program=program["key"], address=request["address"], timeout=timeout_s + 5, **fields)
+    except hydra.EngineError:
+        return response
+    return decompile_result.merge(response, reply)
+
+
 class QueryRunner:
     def __init__(self, settings: dict, engine: hydra.Engine | None = None):
         self.settings = settings
@@ -796,11 +819,13 @@ class QueryRunner:
                     if pool is None:
                         response, raw = run_script(reader, program, request, timeout_s, self.requests,
                                                    deadline_s=self._native_deadline(timeout_s))
+                        response = engine_decompile(reader, program, request, timeout_s, response)
                     else:
                         # One attempt, one entry: the opens and the script run on it with one clock (7.6). A retry takes another.
                         with pool.attempt(self._deadline(timeout_s)) as entry:
                             program = self.program_for(selected, engine=entry)
                             response, raw = run_script(entry, program, request, timeout_s, self.requests)
+                            response = engine_decompile(entry, program, request, timeout_s, response)
                 except hydra.EngineError as error:
                     if attempt == 0 and error.code in ("no_program", "not_found", "no_project", "closed"):
                         if pool is not None and error.code == "closed":
