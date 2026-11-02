@@ -14,6 +14,8 @@ pub mod options;
 pub mod proc;
 pub mod queue;
 pub mod records;
+pub mod revisions;
+pub mod store;
 pub mod viewgov;
 
 pub use error::{Error, PublishFailure, Result, ViewError};
