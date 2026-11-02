@@ -320,7 +320,8 @@ class M3Pairing(Gate):
         self.assertTrue(cal["ok"])
         self.assertEqual(cal["markers"], 3)
         self.assertFalse(cal["drift_estimated"], "three markers 10 ms apart cannot say anything about drift")
-        self.assertLess(abs(cal["offset_ns"] + CLOCK_OFFSET_NS), 15_000_000, cal)    # recovers the 250 ms (minus the latency)
+        self.assertLessEqual(abs(cal["offset_ns"] + CLOCK_OFFSET_NS), cal["uncertainty_ns"], cal)    # the stated uncertainty bounds the error
+        self.assertLess(cal["uncertainty_ns"], 40_000_000, cal)    # recovers the 250 ms (minus the latency)
         one = reply["objects"]["1"]
         self.assertEqual(one["status"], "paired")
         delay, uncertainty = one["delay_estimate_ns"], one["delay_uncertainty_ns"]

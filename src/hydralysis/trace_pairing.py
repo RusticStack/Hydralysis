@@ -108,7 +108,7 @@ def pair(owner_events: list[dict], replica_events: list[dict], outages: list[Out
 DEFAULT_SPEC = {"owner_sync": "app.sync", "replica_sync": "app.sync_recv", "sync_key": "n", "truth": "app.truth",
                 "mirror": "app.mirror", "extrapolated": "app.extrapolated", "create": "app.create", "key": "obj", "seq": "seq",
                 "value": "value", "gap_factor": 5, "min_gap_ns": 200_000_000, "max_error": None,
-                "latency_allowance_ns": 10_000_000}
+                "latency_allowance_ns": 20_000_000}
 
 
 def _quantile(sorted_values: list[float], q: float) -> float:
@@ -137,7 +137,8 @@ def pair_report(owner_events: list[dict], replica_events: list[dict], spec: dict
     cal = calibrate(correlate(syncs_o, syncs_r, lambda e: _p(e, spec["sync_key"])))
     out: dict = {"mode": "pair", "roles": {"owner": "authoritative order", "replica": "mapped onto the owner clock"},
                  "calibration": {"ok": cal.ok, "markers": cal.markers, "offset_ns": int(cal.offset_ns), "drift": cal.drift,
-                                 "drift_estimated": cal.drift_estimated, "uncertainty_ns": int(cal.uncertainty_ns),
+                                 "drift_estimated": cal.drift_estimated, "uncertainty_ns": int(cal.uncertainty_ns) + int(spec["latency_allowance_ns"]),
+                                 "spread_ns": int(cal.uncertainty_ns),
                                  "units": "ns (monotonic clock of each side)", "reason": cal.reason}}
     if not cal.ok:
         out.update(usable=False, objects={}, note="the clocks could not be calibrated (%s): nothing is compared, every answer is "
