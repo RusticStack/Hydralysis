@@ -37,3 +37,24 @@ W = white-box (re-expressed as Rust test with the same case).
 views.py, commits.py, workcopy.py, viewpool.py, userscripts.py, jobs/joblog helpers; tests/test_views.py,
 test_view_base.py, test_view_leak.py, test_commit.py, test_viewpool.py, test_publish*.py, test_userscripts.py,
 test_workcopy-related and the RealEngine* classes.
+
+## Stage 1-3 additions (second session)
+
+Modules: layout, error, proc, records (view records), queue (changeset queue), options (publish/rebase/merge options),
+classify (the one rule), gens (CURRENT.log head/append, manifests, live_generations, master_ids, editors_since),
+revisions, store (view store over hy-store storelog), commits (options, select, drift, intent log), settle (view lock,
+finalize_changeset, settle, finalize_commit). Cross-implementation tests (Python 3.15 needed; skipped otherwise):
+
+| Rust test | What it proves | Python tests it stands in for (white-box part) |
+|---|---|---|
+| tests/py_formats.rs | view record, changeset, done records: Python writes/Rust reads; Rust sealed bytes == durable.dumps_sealed | test_views.py record/claim/queue-record cases |
+| tests/py_diff.rs | classify() on 600 generated cases == views.classify; CURRENT.log head/master_ids/editors/live chain agree | test_views.py classification, test_view_base.py chain rules |
+| tests/py_store.rs | Rust-saved store (snapshot+log) loads equal in Python and the reverse; state_text byte-identical; subjects_of/fields_of/reconcile/dependents on 800 generated cases | test_views.py/test_workcopy.py store+revision cases |
+| tests/py_commits.rs | commits.validate (400), select (300), drift_check/_later_dependents (300), intent log agree | test_commit.py option/selection/drift cases |
+| tests/py_settle.rs | finalize_changeset (with/without generation), settle, commits.finalize produce equal stores | test_views.py settle/finalize, test_commit.py finalize cases |
+
+NOT yet covered (no Rust code): views.rebase/merge/drain/_publish_candidate/run_publish_job/start_job (engine-driven),
+seal_changeset (needs lineage.ensure, targets.resolve), queue memo, publish_job_of (overlayjobs), commits._commit,
+_verify_candidate, revert, heal, recover, in_flight_ids, workcopy sync/edit/overlays, viewpool, userscripts, the
+PyO3 binding and HYDRALYSIS_IMPL=rust. All black-box classes (RealEngine*, test_view_leak, test_viewpool, test_publish*)
+remain Python-only.
