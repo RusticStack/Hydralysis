@@ -677,7 +677,7 @@ def _pair(client: TraceClient, owner: str, replica: str, options: dict) -> dict:
             "replica": {"session": replica, "revision": client.info(replica).get("revision")}}
 
 
-REPORTS = ("survival", "bypass", "writers", "links", "discovery", "names")
+REPORTS = ("survival", "bypass", "writers", "links", "discovery", "names", "footprint")
 
 
 def _report_events(client: TraceClient, session: str, options: dict) -> list[dict]:
@@ -734,6 +734,11 @@ def _report(client: TraceClient, session: str, options: dict) -> dict:
                 if isinstance(line, str) and line.split() and "script_function" not in event["payload"]:
                     event["payload"]["script_function"] = line.split()[0]
         result = trace_bindings.link_events(events, params["table"], window=int(params.get("window", 8)))
+    elif kind == "footprint":
+        from hydralysis import trace_footprint
+        writes = [{"event_id": e["event_id"], "site": e["function"]} for e in events if e["kind"] == "core.state.write"]
+        result = trace_footprint.footprint_report(*(_object(params.get(k), "params." + k) for k in ("baseline", "control", "intervened", "removed")),
+                                                  writes=writes, saved=params.get("saved"), reloaded=params.get("reloaded"))
     elif kind == "names":
         from hydralysis import trace_hashes
         algorithm = str(params.get("algorithm") or "fnv1a64")

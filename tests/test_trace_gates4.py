@@ -659,5 +659,117 @@ class SBuildInvalidation(Gate):
         self.assertEqual([m["dependents"] for m in report["moved_layouts"]], [["codec:record-amount"]])
 
 
+POKE_HOOKS = hooks("persist.exe", [
+    dict(id="fx_instrument_poke", event="core.state.write", symbol="fx_instrument_poke", nargs=2,
+         capture=["record:u32@0", "value:i32@1"], const={"key": "persist.record"}),
+])
+
+
+@unittest.skipUnless(LIVE, "needs a trace engine (HYDRALYSIS_INTEGRATION_*, HYDRA_TRACE_EXE), Frida and MSVC")
+class IPersistFootprint(Gate):
+    """Section 15.8: what an intervention left in persistent stores (a save file and an HKCU key), whether it survives
+    removing the intervention, and values that do not round-trip."""
+
+    def setUp(self):
+        import shutil
+        import uuid
+        self.dir = self.root / ("persist-" + uuid.uuid4().hex[:8])
+        self.key = "Software\\HydraTraceGate\\" + uuid.uuid4().hex[:12]
+        self.addCleanup(self.drop_key)
+        self.addCleanup(shutil.rmtree, self.dir, True)
+
+    def drop_key(self):
+        import winreg
+        for sub in (self.key, self.key.rsplit("\\", 1)[0]):
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, sub)
+            except OSError:
+                pass
+
+    def run_exe(self, *args):
+        import subprocess
+        done = subprocess.run([str(self.fx / "persist.exe"), str(self.dir), *args, "--reg=" + self.key], capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        return [line[3:] for line in done.stdout.splitlines() if line.startswith("FX ")]
+
+    def snap(self):
+        from hydralysis import trace_footprint
+        return trace_footprint.snapshot([self.dir], registry=["HKCU\\" + self.key])
+
+    def reset(self):
+        import shutil
+        shutil.rmtree(self.dir, True)
+        self.drop_key()
+
+    @staticmethod
+    def values(lines, what):
+        out = {}
+        for line in lines:
+            if line.startswith(what + " id="):
+                fields = dict(part.split("=", 1) for part in line.split()[1:])
+                out[fields["tag"]] = int(fields["value"])
+        return out
+
+    def scenario(self):
+        baseline = self.snap()
+        self.run_exe("save")
+        control = self.snap()
+        self.reset()
+        profile = g.GateProfile(self.fx, "gate-persist/1", ["persist.exe"], POKE_HOOKS)
+        cap = g.capture(self.root / "runs", "persist.exe", [str(self.dir), "save", "--poke", "--reg=" + self.key], profile.specs(self.root))
+        intervened = self.snap()
+        session = g.unique("i_persist")
+        self.engine.load(session, cap.lines())
+        loaded = self.run_exe("load")                       # a fresh process, no instrumentation: the intervention is gone
+        removed = self.snap()
+        saved = {"hp": 100, "flags": 0, "gold": 250, "boss01": 0}
+        reloaded = self.values(loaded, "loaded")
+        return session, dict(baseline=baseline, control=control, intervened=intervened, removed=removed, saved=saved, reloaded=reloaded), loaded
+
+    def test_the_intervention_caused_change_survives_removal_in_the_file_and_the_registry(self):
+        session, params, loaded = self.scenario()
+        reply = self.engine.tool("query", session, report="footprint", kinds=["core.state.write"], limit=200, params=params)
+        self.assertNotIn("error", reply, reply)
+        result = reply["result"]
+        self.assertEqual(result["verdict"], "caused")
+        caused = {c["path"].replace("/", "\\").rsplit("\\", 1)[-1]: c for c in result["caused"]}
+        self.assertEqual(sorted(caused), ["flags", "persist_save.dat"], "the before-image, the header and the other values are unchanged")
+        for item in caused.values():
+            self.assertEqual((item["change"], item["survives_removal"]), ("changed", True), item)
+            self.assertEqual(item["classification"], "intervention-caused, survives removing the intervention")
+            self.assertEqual([a["site"] for a in item["attribution"]], ["fx_instrument_poke"])
+        self.assertTrue(any(p.startswith("reg:") for p in result["ordinary"]), "creating the key is an ordinary change of the control run")
+        self.assertEqual(result["removal"]["verdict"], "did not round-trip")
+        self.assertEqual(sorted(p.replace("/", "\\").rsplit("\\", 1)[-1] for p in result["removal"]["paths"]), ["flags", "persist_save.dat"])
+        self.assertIn("reg flags=0", loaded, "a plain load still sees the deactivated feature")
+
+    def test_the_change_is_exactly_the_one_value_and_is_attributed_to_the_observed_write(self):
+        session, _params, _loaded = self.scenario()
+        before = (self.dir / "persist_before.dat").read_bytes()
+        after = (self.dir / "persist_save.dat").read_bytes()
+        self.assertEqual([i for i, (x, y) in enumerate(zip(before, after)) if x != y], [12 + 20 * 1 + 8], "record 2, its value")
+        writes = self.engine.rows(session, kinds=["core.state.write"])
+        self.assertEqual([(w["p"]["site"], w["p"]["record"], w["p"]["value"]) for w in writes], [("fx_instrument_poke", 2, 0)])
+
+    def test_without_an_observed_write_the_change_is_reported_unattributed(self):
+        from hydralysis import trace_footprint
+        _session, params, _loaded = self.scenario()
+        result = trace_footprint.footprint_report(params["baseline"], params["control"], params["intervened"], params["removed"])
+        self.assertTrue(result["caused"])
+        self.assertEqual({c["attribution"] for c in result["caused"]}, {"unattributed"})
+
+    def test_a_value_the_loader_drops_does_not_round_trip(self):
+        _session, params, loaded = self.scenario()
+        self.assertIn("dropped id=4 type=2", loaded)
+        from hydralysis import trace_footprint
+        report = trace_footprint.footprint_report(params["baseline"], params["control"], params["intervened"], params["removed"],
+                                                  saved=params["saved"], reloaded=params["reloaded"])
+        trip = report["round_trip"]
+        self.assertEqual(trip["verdict"], "did not round-trip")
+        self.assertEqual(trip["dropped"], [{"key": "boss01", "value": 0}])
+        self.assertEqual(trip["changed"], [])
+        self.assertEqual(trace_footprint.values_round_trip({"a": 1}, {"a": 1})["verdict"], "round-trips")
+
+
 if __name__ == "__main__":
     unittest.main()
