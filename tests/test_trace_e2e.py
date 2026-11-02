@@ -188,7 +188,9 @@ class M1(unittest.TestCase):
         self.assertGreater(health["producer"]["attempted"], 100)
 
     def test_failure_mode_overflow(self):
-        live = self.traced("frameloop.exe", ["--frames=20000"], ring_bytes=1 << 16, batch_ms=300, counter_ms=100, bp_ms=0.2, window=1)
+        # exact mode: the sampling policy would thin this loop before the ring could overflow, and this test is about overflow
+        live = self.traced("frameloop.exe", ["--frames=20000"], ring_bytes=1 << 16, batch_ms=300, counter_ms=100, bp_ms=0.2, window=1,
+                           sampling="exact")
         health = live.stop()["trace"]["health"]
         self.assertGreater(health["producer"]["dropped"], 0)
         gaps = [e["payload"] for e in self.events(live) if e["kind"] == "core.capture.gap"]
@@ -196,6 +198,30 @@ class M1(unittest.TestCase):
         self.assertTrue({g["reason"] for g in gaps} <= {"ring-overflow", "producer-lost"})
         cited = sum(g["dropped"] for g in gaps if g["reason"] in ("ring-overflow", "producer-lost"))
         self.assertGreaterEqual(cited + health["encoder"]["records"], health["producer"]["attempted"])   # every attempt is a record or cited
+
+    def test_a_loop_over_the_rate_budget_is_thinned_and_every_skip_is_counted(self):
+        # the DEFAULT policy: the bare loop offers far more than the budget, so probes are thinned; nothing is silent
+        live = self.traced("frameloop.exe", ["--frames=60000"], sampling={"mode": "adaptive", "rate_budget": 20000})
+        health = live.stop()["trace"]["health"]
+        sampling = health["producer"]["sampling"]
+        self.assertEqual(sampling["policy"], "adaptive")
+        self.assertGreater(sampling["skipped"], 0)
+        events = self.events(live)
+        gaps = [e["payload"] for e in events if e["kind"] == "core.capture.gap" and e["payload"].get("sampled")]
+        self.assertTrue(gaps)
+        self.assertTrue(all(g["reason"] == "budget" for g in gaps))
+        self.assertEqual(sum(g["dropped"] for g in gaps), sampling["skipped"])                 # every skipped hit is cited, exactly
+        calls = [e for e in events if not e["kind"].startswith("core.capture.") and e["kind"] != "core.marker"]
+        self.assertTrue(any(e["confidence"] == "sampled" for e in calls))                       # kept while thinned: labelled
+        total = sum(r["hits"] for r in sampling["sites"])
+        self.assertEqual(total, sampling["skipped"] + sum(r["kept"] for r in sampling["sites"]))
+        self.assertEqual(health["verify"]["outcome"], "clean")
+
+    def test_exact_mode_keeps_every_hit_and_labels_nothing_sampled(self):
+        live = self.traced("frameloop.exe", ["--frames=300"], sampling="exact")
+        health = live.stop()["trace"]["health"]
+        self.assertEqual(health["producer"]["sampling"]["skipped"], 0)
+        self.assertFalse([e for e in self.events(live) if e["confidence"] == "sampled"])
 
     def test_failure_mode_restart_child_is_a_new_producer_generation_and_process(self):
         first = self.traced("frameloop.exe", ["--frames=30"], producer_gen=1)

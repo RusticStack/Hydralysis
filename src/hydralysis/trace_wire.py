@@ -20,7 +20,8 @@ Agent batch (little endian), sent by the in-process agent as `send(message, data
         52 u16 argument count   54 u16 buffer length   56 u64 buffer address   64 u64 args[count]
         then u64 stack[kind >> 4] (the caller chain, the return address first)   then the buffer bytes
 
-    flags: 1 has return, 2 buffer read failed, 4 buffer truncated, 8 buffer is a wide string, 16 buffer present
+    flags: 1 has return, 2 buffer read failed, 4 buffer truncated, 8 buffer is a wide string, 16 buffer present,
+           32 kept while the probe's sampling policy was thinning it (the event's confidence is `sampled`)
 
 A record's text never leaves the encoder: a buffer becomes a keyed id (HMAC-SHA256 under the scope key, 128 bits) and
 its length. Only a site armed for payload mode, with an authorization, yields a content-addressed artifact.
@@ -40,7 +41,7 @@ HEADER = struct.Struct("<IHHIIQIIQQQQ")
 HEADER_BYTES = 64
 RECORD = struct.Struct("<HBBHHQIIQQQIHHQ")
 RECORD_BYTES = 64
-F_RET, F_READ_FAILED, F_TRUNCATED, F_WIDE, F_BUF = 1, 2, 4, 8, 16
+F_RET, F_READ_FAILED, F_TRUNCATED, F_WIDE, F_BUF, F_SAMPLED = 1, 2, 4, 8, 16, 32
 INVALID_HANDLE = 0xFFFFFFFFFFFFFFFF
 DEVICE_PREFIXES = ("\\\\.\\", "\\\\?\\")
 
@@ -379,9 +380,9 @@ class SegmentEncoder:
         return self.chain.n
 
     # -- one event ---------------------------------------------------------------------------------------------------
-    def _event(self, kind: str, t_ns: int, tid, payload: dict, va=None, callstack=None, module=None) -> bytes:
+    def _event(self, kind: str, t_ns: int, tid, payload: dict, va=None, callstack=None, module=None, confidence: str = "exact") -> bytes:
         event = {"kind": kind, "source_id": self.source_id, "source_seq": self.source_seq, "producer_gen": self.producer_gen,
-                 "clock_domain": "qpc-10mhz", "t_mono_ns": t_ns, "process_id": self.process_id, "confidence": "exact",
+                 "clock_domain": "qpc-10mhz", "t_mono_ns": t_ns, "process_id": self.process_id, "confidence": confidence,
                  "acquisition": "atomic", "payload": payload}
         if tid is not None:
             event["thread_id"] = tid
@@ -560,10 +561,12 @@ class SegmentEncoder:
         args, has_ret = r["args"], bool(r["flags"] & F_RET)
         buf = self._buffer(site, r, artifacts)
         out = bytearray()
+        # a record kept while the sampling policy thinned its probe stands for several hits: its summary confidence says so
+        confidence = "sampled" if r["flags"] & F_SAMPLED else "exact"
 
         def emit(event_kind, t, payload):
             payload = {**payload, "call": call}
-            return self._event(event_kind, t, r["tid"], payload, va=va, callstack=stack, module=module)
+            return self._event(event_kind, t, r["tid"], payload, va=va, callstack=stack, module=module, confidence=confidence)
 
         if kind == "open":
             path = r["buf"] if not r["flags"] & F_READ_FAILED else b""

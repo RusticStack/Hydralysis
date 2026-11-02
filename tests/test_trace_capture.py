@@ -66,6 +66,38 @@ class Policy(unittest.TestCase):
         self.assertIn("not one of", tc.check_probe_policy("whatever", {}))
 
 
+class Sampling(unittest.TestCase):
+    """The declared sampling policy: validated, and every hit it skips is cited exactly once, never silently."""
+
+    def test_the_default_policy_is_adaptive_and_bad_options_are_refused(self):
+        from hydralysis.runtime_agents import normalize_sampling
+        self.assertEqual(normalize_sampling(None)["mode"], "adaptive")
+        self.assertEqual(normalize_sampling("exact")["mode"], "exact")
+        self.assertEqual(normalize_sampling({"mode": "fixed", "stride": 16})["stride"], 16)
+        for bad in ({"mode": "random"}, {"rate_budget": 0}, {"stride": 0}, {"exact": "all"}, {"nope": 1}, 5):
+            with self.assertRaises(ValueError):
+                normalize_sampling(bad)
+
+    def test_skipped_hits_become_one_budget_gap_per_report_with_exact_counts(self):
+        with workdir() as root:
+            t = source(root)
+            t.on_ready({"context": {"debugger_present": False}, "installed": [], "qpc_freq": 10_000_000,
+                        "sampling": {"policy": "adaptive", "rate_budget_per_s": 100}})
+            counters = {"attempted": 0, "dropped": 0, "read_failed": 0, "no_ring": 0, "rings": []}
+            first = {"policy": "adaptive", "sites": [{"site": 1, "probe": "CreateFileW", "hits": 100, "kept": 10, "skipped": 90, "stride": 8, "rate_per_s": 5000}]}
+            second = {"policy": "adaptive", "sites": [{"site": 1, "probe": "CreateFileW", "hits": 150, "kept": 20, "skipped": 130, "stride": 4, "rate_per_s": 900}]}
+            t.on_counters({**counters, "sampling": first})
+            t.on_counters({**counters, "sampling": first})        # nothing new: no second citation
+            t.on_counters({**counters, "sampling": second, "final": True})
+            health = t.finalize(detach={"quiescent": True})
+            events = [json.loads(line.split(" ", 1)[1]) for line in t.path.read_text(encoding="utf-8").splitlines() if line.strip()]
+            gaps = [e["payload"] for e in events if e["kind"] == "core.capture.gap" and e["payload"].get("sampled")]
+            self.assertEqual([g["dropped"] for g in gaps], [90, 40])
+            self.assertTrue(all(g["reason"] == "budget" and g["out_of_band"] for g in gaps))
+            self.assertEqual(health["producer"]["sampling"]["sites"][0]["skipped"], 130)
+            self.assertEqual(t.verify()["outcome"], "clean")
+
+
 class Writer(unittest.TestCase):
     def test_batches_become_a_clean_chain_and_the_counters_reconcile(self):
         with workdir() as root:

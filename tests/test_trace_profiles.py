@@ -77,6 +77,15 @@ class Loading(unittest.TestCase):
         self.assertIn("app.feature", profile.kind_names())
         self.assertEqual(profile.session_record()["fixtures_only"], True)
 
+    def test_a_profile_may_declare_its_sampling_policy(self):
+        text = profiles.BASELINE.read_text("utf-8")
+        self.assertIsNone(profiles.load_text(text).data["host"].get("sampling"))        # absent: the recorder's default applies
+        declared = profiles.load_text(text.replace("[host]", "[host]" + chr(10) + 'sampling = "exact"' + chr(10) + "rate_budget = 5000", 1))
+        self.assertEqual(declared.data["host"]["sampling"], {"mode": "exact", "rate_budget": 5000})
+        with self.assertRaises(ProfileError) as caught:
+            profiles.load_text(text.replace("[host]", "[host]" + chr(10) + 'sampling = "whenever"' + chr(10) + "rate_budget = 1", 1))
+        self.assertTrue(any("host.sampling" in e for e in caught.exception.errors) and any("host.rate_budget" in e for e in caught.exception.errors))
+
     def test_a_changed_byte_changes_the_session_hash(self):
         text = profiles.BASELINE.read_text("utf-8")
         other = profiles.load_text(text.replace("limit = 50", "limit = 51"), directory=None)

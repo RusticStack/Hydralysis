@@ -26,6 +26,8 @@ label = "1.2.3"
 [host]
 fault_policy = "tolerant"       # tolerant | fatal | freezes  (spec 15.1); a hook may override with `fault`
 record_handler_chain = true     # record the VEH/UEF chain and debugger state at attach
+# sampling = "adaptive"          # optional: adaptive (the default) thins a hot probe above rate_budget and counts every skip; exact never thins
+# rate_budget = 120000          # kept records per second, all probes (docs/trace-overhead.md)
 
 [[event_kinds]]                 # kinds in your namespace; they extend a core kind
 name = "app.feature"            # <namespace>.<name>, lowercase, never core.*

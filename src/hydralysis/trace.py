@@ -516,7 +516,7 @@ def _verify_profile(profile, options: dict) -> dict:
 
 
 TRACE_CAPTURE_KEYS = ("ring_bytes", "rings", "batch_ms", "batch_bytes", "counter_ms", "bp_ms", "window", "authorize_payload",
-                      "authorize_preview", "builtin", "watchdog", "etw", "fault_policy", "producer_gen", "scope", "scope_key")
+                      "authorize_preview", "builtin", "watchdog", "etw", "fault_policy", "producer_gen", "scope", "scope_key", "sampling", "hooking")
 
 
 def _trace_option(session: str, profile, verification, capture_options: dict) -> dict:
@@ -532,6 +532,8 @@ def _trace_option(session: str, profile, verification, capture_options: dict) ->
         enabled = [h for h in profile.data["hooks"] if h["id"] in option["hooks"]]
         option["fault_policy"] = profiles.host_fault_policy(profile, enabled)
         option["profile"] = {"id": profile.id, "sha256": profile.sha256}
+        if profile.data["host"].get("sampling"):
+            option["sampling"] = dict(profile.data["host"]["sampling"])     # the profile's declared policy; capture_options may override
         watch = _watchdog_option(profile, capture_options.get("watchdog"))
         if watch:
             option["watchdog"] = watch
