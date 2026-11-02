@@ -5,8 +5,13 @@
      moved     df_render, df_mix                    identical code, placed elsewhere in V2
      changed   df_limit (threshold), df_banner (string and an extra call)
      added     df_added (V2 only)
-     removed   df_removed (build 1 only) */
+     removed   df_removed (build 1 only)
+   Trace fixture addition (spec 15.10, docs/trace-fixtures.md): build 2 inserts a field into Record, before
+   `amount`, so the field the codec df_decode_amount reads moves from offset 8 (build 1) to 12 (build 2); the codec
+   (changed code, shifted constant) is the "moved" layout. df_render is the moved hook-table function (identical
+   code placed elsewhere) and df_removed is the removed function. */
 #include <stdio.h>
+#include <stddef.h>
 #include <string.h>
 
 #define DF __declspec(noinline)
@@ -78,6 +83,22 @@ DF int df_walk(int start) {
     return steps;
 }
 
+typedef struct Record {
+    int id;
+    int version;
+#ifdef V2
+    int inserted;      /* the field build 2 inserts */
+#endif
+    int amount;
+} Record;
+
+/* Reads Record.amount from raw bytes at the offset its layout has in this build. */
+DF int df_decode_amount(const unsigned char *raw) {
+    int amount;
+    memcpy(&amount, raw + offsetof(Record, amount), sizeof amount);
+    return amount + df_parse("7");
+}
+
 #ifdef V2
 DF int df_render(int frame) { return table[frame & 15] * 7 + frame / 3; }
 DF int df_added(int value) { return df_walk(value) * df_mix(value, 3) + (int)strlen(df_banner()); }
@@ -95,5 +116,14 @@ int main(int argc, char **argv) {
     g_sink += df_removed(value);
 #endif
     printf("%d\n", g_sink);
+    {
+        Record record = { 5, 1 };
+        record.amount = 900;
+#ifdef V2
+        record.inserted = 111;
+#endif
+        printf("FX amount=%d offset=%d size=%d\n", df_decode_amount((const unsigned char *)&record),
+               (int)offsetof(Record, amount), (int)sizeof(Record));
+    }
     return 0;
 }

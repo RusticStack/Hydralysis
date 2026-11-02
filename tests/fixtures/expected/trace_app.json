@@ -1,0 +1,155 @@
+{
+ "fixture": "trace_app",
+ "spec": [
+  "M1 resources and precedence",
+  "M2 two-config diff"
+ ],
+ "sources": [
+  "trace_app.c",
+  "trace_plugin.c",
+  "trace_common.h"
+ ],
+ "outputs": [
+  "trace_app.exe",
+  "trace_plugin_1.dll",
+  "trace_plugin_2.dll"
+ ],
+ "functions": {
+  "write_file": "fx_write_file",
+  "read_file": "fx_read_file",
+  "read_config": "fx_read_config",
+  "registry": "fx_registry_roundtrip",
+  "registry_cleanup": "fx_registry_cleanup",
+  "load_plugin": "fx_load_plugin",
+  "plugin_id_export": "fx_plugin_id"
+ },
+ "runs": [
+  {
+   "id": "config_A",
+   "program": "trace_app.exe",
+   "args": [
+    "{work}",
+    "A"
+   ],
+   "max_seconds": 20,
+   "exit_code": 0,
+   "stdout_lines": [
+    "FX config=A",
+    "FX precedence=dir_a",
+    "FX data_ok=1",
+    "FX extra_read=0",
+    "FX registry_mode=A ok=1",
+    "FX plugin_id=1",
+    "FX plugin_dir=dir_a",
+    "FX done"
+   ],
+   "files": {
+    "trace_app.cfg": {
+     "text": "precedence=dir_a\nextra=0\n"
+    },
+    "trace_app.data": {
+     "text": "abcdefghijklmnopqrstuvwxyzabcdef"
+    },
+    "plug/dir_a/trace_plugin.dll": {
+     "exists": true
+    },
+    "plug/dir_b/trace_plugin.dll": {
+     "exists": true
+    }
+   },
+   "loser_dir": "dir_b"
+  },
+  {
+   "id": "config_B",
+   "program": "trace_app.exe",
+   "args": [
+    "{work}",
+    "B"
+   ],
+   "max_seconds": 20,
+   "exit_code": 0,
+   "stdout_lines": [
+    "FX config=B",
+    "FX precedence=dir_b",
+    "FX data_ok=1",
+    "FX extra_read=1",
+    "FX registry_mode=B ok=1",
+    "FX plugin_id=2",
+    "FX plugin_dir=dir_b",
+    "FX done"
+   ],
+   "files": {
+    "trace_app.cfg": {
+     "text": "precedence=dir_b\nextra=1\n"
+    },
+    "trace_app.data": {
+     "text": "abcdefghijklmnopqrstuvwxyzabcdef"
+    },
+    "plug/dir_a/trace_plugin.dll": {
+     "exists": true
+    },
+    "plug/dir_b/trace_plugin.dll": {
+     "exists": true
+    },
+    "trace_app.extra": {
+     "text": "extra-config-b"
+    }
+   },
+   "loser_dir": "dir_a"
+  }
+ ],
+ "answers": {
+  "resources": {
+   "files": [
+    "trace_app.cfg (create, write 24/25 bytes, read back)",
+    "trace_app.data (create, write 32, read 32)",
+    "trace_app.extra (config B only: create, write 14, read 14)",
+    "plug/dir_a/trace_plugin.dll and plug/dir_b/trace_plugin.dll (copied from trace_plugin_1/2.dll)"
+   ],
+   "registry": {
+    "key": "HKCU\\Software\\HydraTraceFixture",
+    "value": "Mode",
+    "type": "REG_SZ",
+    "operations": [
+     "create key",
+     "set Mode",
+     "query Mode",
+     "delete key"
+    ]
+   },
+   "data_bytes": "abcdefghijklmnopqrstuvwxyzabcdef"
+  },
+  "dll_search_order": {
+   "call": "LoadLibraryA(\"trace_plugin.dll\") in fx_load_plugin",
+   "config_A": {
+    "set_dll_directory": "plug/dir_a",
+    "path_entry": "plug/dir_b",
+    "loaded_from": "plug/dir_a",
+    "plugin_id": 1,
+    "shadowed": "plug/dir_b/trace_plugin.dll (exists, never loaded)"
+   },
+   "config_B": {
+    "set_dll_directory": "plug/dir_b",
+    "path_entry": "plug/dir_a",
+    "loaded_from": "plug/dir_b",
+    "plugin_id": 2,
+    "shadowed": "plug/dir_a/trace_plugin.dll (exists, never loaded)"
+   },
+   "rule": "the SetDllDirectory directory is searched before PATH, so the same bare name resolves to different files"
+  },
+  "two_config_diff": {
+   "differs": [
+    "trace_app.cfg content",
+    "trace_app.extra exists only in B",
+    "registry value Mode A -> B",
+    "module loaded from dir_a -> dir_b",
+    "fx_plugin_id result 1 -> 2"
+   ],
+   "same": [
+    "trace_app.data content and its write/read",
+    "staged plugin copies",
+    "registry key path"
+   ]
+  }
+ }
+}

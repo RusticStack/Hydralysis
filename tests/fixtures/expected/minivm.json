@@ -1,0 +1,258 @@
+{
+ "fixture": "minivm",
+ "spec": [
+  "15.7"
+ ],
+ "sources": [
+  "minivm.c",
+  "trace_common.h"
+ ],
+ "outputs": [
+  "minivm.exe"
+ ],
+ "functions": {
+  "register": "fx_vm_register",
+  "load_table": "fx_vm_load_table",
+  "find": "fx_vm_find",
+  "dispatch": "fx_vm_dispatch",
+  "run_line": "fx_vm_run_line"
+ },
+ "data": {
+  "table": "g_native_table"
+ },
+ "runs": [
+  {
+   "id": "default",
+   "program": "minivm.exe",
+   "args": [],
+   "max_seconds": 10,
+   "exit_code": 0,
+   "stdout_lines": [
+    "FX registered=12",
+    "FX call name=add args=2 result=5",
+    "FX call name=sub args=2 result=6",
+    "FX call name=mul args=2 result=42",
+    "FX call name=neg args=1 result=-5",
+    "FX call name=min args=2 result=3",
+    "FX call name=max args=2 result=9",
+    "FX call name=clamp args=3 result=10",
+    "FX call name=abs args=1 result=8",
+    "FX call name=sq args=1 result=144",
+    "FX call name=avg3 args=3 result=6",
+    "FX call name=dist2 args=4 result=25",
+    "FX call name=select args=3 result=111",
+    "FX script_ok=12"
+   ]
+  }
+ ],
+ "answers": {
+  "registration": {
+   "table": {
+    "symbol": "g_native_table",
+    "row": "{const char *name; native_fn fn; int nargs}",
+    "rows": 10,
+    "loader": "fx_vm_load_table"
+   },
+   "calls": {
+    "function": "fx_vm_register",
+    "sites": 2,
+    "names": [
+     "dist2",
+     "select"
+    ]
+   }
+  },
+  "natives": [
+   {
+    "script_name": "add",
+    "native": "fx_nat_add",
+    "params": 2,
+    "registered_by": "table"
+   },
+   {
+    "script_name": "sub",
+    "native": "fx_nat_sub",
+    "params": 2,
+    "registered_by": "table"
+   },
+   {
+    "script_name": "mul",
+    "native": "fx_nat_mul",
+    "params": 2,
+    "registered_by": "table"
+   },
+   {
+    "script_name": "neg",
+    "native": "fx_nat_neg",
+    "params": 1,
+    "registered_by": "table"
+   },
+   {
+    "script_name": "min",
+    "native": "fx_nat_min",
+    "params": 2,
+    "registered_by": "table"
+   },
+   {
+    "script_name": "max",
+    "native": "fx_nat_max",
+    "params": 2,
+    "registered_by": "table"
+   },
+   {
+    "script_name": "clamp",
+    "native": "fx_nat_clamp",
+    "params": 3,
+    "registered_by": "table"
+   },
+   {
+    "script_name": "abs",
+    "native": "fx_nat_abs",
+    "params": 1,
+    "registered_by": "table"
+   },
+   {
+    "script_name": "sq",
+    "native": "fx_nat_sq",
+    "params": 1,
+    "registered_by": "table"
+   },
+   {
+    "script_name": "avg3",
+    "native": "fx_nat_avg3",
+    "params": 3,
+    "registered_by": "table"
+   },
+   {
+    "script_name": "dist2",
+    "native": "fx_nat_dist2",
+    "params": 4,
+    "registered_by": "call"
+   },
+   {
+    "script_name": "select",
+    "native": "fx_nat_select",
+    "params": 3,
+    "registered_by": "call"
+   }
+  ],
+  "total_natives": 12,
+  "table_natives": 10,
+  "call_natives": 2,
+  "signature": "int native(const int *args); params = declared nargs",
+  "script": [
+   {
+    "line": "add 2 3",
+    "native": "add",
+    "args": [
+     2,
+     3
+    ],
+    "result": 5
+   },
+   {
+    "line": "sub 10 4",
+    "native": "sub",
+    "args": [
+     10,
+     4
+    ],
+    "result": 6
+   },
+   {
+    "line": "mul 6 7",
+    "native": "mul",
+    "args": [
+     6,
+     7
+    ],
+    "result": 42
+   },
+   {
+    "line": "neg 5",
+    "native": "neg",
+    "args": [
+     5
+    ],
+    "result": -5
+   },
+   {
+    "line": "min 9 3",
+    "native": "min",
+    "args": [
+     9,
+     3
+    ],
+    "result": 3
+   },
+   {
+    "line": "max 9 3",
+    "native": "max",
+    "args": [
+     9,
+     3
+    ],
+    "result": 9
+   },
+   {
+    "line": "clamp 15 0 10",
+    "native": "clamp",
+    "args": [
+     15,
+     0,
+     10
+    ],
+    "result": 10
+   },
+   {
+    "line": "abs -8",
+    "native": "abs",
+    "args": [
+     -8
+    ],
+    "result": 8
+   },
+   {
+    "line": "sq 12",
+    "native": "sq",
+    "args": [
+     12
+    ],
+    "result": 144
+   },
+   {
+    "line": "avg3 3 6 9",
+    "native": "avg3",
+    "args": [
+     3,
+     6,
+     9
+    ],
+    "result": 6
+   },
+   {
+    "line": "dist2 0 0 3 4",
+    "native": "dist2",
+    "args": [
+     0,
+     0,
+     3,
+     4
+    ],
+    "result": 25
+   },
+   {
+    "line": "select 1 111 222",
+    "native": "select",
+    "args": [
+     1,
+     111,
+     222
+    ],
+    "result": 111
+   }
+  ],
+  "cross_layer_edge": "script call line -> fx_vm_dispatch (indirect call through Native.fn) -> fx_nat_<name>",
+  "trace_link": "a fx_vm_run_line event for 'sq 12' links to the fx_nat_sq event with args [12] and result 144"
+ }
+}

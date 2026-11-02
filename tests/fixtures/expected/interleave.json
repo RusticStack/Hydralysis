@@ -1,0 +1,175 @@
+{
+ "fixture": "interleave",
+ "spec": [
+  "14.2",
+  "14.3"
+ ],
+ "sources": [
+  "interleave.c",
+  "interleave_mod.c",
+  "trace_common.h"
+ ],
+ "outputs": [
+  "interleave.exe",
+  "interleave_mod.dll"
+ ],
+ "functions": {
+  "submit": "fx_submit",
+  "submit_dropped": "fx_submit_dropped",
+  "handle": "fx_handle_request",
+  "store_result": "fx_store_result",
+  "complete": "fx_complete",
+  "object_create": "fx_object_create",
+  "object_destroy": "fx_object_destroy",
+  "handle_cycle": "fx_handle_cycle",
+  "module_cycle": "fx_module_cycle",
+  "spawn_child": "fx_spawn_child",
+  "child_work": "fx_child_work",
+  "module_export": "fx_mod_value"
+ },
+ "runs": [
+  {
+   "id": "default",
+   "program": "interleave.exe",
+   "args": [],
+   "max_seconds": 30,
+   "exit_code": 0,
+   "stdout_lines": [
+    "FX result op=1000 value=3001",
+    "FX result op=1001 value=3004",
+    "FX result op=1002 value=3007",
+    "FX result op=1003 value=3010",
+    "FX result op=1004 value=3013",
+    "FX result op=1005 value=3016",
+    "FX result op=1006 value=3019",
+    "FX result op=1007 value=3022",
+    "FX result op=2000 value=6002",
+    "FX result op=2001 value=6005",
+    "FX result op=2002 value=6008",
+    "FX result op=2003 value=6011",
+    "FX result op=2004 value=6014",
+    "FX result op=2005 value=6017",
+    "FX result op=2006 value=6020",
+    "FX result op=2007 value=6023",
+    "FX completed=16 dropped=1",
+    "FX address_reused=1 tags=111,222",
+    "<regex>FX handle_reused=[01]",
+    "FX module_status=0 base_changed=1",
+    "FX children=0,0 pids_differ=1",
+    "FX done"
+   ],
+   "note": "lines starting with <regex> are matched as regular expressions (handle values may differ)"
+  }
+ ],
+ "answers": {
+  "pools": {
+   "P": {
+    "pool_number": 1,
+    "ops": [
+     1000,
+     1001,
+     1002,
+     1003,
+     1004,
+     1005,
+     1006,
+     1007
+    ],
+    "submit_pool_index": 0,
+    "workers": 2
+   },
+   "Q": {
+    "pool_number": 2,
+    "ops": [
+     2000,
+     2001,
+     2002,
+     2003,
+     2004,
+     2005,
+     2006,
+     2007
+    ],
+    "submit_pool_index": 1,
+    "workers": 2
+   }
+  },
+  "correlation_chain": {
+   "per_op": [
+    "fx_submit(pool_index, op)",
+    "fx_handle_request(pool_number, op, worker)",
+    "fx_store_result(op, value)",
+    "fx_complete(op)"
+   ],
+   "identity": "the op argument (1000..1007, 2000..2007)",
+   "value": "op*3 + pool_number",
+   "handoff": "fx_submit runs on the main thread, fx_handle_request on a pool thread (queue plus semaphore): a call stack does not connect them"
+  },
+  "interleaving": "main alternates P and Q submissions, so events of the two pools interleave; ops of P (1xxx) and Q (2xxx) are unrelated",
+  "explanation_for_op_1003": {
+   "must_include": [
+    "fx_submit",
+    "fx_handle_request",
+    "fx_store_result",
+    "fx_complete"
+   ],
+   "must_not_include_ops": [
+    2000,
+    2001,
+    2002,
+    2003,
+    2004,
+    2005,
+    2006,
+    2007,
+    9999
+   ]
+  },
+  "missing_link": {
+   "op": 9999,
+   "events": [
+    "fx_submit_dropped(1, 9999)"
+   ],
+   "never_followed_by": [
+    "fx_handle_request",
+    "fx_store_result",
+    "fx_complete"
+   ],
+   "expected_report": "request 9999 has no handler: unresolved boundary, not connected to the nearest-timestamp handler"
+  },
+  "identity_reuse": {
+   "address": {
+    "api": "VirtualAlloc/VirtualFree/VirtualAlloc at the same address",
+    "tags": [
+     111,
+     222
+    ],
+    "reused": true,
+    "lifetimes": 2,
+    "functions": [
+     "fx_object_create",
+     "fx_object_destroy"
+    ]
+   },
+   "handle": {
+    "api": "CreateEventA, CloseHandle, CreateEventA",
+    "reused_expected": "almost always (printed handle_reused)",
+    "function": "fx_handle_cycle"
+   },
+   "module": {
+    "dll": "interleave_mod.dll",
+    "loads": 2,
+    "second_base_differs": true,
+    "how": "the old image range is reserved after FreeLibrary, so the reload must move",
+    "function": "fx_module_cycle"
+   },
+   "process": {
+    "children": 2,
+    "program": "interleave.exe --child",
+    "pids_differ": true,
+    "note": "a PID cannot be forced to repeat; two sequential child generations are produced, PID reuse is covered by synthetic events"
+   }
+  },
+  "no_silent_merge": "events with the same address, handle or module base but different lifetime/load instance stay distinct identities"
+ }
+}

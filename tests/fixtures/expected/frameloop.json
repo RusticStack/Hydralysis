@@ -1,0 +1,277 @@
+{
+ "fixture": "frameloop",
+ "spec": [
+  "15.2",
+  "15.3",
+  "14.8"
+ ],
+ "sources": [
+  "frameloop.c",
+  "trace_common.h"
+ ],
+ "outputs": [
+  "frameloop.exe"
+ ],
+ "functions": {
+  "frame_begin": "fx_frame_begin",
+  "frame_end": "fx_frame_end",
+  "phase_begin": "fx_phase_begin",
+  "stage_input": "fx_stage_input",
+  "stage_update": "fx_stage_update",
+  "stage_render": "fx_stage_render",
+  "job_callback": "fx_job_callback",
+  "job_physics": "fx_job_physics",
+  "pool_thread": "fx_pool_thread",
+  "ours_write": "fx_ours_write",
+  "host_overwrite": "fx_host_overwrite",
+  "consume": "fx_consume"
+ },
+ "data": {
+  "entity": "g_entity"
+ },
+ "entity_layout": [
+  "tag:int@0",
+  "value:int@4",
+  "writer:int@8",
+  "write_frame:int@12"
+ ],
+ "runs": [
+  {
+   "id": "default",
+   "program": "frameloop.exe",
+   "args": [],
+   "max_seconds": 20,
+   "exit_code": 0,
+   "stdout_lines": [
+    "FX frames=60",
+    "FX callback_sum=1770 physics_sum=3540",
+    "FX consumer_sum=517770",
+    "FX verdicts survived=6 overwritten=54 read_before_write=0"
+   ]
+  },
+  {
+   "id": "callback_on_worker",
+   "program": "frameloop.exe",
+   "args": [
+    "--callback-on=worker"
+   ],
+   "max_seconds": 20,
+   "exit_code": 0,
+   "stdout_lines": [
+    "FX frames=60",
+    "FX callback_sum=1770 physics_sum=3540",
+    "FX consumer_sum=517770",
+    "FX verdicts survived=6 overwritten=54 read_before_write=0"
+   ]
+  },
+  {
+   "id": "ours_write_in_render",
+   "program": "frameloop.exe",
+   "args": [
+    "--ours-stage=render"
+   ],
+   "max_seconds": 20,
+   "exit_code": 0,
+   "stdout_lines": [
+    "FX frames=60",
+    "FX callback_sum=1770 physics_sum=3540",
+    "FX consumer_sum=517764",
+    "FX verdicts survived=0 overwritten=54 read_before_write=6"
+   ]
+  },
+  {
+   "id": "no_overwrite",
+   "program": "frameloop.exe",
+   "args": [
+    "--no-overwrite"
+   ],
+   "max_seconds": 20,
+   "exit_code": 0,
+   "stdout_lines": [
+    "FX frames=60",
+    "FX callback_sum=1770 physics_sum=3540",
+    "FX consumer_sum=301770",
+    "FX verdicts survived=60 overwritten=0 read_before_write=0"
+   ]
+  },
+  {
+   "id": "skip_update_marker",
+   "program": "frameloop.exe",
+   "args": [
+    "--skip-marker=update"
+   ],
+   "max_seconds": 20,
+   "exit_code": 0,
+   "stdout_lines": [
+    "FX frames=60",
+    "FX callback_sum=1770 physics_sum=3540",
+    "FX consumer_sum=517770",
+    "FX verdicts survived=6 overwritten=54 read_before_write=0"
+   ]
+  },
+  {
+   "id": "ours_in_render_no_overwrite",
+   "program": "frameloop.exe",
+   "args": [
+    "--ours-stage=render",
+    "--no-overwrite"
+   ],
+   "max_seconds": 20,
+   "exit_code": 0,
+   "stdout_lines": [
+    "FX frames=60",
+    "FX callback_sum=1770 physics_sum=3540",
+    "FX consumer_sum=296711",
+    "FX verdicts survived=0 overwritten=0 read_before_write=60"
+   ]
+  }
+ ],
+ "answers": {
+  "frames_default": 60,
+  "phases": {
+   "1": "input (fx_stage_input)",
+   "2": "update (fx_stage_update)",
+   "3": "render (fx_stage_render)",
+   "marker": "fx_phase_begin(stage number)",
+   "frame_markers": [
+    "fx_frame_begin",
+    "fx_frame_end"
+   ]
+  },
+  "roles": {
+   "main": "the thread that runs main: frame markers, stages and (default) fx_job_callback",
+   "worker": "pool threads whose start function is fx_pool_thread: fx_job_physics every frame, fx_job_callback with --callback-on=worker"
+  },
+  "only_on_main_check": {
+   "function": "fx_job_callback",
+   "default_run": "passes (all 60 calls on main)",
+   "callback_on_worker_run": "fails with a cited fx_job_callback event on a worker role",
+   "calls_per_run": 60
+  },
+  "ordering_check": {
+   "rule": "fx_ours_write precedes fx_consume in the same frame",
+   "default_run": "passes for 60 frames",
+   "ours_write_in_render_run": "fails: fx_consume runs before fx_ours_write in every frame (60)"
+  },
+  "missing_marker": {
+   "run": "skip_update_marker",
+   "expect": "phase 'update' has no marker: role/phase keys unresolved and checks over it are unknown, not pass",
+   "missing_phase": 2
+  },
+  "intervention_outcome": {
+   "field": "g_entity.value (offset 4)",
+   "consumer": "fx_consume",
+   "our_write": "fx_ours_write",
+   "overwriting_site": "fx_host_overwrite",
+   "default": {
+    "frames": 60,
+    "survived_frames": [
+     9,
+     19,
+     29,
+     39,
+     49,
+     59
+    ],
+    "overwritten": 54,
+    "survived": 6,
+    "ratio": "54 of 60 frames overwritten by fx_host_overwrite",
+    "values": {
+     "ours": "5000+frame",
+     "host": "9000+frame"
+    }
+   },
+   "no_overwrite": {
+    "verdicts": "every frame survived",
+    "survived": 60
+   },
+   "ours_write_in_render": {
+    "verdicts": "consumer read before write on 6 frames, overwritten on 54",
+    "read_before_write": 6,
+    "overwritten": 54
+   },
+   "ours_in_render_no_overwrite": {
+    "read_before_write": 60
+   },
+   "per_frame_default": [
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "survived",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "survived",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "survived",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "survived",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "survived",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "overwritten by fx_host_overwrite",
+    "survived"
+   ]
+  },
+  "no_frame_without_event": {
+   "event": "fx_host_overwrite",
+   "default_run_frames_without": [
+    9,
+    19,
+    29,
+    39,
+    49,
+    59
+   ]
+  },
+  "at_most_once_per_frame": [
+   "fx_ours_write",
+   "fx_host_overwrite",
+   "fx_consume"
+  ],
+  "performance_use": "frameloop.exe --frames=200000 is the overhead benchmark (about 1 s unhooked)"
+ }
+}
