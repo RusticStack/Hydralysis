@@ -120,3 +120,60 @@ Not ported: `commits._commit`, `_verify_candidate` (engine-driven candidate buil
   `commits._commit`, `_verify_candidate` (they stay Python behind the Host trait); rebase/merge/drain/job are not routed
   (tested only differentially in Rust).
 - Known defect in Python: `run_publish_job` publish_wait_expired path raises TypeError (csid passed twice).
+
+## Stage 9: workcopy, userscripts and viewpool (this branch: r/hy-workcopy)
+
+New modules: `workcopy` (engine-free logic and the engine-bound steps behind the `Host` trait), `userscripts`, `viewpool`.
+`Host` gained `attribution()` (default `settle::attribution()`; the Python host answers with `settle.attribution()`).
+
+| Rust test | What it proves | Python tests it stands in for |
+|---|---|---|
+| src/userscripts.rs (5 unit tests) | `check_options`, `choose` (levels, `not_available`), `list_scripts` (Python `splitlines`, `strip`, suffix, Windows case-insensitive order), `stage` (owners.json, sealed) | test_userscripts.py option, choice, listing and staging cases |
+| src/workcopy.rs (10 unit tests) | `prefix_matches`, `same_base`, `base_key`, archive and corpus stores, `replayable` | test_store_v3.py prefix cases, test_archive_import.py |
+| tests/py_workcopy.rs (6 differential tests) | `revert`, `edit`, `add_proposals` (results and resulting stores equal to the Python implementation, on a fake engine host), `base_master_gpr`, `read_gpr`, `prefix_matches`, `base_key`, corpus/archive stores, `forget_current` | test_workcopy*.py white-box cases |
+| tests/viewpool.rs (10 tests) | warm worker reuse, busy workers, broken stub, idle sweep, keep_idle, close_all and shutdown, max_workers | test_viewpool.py Reuse, Failure and Idle classes (the stub worker of the Python tests) |
+
+Routing (`native/src/views.rs`, `src/hydralysis/viewnative.py`, `workcopy.py`, `userscripts.py`, `viewpool.py`):
+- Routed under `HYDRALYSIS_IMPL=rust`: `workcopy.base_master_gpr, read_gpr, store_corpus, store_archive, verify_archive,
+  _replayable`; `userscripts.check_options, choose, list_scripts, _stage`; the process pool of `viewpool.dispatch`
+  (`NativePool`, a `hydralysis_native.ViewPool`).
+- Opt-in only (`HYDRALYSIS_ROUTE_HOSTED=1` as well): `workcopy.edit, revert, add_proposals`, through `workcopy_host_call_rs`
+  with a Python host object (`WorkcopyHost`: heal, sync, attribution). Measured slower and fatter than Python (see the
+  benchmark), so they are not on by default. Exceptions raised by the Python host travel through Rust unchanged.
+- The Python original runs while a seam is replaced (`workcopy._SEAMS`), `MAX_OVERLAYS` changed, `HYDRALYSIS_TEST_FAULT` set or
+  `durable.replace_file` patched.
+
+Quirks kept (not fixed, to be reported):
+- `_REBASING` is thread-local state shared with Python's rebase, so `forks_on_disk`, `superseded_forks`, `rebase_lane` are
+  ported but not routed; likewise `forget_current`, `retire`, `prefix_matches`, `same_base`, `base_key`, `bases_root`
+  (sub-microsecond bodies; JSON overhead would dominate).
+- Python `edit` mutates the caller's `options` (pops expect_revision, corpus, archive); the Rust version does not.
+- `state["fork_gpr"]` missing is a `KeyError` in Python; Rust mirrors it as `Runtime("'fork_gpr'")`.
+- `KEEP_IDLE=0` makes Python's `[:-0]` empty, so no idle worker is ever stopped; mirrored.
+- Python viewpool defect: `_stop` marks the worker `dead`, so `alive()` is false for stopping entries; the `STOP_GRACE` kill
+  in the sweeper is never reached and entries are just dropped at the next tick. Preserved.
+- Rust sweeper is deadline-driven instead of a 0.25 s poll: stop time is more precise (the one observable difference).
+- `revisions::dependents` is quadratic in Python (a double loop per pass); the Rust version indexes the lowest `seq` per
+  touched pair, same visiting order and same result.
+- The parsed-store cache (`_LOADED`) is still not ported.
+
+Not ported (stays Python behind `Host`): `_sync`, `_apply`, `release`, `discard_forks`, `userscripts.run`,
+`views._publish_candidate`, `_verify_candidate`, `start_job`, `run_job`, `adoptable`, `views_status`, the leader's manifest
+and done-record helpers.
+
+Benchmark: `benchmarks/bench_workcopy.py` (CPU time and peak working set per child process, median of 5 to 7 runs, Windows,
+a loaded machine with other builds running; `--impl rust-hosted` adds the opt-in edit path):
+
+| workload | Python | Rust (`HYDRALYSIS_IMPL=rust`) |
+|---|---|---|
+| files: store_archive + verify_archive + store_corpus of a 192 MiB file | 0.516 s CPU, 34.1 MiB peak | 0.375 s, 30.7 MiB (27 percent less CPU) |
+| scripts: 30 list_scripts of 1500 scripts + 60 check_options | 0.297 s, 28.0 MiB | 0.109 s, 25.9 MiB (63 percent less CPU) |
+| viewpool: 200 dispatches to a warm stub worker | 0.031 s, 25.7 MiB | 0.016 s, 26.0 MiB (at the clock's 16 ms tick: no real difference) |
+| edit: 40 edits + 10 reverts + summary/changes on a 3000-record view, engine stubbed | 5.1 to 6.7 s, 87 MiB | not routed by default; `rust-hosted` 9.7 to 10.1 s, 172 MiB (about 1.9x the CPU, 2x the memory) |
+
+The hosted edit/revert/add_proposals are therefore opt-in. In-process the Rust edit costs about 80 ms CPU on that view
+(load 20, save 30) against about 50 ms in Python, which reuses the parsed store and its append log; the rest of the gap
+and the memory are the `serde_json::Value` copies a store of 3000 records needs in Rust (a copy per load, per save and per
+handoff to the Python host). With `HYDRALYSIS_IMPL=rust` alone, the edit workload is slower still (14 s, 167 MiB): there
+the Python `load_store`/`_save_store` call the earlier storage-lane functions (`hydralysis_rs.storelog_read`,
+about 200 ms per call on this view, `storelog_save`, `storelog_known_edits`), and that is not this stage's code.

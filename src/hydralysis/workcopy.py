@@ -1599,3 +1599,26 @@ def revert(settings: dict, target: dict, ids: list[str], expect: int | None = No
             **({"cascaded": [ident for ident in removed if ident in set(later)]} if later else {}),
             **_rebase_report(expect, decision),
             "note": "the working copy is rebuilt from the unchanged master on the next query"}
+
+
+# ---- optional Rust implementation (HYDRALYSIS_IMPL=rust) ----------------------------------------------------------------
+# The functions below that need no engine are answered by `hy_views::workcopy`; `edit`, `revert` and `add_proposals` call
+# back into `heal`, `_sync` and `_attribution` above (looked up when called, so a replaced one is the one that runs). While
+# any name in `_SEAMS` is replaced (a test double, a patched limit) the original runs: Rust cannot see those.
+
+_SEAMS = {name: globals()[name] for name in (
+    "view_lock", "load_store", "_save_store", "_load_store_uncached", "_clean_record", "_v3", "_keep_old_format", "_store_path",
+    "_directory", "_state", "_store_record", "SYNC_LOCK_S", "MAX_HISTORY_BYTES", "MAX_CORPUS_BYTES", "STORE_VERSION",
+    "MAX_CHANGESETS")}
+
+from hydralysis.viewnative import hosted as _hosted, routed as _routed  # noqa: E402
+
+base_master_gpr = _routed("workcopy_base_master_gpr", base_master_gpr)
+read_gpr = _routed("workcopy_read_gpr", read_gpr)
+store_corpus = _routed("workcopy_store_corpus", store_corpus, finish=tuple)
+store_archive = _routed("workcopy_store_archive", store_archive, finish=tuple)
+verify_archive = _routed("workcopy_verify_archive", verify_archive, prepare=lambda values: [{}] + [str(values[0])] + values[1:])
+_replayable = _routed("workcopy_replayable", _replayable)
+revert = _hosted("workcopy_revert", revert)
+edit = _hosted("workcopy_edit", edit)
+add_proposals = _hosted("workcopy_add_proposals", add_proposals)
