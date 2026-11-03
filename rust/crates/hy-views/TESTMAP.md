@@ -177,3 +177,10 @@ and the memory are the `serde_json::Value` copies a store of 3000 records needs 
 handoff to the Python host). With `HYDRALYSIS_IMPL=rust` alone, the edit workload is slower still (14 s, 167 MiB): there
 the Python `load_store`/`_save_store` call the earlier storage-lane functions (`hydralysis_rs.storelog_read`,
 about 200 ms per call on this view, `storelog_save`, `storelog_known_edits`), and that is not this stage's code.
+
+## Python seam: `proc.popen` and the warm pool (branch r/hy-parityfix)
+
+`viewpool.dispatch` hands a publish job to the native pool (`hydralysis_native.ViewPool`) under `HYDRALYSIS_IMPL=rust`, which starts its
+warm workers in Rust. A test that patches `hydralysis.proc.popen` (test_query::ViewsThroughQuery::test_the_publish_job_runs_end_to_end_through_its_own_worker_record)
+expects the spawn to go through it, so while `proc.popen` is patched `dispatch` serves the job from a Python `Pool` kept apart from
+the native one (`viewpool._POPEN_SEAM`, `_SEAM_POOL`). Production pays one identity comparison per dispatch.

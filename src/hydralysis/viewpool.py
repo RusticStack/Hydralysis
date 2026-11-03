@@ -36,6 +36,9 @@ import threading
 import time
 from pathlib import Path
 
+from hydralysis import proc
+from hydralysis._seams import Seam
+
 # Control lines on the worker's stdout. Anything else it writes (a warning, a library's print) is drained and dropped:
 # its stdout was DEVNULL before, and the result of a job is the job record, never its output.
 PREFIX = b"@hydralysis-viewpool "
@@ -174,7 +177,6 @@ class Pool:
     # -- worker lifecycle ----------------------------------------------------------------------------------------------
 
     def _spawn(self) -> _Worker | None:
-        from hydralysis import proc
         try:
             child = proc.popen(command(), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                env=dict(self.env or os.environ), **({} if os.name == "nt" else {"start_new_session": True}))
@@ -336,11 +338,15 @@ class NativePool:
 _POOL: Pool | None = None
 _POOL_LOCK = threading.Lock()
 _DISABLED = False
+# A test that patches `proc.popen` expects the warm worker to be started through it. The native pool starts its workers in
+# Rust, so while `proc.popen` is patched the Python pool (kept apart from `_POOL`) serves the dispatch.
+_POPEN_SEAM = Seam((proc, "popen"))
+_SEAM_POOL: Pool | None = None
 
 
 def dispatch(path: Path, env: dict, max_workers: int = 1) -> bool:
     """Hand the publish job at PATH to a warm worker, or answer False so the caller spawns the one-shot worker."""
-    global _POOL
+    global _POOL, _SEAM_POOL
     if _test_faults():
         return False
     with _POOL_LOCK:
@@ -350,6 +356,10 @@ def dispatch(path: Path, env: dict, max_workers: int = 1) -> bool:
             _POOL = NativePool.make() or Pool()
             atexit.register(_shutdown)
         pool = _POOL
+        if isinstance(pool, NativePool) and _POPEN_SEAM.active():
+            if _SEAM_POOL is None:
+                _SEAM_POOL = Pool()
+            pool = _SEAM_POOL
     try:
         delivered = pool.send(Path(path), env, max_workers)
     except Exception:   # noqa: BLE001 - a pool that cannot work must never fail a publish
@@ -366,29 +376,33 @@ def disable() -> None:
     with _POOL_LOCK:
         _DISABLED = True
         pool = _POOL
-    if pool is not None:
-        try:
-            pool.close_all()
-        except Exception:   # noqa: BLE001 - the fallback path does not depend on this
-            pass
+        seam_pool = _SEAM_POOL
+    for each in (pool, seam_pool):
+        if each is not None:
+            try:
+                each.close_all()
+            except Exception:   # noqa: BLE001 - the fallback path does not depend on this
+                pass
 
 
 def _shutdown() -> None:
     with _POOL_LOCK:
-        pool = _POOL
-    if pool is not None:
-        try:
-            pool.shutdown()
-        except Exception:   # noqa: BLE001 - nothing here may raise at exit
-            pass
+        pools = (_POOL, _SEAM_POOL)
+    for pool in pools:
+        if pool is not None:
+            try:
+                pool.shutdown()
+            except Exception:   # noqa: BLE001 - nothing here may raise at exit
+                pass
 
 
 def close_all() -> None:
     """Stop every idle worker now (tests and `disable`); busy workers are left to finish their job."""
     with _POOL_LOCK:
-        pool = _POOL
-    if pool is not None:
-        pool.close_all()
+        pools = (_POOL, _SEAM_POOL)
+    for pool in pools:
+        if pool is not None:
+            pool.close_all()
 
 
 # -- the worker --------------------------------------------------------------------------------------------------------
