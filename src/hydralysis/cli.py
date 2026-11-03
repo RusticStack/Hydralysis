@@ -152,6 +152,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         if args.command == "mcp":
+            from hydralysis import mcp_launch
+            code = mcp_launch.run_native()
+            if code is not None:
+                return code
             Server().serve()
             return 0
         if args.command == "tools":

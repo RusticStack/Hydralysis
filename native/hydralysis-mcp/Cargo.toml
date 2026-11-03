@@ -1,0 +1,25 @@
+[package]
+name = "hydralysis-mcp"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Native MCP host for Hydralysis: stdio transport, catalog, lanes and the offline PE tools; the rest is delegated to a short-lived Python worker"
+publish = false
+
+[[bin]]
+name = "hydralysis-mcp"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "s"
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"

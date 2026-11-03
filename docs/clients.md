@@ -70,3 +70,30 @@ hydralysis call prologue --args-file checks.json
 $answer = hydralysis call bytes --args '{"exe": "D:/Game/bin/x64/Game.exe", "address": "rva:0x1000", "size": 16}' | ConvertFrom-Json
 if (-not $answer.ok) { throw $answer.error }
 ```
+
+## Native MCP host (optional)
+
+`native/hydralysis-mcp` is a Rust build of this server's transport. It speaks the same stdio MCP (initialize, `tools/list`,
+`tools/call`, ping, cancellation, the fast/engine/long lanes, the 128 KiB output cap and the error envelopes of
+`hydralysis/mcp.py`), advertises the same catalog (epoch, hash and bytes come from `native/hydralysis-mcp/catalog.json`,
+which `tools/gen_mcp_catalog.py` writes from `api.py`), and answers `fingerprint`, `imports`, `function`, `bytes`,
+`strings`, `sigscan`, `callers` and `xrefs` itself for well-formed PE images. Everything else (the engine tools,
+`disasm`/`inspect`/`callees`, the evidence store, `trace`, `runtime`) is run by `python -m hydralysis.worker`, a Python
+process the host starts on the first such call and closes after `HYDRALYSIS_WORKER_IDLE_S` (default 30) idle seconds. A
+call the native code is not certain about (an argument of an unusual type, a PE pefile might read differently, any error)
+is also handed to the worker, so the reply and the error text are always the Python ones.
+
+Build it with `python tools/build_mcp_host.py` (needs a Rust toolchain; it copies the binary to `src/hydralysis/bin/`,
+which the wheel ships). `hydralysis mcp` then starts the binary and keeps the Python server as the fallback when it is
+missing; `HYDRALYSIS_MCP=python` forces the Python server and `HYDRALYSIS_MCP=native` requires the binary. For the
+smallest resident footprint register the binary itself (`<checkout>/src/hydralysis/bin/hydralysis-mcp.exe`, with
+`HYDRALYSIS_PYTHON` set to the venv's `python.exe`); `hydralysis mcp` and `python -m hydralysis.mcp_launch` keep a small
+Python launcher process alive beside it. The `rusticre` command starts the same host.
+
+| Variable | Meaning |
+| --- | --- |
+| `HYDRALYSIS_MCP` | `python`, `native` or unset (auto) |
+| `HYDRALYSIS_MCP_BIN` | the binary to start |
+| `HYDRALYSIS_PYTHON` | the interpreter of the worker (set by `hydralysis mcp`; default `python`) |
+| `HYDRALYSIS_WORKER_IDLE_S` | seconds of idleness before the worker is closed (default 30) |
+| `HYDRALYSIS_MCP_ENV_TTL_S` | seconds the launch environment report is cached in the temp folder (default 300; 0 = off) |
