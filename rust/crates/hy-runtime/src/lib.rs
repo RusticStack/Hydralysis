@@ -1,6 +1,7 @@
 //! Host side of the Frida-free runtime. See DESIGN.md.
 pub mod authorize;
 pub mod clock;
+pub mod decode;
 #[cfg(windows)]
 pub mod identity;
 #[cfg(windows)]
@@ -11,6 +12,7 @@ pub mod pe_exports;
 pub mod sampling;
 #[cfg(windows)]
 pub mod session;
+pub mod snapshot;
 #[cfg(windows)]
 pub mod threadinfo;
 #[cfg(windows)]

@@ -209,3 +209,56 @@ def compare(a: dict, b: dict, mask=(), predicates=(), use_default_mask: bool = T
             "predicates": verdicts, "rows_compared": len(set(rows_a) | set(rows_b)),
             "a": {"snapshot": a.get("snapshot"), "stable_sha256": stable_sha256(a, mask)},
             "b": {"snapshot": b.get("snapshot"), "stable_sha256": stable_sha256(b, mask)}}
+
+
+# ---- optional Rust implementation (HYDRALYSIS_IMPL=rust) ------------------------------------------------------------------
+# crates/hy-runtime `snapshot`, bound in crates/hy-rt-py (`hydralysis_rt`). `compare` (flatten both sides, mask, diff,
+# predicates) and `stable_sha256` run in Rust; the argument checks (`check_mask`, `check_predicates`) stay here and run first,
+# so their ValueErrors are Python's. Input the port does not model raises `Unmodelled` and the Python function answers.
+# The functions above stay the specification. `flatten` and `snapshot_id` are not routed: `snapshot_id` measured 0.3x (json's
+# C encoder beats the conversion) and `flatten` is only called from these two (benchmarks/bench_runtime_decode.py).
+
+_stable_sha256_py, _compare_py = stable_sha256, compare
+
+
+def _install_rust() -> None:
+    import os
+    import sys
+    if os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() != "rust":
+        return
+    try:
+        from hydralysis import rust_frida
+        rt = rust_frida._load_rt()
+        unmodelled = rt.Unmodelled
+        routines = (rt.snapshot_compare, rt.snapshot_stable_sha256)
+    except Exception:  # noqa: BLE001 - no Rust runtime built: the Python stays
+        return
+    from hydralysis._seams import Seam, guarded
+    module = sys.modules[__name__]
+    seam = Seam((module, "canonical"), (module, "flatten"), (module, "_masked"), (module, "_shown"), (module, "_evaluate"),
+                (module, "_key"), (module, "fnmatch"), (module, "hashlib"), (module, "json"))
+
+    def routed(rust_function, python_function):
+        def call(*args, **kwargs):
+            try:
+                return rust_function(*args, **kwargs)
+            except unmodelled:
+                return python_function(*args, **kwargs)
+        return guarded(call, python_function, seam)
+
+    def stable(record, mask=()):
+        return rt.snapshot_stable_sha256(record, list(DEFAULT_VOLATILE + tuple(mask)))
+
+    def compare_checked(a, b, mask=(), predicates=(), use_default_mask: bool = True, limit: int = 200):
+        mask = check_mask(list(mask) if isinstance(mask, tuple) else mask)
+        predicates = check_predicates(list(predicates) if isinstance(predicates, tuple) else predicates)
+        if type(limit) is not int or limit < 0:
+            raise unmodelled("limit")
+        patterns = (DEFAULT_VOLATILE if use_default_mask else ()) + tuple(mask)
+        return rt.snapshot_compare(a, b, list(patterns), list(DEFAULT_VOLATILE + tuple(mask)), predicates, limit)
+
+    module.stable_sha256 = routed(stable, _stable_sha256_py)
+    module.compare = routed(compare_checked, _compare_py)
+
+
+_install_rust()

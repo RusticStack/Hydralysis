@@ -4,6 +4,10 @@
 //! `RuntimeError`/`OSError`/`ValueError`; nothing here panics on input (PyO3 would turn a panic into `PanicException`,
 //! not end the process).
 
+mod convert;
+mod decode;
+mod snapshot;
+
 use hy_runtime::memory::{Gate, MemError};
 use hy_runtime::proto;
 use hy_runtime::sampling::{Mode, Policy, Sampler};
@@ -709,5 +713,12 @@ fn version() -> &'static str {
 fn hydralysis_rt(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RtSession>()?;
     m.add_function(wrap_pyfunction!(version, m)?)?;
+    m.add("Unmodelled", m.py().get_type::<convert::Unmodelled>())?;
+    m.add_function(wrap_pyfunction!(decode::decode_normalize, m)?)?;
+    m.add_function(wrap_pyfunction!(decode::decode_value, m)?)?;
+    m.add_function(wrap_pyfunction!(decode::decode_event, m)?)?;
+    m.add_function(wrap_pyfunction!(decode::decode_layout_values, m)?)?;
+    m.add_function(wrap_pyfunction!(snapshot::snapshot_stable_sha256, m)?)?;
+    m.add_function(wrap_pyfunction!(snapshot::snapshot_compare, m)?)?;
     Ok(())
 }
