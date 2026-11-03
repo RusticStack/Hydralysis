@@ -6,7 +6,7 @@ instead of a Python interpreter; the tools it does not port run in a short-lived
 
 HYDRALYSIS_MCP selects the server: `python` always uses the Python server, `native` requires the binary (exit 2 when it
 is missing), anything else (the default) uses the binary when one is found and the Python server otherwise.
-HYDRALYSIS_MCP_BIN names the binary explicitly. This module imports only the standard library, so
+HYDRALYSIS_MCP_BIN names the binary explicitly. This module imports only the standard library and `proc`, so
 `python -m hydralysis.mcp_launch` is a lean launcher: it holds a Python process of a few megabytes, not the server.
 """
 
@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
 import sys
 from pathlib import Path
+
+from . import proc
 
 BINARY = "hydralysis-mcp.exe" if os.name == "nt" else "hydralysis-mcp"
 
@@ -55,7 +56,7 @@ def run_native(environ=None) -> int | None:
         return None
     environ.setdefault("HYDRALYSIS_PYTHON", sys.executable)
     try:
-        child = subprocess.Popen([binary], env=environ)
+        child = proc.popen_host([binary], env=environ)
     except OSError as exc:
         if chosen == "native":
             print("hydralysis: cannot start %s: %s" % (binary, exc), file=sys.stderr)

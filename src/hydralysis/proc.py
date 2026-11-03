@@ -95,6 +95,15 @@ def popen_worker(command, **kwargs) -> subprocess.Popen:
     return _register(subprocess.Popen(command, **kwargs))
 
 
+def popen_host(command, **kwargs) -> subprocess.Popen:
+    """The native MCP host (`mcp_launch`): the one child that IS this process's stdio server.
+
+    It inherits this process's stdin and stdout on purpose (it speaks MCP on them in place of the Python server), so it
+    takes none of the `_defaults` that keep every other child off the server's stdin. The caller waits for it; it is
+    not a background child and is not reaped by the registry."""
+    return subprocess.Popen(command, **kwargs)
+
+
 _KERNEL: list = []
 
 
