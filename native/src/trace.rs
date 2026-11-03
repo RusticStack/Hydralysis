@@ -1422,12 +1422,8 @@ impl SegmentEncoder {
         skip: u64,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let value = py_to_value(payload)?;
-        self.source_seq += skip;
-        if kind == "core.capture.gap" {
-            self.stat("gaps", 1);
-        }
         let line = self
-            .event(kind, t_ns, tid, value, 0, &[], None)
+            .control_event(kind, t_ns, tid, value, skip)
             .map_err(err)?;
         Ok(PyBytes::new(py, &line))
     }
@@ -1457,23 +1453,42 @@ impl SegmentEncoder {
         t_ns: u64,
         no_ring: u64,
     ) -> PyResult<Bound<'py, PyBytes>> {
-        let mut rows: Vec<(u16, u64, u64)> = Vec::new();
-        for row in rings.iter() {
-            let d = row
-                .cast::<PyDict>()
-                .map_err(|_| err("a ring row is a dict"))?;
-            let get = |k: &str| -> PyResult<u64> {
-                Ok(d.get_item(k)?
-                    .map(|v| v.extract::<u64>())
-                    .transpose()?
-                    .unwrap_or(0))
-            };
-            rows.push((
-                get("ring")?.try_into().map_err(|_| err("ring id"))?,
-                get("attempted")?,
-                get("dropped")?,
-            ));
-        }
+        let rows = ring_rows(rings)?;
+        let out = self.finalize_rows(rows, t_ns, no_ring).map_err(err)?;
+        Ok(PyBytes::new(py, &out))
+    }
+}
+
+/// The `(ring, attempted, dropped)` rows of a finalize call.
+fn ring_rows(rings: &Bound<'_, PyList>) -> PyResult<Vec<(u16, u64, u64)>> {
+    let mut rows: Vec<(u16, u64, u64)> = Vec::new();
+    for row in rings.iter() {
+        let d = row
+            .cast::<PyDict>()
+            .map_err(|_| err("a ring row is a dict"))?;
+        let get = |k: &str| -> PyResult<u64> {
+            Ok(d.get_item(k)?
+                .map(|v| v.extract::<u64>())
+                .transpose()?
+                .unwrap_or(0))
+        };
+        rows.push((
+            get("ring")?.try_into().map_err(|_| err("ring id"))?,
+            get("attempted")?,
+            get("dropped")?,
+        ));
+    }
+    Ok(rows)
+}
+
+impl SegmentEncoder {
+    /// The loss only the out-of-band counters know, as gap events (the body of `finalize`).
+    fn finalize_rows(
+        &mut self,
+        mut rows: Vec<(u16, u64, u64)>,
+        t_ns: u64,
+        no_ring: u64,
+    ) -> Result<Vec<u8>, String> {
         rows.sort_by_key(|r| r.0);
         let mut out = Vec::new();
         for (ring, attempted, dropped) in rows {
@@ -1492,25 +1507,43 @@ impl SegmentEncoder {
                 };
                 let p = json!({"reason": reason, "dropped": missing, "ring": ring, "out_of_band": true,
                     "first_missing_source_seq": first, "last_missing_source_seq": first + u64::from(missing) - 1});
-                out.extend(
-                    self.event("core.capture.gap", t_ns, None, p, 0, &[], None)
-                        .map_err(err)?,
-                );
+                out.extend(self.event("core.capture.gap", t_ns, None, p, 0, &[], None)?);
             }
         }
         if no_ring != 0 {
             self.stat("gaps", 1);
             let p = json!({"reason": "budget", "dropped": no_ring, "out_of_band": true, "detail": "threads past the agent's ring budget"});
-            out.extend(
-                self.event("core.capture.gap", t_ns, None, p, 0, &[], None)
-                    .map_err(err)?,
-            );
+            out.extend(self.event("core.capture.gap", t_ns, None, p, 0, &[], None)?);
         }
-        Ok(PyBytes::new(py, &out))
+        Ok(out)
+    }
+
+    /// One control event on the chain (the body of `encode_event`).
+    fn control_event(
+        &mut self,
+        kind: &str,
+        t_ns: u64,
+        tid: Option<u32>,
+        payload: Value,
+        skip: u64,
+    ) -> Result<Vec<u8>, String> {
+        self.source_seq += skip;
+        if kind == "core.capture.gap" {
+            self.stat("gaps", 1);
+        }
+        self.event(kind, t_ns, tid, payload, 0, &[], None)
     }
 }
 
+mod keys;
+mod pump;
+mod segment;
+
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<pump::TracePump>()?;
+    module.add_function(wrap_pyfunction!(keys::annotate_events, module)?)?;
+    module.add_function(wrap_pyfunction!(segment::scan_chain, module)?)?;
+    module.add_function(wrap_pyfunction!(segment::verify_segment_file, module)?)?;
     module.add_function(wrap_pyfunction!(canon, module)?)?;
     module.add_function(wrap_pyfunction!(keyed_id, module)?)?;
     module.add_function(wrap_pyfunction!(decode_batch, module)?)?;

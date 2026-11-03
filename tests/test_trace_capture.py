@@ -176,7 +176,7 @@ class Writer(unittest.TestCase):
 
     def test_a_failed_write_keeps_the_lines_and_retries_them_in_order(self):
         with workdir() as root:
-            t = source(root)
+            t = source(root, native=False)
             t.on_ready({"context": {}, "installed": [], "qpc_freq": 10_000_000})
             real = os.write
             calls = {"n": 0}
@@ -194,6 +194,86 @@ class Writer(unittest.TestCase):
             t.finalize(detach={"quiescent": True})
             self.assertEqual(t.verify()["outcome"], "clean")                       # nothing lost, nothing reordered
             self.assertFalse(t.health()["claims"]["fault_free"])                   # and the failure is reported
+
+    @unittest.skipUnless(tc._TracePump is not None and os.environ.get("HYDRALYSIS_NATIVE", "1") != "0", "the native pump is not built")
+    def test_the_native_pump_keeps_failed_writes_and_retries_them_in_order(self):
+        with workdir() as root:
+            t = source(root)
+            self.assertIsNotNone(t._pump)
+            t.on_ready({"context": {}, "installed": [], "qpc_freq": 10_000_000})
+            t._pump.inject_write_failures(1)
+            t.on_batch(tw.build_batch(1, 0, 1, (1, 0, 0, 0), [rec(0, 0, 10)]))
+            self.assertGreater(t.health()["writer"]["pending_bytes"], 0)
+            self.assertEqual(t.writer["write_failed"], 1)
+            t.on_batch(tw.build_batch(1, 1, 2, (2, 0, 0, 0), [rec(0, 1, 11)]))
+            t.finalize(detach={"quiescent": True})
+            self.assertEqual(t.verify()["outcome"], "clean")
+            self.assertFalse(t.health()["claims"]["fault_free"])
+
+    @unittest.skipUnless(tc._TracePump is not None and os.environ.get("HYDRALYSIS_NATIVE", "1") != "0", "the native pump is not built")
+    def test_the_native_pump_and_the_python_writer_write_the_same_bytes(self):
+        """The same batches (a clean one, a ring gap, a missing batch, a payload artifact) give the same segment bytes, the same
+        sidecar, the same counters and the same artifacts; the size limit stops both after the same batch."""
+        batches = [tw.build_batch(1, 0, 100, (3, 0, 0, 0), [rec(0, 0, 10), rec(0, 1, 20, path="\\\\.\\NUL", handle=33),
+                                                          rec(0, 2, 21, site=2, args=[33, 4, 0, 4, 0, 0, 0, 0])]),
+                   tw.build_batch(1, 1, 200, (7, 1, 0, 0), [rec(0, 6, 30), rec(1, 0, 31)]),       # ring 0 lost 3 records
+                   tw.build_batch(1, 3, 300, (9, 1, 0, 0), [rec(0, 7, 40), rec(1, 1, 41)])]       # batch 2 never arrived
+        results = []
+        for native in (True, False):
+            with workdir() as root, patch.object(tc.TraceSource, "_now_ns", staticmethod(lambda: 12345)):
+                t = source(root, native=native, payload_authorized=True, max_bytes=6000)
+                self.assertEqual(t._pump is not None, native)
+                replies = [t.on_batch(b) for b in batches]
+                replies.append(t.on_batch(b"garbage"))
+                for i in range(4):
+                    replies.append(t.on_batch(tw.build_batch(1, 4 + i, 400 + i, (10 + i, 1, 0, 0), [rec(1, 2 + i, 50 + i)])))
+                t._notify(force=True)
+                sidecar = json.loads(Path(str(t.path) + ".head").read_text())
+                artifacts = sorted(p.name for p in (t.directory / "artifacts").iterdir())
+                results.append({"replies": replies, "sidecar": sidecar, "artifacts": artifacts, "stats": dict(t.encoder.stats),
+                                "writer": {k: v for k, v in t.writer.items() if k != "syncs"}, "decode_failed": t.transport["decode_failed"],
+                                "full": t.full, "verify": t.verify(), "bytes": t.path.read_bytes()})
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(results[0]["verify"]["outcome"], "clean")
+        self.assertTrue(results[0]["full"])
+        self.assertIn(b"segment size limit", results[0]["bytes"])
+
+    def test_the_native_tail_and_verify_judge_a_segment_like_the_python_ones(self):
+        """SegmentTail and verify_segment give the same events, counters, damage and outcome with and without the Rust walk,
+        on a clean segment, a torn tail, a flipped byte, a removed line and a noncanonical (re-spaced) line."""
+        from hydralysis import trace_pump
+        with workdir() as root:
+            t = source(root)
+            t.on_ready({"context": {}, "installed": [], "qpc_freq": 10_000_000})
+            for i in range(6):
+                t.on_batch(tw.build_batch(1, i, i + 1, (i + 1, 0, 0, 0), [rec(0, i, 10 + i, path="C:\\f%d" % i)]))
+            t.finalize(detach={"quiescent": True})
+            good = t.path.read_bytes()
+            lines = good.split(b"\n")
+            first = lines[3]
+            respaced = first[:9] + first[9:].replace(b'"kind":', b'"kind": ', 1)
+            import zlib
+            respaced = b"%08x " % (zlib.crc32(respaced[9:]) & 0xFFFFFFFF) + respaced[9:]
+            flipped = bytearray(good)
+            flipped[len(good) // 2] ^= 0x01
+            variants = {"clean": good, "torn": good[:-7], "flipped": bytes(flipped),
+                        "removed": b"\n".join(lines[:2] + lines[3:]), "respaced": b"\n".join(lines[:3] + [respaced] + lines[4:])}
+            for name, data in variants.items():
+                results = []
+                for native in ("1", "0"):
+                    path = Path(root) / ("v-%s-%s.seg" % (name, native))
+                    path.write_bytes(data)
+                    with patch.dict(os.environ, {"HYDRALYSIS_NATIVE": native}):
+                        tail = trace_pump.SegmentTail(path, t.segment_id, skip=2)
+                        events = []
+                        while True:
+                            got = tail.read(3)
+                            if not got:
+                                break
+                            events.extend(got)
+                        verdict = tc.verify_segment(path, t.segment_id)
+                    results.append((events, tail.count, tail.head, tail.offset, tail.damage, verdict))
+                self.assertEqual(results[0], results[1], name)
 
     def test_the_size_limit_stops_recording_with_a_gap_never_silently(self):
         with workdir() as root:
@@ -231,7 +311,7 @@ class Writer(unittest.TestCase):
 
     def test_an_artifact_that_cannot_be_made_durable_blocks_its_reference(self):
         with workdir() as root:
-            t = source(root, payload_authorized=True)
+            t = source(root, payload_authorized=True, native=False)
             t.on_ready({"context": {}, "installed": [], "qpc_freq": 10_000_000})
             before = t.encoder.count
             with patch("hydralysis.trace_capture.durable.atomic_write", side_effect=OSError("disk")):
@@ -239,6 +319,17 @@ class Writer(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertEqual(t.path.read_bytes().count(b"driver.ioctl"), 0)       # nothing refers to bytes that are not there
             self.assertGreaterEqual(t.encoder.count, before)
+
+    def test_an_artifact_that_cannot_be_made_durable_blocks_its_reference_in_the_native_pump_too(self):
+        with workdir() as root:
+            t = source(root, payload_authorized=True)
+            t.on_ready({"context": {}, "installed": [], "qpc_freq": 10_000_000})
+            (t.directory / "artifacts").write_bytes(b"a file where the directory should be")
+            result = t.on_batch(tw.build_batch(1, 0, 1, (1, 0, 0, 0), [rec(0, 0, 11, site=2, args=[33, 4, 0, 4, 0, 0, 0, 0])]))
+            self.assertFalse(result["ok"])
+            self.assertEqual(t.path.read_bytes().count(b"driver.ioctl"), 0)
+            self.assertEqual(t.writer["artifact_failed"], 1)
+            self.assertFalse(t.health()["claims"]["fault_free"])
 
     def test_correlation_ids_are_keyed_by_scope(self):
         with workdir() as a, workdir() as b:

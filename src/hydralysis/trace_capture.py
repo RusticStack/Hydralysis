@@ -28,6 +28,15 @@ from pathlib import Path
 from hydralysis import durable
 from hydralysis import trace_wire as tw
 
+try:  # optional Rust capture writer (native/src/trace/pump.rs); HYDRALYSIS_NATIVE=0 or a missing wheel uses the Python writer below
+    from hydralysis_native import TracePump as _TracePump  # type: ignore[import-not-found]
+except ImportError:
+    _TracePump = None
+try:
+    from hydralysis_native import verify_segment_file as _verify_file  # type: ignore[import-not-found]
+except ImportError:
+    _verify_file = None
+
 SEGMENT = "agent.seg"
 NOTIFY_EVERY_S = 0.02
 SYNC_EVERY_BYTES = 1 << 20
@@ -65,7 +74,7 @@ class TraceSource:
     def __init__(self, directory: Path, *, session: str, source_id: str = "agent", producer_gen: int, process_id: int, sites: dict,
                  qpc_freq: int, key: bytes | None = None, fault_policy: str = "fatal", payload_authorized: bool = False,
                  max_payload: int = 4096, max_bytes: int = MAX_SEGMENT_BYTES, scope: str | None = None, encoder=None,
-                 notify=None):
+                 notify=None, native: bool | None = None):
         self.session, self.source_id, self.producer_gen, self.process_id = session, source_id, producer_gen, process_id
         self.directory = Path(directory) / "trace"
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -77,9 +86,18 @@ class TraceSource:
         self.payload_authorized = payload_authorized
         self.fault_policy = fault_policy
         self.segment_id = "%s/%s/%d" % (session, source_id, producer_gen)
-        make = encoder or tw.make_encoder
-        self.encoder = make(self.segment_id, source_id, producer_gen, process_id, sites, self.key, qpc_freq,
-                            payload_authorized=payload_authorized, max_payload=max_payload)
+        # The native pump decodes, encodes, chains and writes a batch with the GIL released; the Python path is the same
+        # work in the encoder's twin and this class's own writer (kept for HYDRALYSIS_NATIVE=0, an injected encoder, and
+        # tests that fail its os-level calls).
+        self._pump = None
+        if encoder is None and native is not False and _TracePump is not None and os.environ.get("HYDRALYSIS_NATIVE", "1") != "0":
+            self._pump = _TracePump(os.fspath(self.directory), self.segment_id, source_id, producer_gen, process_id, sites, self.key,
+                                    int(qpc_freq), payload_authorized, max_payload, max_bytes, SYNC_EVERY_BYTES, NOTIFY_EVERY_S)
+            self.encoder = self._pump
+        else:
+            make = encoder or tw.make_encoder
+            self.encoder = make(self.segment_id, source_id, producer_gen, process_id, sites, self.key, qpc_freq,
+                                payload_authorized=payload_authorized, max_payload=max_payload)
         self.lock = threading.Lock()
         self.sites = sites
         self.lifetimes_done = False
@@ -173,8 +191,8 @@ class TraceSource:
             return False
         self.full = True
         reason = "segment size limit" if self._size() >= self.max_bytes else "writer cannot keep up"
-        self._append(self.encoder.encode_event("core.capture.gap", self._now_ns(), {
-            "reason": "budget", "detail": reason, "limit_bytes": self.max_bytes, "out_of_band": False}))
+        self._emit("core.capture.gap", self._now_ns(), {
+            "reason": "budget", "detail": reason, "limit_bytes": self.max_bytes, "out_of_band": False})
         return True
 
     @staticmethod
@@ -182,7 +200,30 @@ class TraceSource:
         """Control events share the agent's clock: on Windows `perf_counter_ns` is QueryPerformanceCounter in nanoseconds."""
         return time.perf_counter_ns()
 
+    def _emit(self, kind: str, t_ns: int, payload: dict) -> None:
+        """Encode one control event onto the chain and append it."""
+        if self._pump is not None:
+            self._pump.event(kind, t_ns, payload)
+            self._after_native()
+        else:
+            self._append(self.encoder.encode_event(kind, t_ns, payload))
+
+    def _after_native(self) -> None:
+        """Take over the pump's counters and errors; run the ingester's callback when the sidecar was just replaced."""
+        pump = self._pump
+        self.writer = pump.writer
+        fresh = pump.take_errors()
+        if fresh:
+            self.errors = (self.errors + fresh)[-5:]
+        self.full = pump.full
+        if pump.take_notified() and self.notify is not None:
+            self._notify_callback()
+
     def _notify(self, force: bool = False) -> None:
+        if self._pump is not None:
+            self._pump.notify(force)
+            self._after_native()
+            return
         now = time.monotonic()
         if not force and now - self._notified < NOTIFY_EVERY_S:
             return
@@ -194,10 +235,16 @@ class TraceSource:
         except OSError as exc:
             self.errors.append("notify: %s" % exc)
         if self.notify is not None:
-            try:
-                self.notify(self.path, info)
-            except Exception as exc:  # the ingester's trouble never stops the writer
-                self.errors.append("notify callback: %r" % exc)
+            self._notify_callback(info)
+
+    def _notify_callback(self, info: dict | None = None) -> None:
+        if info is None:
+            info = {"records": self.encoder.count, "head": self.encoder.head, "bytes": self.writer["bytes"],
+                    "full": self.full, "finalized": self.finalized}
+        try:
+            self.notify(self.path, info)
+        except Exception as exc:  # the ingester's trouble never stops the writer
+            self.errors.append("notify callback: %r" % exc)
 
     # ---- events from the agent ----------------------------------------------------------------------------------------------
     def on_ready(self, message: dict, qpc_ns: int | None = None) -> None:
@@ -213,7 +260,7 @@ class TraceSource:
                                                                        "frequency_hz": int(message.get("qpc_freq", 0) or 0)},
                        "scope": {"name": self.scope, "key_id": self.key_id}, "payload_mode": self.payload_authorized,
                        "capabilities_refused": []}
-            self._append(self.encoder.encode_event("core.capture.source", self.opened_ns, payload))
+            self._emit("core.capture.source", self.opened_ns, payload)
 
     def record_lifetimes(self, process: dict, modules: list[dict], *, late: bool = False) -> int:
         """The process and its mapped modules as `core.process.start` / `core.module.load`, the lifetime facts an ingester needs to
@@ -224,9 +271,9 @@ class TraceSource:
                 return 0
             now = self._now_ns()
             if not late and not self.lifetimes_done:
-                self._append(self.encoder.encode_event("core.process.start", now, {
+                self._emit("core.process.start", now, {
                     "pid": self.process_id, "image": process.get("image"), "image_sha256": process.get("image_sha256"),
-                    "observed": "attach"}))
+                    "observed": "attach"})
                 self.lifetimes_done = True
             for item in modules:
                 key = (item.get("name"), item.get("base"))
@@ -235,7 +282,7 @@ class TraceSource:
                 self.modules_seen.add(key)
                 payload = {"name": item.get("name"), "path": item.get("path"), "base": int(str(item["base"]), 0),
                            "size": int(item["size"]), "build": item.get("file_sha256"), "observed": "late" if late else "attach"}
-                self._append(self.encoder.encode_event("core.module.load", now, payload))
+                self._emit("core.module.load", now, payload)
                 written += 1
         return written
 
@@ -256,7 +303,7 @@ class TraceSource:
             if load:
                 payload["build"] = None
                 self.modules_seen.add((message.get("name"), message.get("base")))
-            self._append(self.encoder.encode_event("core.module.load" if load else "core.module.unload", t_ns, payload))
+            self._emit("core.module.load" if load else "core.module.unload", t_ns, payload)
 
     def refuse(self, what: str, reason: str, limitation: str | None = None) -> None:
         """A capability that was asked for and not given (an optional hook, ETW without elevation): recorded as a source event."""
@@ -264,7 +311,7 @@ class TraceSource:
             payload = {"source_type": what, "state": "refused", "reason": reason}
             if limitation:
                 payload["limitation"] = limitation
-            self._append(self.encoder.encode_event("core.capture.source", self._now_ns(), payload))
+            self._emit("core.capture.source", self._now_ns(), payload)
 
     def on_batch(self, data) -> dict:
         """Append one agent batch. A batch that does not decode is counted and never written; the stream goes on."""
@@ -274,6 +321,8 @@ class TraceSource:
                 return {"ok": False, "reason": "finalized"}
             self.transport["batches"] += 1
             self.transport["bytes"] += len(data)
+            if self._pump is not None:
+                return self._native_batch(data)
             if self._over_limit():
                 self.writer["refused_after_full"] += 1
                 return {"ok": False, "reason": "budget"}
@@ -291,6 +340,17 @@ class TraceSource:
                     return {"ok": False, "reason": "artifact could not be made durable"}
             self._append(bytes(lines))
             return {"ok": True, **info}
+
+    def _native_batch(self, data: bytes) -> dict:
+        status, reason, records, batch_seq = self._pump.batch(data, self._now_ns())
+        self._after_native()
+        if status == "ok":
+            return {"ok": True, "records": records, "batch_seq": batch_seq}
+        if status == "decode":
+            self.transport["decode_failed"] += 1
+            self.errors.append("batch: %s" % reason)
+            self.errors = self.errors[-5:]
+        return {"ok": False, "reason": reason}
 
     def _artifact(self, digest: str, blob: bytes) -> bool:
         target = self.directory / "artifacts" / digest
@@ -333,11 +393,11 @@ class TraceSource:
             if new <= 0:
                 continue
             self._skipped_reported[row["site"]] = skipped
-            self._append(self.encoder.encode_event("core.capture.gap", self._now_ns(), {
+            self._emit("core.capture.gap", self._now_ns(), {
                 "reason": "budget", "dropped": new, "sampled": True, "probe": row.get("probe"), "site": row["site"],
                 "policy": sampling.get("policy"), "stride": row.get("stride"), "rate_per_s": row.get("rate_per_s"),
                 "kept": row.get("kept"), "hits": row.get("hits"), "out_of_band": True,
-                "detail": "skipped by the declared sampling policy; kept records carry confidence sampled"}))
+                "detail": "skipped by the declared sampling policy; kept records carry confidence sampled"})
 
     # ---- the end -----------------------------------------------------------------------------------------------------------
     def finalize(self, *, detach: dict | None = None, reason: str = "stopped") -> dict:
@@ -347,14 +407,22 @@ class TraceSource:
                 return self.health(locked=True)
             t_ns = self._now_ns()
             rows = [{"ring": r["ring"], "attempted": r["attempted"], "dropped": r["dropped"]} for r in self.producer.get("rings", [])]
-            self._append(bytes(self.encoder.finalize(rows, t_ns, int(self.producer.get("no_ring", 0) or 0))))
+            if self._pump is not None:
+                self._pump.finalize_rings(rows, t_ns, int(self.producer.get("no_ring", 0) or 0))
+                self._after_native()
+            else:
+                self._append(bytes(self.encoder.finalize(rows, t_ns, int(self.producer.get("no_ring", 0) or 0))))
             quiescent = None if detach is None else bool(detach.get("quiescent"))
-            self._append(self.encoder.encode_event("core.capture.source", t_ns, {
+            self._emit("core.capture.source", t_ns, {
                 "source_type": "inprocess-frida", "state": "deactivated" if quiescent in (None, True) else "detach-failed",
                 "reason": reason, "producer": self.producer, "transport": self.transport, "writer": self.writer,
-                "detach": detach}))
+                "detach": detach})
             self.finalized = True
             self.closed_ns = t_ns
+            if self._pump is not None:
+                self._pump.close()          # flush, fsync, final sidecar, close
+                self._after_native()
+                return self.health(locked=True)
             self._flush_pending()
             self.sync()
             self._notify(force=True)
@@ -394,7 +462,7 @@ class TraceSource:
                     "producer": producer, "producer_state": state,
                     "reads_refused": producer.get("read_failed", 0) + self.encoder.stats.get("read_failures", 0),
                     "transport": {**self.transport, "batches_missing": lost_batches, "gaps_reported": self.encoder.stats.get("transport_gaps", 0)},
-                    "writer": dict(self.writer, pending_bytes=len(self._pending)),
+                    "writer": dict(self.writer, pending_bytes=self._pump.pending_bytes if self._pump is not None else len(self._pending)),
                     "encoder": dict(self.encoder.stats), "errors": list(self.errors), "claims": claims,
                     "coverage": {"observer": "agent", "state": "closed" if self.finalized else "active",
                                  "note": "a zero loss counter is coverage only while the observer was active"}}
@@ -409,6 +477,18 @@ def verify_segment(path: Path, segment_id: str) -> dict:
     path = Path(path)
     if not path.exists():
         return {"outcome": "missing", "records": 0}
+    if os.environ.get("HYDRALYSIS_NATIVE", "1") != "0" and _verify_file is not None:
+        walked = _verify_file(os.fspath(path), tw.genesis_hash(segment_id))
+        if walked is not None:
+            outcome, records, offset, n, head = walked
+            out = {"outcome": outcome, "records": records}
+            if outcome in ("torn-tail", "corrupt", "chain-break"):
+                out["offset"] = offset
+            if outcome == "chain-break":
+                out["n"] = n
+            if outcome == "clean":
+                out["head"] = head
+            return out
     data = path.read_bytes()
     if not data:
         return {"outcome": "empty", "records": 0}
