@@ -2188,6 +2188,19 @@ def main(argv: list[str]) -> None:
         raise
 
 
+
+# ---- optional Rust implementation of the disk-level functions (HYDRALYSIS_IMPL=rust) ---------------------------------
+
+from hydralysis.viewnative import routed as _routed  # noqa: E402
+
+live_generations = _routed("views_live_generations", live_generations, ViewError)
+master_ids = _routed("views_master_ids", master_ids, ViewError, finish=set)
+editors_since = _routed("views_editors_since", editors_since, ViewError,
+                                prepare=lambda values: values[:3] + [None if values[3] is None else sorted(values[3])])
+outstanding = _routed("views_outstanding", outstanding, ViewError)
+reserve_generation = _routed("views_reserve_generation", reserve_generation, ViewError)
+validate = _routed("views_validate", validate, ViewError, prepare=lambda values: [{}] + values)
+
 if __name__ == "__main__":
     import sys
     main(sys.argv[1:])

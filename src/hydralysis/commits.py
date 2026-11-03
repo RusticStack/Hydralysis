@@ -1582,3 +1582,13 @@ def handle(capability: str, request: dict) -> str:
         rows.append({key: record.get(key) for key in ("id", "kind", "state", "target", "view", "created_at", "elapsed_s", "error")
                      if key in record} | {"cid": (record.get("options") or {}).get("cid")})
     return json.dumps({"jobs": rows[:limit], "filters": {key: options[key] for key in ("kind", "cid") if key in options}}, indent=2)
+
+
+# ---- optional Rust implementation of the disk-level commit functions (HYDRALYSIS_IMPL=rust) ----------------------
+
+from hydralysis.viewnative import routed as _routed  # noqa: E402
+
+recover = _routed("commits_recover", recover, CommitError)
+in_flight_ids = _routed("commits_in_flight_ids", in_flight_ids, CommitError)
+request_abort = _routed("commits_request_abort", request_abort, CommitError)
+revert = _routed("commits_revert", revert, CommitError, prepare=lambda values: values[:3])

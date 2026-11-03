@@ -24,4 +24,5 @@ pub mod store;
 pub mod viewgov;
 pub mod views;
 
+pub use hy_core;
 pub use error::{Error, PublishFailure, Result, ViewError};
