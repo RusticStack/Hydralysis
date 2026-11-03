@@ -64,6 +64,8 @@ class M1(unittest.TestCase):
         for live in self.lives:
             live.close()
         self.lives.clear()
+        import gc
+        gc.collect()
 
     # ---- helpers ----------------------------------------------------------------------------------------------------
     def traced(self, exe, argv, *, hooks=None, wait=True, linger_ms=600, **trace):
@@ -214,13 +216,15 @@ class M1(unittest.TestCase):
         self.assertIsNone(agent.trace)
 
     def test_failure_modes_lose_the_producer_versus_a_clean_stop(self):
-        live = self.traced("frameloop.exe", ["--frames=100000", "--spin-us=1000"], wait=False)
+        # A slow loop (60k frames, 10 ms each) with a long watchdog: the producer is still alive when the
+        # test stops it, but mostly idle, so the recorder can prove quiescence even after a loaded class.
+        live = self.traced("frameloop.exe", ["--frames=60000", "--sleep-ms=10", "--watchdog=600"], wait=False)
         self.wait_segment(live, min_bytes=65536)
         stopped_alive = self.stop_quiescent(live)["health"]
         subprocess.run(["taskkill", "/F", "/PID", str(live.pid)], capture_output=True)
         self.assertEqual(stopped_alive["producer_state"], "final")                          # the producer reported its last counters
         self.assertEqual(stopped_alive["transport"]["batches_missing"], 0)
-        killed = self.traced("frameloop.exe", ["--frames=100000", "--spin-us=1000"], wait=False)
+        killed = self.traced("frameloop.exe", ["--frames=60000", "--sleep-ms=10", "--watchdog=600"], wait=False)
         self.wait_segment(killed)
         self.wait_attempted(killed, 100)
         subprocess.run(["taskkill", "/F", "/PID", str(killed.pid)], capture_output=True)

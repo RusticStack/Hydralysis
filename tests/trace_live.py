@@ -185,6 +185,19 @@ class Live:
             self.job.kill()          # a blocked debugger call returns once the target is gone
             worker.join(CLEANUP_BUDGET_S)
         self.job.close()
+        # The M1 class runs many captures in one interpreter. Drop the agent's TraceSource and script
+        # references here so the next test starts from the same baseline; cleanup has already stopped
+        # the capture and killed the fixture tree.
+        agent = getattr(self, "agent", None)
+        if agent is not None:
+            try:
+                agent.trace = None
+                agent.trace_info = {}
+                agent.scripts.clear()
+                agent.pauses.clear()
+            except Exception:
+                pass
+        self.agent = None
 
 
 # ---- ingest helpers ----------------------------------------------------------------------------------------------------

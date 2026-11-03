@@ -1,6 +1,6 @@
 /* A real-time loop: frames, stages, thread roles, a write that may not survive (docs/trace-fixtures.md,
    spec 15.2, 15.3 and 14.8).
-   usage: frameloop.exe [--frames=60] [--sleep-ms=0] [--callback-on=main|worker] [--ours-stage=update|render]
+   usage: frameloop.exe [--frames=60] [--sleep-ms=0] [--watchdog=120] [--callback-on=main|worker] [--ours-stage=update|render]
                         [--no-overwrite] [--survive-every=10] [--skip-marker=input|update|render]
    Each frame: fx_frame_begin(frame); stage 1 input (fx_stage_input), stage 2 update (fx_stage_update), stage 3
    render (fx_stage_render); fx_frame_end(frame). Every stage opens with fx_phase_begin(stage number) unless
@@ -99,6 +99,7 @@ static void spin_us(int microseconds) {
 
 int main(int argc, char **argv) {
     int frames = fx_arg_int(argc, argv, "--frames=", 60), sleep_ms = fx_arg_int(argc, argv, "--sleep-ms=", 0);
+    int watchdog = fx_arg_int(argc, argv, "--watchdog=", 120);
     int every = fx_arg_int(argc, argv, "--survive-every=", 10);
     const char *callback = fx_arg(argc, argv, "--callback-on="), *ours = fx_arg(argc, argv, "--ours-stage=");
     const char *skip = fx_arg(argc, argv, "--skip-marker=");
@@ -108,7 +109,7 @@ int main(int argc, char **argv) {
     const char *wait_path = fx_arg(argc, argv, "--wait-file=");
     unsigned long long *times = times_path ? (unsigned long long *)calloc((size_t)frames + 1, sizeof *times) : NULL;
     LARGE_INTEGER tick;
-    fx_arm_watchdog(120);
+    fx_arm_watchdog(watchdog);
     g_jobs = CreateSemaphoreA(NULL, 0, 2, NULL);
     g_job_done = CreateEventA(NULL, FALSE, FALSE, NULL);
     for (int i = 0; i < 2; ++i) g_pool[i] = CreateThread(NULL, 0, fx_pool_thread, NULL, 0, NULL);
