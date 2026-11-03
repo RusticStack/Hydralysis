@@ -6,11 +6,15 @@
 //! accept the shapes the producers emit and answer [`Error::Unsupported`] for anything else, so the caller can run the
 //! Python implementation, which stays the specification. See `PORTING.md`.
 
+pub mod canon;
 #[cfg(windows)]
 pub mod capture;
 pub mod hashes;
+pub mod jsonl;
 pub mod pyfmt;
 pub mod reports;
+pub mod schema;
+pub mod shape;
 pub mod unwind;
 
 /// Why a call did not produce an answer.

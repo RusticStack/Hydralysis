@@ -107,9 +107,88 @@ fn parse_ascii(text: &str, fixed: Option<u32>) -> Option<i128> {
     Some(if negative { -value } else { value })
 }
 
+/// The length of [`write_json_string`]'s output for TEXT.
+pub fn json_string_len(text: &str) -> usize {
+    2 + text
+        .chars()
+        .map(|c| match c {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
+            ' '..='\u{7f}' => 1,
+            c if c.len_utf16() == 2 => 12,
+            _ => 6,
+        })
+        .sum::<usize>()
+}
+
+/// `repr(float)` for a finite number: the shortest digits that read back, positional between 1e-4 and 1e16 and
+/// `d.ddde+XX` outside, with a `.0` on whole numbers. (`json.dumps` writes floats this way.)
+pub fn float_repr(value: f64) -> String {
+    let scientific = format!("{value:e}"); // shortest round-trip digits: "-1.2345e-5"
+    let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    let (sign, mantissa) = mantissa.strip_prefix('-').map_or(("", mantissa), |rest| ("-", rest));
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    if !(-4..16).contains(&exponent) {
+        let head = &digits[..1];
+        let tail = &digits[1..];
+        let point = if tail.is_empty() { String::new() } else { format!(".{tail}") };
+        let exponent_sign = if exponent < 0 { '-' } else { '+' };
+        return format!("{sign}{head}{point}e{exponent_sign}{:02}", exponent.abs());
+    }
+    let body = if exponent < 0 {
+        format!("0.{}{digits}", "0".repeat((-exponent - 1) as usize))
+    } else {
+        let whole = exponent as usize + 1;
+        if digits.len() <= whole {
+            format!("{digits}{}.0", "0".repeat(whole - digits.len()))
+        } else {
+            format!("{}.{}", &digits[..whole], &digits[whole..])
+        }
+    };
+    format!("{sign}{body}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn float_repr_matches_python() {
+        for (value, text) in [
+            (0.0, "0.0"),
+            (-0.0, "-0.0"),
+            (1.0, "1.0"),
+            (1.5, "1.5"),
+            (100.0, "100.0"),
+            (123456789012345.0, "123456789012345.0"),
+            (1e15, "1000000000000000.0"),
+            (1e16, "1e+16"),
+            (1.5e16, "1.5e+16"),
+            (1.2345e20, "1.2345e+20"),
+            (0.0001, "0.0001"),
+            (0.00012, "0.00012"),
+            (0.00001, "1e-05"),
+            (1.5e-7, "1.5e-07"),
+            (1e-100, "1e-100"),
+            (1e300, "1e+300"),
+            (0.1, "0.1"),
+            (-2.5e-5, "-2.5e-05"),
+            (123.456, "123.456"),
+            (5e-324, "5e-324"),
+            (1.7976931348623157e308, "1.7976931348623157e+308"),
+        ] {
+            assert_eq!(float_repr(value), text, "{value:e}");
+        }
+    }
+
+    #[test]
+    fn json_string_len_counts_what_write_json_string_writes() {
+        for text in ["", "abc", "a\"b\\c\n\r\t\u{8}\u{c}\u{1}\u{7f}\u{e9}\u{20ac}\u{1f600}~ "] {
+            let mut out = String::new();
+            write_json_string(text, &mut out);
+            assert_eq!(json_string_len(text), out.len(), "{text:?}");
+        }
+    }
 
     #[test]
     fn int_base0_matches_python() {
