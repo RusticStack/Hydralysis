@@ -57,6 +57,14 @@ class M1(unittest.TestCase):
             live.close()
         cls.root.cleanup()
 
+    def tearDown(self):
+        # Each test owns the targets it starts. Close them before the next test, so a finished fixture
+        # (deadlock.exe, a detached frameloop, ...) cannot load the next measurement; class teardown is
+        # only the final safety net.
+        for live in self.lives:
+            live.close()
+        self.lives.clear()
+
     # ---- helpers ----------------------------------------------------------------------------------------------------
     def traced(self, exe, argv, *, hooks=None, wait=True, linger_ms=600, **trace):
         specs, _verification = self.tl.specs_for(self.fx, [exe], hooks)
@@ -235,8 +243,10 @@ class M1(unittest.TestCase):
         self.assertGreaterEqual(cited + health["encoder"]["records"], health["producer"]["attempted"])   # every attempt is a record or cited
 
     def test_a_loop_over_the_rate_budget_is_thinned_and_every_skip_is_counted(self):
-        # the DEFAULT policy: the bare loop offers far more than the budget, so probes are thinned; nothing is silent
-        live = self.traced("frameloop.exe", ["--frames=60000"], sampling={"mode": "adaptive", "rate_budget": 20000})
+        # The DEFAULT policy: the bare loop offers far more than the budget, so probes are thinned; nothing is
+        # silent. The budget is 1,000/s so thinning starts early and a kept event is labelled `sampled` even on a
+        # loaded host; the exact budget is not the subject, the policy, the citations and the sampled label are.
+        live = self.traced("frameloop.exe", ["--frames=60000"], sampling={"mode": "adaptive", "rate_budget": 1000})
         health = live.stop()["trace"]["health"]
         sampling = health["producer"]["sampling"]
         self.assertEqual(sampling["policy"], "adaptive")

@@ -237,7 +237,7 @@ typedef struct {
 } Shared;
 
 typedef struct { Shared *sh; guint32 id, nargs, flags, buf_max; gint32 buf_ptr_arg, buf_len_arg; guint32 buf_fixed, stack_depth;
-  volatile guint32 mask; guint32 fast; } Site;   /* mask: stride - 1; after a kept hit the next `mask` hits of a thread are skipped */
+  volatile guint32 mask; guint32 fast; guint32 thinned; } Site;   /* mask: stride - 1; thinned: the site was ever thinned (sticky label) */
 
 typedef struct {
   guint16 size; guint8 kind, flags; guint16 site, ring;
@@ -306,12 +306,13 @@ void site_init(Site *s, Shared *sh, guint id, guint nargs, guint flags, gint buf
   s->buf_max = buf_max > BUFMAX ? BUFMAX : buf_max;
   s->stack_depth = stack_depth > MAX_STACK ? MAX_STACK : stack_depth;
   s->mask = 0;
+  s->thinned = 0;
   /* the lean record: a plain call site (no return, no buffer, no stack walk) */
   s->fast = (!(flags & 1) && buf_ptr_arg < 0 && stack_depth <= 1) ? 1 : 0;
 }
 
 void set_mode(Shared *sh, gint m) { sh->mode = m; }
-void set_mask(Site *s, guint m) { s->mask = m; }
+void set_mask(Site *s, guint m) { s->mask = m; if (m) s->thinned = 1; }
 
 /* The thread is gone: its ring waits to be drained, then it is free for the next thread. */
 void exit_cb(void *p) {
@@ -479,7 +480,7 @@ static void emit(Ring *r, Site *s, Inv *inv, guint64 ret, guint32 last_error, gu
   base = r->buf + pos;
   rec = (Rec *)base;
   rec->size = (guint16)total; rec->kind = (guint8)(1 | (nst << 4));
-  rec->flags = (guint8)(inv->bflags | (has_ret ? 1 : 0) | (s->mask ? F_SAMPLED : 0));
+  rec->flags = (guint8)(inv->bflags | (has_ret ? 1 : 0) | (s->thinned ? F_SAMPLED : 0));
   rec->site = (guint16)s->id; rec->ring = (guint16)r->ring_id;
   rec->qpc = inv->qpc; rec->tid = r->tid; rec->ring_seq = seq;
   rec->ret_addr = inv->ret_addr; rec->qpc_end = qpc_end; rec->retval = ret;
@@ -514,7 +515,7 @@ static void emit_fast(Ring *r, Site *s, Shared *sh, guint64 ret, const guint64 *
   }
   if (sh->use_qpc) { QueryPerformanceCounter(&q); t = (guint64)q; } else t = rdtsc_();
   rec = r->buf + pos;
-  *(guint64 *)rec = (guint64)(guint16)total | ((guint64)3 << 16) | ((guint64)n << 24) | ((guint64)s->id << 32) | ((guint64)(s->mask ? F_SAMPLED : 0) << 48);
+  *(guint64 *)rec = (guint64)(guint16)total | ((guint64)3 << 16) | ((guint64)n << 24) | ((guint64)s->id << 32) | ((guint64)(s->thinned ? F_SAMPLED : 0) << 48);
   *(guint32 *)(rec + 8) = r->attempted++;
   *(guint64 *)(rec + 16) = t;
   *(guint64 *)(rec + 24) = ret;
