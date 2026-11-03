@@ -118,4 +118,11 @@ in Rust (parsed from the engine rows or segments there), which changes the API a
 
 ## Verification
 
-See the final report of the port for the exact runs and their results.
+Run on branch `r/hy-trace` (logs in `E:\Projects\Hydra\_logs\h7\trace\`):
+
+* `rust/`: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`: all exit 0
+  (59 tests in `hy-trace`).
+* `native/`: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`: all exit 0.
+* `tools/run_tests.py -k test_trace` (385 tests, including the four `*_native` parity files): `HYDRALYSIS_IMPL` unset, OK;
+  `HYDRALYSIS_IMPL=rust`, OK. (The failures once known in `test_trace_e2e` M1 and `test_trace_gates` M2 did not occur.)
+* Extensions built with `cargo build --release` in `native/` (`hydralysis_native.dll` copied to `src\hydralysis_native.pyd`).
