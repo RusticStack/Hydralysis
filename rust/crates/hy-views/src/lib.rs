@@ -23,6 +23,7 @@ pub mod settle;
 pub mod store;
 pub mod userscripts;
 pub mod viewgov;
+pub mod viewpool;
 pub mod views;
 pub mod workcopy;
 

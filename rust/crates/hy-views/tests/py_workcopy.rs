@@ -113,7 +113,9 @@ fn rust_run(op: &str, args: &Value, s: &Settings) -> Value {
             workcopy::revert(&host, s, &selected(), &ids, args["expect"].as_i64(), args["cascade"].as_bool().unwrap_or(false))
         }
         "edit" => workcopy::edit(&host, s, &selected(), args["address"].as_str().unwrap(), args["options"].clone(), 30),
-        "add" => workcopy::add_proposals(&host, s, &selected(), args["records"].as_array().unwrap(), args["expect"].as_i64(), 30, &args["from"]),
+        "add" => {
+            workcopy::add_proposals(&host, s, &selected(), args["records"].as_array().unwrap(), args["expect"].as_i64(), 30, &args["from"])
+        }
         _ => unreachable!(),
     };
     result.unwrap_or_else(|e| json!({"raised": e.to_string()}))
@@ -137,10 +139,10 @@ fn new_ids(result: &Value, store: &Value) -> Vec<String> {
             found.push(ident);
         }
     }
-    if let Some(ident) = result["overlay_id"].as_str() {
-        if !found.iter().any(|f| f == ident) {
-            found.push(ident.to_string());
-        }
+    if let Some(ident) = result["overlay_id"].as_str()
+        && !found.iter().any(|f| f == ident)
+    {
+        found.push(ident.to_string());
     }
     found
 }
@@ -167,9 +169,6 @@ fn check(py: &str, name: &str, tweak: &str, op: &str, args: Value) {
     mask_ids(&mut store_b, &ids_b);
     normalise(&mut rust_out, &roots);
     normalise(&mut py_out, &roots);
-    if std::env::var("WC_SHOW").is_ok() {
-        eprintln!("{name}: {}", rust_out.to_string().chars().take(230).collect::<String>());
-    }
     assert_eq!(rust_out, py_out, "result of case {name}");
     assert_eq!(store_a, store_b, "store of case {name}");
 }
@@ -177,9 +176,7 @@ fn check(py: &str, name: &str, tweak: &str, op: &str, args: Value) {
 #[test]
 fn revert_matches_python() {
     let Some(py) = python() else { return };
-    let one = |ids: &[usize], expect: Value, cascade: bool| {
-        json!({"ids": ids.iter().map(|i| id(*i)).collect::<Vec<_>>(), "expect": expect, "cascade": cascade})
-    };
+    let one = |ids: &[usize], expect: Value, cascade: bool| json!({"ids": ids.iter().map(|i| id(*i)).collect::<Vec<_>>(), "expect": expect, "cascade": cascade});
     check(&py, "single", "plain", "revert", one(&[2], json!(4), false));
     check(&py, "two", "plain", "revert", one(&[1, 3], json!(4), false));
     check(&py, "missing_expect", "plain", "revert", one(&[2], Value::Null, false));
@@ -207,7 +204,13 @@ fn edit_matches_python() {
     check(&py, "missing_expect", "plain", "edit", json!({"address": "0x402000", "options": options(Value::Null, "fresh")}));
     // an older revision whose later edits touched other subjects is rebased; one whose subject moved is a conflict
     check(&py, "rebased", "plain", "edit", json!({"address": "0x402000", "options": options(json!(2), "fresh")}));
-    check(&py, "conflict", "plain", "edit", json!({"address": format!("0x{:x}", 0x401000 + 3 * 16), "options": options(json!(2), "fresh")}));
+    check(
+        &py,
+        "conflict",
+        "plain",
+        "edit",
+        json!({"address": format!("0x{:x}", 0x401000 + 3 * 16), "options": options(json!(2), "fresh")}),
+    );
     check(&py, "stale_view", "stale", "edit", json!({"address": "0x402000", "options": options(json!(4), "fresh")}));
     check(&py, "bad_address", "plain", "edit", json!({"address": "zz", "options": options(json!(4), "fresh")}));
     check(&py, "no_address", "plain", "edit", json!({"address": "", "options": options(json!(4), "fresh")}));
@@ -343,7 +346,8 @@ print(json.dumps(out))
     let good = store::state_of(&store);
     let ids: Vec<&str> = recs.iter().map(|r| r["id"].as_str().unwrap()).collect();
     let digest = |n: usize| store::digest_of(&ids[..n]);
-    let bases = [json!({"lineage": "", "generation": 0}), json!({"lineage": "L-1", "generation": 2}), json!({"lineage": "", "generation": 1})];
+    let bases =
+        [json!({"lineage": "", "generation": 0}), json!({"lineage": "L-1", "generation": 2}), json!({"lineage": "", "generation": 1})];
     for n in [0usize, 1, 3, 5, 6] {
         for committed in [json!(store::digest_of::<String>(&[])), json!("x"), Value::Null] {
             for base in std::iter::once(Value::Null).chain(bases.iter().cloned()) {
@@ -368,7 +372,13 @@ print(json.dumps(out))
     }
     cases.push(json!({"op": "prefix", "records": recs, "marker": {}, "wanted": good}));
     cases.push(json!({"op": "prefix", "records": recs, "marker": null, "wanted": good}));
-    for record in [Value::Null, json!({}), json!({"lineage": "L-1", "generation": 2}), json!({"lineage": "L-1", "generation": 2.0}), json!({"lineage": null, "generation": null})] {
+    for record in [
+        Value::Null,
+        json!({}),
+        json!({"lineage": "L-1", "generation": 2}),
+        json!({"lineage": "L-1", "generation": 2.0}),
+        json!({"lineage": null, "generation": null}),
+    ] {
         for wanted in &bases {
             cases.push(json!({"op": "same", "record": record, "wanted": wanted}));
         }

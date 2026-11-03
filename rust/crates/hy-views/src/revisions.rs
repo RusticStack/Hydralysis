@@ -298,28 +298,35 @@ pub fn dependents(records: &[Value], selected: &BTreeSet<String>, committed: &BT
     chain.sort_by_key(|r| seq(r));
     let mut taken: BTreeSet<String> = selected.clone();
     let mut found: Vec<String> = Vec::new();
-    let non_report = |r: &Value| -> BTreeSet<Pair> { touches(r).into_iter().filter(|p| p.1 != REPORT).collect() };
+    // What each record touches is read once, and what the taken records touch is kept as the lowest `seq` per pair: the
+    // question "does a taken record of a lower seq touch one of my pairs" is then one lookup per pair. The records are visited
+    // in the same order, and a record taken is seen by the later ones of the same pass, as in the original double loop.
+    let touched: Vec<BTreeSet<Pair>> = chain.iter().map(|r| touches(r).into_iter().filter(|p| p.1 != REPORT).collect()).collect();
+    let mut lowest: std::collections::HashMap<&Pair, i64> = std::collections::HashMap::new();
+    for (record, pairs) in chain.iter().zip(&touched) {
+        if taken.contains(as_str(record, "id")) {
+            for pair in pairs {
+                let at = lowest.entry(pair).or_insert(i64::MAX);
+                *at = (*at).min(seq(record));
+            }
+        }
+    }
     let mut changed = true;
     while changed {
         changed = false;
-        for record in &chain {
+        for (record, mine) in chain.iter().zip(&touched) {
             let id = as_str(record, "id");
-            if taken.contains(id) {
+            if taken.contains(id) || mine.is_empty() {
                 continue;
             }
-            let mine = non_report(record);
-            if mine.is_empty() {
-                continue;
-            }
-            for earlier in &chain {
-                if !taken.contains(as_str(earlier, "id")) || seq(earlier) >= seq(record) {
-                    continue;
-                }
-                if !mine.is_disjoint(&non_report(earlier)) {
-                    taken.insert(id.to_string());
-                    found.push(id.to_string());
-                    changed = true;
-                    break;
+            let own = seq(record);
+            if mine.iter().any(|pair| lowest.get(pair).is_some_and(|low| *low < own)) {
+                taken.insert(id.to_string());
+                found.push(id.to_string());
+                changed = true;
+                for pair in mine {
+                    let at = lowest.entry(pair).or_insert(i64::MAX);
+                    *at = (*at).min(own);
                 }
             }
         }

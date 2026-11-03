@@ -107,6 +107,11 @@ pub fn edit_of(value: &Map<String, Value>) -> Result<Map<String, Value>> {
     if value.keys().any(|k| !matches!(k.as_str(), "id" | "address" | "options")) {
         return Err(Error::value("overlay edit accepts id, address and options"));
     }
+    edit_fields(value)
+}
+
+/// [`edit_of`] for a map that may hold other keys (a stored record): only `id`, `address` and `options` are read.
+fn edit_fields(value: &Map<String, Value>) -> Result<Map<String, Value>> {
     let validate = *VALIDATOR.read().unwrap();
     let options = validate(value.get("options").unwrap_or(&Value::Null))?;
     let address = match value.get("address") {
@@ -149,9 +154,7 @@ pub fn clean_record(item: &Value, position: usize, previous_seq: i64) -> Result<
     let Value::Object(item) = item else {
         return Err(Error::value("overlay history holds a record that is not an object"));
     };
-    let subset: Map<String, Value> =
-        ["id", "address", "options"].iter().filter_map(|k| item.get(*k).map(|v| ((*k).to_string(), v.clone()))).collect();
-    let mut clean = edit_of(&subset)?;
+    let mut clean = edit_fields(item)?;
     for key in ["by", "at", "batch"] {
         if let Some(v) = item.get(key) {
             clean.insert(key.into(), v.clone());
@@ -390,8 +393,8 @@ pub fn v3(store: &Store, target: &Target, known: &[Value]) -> Result<Value> {
 pub fn save_store(settings: &Settings, target: &Target, store: &Store) -> Result<()> {
     let path = store_path(settings, target)?;
     let known = hy_store::storelog::known_edits(&path);
-    let known: Vec<Value> = known.and_then(|k| k.as_array().cloned()).unwrap_or_default();
-    let record = v3(store, target, &known)?;
+    let known: &[Value] = known.as_ref().and_then(Value::as_array).map_or(&[], Vec::as_slice);
+    let record = v3(store, target, known)?;
     keep_old_format(&path)?;
     hy_store::storelog::save(
         &path,

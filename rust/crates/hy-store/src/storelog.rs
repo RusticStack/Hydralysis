@@ -224,8 +224,11 @@ pub fn clear_cache() {
 
 /// The clean `edits` of the store on disk as this process last wrote or read them, when the files are unchanged since.
 pub fn known_edits(path: &Path) -> Option<Value> {
-    let found = cached(&path_key(path))?;
-    if found.signature != signature(path) {
+    // Under the lock, only the edits are copied: copying the whole entry (the store as a tree) to read one field is waste.
+    let sig = signature(path);
+    let cache = CACHE.lock().ok()?;
+    let (_, found) = cache.entries.get(&path_key(path))?;
+    if found.signature != sig {
         return None;
     }
     found.record.get("edits").filter(|e| e.is_array()).cloned()
@@ -503,14 +506,15 @@ pub fn save(path: &Path, record: &Value, max_bytes: Option<usize>, too_large: Op
     AppendLog::new(log_path(path)).append(&row, false)?;
     fault("store.after_append")?;
     apply_row(&mut current.record, &row);
-    let state = Cached { n: after, size: estimate, signature: signature(path), since: current.since + line_len, ..current.clone() };
-    remember(&current.key, state);
+    let (key, anchor) = (current.key.clone(), current.anchor.clone());
+    let since = current.since + line_len;
+    remember(&key, Cached { n: after, size: estimate, signature: signature(path), since, ..current });
     if due {
         // The mutation is durable (the row above): compaction is best effort from here.
-        if let Err(error) = snapshot(path, record, current.anchor.as_deref(), max_bytes, too_large) {
+        if let Err(error) = snapshot(path, record, anchor.as_deref(), max_bytes, too_large) {
             if is_os(&error) || is_value(&error) {
                 upkeep_failed(path, "compaction", &error);
-                forget(&current.key);
+                forget(&key);
             } else {
                 return Err(error);
             }
