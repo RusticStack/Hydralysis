@@ -80,6 +80,8 @@ pub struct Counters {
     pub read_failed: u64,
     pub unreturned: u64,
     pub stalls: u64,
+    /// Time hits spent waiting for a full ring, in the record clock's ticks.
+    pub stall_ticks: u64,
     pub no_ring: u64,
     pub bad_records: u64,
     pub events_lost: u64,
@@ -646,6 +648,7 @@ impl Session {
                 c.read_failed += u(proto::R_READ_FAILED);
                 c.unreturned += u(proto::R_UNRETURNED);
                 c.stalls += u(proto::R_STALLS);
+                c.stall_ticks += (r.add(proto::R_STALL_TICKS) as *const u64).read_volatile();
                 for s in 0..proto::MAX_SITES {
                     let p = r.add(proto::RING_CTR + s * proto::CTR_SIZE) as *const u64;
                     c.sites[s].hits += p.read_volatile();
@@ -678,6 +681,7 @@ impl Session {
 
     /// Out-of-band events (breakpoint hits, watch hits, auto-continues) since the last call.
     pub fn events(&mut self) -> Vec<Event> {
+        self.refine_clock();
         let head = self.rd32(proto::H_EVENT_HEAD);
         let mut out = Vec::new();
         let backlog = head.wrapping_sub(self.next_event) as usize;

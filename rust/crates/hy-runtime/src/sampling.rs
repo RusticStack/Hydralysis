@@ -84,6 +84,11 @@ impl Sampler {
         self.stride[site]
     }
 
+    /// The smoothed hit rate of a site in hits per second (0 until two ticks have been seen).
+    pub fn rate(&self, site: usize) -> f64 {
+        self.rate.get(site).copied().flatten().unwrap_or(0.0)
+    }
+
     /// A site's `skipped` count as reported: only a site that was ever thinned can have skipped a hit (this keeps
     /// exact mode from reporting a phantom skip for a hit that was counted but not yet kept when the counters were read).
     pub fn reported_skipped(&self, site: usize, hits: u64, kept: u64) -> u64 {
@@ -225,6 +230,12 @@ mod tests {
         );
         assert_eq!(s.stride(1), 1);
         assert_eq!(s.reported_skipped(0, 100, 70), 30);
+        assert_eq!((s.rate(0), s.rate(1)), (1_200_000.0, 10_000.0));
+        assert_eq!(
+            s.rate(9),
+            0.0,
+            "a site the sampler does not own has no rate"
+        );
     }
 
     #[test]

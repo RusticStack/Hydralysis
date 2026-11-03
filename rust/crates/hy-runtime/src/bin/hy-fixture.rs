@@ -2,7 +2,9 @@
 //!   info              print the RVA and first bytes of `fx_hit` and the RVA of the data cell
 //!   churn N           N short-lived threads, each calling `fx_hit` three times (thread-exit ring reuse)
 //!   pause             call `fx_hit(7)` once on the main thread (breakpoint tests)
-//!   watch             print ADDR, wait, write the cell five times, then once from a late thread
+//!   watch [LINGER_MS]  print ADDR, wait, write the cell five times, then once from a late thread; linger (default 50 ms) before exiting
+//!   hits N FILE       wait until FILE exists, call `fx_hit` N times (5 ms apart), then stay alive (capture-window tests)
+//!   loadlib [LINGER_MS]  load winmm.dll, free it again, linger (default 600 ms): module notification tests
 //!   write             print ADDR, wait until the cell reads 0x3333 (compare-and-swap write tests)
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -55,6 +57,31 @@ fn main() {
             fx_hit(7);
             println!("AFTER");
         }
+        "hits" => {
+            let n: u64 = args[2].parse().unwrap();
+            let gate = std::path::Path::new(&args[3]);
+            while !gate.exists() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            for i in 0..n {
+                fx_hit(i);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_secs(120));
+        }
+        "loadlib" => {
+            use windows_sys::Win32::Foundation::FreeLibrary;
+            use windows_sys::Win32::System::LibraryLoader::LoadLibraryA;
+            std::thread::sleep(Duration::from_millis(400));
+            let module = unsafe { LoadLibraryA(c"winmm.dll".as_ptr().cast()) };
+            std::thread::sleep(Duration::from_millis(100));
+            if !module.is_null() {
+                unsafe { FreeLibrary(module) };
+            }
+            let linger: u64 = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(600);
+            std::thread::sleep(Duration::from_millis(linger));
+            println!("DONE");
+        }
         "watch" => {
             println!("ADDR={:x}", &CELL as *const AtomicU64 as usize);
             std::thread::sleep(Duration::from_millis(600));
@@ -68,7 +95,8 @@ fn main() {
             })
             .join()
             .unwrap();
-            std::thread::sleep(Duration::from_millis(50));
+            let linger: u64 = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(50);
+            std::thread::sleep(Duration::from_millis(linger));
             println!("DONE");
         }
         "write" => {

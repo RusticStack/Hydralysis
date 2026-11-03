@@ -12,6 +12,8 @@ pub mod sampling;
 #[cfg(windows)]
 pub mod session;
 #[cfg(windows)]
+pub mod threadinfo;
+#[cfg(windows)]
 pub mod watch;
 
 pub use hy_agent_proto as proto;

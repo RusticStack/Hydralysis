@@ -699,6 +699,33 @@ fn disarm_reads_back_every_thread_and_clears() {
         matches!(s.disarm_watch(slot), Err(MemError::BadRequest(_))),
         "clear is final"
     );
+    // an independent DR7 readback agrees with the state machine: armed shows the slot, clear does not
+    let armed = s
+        .arm_watch(&Gate::Fixture, addr, 8, Kind::Write, 10)
+        .unwrap();
+    let (rows, unreadable) = s.read_dr7();
+    assert!(
+        unreadable.is_empty(),
+        "every thread readable: {unreadable:?}"
+    );
+    assert!(!rows.is_empty());
+    assert!(
+        rows.iter()
+            .all(|&(_, dr7)| dr7 & (0b11 << (2 * armed)) != 0),
+        "slot {armed} is enabled on every thread: {rows:x?}"
+    );
+    let covered = s.watch_threads(armed);
+    assert_eq!(
+        covered.len(),
+        rows.len(),
+        "the covered set is the readable set"
+    );
+    assert_eq!(s.disarm_watch(armed).unwrap(), Phase::Clear);
+    let (rows, _) = s.read_dr7();
+    assert!(
+        rows.iter()
+            .all(|&(_, dr7)| dr7 & (0b11 << (2 * armed)) == 0)
+    );
     // the slot is reusable after a clear
     let again = s
         .arm_watch(&Gate::Fixture, addr, 4, Kind::Write, 10)
@@ -714,6 +741,45 @@ fn disarm_reads_back_every_thread_and_clears() {
     .unwrap();
     wait_exit(&mut s, Duration::from_secs(20), |_| {});
     assert_eq!(s.exit_code(), Some(0));
+}
+
+// ---------------------------------------------------------------- modules
+
+fn event_name(data: &[u64; 5]) -> String {
+    let mut bytes = Vec::new();
+    for w in &data[2..5] {
+        bytes.extend_from_slice(&w.to_le_bytes());
+    }
+    let n = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..n]).to_ascii_lowercase()
+}
+
+#[test]
+fn the_loader_reports_a_module_loaded_and_unloaded_while_the_agent_is_in() {
+    let out = work("loadlib").join("out.txt");
+    let mut s = Session::spawn_with(&hy_fixture(), &["loadlib".into()], &[], Some(&out)).unwrap();
+    s.inject(&agent_dll()).unwrap();
+    s.resume();
+    let mut events = Vec::new();
+    wait_exit(&mut s, Duration::from_secs(30), |s| {
+        events.extend(s.events())
+    });
+    events.extend(s.events());
+    let of = |kind: u16| {
+        events
+            .iter()
+            .filter(|e| e.kind == kind && event_name(&e.data) == "winmm.dll")
+            .collect::<Vec<_>>()
+    };
+    let (loaded, unloaded) = (of(proto::EV_MODULE_LOAD), of(proto::EV_MODULE_UNLOAD));
+    assert_eq!(loaded.len(), 1, "one load of winmm.dll: {events:?}");
+    assert_eq!(unloaded.len(), 1, "one unload of winmm.dll");
+    assert_eq!(loaded[0].data[0], unloaded[0].data[0], "same base");
+    assert!(loaded[0].data[1] > 0, "the size of the image is reported");
+    assert!(
+        loaded[0].tsc < unloaded[0].tsc,
+        "in the order they happened"
+    );
 }
 
 // ---------------------------------------------------------------- identity

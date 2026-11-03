@@ -10,6 +10,7 @@ compile_error!(
 );
 
 mod hook;
+mod modules;
 mod pause;
 mod ring;
 mod threads;
@@ -267,6 +268,7 @@ pub unsafe extern "system" fn hy_agent_init(_param: *mut core::ffi::c_void) -> u
             );
         }
         AddVectoredExceptionHandler(1, Some(watch::veh));
+        modules::register();
         let t = CreateThread(
             core::ptr::null(),
             0,

@@ -132,6 +132,8 @@ pub const EV_BREAKPOINT: u16 = 1;
 pub const EV_AUTO_CONTINUE: u16 = 2; // agent hard limit reached
 pub const EV_WATCH_HIT: u16 = 3; // data = [rip, dr6, address, slot bitmap, 0]
 pub const EV_UNRETURNED: u16 = 4; // shadow entries dropped because the frame was unwound without a return
+pub const EV_MODULE_LOAD: u16 = 5; // data = [base, size, name x 3]: the first 24 ASCII characters of the base name
+pub const EV_MODULE_UNLOAD: u16 = 6; // same data, sent when the module is unmapped
 
 // Watch table.
 pub const WATCH_OFF: usize = 0xA800;
@@ -146,7 +148,7 @@ pub const W_LIMIT: usize = 24; // u32 events recorded at most
 pub const W_SEEN: usize = 28; // u32
 
 // Rings. Ring header: head@0 (producer), dropped@8, tid@12, state@16, read_failed@20, attempted@24, ring_seq@28,
-// unreturned@32, stalls@36; tail@64 (consumer); per-site counters from RING_CTR.
+// unreturned@32, stalls@36, shed@40, stall_ticks@48 (u64); tail@64 (consumer); per-site counters from RING_CTR.
 pub const R_HEAD: usize = 0;
 pub const R_DROPPED: usize = 8;
 pub const R_TID: usize = 12;
@@ -156,6 +158,7 @@ pub const R_ATTEMPTED: usize = 24;
 pub const R_SEQ: usize = 28;
 pub const R_UNRETURNED: usize = 32;
 pub const R_STALLS: usize = 36; // times a hit waited for the drain
+pub const R_STALL_TICKS: usize = 48; // u64: the record clock's ticks hits spent waiting for the drain
 pub const R_SHED: usize = 40; // 1 while the ring sheds (drops at once) after a stall ran out of patience
 pub const R_TAIL: usize = 64;
 pub const RING_CTR: usize = 256;

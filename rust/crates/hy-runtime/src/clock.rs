@@ -37,6 +37,15 @@ impl Clock {
         }
     }
 
+    /// A span of record-clock ticks in QueryPerformanceCounter ticks.
+    pub fn span_to_qpc(&self, ticks: u64) -> u64 {
+        if self.use_qpc {
+            ticks
+        } else {
+            (ticks as f64 * self.ratio) as u64
+        }
+    }
+
     /// A record timestamp in QueryPerformanceCounter ticks. Zero before the first usable refinement.
     pub fn to_qpc(&self, t: u64) -> u64 {
         if self.use_qpc {
@@ -61,6 +70,15 @@ mod tests {
         c.refine(1_000_000 + 3_000_000, 500 + 10_000); // 3 TSC ticks per QPC tick... ratio 1/300
         let q = c.to_qpc(1_000_000 + 1_500_000);
         assert!((q as i64 - 5_500).abs() <= 1, "{q}");
+    }
+
+    #[test]
+    fn spans_convert_without_an_origin() {
+        let mut c = Clock::new(false, 0, 0, 10_000_000);
+        assert_eq!(c.span_to_qpc(3000), 0, "no usable ratio yet");
+        c.refine(3_000_000, 10_000);
+        assert_eq!(c.span_to_qpc(300_000), 1000);
+        assert_eq!(Clock::new(true, 0, 0, 1).span_to_qpc(77), 77);
     }
 
     #[test]

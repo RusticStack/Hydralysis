@@ -244,16 +244,20 @@ unsafe fn wait_for_room(ring: *mut u8, head: u32, need: usize) -> bool {
         let budget = (section().add(p::H_STALL_BUDGET) as *const u64).read_volatile();
         let t0 = now();
         bump32(ring, p::R_STALLS);
-        loop {
+        let room = loop {
             core::hint::spin_loop();
             if fits() {
-                return true;
+                break true;
             }
             if now().wrapping_sub(t0) > budget {
                 shed.store(1, Ordering::Relaxed);
-                return false;
+                break false;
             }
-        }
+        };
+        // Only the ring's owner thread stalls on it, so a plain read-modify-write is the whole synchronisation.
+        let ticks = ring.add(p::R_STALL_TICKS) as *mut u64;
+        ticks.write_volatile(ticks.read_volatile().wrapping_add(now().wrapping_sub(t0)));
+        room
     }
 }
 

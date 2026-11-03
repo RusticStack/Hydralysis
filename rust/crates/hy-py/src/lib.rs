@@ -14,9 +14,14 @@ use pyo3::types::{PyBytes, PyDict, PyList};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use windows_sys::Win32::System::Performance::QueryPerformanceCounter;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+type SamplingRow = (usize, u64, u64, u64, u32, f64);
+type SamplingReport = (u32, f64, Vec<SamplingRow>);
+type Dr7Rows = (Vec<(u32, u64)>, Vec<u32>);
 
 fn os(e: std::io::Error) -> PyErr {
     PyOSError::new_err(e.to_string())
@@ -48,10 +53,24 @@ const W_SAMPLED: u8 = 32;
 
 const MAGIC: u32 = 0x3142_5448;
 
+/// Sites at or above this index belong to the observe/break probes of the script surface; the trace recorder owns the
+/// ones below (it takes at most 48). Both drain the same rings, so each leaves the other's hits where it finds them.
+const OBSERVE_BASE: u16 = 48;
+
+/// Hits drained from the rings and not yet handed to their consumer.
+#[derive(Default)]
+struct Stash {
+    trace: Vec<proto::Hit>,
+    observe: Vec<proto::Hit>,
+}
+
 #[pyclass(module = "hydralysis_rt")]
 struct RtSession {
     inner: Mutex<Option<Session>>,
     sampler: Mutex<Option<Sampler>>,
+    /// Trace records that came back with their return (the recorder's `left`).
+    returned: AtomicU64,
+    stash: Mutex<Stash>,
     #[pyo3(get)]
     pid: u32,
     #[pyo3(get)]
@@ -79,7 +98,32 @@ impl RtSession {
             image: s.identity.image.clone(),
             inner: Mutex::new(Some(s)),
             sampler: Mutex::new(None),
+            returned: AtomicU64::new(0),
+            stash: Mutex::new(Stash::default()),
         }
+    }
+
+    /// Drain the rings once and sort what came out between the two consumers.
+    fn pull(&self, s: &mut Session) -> PyResult<()> {
+        let hits = s.drain();
+        if hits.is_empty() {
+            return Ok(());
+        }
+        let mut stash = self
+            .stash
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("stash lock poisoned"))?;
+        for h in hits {
+            if h.site >= OBSERVE_BASE {
+                stash.observe.push(h);
+            } else {
+                if h.flags & proto::RF_RETURNED != 0 {
+                    self.returned.fetch_add(1, Ordering::Relaxed);
+                }
+                stash.trace.push(h);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -259,7 +303,14 @@ impl RtSession {
     ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
         let batches = py.detach(|| {
             self.with(|s| {
-                let hits = s.drain();
+                self.pull(s)?;
+                let hits = std::mem::take(
+                    &mut self
+                        .stash
+                        .lock()
+                        .map_err(|_| PyRuntimeError::new_err("stash lock poisoned"))?
+                        .trace,
+                );
                 if hits.is_empty() {
                     return Ok(Vec::new());
                 }
@@ -316,6 +367,49 @@ impl RtSession {
         Ok(batches.iter().map(|b| PyBytes::new(py, b)).collect())
     }
 
+    /// Hits of the observe/break sites (index 48 and up) since the last call, oldest first, as dicts:
+    /// `site tid args stack ret_addr retval last_error returned buf buf_addr buf_failed t` (`t` in QPC ticks).
+    fn drain_hits<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        let hits = py.detach(|| {
+            self.with(|s| {
+                self.pull(s)?;
+                let clock = s.clock;
+                let taken = std::mem::take(
+                    &mut self
+                        .stash
+                        .lock()
+                        .map_err(|_| PyRuntimeError::new_err("stash lock poisoned"))?
+                        .observe,
+                );
+                Ok(taken
+                    .into_iter()
+                    .map(|h| {
+                        let t = clock.to_qpc(h.tsc);
+                        (h, t)
+                    })
+                    .collect::<Vec<_>>())
+            })
+        })?;
+        hits.into_iter()
+            .map(|(h, t)| {
+                let d = PyDict::new(py);
+                d.set_item("site", h.site)?;
+                d.set_item("tid", h.tid)?;
+                d.set_item("args", h.args)?;
+                d.set_item("stack", h.stack)?;
+                d.set_item("ret_addr", h.ret_addr)?;
+                d.set_item("retval", h.retval)?;
+                d.set_item("last_error", h.last_error)?;
+                d.set_item("returned", h.flags & proto::RF_RETURNED != 0)?;
+                d.set_item("buf", PyBytes::new(py, &h.buf))?;
+                d.set_item("buf_addr", h.buf_addr)?;
+                d.set_item("buf_failed", h.flags & proto::RF_BUF_FAILED != 0)?;
+                d.set_item("t", t)?;
+                Ok(d)
+            })
+            .collect()
+    }
+
     /// Choose the sampling policy: `mode` is "adaptive", "exact" or "fixed" (with `stride`); `exact_sites` are site
     /// indexes never thinned.
     #[pyo3(signature = (mode, rate_budget, stride, interval_ms, exact_sites=Vec::new()))]
@@ -347,7 +441,7 @@ impl RtSession {
             .sampler
             .lock()
             .map_err(|_| PyRuntimeError::new_err("sampler lock poisoned"))? =
-            Some(Sampler::new(policy, proto::MAX_SITES));
+            Some(Sampler::new(policy, usize::from(OBSERVE_BASE)));
         Ok(())
     }
 
@@ -367,9 +461,9 @@ impl RtSession {
         Ok(())
     }
 
-    /// `(policy_changes, effective_budget, [(site, hits, kept, skipped, stride)])` for every site slot (the caller picks the armed ones).
-    #[allow(clippy::type_complexity)]
-    fn sampling_report(&self) -> PyResult<(u32, f64, Vec<(usize, u64, u64, u64, u32)>)> {
+    /// `(policy_changes, effective_budget, [(site, hits, kept, skipped, stride, rate_per_s)])` for every site slot (the
+    /// caller picks the armed ones). Sites from `OBSERVE_BASE` up are not the sampler's: stride 1, rate 0.
+    fn sampling_report(&self) -> PyResult<SamplingReport> {
         let g = self
             .sampler
             .lock()
@@ -381,11 +475,15 @@ impl RtSession {
             .iter()
             .enumerate()
             .map(|(i, x)| {
-                let (skipped, stride) = match g.as_ref() {
-                    Some(y) => (y.reported_skipped(i, x.hits, x.kept), y.stride(i)),
-                    None => (0, 1),
+                let (skipped, stride, rate) = match g.as_ref() {
+                    Some(y) if i < usize::from(OBSERVE_BASE) => (
+                        y.reported_skipped(i, x.hits, x.kept),
+                        y.stride(i),
+                        y.rate(i),
+                    ),
+                    _ => (0, 1, 0.0),
                 };
-                (i, x.hits, x.kept, skipped, stride)
+                (i, x.hits, x.kept, skipped, stride, rate)
             })
             .collect();
         Ok((changes, effective, rows))
@@ -393,7 +491,8 @@ impl RtSession {
 
     /// Cumulative counters, per-site `(hits, kept)` and per-ring rows.
     fn counters<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let (c, rows, freq) = self.with(|s| Ok((s.counters(), s.ring_rows(), s.clock.freq)))?;
+        let (c, rows, clock) = self.with(|s| Ok((s.counters(), s.ring_rows(), s.clock)))?;
+        let freq = clock.freq;
         let d = PyDict::new(py);
         d.set_item("attempted", c.attempted)?;
         d.set_item("dropped", c.dropped)?;
@@ -401,8 +500,10 @@ impl RtSession {
         d.set_item("no_ring", c.no_ring)?;
         d.set_item("unreturned", c.unreturned)?;
         d.set_item("stalls", c.stalls)?;
+        d.set_item("stall_ticks", clock.span_to_qpc(c.stall_ticks))?;
         d.set_item("bad_records", c.bad_records)?;
         d.set_item("qpc_freq", freq)?;
+        d.set_item("returned", self.returned.load(Ordering::Relaxed))?;
         let sites = PyList::empty(py);
         for x in &c.sites {
             sites.append((x.hits, x.kept))?;
@@ -425,13 +526,23 @@ impl RtSession {
         self.with(|s| Ok(s.ring_count()))
     }
 
-    /// Out-of-band events: `(kind, site, tid, slot, data)`.
+    /// Out-of-band events: `(kind, site, tid, slot, data, qpc)`.
     #[allow(clippy::type_complexity)]
-    fn events(&self) -> PyResult<Vec<(u16, u16, u32, u32, Vec<u64>)>> {
+    fn events(&self) -> PyResult<Vec<(u16, u16, u32, u32, Vec<u64>, u64)>> {
         self.with(|s| {
+            let clock = s.clock;
             Ok(s.events()
                 .into_iter()
-                .map(|e| (e.kind, e.site, e.tid, e.slot, e.data.to_vec()))
+                .map(|e| {
+                    (
+                        e.kind,
+                        e.site,
+                        e.tid,
+                        e.slot,
+                        e.data.to_vec(),
+                        clock.to_qpc(e.tsc),
+                    )
+                })
                 .collect())
         })
     }
@@ -472,6 +583,26 @@ impl RtSession {
 
     fn threads(&self) -> PyResult<Vec<u32>> {
         self.with(|s| Ok(s.threads()))
+    }
+
+    /// Every thread as `(tid, state, {register: value})`; the state is Frida's name, the registers are empty for a
+    /// thread that could not be stopped for the read.
+    #[allow(clippy::type_complexity)]
+    fn thread_report<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<Vec<(u32, &'static str, Bound<'py, PyDict>)>> {
+        let report = py.detach(|| self.with(|s| Ok(s.thread_report())))?;
+        report
+            .into_iter()
+            .map(|t| {
+                let regs = PyDict::new(py);
+                for (name, value) in t.regs {
+                    regs.set_item(name, value)?;
+                }
+                Ok((t.tid, t.state.as_str(), regs))
+            })
+            .collect()
     }
 
     fn read_memory<'py>(
@@ -548,6 +679,16 @@ impl RtSession {
                 Tainted => "tainted",
             })
         })
+    }
+
+    /// DR7 of every thread, read now: `([(tid, dr7)], [tid that could not be read])`.
+    fn read_dr7(&self, py: Python<'_>) -> PyResult<Dr7Rows> {
+        py.detach(|| self.with(|s| Ok(s.read_dr7())))
+    }
+
+    /// The threads a watch slot has been programmed into.
+    fn watch_threads(&self, slot: usize) -> PyResult<Vec<u32>> {
+        self.with(|s| Ok(s.watch_threads(slot)))
     }
 
     fn watch_hits(&self, slot: usize) -> PyResult<u32> {

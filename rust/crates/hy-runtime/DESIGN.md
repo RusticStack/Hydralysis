@@ -138,7 +138,7 @@ recorded) the bare loop measured p50 +10%, mean +7%, wall +5%, which is the cost
 
 - x86 (WOW64) targets: no x86 stub, no 32-bit `LoadLibraryW` resolution. `hy-agent-dll` refuses to compile for
   non-x86-64 until it exists.
-- PyO3 surface in `native/` (`HYDRALYSIS_IMPL=rust`) and the worker/tool-surface port.
+- The worker/tool-surface port (the PyO3 surface and the Frida-shaped device are done; see PORTING.md for what differs).
 - Feeding `Session::drain` to the h7 native TRACE-1 pump; the sampler is wired by the caller (`Session::sampling_tick`), there is no timer thread in the host crate yet.
 - ETW integration with `hydra-etw`.
 - Sealed mailbox / HMAC IPC and the event-log hash chain belong to the storage lane.

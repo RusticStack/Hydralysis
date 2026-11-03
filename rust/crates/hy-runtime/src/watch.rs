@@ -156,6 +156,29 @@ fn program_thread(
     }
 }
 
+/// Read DR7 of a thread without changing it. `None` when the thread is gone or cannot be suspended.
+fn read_thread_dr7(tid: u32) -> Option<u64> {
+    unsafe {
+        let h = OpenThread(
+            THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+            0,
+            tid,
+        );
+        if h.is_null() {
+            return None;
+        }
+        let t = Thread(h);
+        if SuspendThread(t.0) == u32::MAX {
+            return None;
+        }
+        let mut c: Ctx = core::mem::zeroed();
+        c.0.ContextFlags = CONTEXT_DEBUG_REGISTERS_AMD64;
+        let ok = GetThreadContext(t.0, &mut c.0) != 0;
+        ResumeThread(t.0);
+        ok.then_some(c.0.Dr7)
+    }
+}
+
 impl Session {
     /// Arm a hardware watch. Needs the policy gate; size 1/2/4/8, naturally aligned, data memory only.
     pub fn arm_watch(
@@ -289,6 +312,33 @@ impl Session {
             self.wr32(proto::watch_offset(slot) + proto::W_ARMED, 0);
         }
         Ok(phase)
+    }
+
+    /// DR7 of every thread of the target, read fresh: `(readable rows as (tid, dr7), tids that could not be read)`.
+    /// A thread that exited between the listing and the read is not "unreadable": it is gone.
+    pub fn read_dr7(&self) -> (Vec<(u32, u64)>, Vec<u32>) {
+        let (mut rows, mut unreadable) = (Vec::new(), Vec::new());
+        for tid in self.threads() {
+            match read_thread_dr7(tid) {
+                Some(dr7) => rows.push((tid, dr7)),
+                None if self.threads().contains(&tid) => unreadable.push(tid),
+                None => {}
+            }
+        }
+        (rows, unreadable)
+    }
+
+    /// The threads a slot has been programmed into (sorted).
+    pub fn watch_threads(&self, slot: usize) -> Vec<u32> {
+        let mut v: Vec<u32> = self
+            .watch
+            .slots
+            .get(slot)
+            .and_then(|w| w.as_ref())
+            .map(|w| w.threads.iter().copied().collect())
+            .unwrap_or_default();
+        v.sort_unstable();
+        v
     }
 
     pub fn watch_hits(&self, slot: usize) -> u32 {
