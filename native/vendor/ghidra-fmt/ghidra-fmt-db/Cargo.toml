@@ -1,0 +1,18 @@
+[package]
+name = "ghidra-fmt-db"
+description = "Ghidra database (DBHandle, master table, Table) read path"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ghidra-fmt-bytes.workspace = true
+ghidra-fmt-gbf.workspace = true
+ghidra-fmt-chain.workspace = true
+ghidra-fmt-field.workspace = true
+ghidra-fmt-btree.workspace = true
+
+[lints]
+workspace = true
