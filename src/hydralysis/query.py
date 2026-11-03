@@ -20,7 +20,7 @@ import zlib
 from contextlib import contextmanager
 from pathlib import Path
 
-from hydralysis import hydra, lineage, targets, viewgov, views, workcopy
+from hydralysis import hydra, lineage, staticplane, targets, viewgov, views, workcopy
 from hydralysis import decompile_result
 from hydralysis.analysis import ADVANCED_ACTIONS, BULK_KINDS, validate_options
 from hydralysis.locks import LockBusy
@@ -906,8 +906,28 @@ class QueryRunner:
             raise failure
         return answer, {}
 
+    def _static(self, selected: dict, request: dict, expected_state) -> dict | None:
+        """The answer of the static read plane (`staticplane`, no engine) or None, and then the engine answers.
+
+        Only with `HYDRALYSIS_IMPL=rust` and the native module, only for a read that no overlay touches, and only for
+        what the plane answers exactly; any refusal of the plane (an unsupported database, a changing file, a question
+        it does not answer) is None, never a partial or guessed reply."""
+        if expected_state is not None or os.environ.get("HYDRALYSIS_TEST_FAULT"):
+            return None
+        if os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() != "rust":
+            return None
+        gpr = selected["gpr"] if selected.get("master_read") else workcopy.read_gpr(self.settings, selected)
+        reply, seconds = staticplane.timed(gpr, selected["program"], request)
+        if reply is None:
+            return None
+        reply["engine"] = {"program": None, "mode": "static", "script_s": round(seconds, 6)}
+        return reply
+
     def _ask(self, selected: dict, request: dict, timeout_s: int, trace: dict | None = None) -> dict:
         expected_state = None if selected.get("master_read") else workcopy.expected_state(self.settings, selected)
+        static = self._static(selected, request, expected_state)
+        if static is not None:
+            return static
         for attempt in (0, 1):
             pool = self._pool()
             reader = self.engine if pool is not None else self.reader(selected)

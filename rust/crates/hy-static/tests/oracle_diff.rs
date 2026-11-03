@@ -400,3 +400,48 @@ fn an_unanalysed_project_and_foreign_layouts_are_declined() {
         }
     }
 }
+
+#[test]
+fn the_json_entry_point_agrees_with_the_typed_api() {
+    use serde_json::Value;
+    let p = analysed();
+    let project = fixtures().join("legacy-12.1.4-analysed").to_string_lossy().into_owned();
+    let args = |extra: Vec<Value>| -> Vec<Value> { [vec![json!(project), json!("/flow_fixture.exe")], extra].concat() };
+    let ok = |name: &str, extra: Vec<Value>| hy_static::call_json(name, &args(extra));
+
+    assert_eq!(hy_static::call_json("supports", &[json!("xrefs")]), json!({"ok": true}));
+    assert_eq!(hy_static::call_json("supports", &[json!("decompile")]), json!({"ok": false}));
+    let info = ok("info", vec![]);
+    assert_eq!(info["ok"]["sha256"], json!(p.info().sha256));
+    assert_eq!(info["ok"]["image_base"], json!("0x140000000"));
+
+    let at = 0x1_4000_14f0u64;
+    let refs = ok("xrefs_to", vec![json!(at)]);
+    assert_eq!(refs["ok"].as_array().unwrap().len(), p.xrefs_to(at).unwrap().len());
+    let functions = ok("functions", vec![]);
+    assert_eq!(functions["ok"].as_array().unwrap().len(), p.functions().unwrap().len());
+    let first = p.functions().unwrap()[0].entry;
+    assert_eq!(ok("function_at_entry", vec![json!(first)])["ok"]["address"], json!(format!("0x{}", address_text(first))));
+    assert_eq!(ok("function_at_entry", vec![json!(first + 1)]), json!({"ok": null}));
+    let bytes = ok("read_bytes", vec![json!(p.info().image_base), json!(4)]);
+    assert_eq!(bytes["ok"], json!("4d5a9000"));
+    let named = ok("symbols_named", vec![json!("no_such_symbol_anywhere")]);
+    assert_eq!(named["ok"], json!([]));
+
+    let answered = ok("answer", vec![request("0x1400014f0", 5, "")]);
+    assert_eq!(answered["ok"]["ok"], json!(true));
+
+    // Refusals come back as data, not as errors.
+    let declined = ok(
+        "answer",
+        vec![{
+            let mut r = request("0x1400014f0", 5, "");
+            r["action"] = json!("function");
+            r
+        }],
+    );
+    assert_eq!(declined["fallback"]["kind"], json!("unsupported"));
+    assert_eq!(ok("nonsense", vec![])["fallback"]["kind"], json!("unsupported"));
+    assert_eq!(hy_static::call_json("info", &[json!("/no/such/project"), json!("/x.exe")])["fallback"]["kind"], json!("unsupported"));
+    assert_eq!(hy_static::call_json("info", &[])["fallback"]["kind"], json!("unsupported"));
+}

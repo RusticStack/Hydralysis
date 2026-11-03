@@ -11,11 +11,13 @@
 //! What is answered, and what is not, is in `PORTING.md` next to this file.
 
 mod answer;
+mod call;
 mod error;
 mod layout;
 mod program;
 
 pub use answer::{ACTIONS, answer, answer_in_project};
+pub use call::{call, call_json};
 pub use error::{Error, Result};
 pub use layout::{Located, Stamp, locate};
 pub use program::{FunctionInfo, LANGUAGE, MAX_READ, ProgramInfo, StaticProgram, SymbolInfo, Xref, address_text};
