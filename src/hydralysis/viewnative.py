@@ -132,6 +132,37 @@ def routed(name: str, python_function, error=None, prepare=None, finish=None):
     return wrapper
 
 
+def _store_unpatched() -> bool:
+    """False while a white-box test has replaced a part of the store writer or reader (see `_rust_store.install_storelog`):
+    the whole-store load and save then run in Python, through the patched part."""
+    storelog = sys.modules.get("hydralysis.storelog")
+    check = getattr(storelog, "rust_unpatched", None)
+    return check is None or check()
+
+
+def store_text(settings: dict, target: dict) -> str | None:
+    """The version-3 store of the view as JSON text, loaded and cleaned by Rust; None when Rust does not answer (the Python
+    `_load_store_uncached` then does). The reply is `{"ok":<store>}`: the store text is cut out of it, not parsed twice."""
+    native = native_views()
+    if native is None or not _store_unpatched():
+        return None
+    reply = native.views_call_rs("workcopy_load_store", json.dumps([settings, target], default=str))
+    if reply.startswith('{"ok":') and reply.endswith("}"):
+        return reply[6:-1]
+    _raise(json.loads(reply)["err"])
+
+
+def save_store(settings: dict, target: dict, store: dict) -> bool:
+    """Write the store with Rust (`HYDRALYSIS_IMPL=rust`, no seam replaced); False when Rust does not answer."""
+    native = native_views()
+    if native is None or not _store_unpatched():
+        return False
+    reply = native.views_call_rs("workcopy_save_store", json.dumps([settings, target, store], default=str))
+    if not reply.startswith('{"ok":'):
+        _raise(json.loads(reply)["err"])
+    return True
+
+
 class WorkcopyHost:
     """What the Rust `edit`, `revert` and `add_proposals` ask of Python: the engine-bound steps and the caller's identity.
     Each method takes one JSON array text and answers one JSON text; an exception propagates to the caller unchanged. The
@@ -161,9 +192,11 @@ def hosted(name: str, python_function, drop: tuple[str, ...] = ("engine",), fini
     """Like `routed`, for the functions whose engine-bound steps Rust asks `WorkcopyHost` for. The parameters named in DROP
     (the engine handle) do not cross.
 
-    Opt-in (`HYDRALYSIS_ROUTE_HOSTED=1`, besides `HYDRALYSIS_IMPL=rust`): measured on a 3000-record view, the Rust edit,
-    revert and add_proposals cost more CPU (about 1.5x) and about twice the peak memory of the Python ones, whose parsed-store
-    cache and log append they cannot yet match, so by default they stay Python. The Rust code is tested against Python."""
+    Opt-in (`HYDRALYSIS_ROUTE_HOSTED=1`, besides `HYDRALYSIS_IMPL=rust`): measured on a 3000-record view
+    (benchmarks/bench_workcopy.py -w edit), the Rust edit, revert and add_proposals cost about the CPU of the Python ones
+    (4.5 s against 5.0 s) but a peak of 164 MiB against 87 MiB, because the store crosses as JSON text in every call; the
+    default rust route (Rust `load_store` and `save_store`, Python `edit`/`revert`) is 119 MiB, so by default the hosted ones
+    stay Python. The Rust code is tested against Python."""
     signature = inspect.signature(python_function)
 
     @functools.wraps(python_function)

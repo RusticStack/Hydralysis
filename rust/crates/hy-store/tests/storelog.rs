@@ -348,3 +348,51 @@ fn random_mutation_sequences_load_identically_with_compaction() {
     }
     assert_eq!(read_back(&path), store);
 }
+
+/// The log rows without the anchors that name them (a fresh random one per snapshot).
+fn row_bodies(path: &Path) -> Vec<Value> {
+    log_rows(path)
+        .into_iter()
+        .map(|mut row| {
+            let map = row.as_object_mut().unwrap();
+            map.remove("a");
+            map.remove("prev");
+            row
+        })
+        .collect()
+}
+
+#[test]
+fn saving_an_owned_record_writes_what_saving_a_borrowed_one_writes() {
+    let borrowed = Fixture::new();
+    let owned_dir = tempfile::tempdir().unwrap();
+    let owned = owned_dir.path().join("view.json");
+    // Appends, a middle removal (the whole list is pushed), a change to a scalar, a field that disappears, a revert-style
+    // journal, and compaction every fifth row.
+    storelog::configure(5, SNAPSHOT_LOG_BYTES, CACHE_ENTRIES);
+    let mut store = base();
+    let mut steps = Vec::new();
+    for i in 0..9 {
+        store = with_edit(&store, i);
+        store["meta"]["n"] = json!(i);
+        steps.push(store.clone());
+    }
+    let mut removed = store.clone();
+    removed["edits"].as_array_mut().unwrap().remove(3);
+    removed["journal"] = json!([{"revert": 3}]);
+    steps.push(removed.clone());
+    let mut gone = removed.clone();
+    gone.as_object_mut().unwrap().remove("meta");
+    steps.push(gone);
+    steps.push(with_edit(&removed, 99));
+    for step in &steps {
+        storelog::save(&borrowed.store(), step, Some(100_000), None).unwrap();
+        storelog::save_owned(&owned, step.clone(), Some(100_000), None).unwrap();
+        assert_eq!(read_back(&owned), read_back(&borrowed.store()));
+    }
+    assert_eq!(read_back(&owned), *steps.last().unwrap());
+    assert_eq!(row_bodies(&owned), row_bodies(&borrowed.store()));
+    // The cache the owned saves leave behind answers like the one the borrowed saves leave.
+    storelog::save_owned(&owned, steps.last().unwrap().clone(), None, None).unwrap();
+    assert_eq!(row_bodies(&owned), row_bodies(&borrowed.store()), "an unchanged save adds no row");
+}

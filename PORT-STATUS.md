@@ -19,7 +19,7 @@ the measurements recorded by the earlier lanes; it was not profiled module by mo
 | Runtime | runtime_device, runtime_events, rust_frida (Rust Frida-shaped device) | hy-runtime, hy-rt-py |
 
 In flight on other lanes (not duplicated here): `r/hy-workcopy` (workcopy file stores, userscripts options/choose/list/stage,
-viewpool; its own benchmark says the hosted edit path is slower and stays opt-in), `r/hy-static` (static plane cache),
+viewpool; the hosted edit path, `HYDRALYSIS_ROUTE_HOSTED=1`, still stays opt-in: CPU 1.1x faster than Python but peak 164 MiB against 87 MiB), `r/hy-static` (static plane cache),
 `r/hy-parityfix` (43 rust-mode failures).
 
 ## Ported on this branch
@@ -27,6 +27,7 @@ viewpool; its own benchmark says the hosted edit path is slower and stays opt-in
 | Module | Rust | Routing | Result |
 |---|---|---|---|
 | `trace_pairing.pair_report` | `hy-trace::pairing`, `native/src/trace/pairing.rs` | on with `HYDRALYSIS_IMPL=rust` | 5x to 36x faster, byte-identical |
+| `workcopy.load_store`, `workcopy._save_store`, `revisions.dependents` (the edit/revert path, not the hosted one) | `hy-views::store`, `hy-store::storelog`, `native/src/views.rs` (`workcopy_load_store`, `workcopy_save_store`, `revisions_dependents`) | on with `HYDRALYSIS_IMPL=rust`; `dependents` only from 64 records (below: Python); not while a store seam is patched (`storelog.rust_unpatched`) | `bench_workcopy.py -w edit`: CPU 4.4 s against 5.0 s (1.1x to 1.3x across runs), peak 119 MiB against 87 MiB (+32 MiB; was 167 MiB and 17 s CPU). files 1.26x, viewpool 1.3x, scripts 2.4x. `dependents` per call, Python / native: 8 records 0.57x, 16 0.73x, 32 0.95x, 48 0.99x, 64 1.24x, 96 2.5x, 256 4.5x, 3000 36x |
 | `trace_bindings.link_events` | `hy-trace::bindings`, `native/src/trace/bindings.rs` | on with `HYDRALYSIS_IMPL=rust` | events read in place (no copies): 4.2x at 5k events, 2.5x at 50k, 3.2x at 300k, peak memory no higher than Python |
 | `runtime_snapshot.compare`, `.stable_sha256`, `.snapshot_id` | `hy-runtime::snapshot`, `hy-rt-py` (`snapshot_compare`, `snapshot_stable_sha256`, `snapshot_id`) | on with `HYDRALYSIS_IMPL=rust` | compare 3x, stable hash 3.8x to 6x, `snapshot_id` 1.6x to 3.7x (writes the canonical JSON straight from the Python objects, then hashes it) |
 | `runtime_decode.normalize`, `.decode`, `.decode_event`, `.layout_values` | `hy-runtime::decode` (pure helpers), `hy-rt-py` `decode_*` (reads the specs and captures from the Python objects, builds the answers as Python lists and dicts) | on with `HYDRALYSIS_IMPL=rust` (the `HYDRALYSIS_RUNTIME_HELD` gate is gone) | 1.3x to 2.5x at every benchmark size, same peak memory; single calls 0.8 us against 1.5 us (normalize), 0.75 against 1.8 (decode_event) |

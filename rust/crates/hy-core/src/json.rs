@@ -84,33 +84,45 @@ fn write_value(out: &mut Vec<u8>, value: &Value, o: Options, depth: usize) {
             }
             out.push(b']');
         }
-        Value::Object(map) => {
-            if map.is_empty() {
-                out.extend_from_slice(b"{}");
-                return;
-            }
-            out.push(b'{');
-            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
-            if o.sort_keys {
-                entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-            }
-            for (i, (key, item)) in entries.into_iter().enumerate() {
-                if i > 0 {
-                    item_separator(out, o.layout);
-                }
-                if let Layout::Pretty(n) = o.layout {
-                    newline(out, n, depth + 1);
-                }
-                write_string(out, key, o.ensure_ascii);
-                out.extend_from_slice(if o.layout == Layout::Compact { b":" } else { b": " });
-                write_value(out, item, o, depth + 1);
-            }
-            if let Layout::Pretty(n) = o.layout {
-                newline(out, n, depth);
-            }
-            out.push(b'}');
-        }
+        Value::Object(map) => write_object(out, map, None, o, depth),
     }
+}
+
+/// An object, with EXTRA written after its own entries (a key the map does not carry), as `dumps` would write the map
+/// with that key inserted last and no sorting. Lets a caller add one entry without copying the whole tree.
+fn write_object(out: &mut Vec<u8>, map: &serde_json::Map<String, Value>, extra: Option<(&str, &Value)>, o: Options, depth: usize) {
+    if map.is_empty() && extra.is_none() {
+        out.extend_from_slice(b"{}");
+        return;
+    }
+    out.push(b'{');
+    let mut entries: Vec<(&str, &Value)> = map.iter().map(|(k, v)| (k.as_str(), v)).collect();
+    if o.sort_keys {
+        entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    }
+    entries.extend(extra);
+    for (i, (key, item)) in entries.into_iter().enumerate() {
+        if i > 0 {
+            item_separator(out, o.layout);
+        }
+        if let Layout::Pretty(n) = o.layout {
+            newline(out, n, depth + 1);
+        }
+        write_string(out, key, o.ensure_ascii);
+        out.extend_from_slice(if o.layout == Layout::Compact { b":" } else { b": " });
+        write_value(out, item, o, depth + 1);
+    }
+    if let Layout::Pretty(n) = o.layout {
+        newline(out, n, depth);
+    }
+    out.push(b'}');
+}
+
+/// `dumps` of the object MAP with one more entry, KEY: EXTRA, last (see [`write_object`]; keys are not sorted).
+pub fn dumps_object_with(map: &serde_json::Map<String, Value>, key: &str, extra: &Value, options: Options) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128);
+    write_object(&mut out, map, Some((key, extra)), Options { sort_keys: false, ..options }, 0);
+    out
 }
 
 fn item_separator(out: &mut Vec<u8>, layout: Layout) {

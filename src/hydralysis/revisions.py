@@ -234,3 +234,32 @@ def dependents(records: list[dict], selected: set[str], committed: set[str] = fr
                     changed = True
                     break
     return sorted(found, key=lambda ident: next(record["seq"] for record in chain if record["id"] == ident))
+
+
+# ---- optional Rust implementation (HYDRALYSIS_IMPL=rust) ----------------------------------------------------------------
+# `dependents` is quadratic in the Python above; hy_views indexes the lowest `seq` per touched pair (same visiting order, same
+# answer). The records cross as JSON; the Python runs while a view seam is replaced (viewnative._python_seams_active).
+
+_dependents_py = dependents
+# Below this many records the JSON crossing costs more than the Python scan. Measured, Python / native per call: 8 records
+# 0.57x, 16 0.73x, 32 0.95x, 48 0.99x, 64 1.24x, 96 2.5x, 256 4.5x, 3000 36x (a shared machine: read the ratios).
+DEPENDENTS_NATIVE_MIN_RECORDS = 64
+
+
+def _install_rust() -> None:
+    global dependents
+    from hydralysis import viewnative
+    native = viewnative.routed("revisions_dependents", _dependents_py,
+                               prepare=lambda values: [{}, values[0], sorted(values[1]), sorted(values[2])])
+
+    def dependents(records: list[dict], selected: set[str], committed: set[str] = frozenset()) -> list[str]:
+        if len(records) < DEPENDENTS_NATIVE_MIN_RECORDS:
+            return _dependents_py(records, selected, committed)
+        return native(records, selected, committed)
+
+    dependents.__doc__ = _dependents_py.__doc__
+    dependents.python_function = _dependents_py
+    globals()["dependents"] = dependents
+
+
+_install_rust()
