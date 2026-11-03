@@ -154,3 +154,12 @@ and `export_worker.run`.
   interleave a read-modify-write); the stage text and the final states are otherwise identical.
 - Engine errors from Rust-built `EngineError::new` carry a minimal `str()` JSON (`engine_error`, `message`, `command`); the
   PyO3 adapter passes the Python exception's own `str()`.
+
+## Static read plane (lane r/hy-static)
+
+| Python test | Class | Status |
+|---|---|---|
+| test_query.py (83) | BB | passes with `HYDRALYSIS_IMPL` unset (217 s) and `=rust` (234 s); the engine stand-ins are not real projects, so the plane declines and the engine path answers |
+| new: tests/test_static_plane.py (7) | PAR | xrefs of 61 addresses equal the Java oracle through `QueryRunner` with no engine call; paging; engine fallback for function/functions/decompile, a program not in the index, overlays, no switch |
+| new: rust/crates/hy-static/tests/oracle_diff.rs (12) | PAR | Java oracle: references to/from, functions, symbols; PE image for bytes; JSON entry point |
+| benchmarks/static_plane.py | PAR | real engine: 200 xrefs queries, rows equal |
