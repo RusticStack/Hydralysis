@@ -94,3 +94,11 @@ structured error. The port raises the structured error; the test asserts the Typ
 
 Not ported in this stage: tamper cache (`tampered_cache_s` > 0 re-hashes every time, same answer), FaultInjected
 `publish.append_torn` (inside the candidate step), the engine-bound `_publish_candidate`, `_verify_candidate`.
+
+## Stage 7 (commit lifecycle without the engine)
+Module lifecycle: recover, in_flight_ids, revert (+ rehydrate from the archive), heal, close_intent, request_abort, find_lineage.
+| Rust test | What it proves | Python tests it stands in for (white-box part) |
+|---|---|---|
+| tests/py_lifecycle.rs | 27 scenarios built on disk in two roots, run by each implementation, results + CURRENT.log + intent logs + store equal: recovery (roll forward, roll back on a tampered generation, unpublished candidate, after PREPARE, backup kept, nothing to do), revert (ok, stale expect, not latest, wrong view, previous generation gone, rehydration from the archive, archive mismatch, revert of a reverted commit, nothing to revert, commit lock busy), heal (rolls forward, closes the intent, finishes a revert, nothing, busy), in-flight ids (dead, live, published, settled), abort (requested, too late). Slow (about 200 s: the Python side) | test_commit.py recover/revert/heal cases |
+
+Not ported: `commits._commit`, `_verify_candidate` (engine-driven candidate build; stays Python, as `views._publish_candidate`).

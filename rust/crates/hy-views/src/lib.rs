@@ -11,6 +11,7 @@ pub mod generations;
 pub mod gens;
 pub mod jobowner;
 pub mod layout;
+pub mod lifecycle;
 pub mod locks;
 pub mod options;
 pub mod proc;

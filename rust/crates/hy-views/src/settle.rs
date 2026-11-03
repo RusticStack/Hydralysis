@@ -66,7 +66,7 @@ pub fn attribution() -> Value {
     json!({"client": format!("rusticre:{}", std::process::id()), "harness": agent_name()})
 }
 
-fn archive_path(settings: &Settings, selected: &Target, cid: &str) -> PathBuf {
+pub fn archive_path(settings: &Settings, selected: &Target, cid: &str) -> PathBuf {
     root_path(settings)
         .join("overlays")
         .join("archive")
