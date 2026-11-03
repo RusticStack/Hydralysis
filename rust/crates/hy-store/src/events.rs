@@ -532,4 +532,12 @@ impl EventLog {
             *slot = writer;
         }
     }
+
+    /// Test hook: while set, every record write fails with this OS error (`OSError: [Errno code] text`).
+    pub fn inject_write_failure(&self, failure: Option<(i32, &str)>) {
+        self.set_writer(failure.map(|(code, text)| -> LineWriter {
+            let message = format!("OSError: [Errno {code}] {text}");
+            std::sync::Arc::new(move |_: &[u8]| Err(message.clone()))
+        }));
+    }
 }

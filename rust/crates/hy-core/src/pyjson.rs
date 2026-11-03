@@ -172,7 +172,8 @@ impl Decoder<'_> {
     fn string(&self, mut end: usize) -> Scan<(usize, usize)> {
         let begin = end - 1;
         loop {
-            let Some(found) = (end..self.chars.len()).find(|&i| matches!(self.chars[i], '"' | '\\') || (self.chars[i] as u32) < 0x20) else {
+            let Some(found) = (end..self.chars.len()).find(|&i| matches!(self.chars[i], '"' | '\\') || (self.chars[i] as u32) < 0x20)
+            else {
                 return fail("Unterminated string starting at", begin);
             };
             let terminator = self.chars[found];
@@ -345,10 +346,7 @@ mod tests {
         assert_eq!(utf8_error(b"{}"), None);
         assert_eq!(utf8_error(b"\xff").as_deref(), Some("'utf-8' codec can't decode byte 0xff in position 0: invalid start byte"));
         assert_eq!(utf8_error(b"a\xc3").as_deref(), Some("'utf-8' codec can't decode byte 0xc3 in position 1: unexpected end of data"));
-        assert_eq!(
-            utf8_error(b"\xe2\x82").as_deref(),
-            Some("'utf-8' codec can't decode bytes in position 0-1: unexpected end of data")
-        );
+        assert_eq!(utf8_error(b"\xe2\x82").as_deref(), Some("'utf-8' codec can't decode bytes in position 0-1: unexpected end of data"));
         assert_eq!(
             utf8_error(b"\xe2\x82x").as_deref(),
             Some("'utf-8' codec can't decode bytes in position 0-1: invalid continuation byte")

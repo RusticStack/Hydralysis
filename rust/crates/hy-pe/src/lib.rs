@@ -447,10 +447,13 @@ mod reloc_tests {
         put(&mut d, opt + 92, &16u32.to_le_bytes());
         put(&mut d, opt + 96 + 5 * 8, &0x3000u32.to_le_bytes());
         put(&mut d, opt + 96 + 5 * 8 + 4, &12u32.to_le_bytes());
-        for (i, (name, vsize, rva, raw, offset)) in
-            [(&b".text"[..], 0x100u32, 0x1000u32, 0x20u32, 0x200u32), (b".data", 0x20, 0x2000, 0x20, 0x220), (b".reloc", 0x20, 0x3000, 0x20, 0x400)]
-                .into_iter()
-                .enumerate()
+        for (i, (name, vsize, rva, raw, offset)) in [
+            (&b".text"[..], 0x100u32, 0x1000u32, 0x20u32, 0x200u32),
+            (b".data", 0x20, 0x2000, 0x20, 0x220),
+            (b".reloc", 0x20, 0x3000, 0x20, 0x400),
+        ]
+        .into_iter()
+        .enumerate()
         {
             let at = opt + 224 + i * 40;
             put(&mut d, at, name);
