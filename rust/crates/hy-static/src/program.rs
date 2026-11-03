@@ -180,7 +180,7 @@ impl StaticProgram {
                 return Err(Error::unsupported(format!("address space {:?} (overlay or unknown space)", entry.space_name)));
             }
         }
-        let options = options_of(&db)?;
+        let options = options_of(db)?;
         let flag = |key: &str| options.get(&format!("Program Information.{key}"));
         if flag("Analyzed").map(String::as_str) != Some("true") {
             return Err(Error::unsupported("the program is not marked analysed"));
@@ -202,7 +202,7 @@ impl StaticProgram {
                 return Err(Error::unsupported(format!("memory block {:?} is outside the default space", block.name)));
             }
         }
-        let file_bytes = read_file_bytes(&db)?;
+        let file_bytes = read_file_bytes(db)?;
         Ok(Self { prog, located, info, blocks, file_bytes, symbols: OnceLock::new(), functions: OnceLock::new() })
     }
 
@@ -231,7 +231,13 @@ impl StaticProgram {
         &self.blocks
     }
 
-    fn space_address(&self, offset: u64) -> Address {
+    /// The default space name (`ram`).
+    pub fn default_space(&self) -> &str {
+        &self.db().address_map().spaces().default_space
+    }
+
+    /// An address in the default space.
+    pub fn space_address(&self, offset: u64) -> Address {
         Address::Space { space: self.db().address_map().spaces().default_space.clone(), offset }
     }
 

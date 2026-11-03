@@ -11,9 +11,15 @@ use serde_json::{Map, Value, json};
 
 use crate::error::{Error, Result};
 use crate::program::{StaticProgram, address_text};
+use crate::rows;
+use ghidra_progdb::Address;
 
 /// The actions [`answer`] can answer. Everything else goes to the engine.
-pub const ACTIONS: &[&str] = &["xrefs"];
+pub const ACTIONS: &[&str] = &["xrefs", "function", "functions"];
+
+/// Function questions rebuild the function index on every call (nothing is kept open between calls), which grows with
+/// the program; above this size the engine, warm, is the faster answer and the plane declines.
+pub const INDEX_FILE_MAX: u64 = 48 << 20;
 
 fn text<'a>(request: &'a Value, key: &str) -> &'a str {
     request.get(key).and_then(Value::as_str).unwrap_or("")
@@ -57,6 +63,22 @@ pub fn answer(program: &StaticProgram, request: &Value) -> Result<Value> {
         .and_then(Value::as_u64)
         .filter(|n| (1..=200).contains(n))
         .ok_or_else(|| Error::unsupported("limit outside 1..200"))? as usize;
+    let mut out = Map::new();
+    out.insert("id".into(), Value::String(text(request, "id").to_owned()));
+    out.insert("program".into(), Value::String(info.name.clone()));
+    out.insert("sha256".into(), Value::String(info.sha256.clone()));
+    out.insert("image_base".into(), Value::String(format!("0x{}", address_text(info.image_base))));
+    out.insert("address_kind".into(), Value::String("VA".into()));
+    match action {
+        "xrefs" => xrefs(program, request, limit, &mut out)?,
+        "function" => function(program, request, &mut out)?,
+        _ => functions(program, request, limit, &mut out)?,
+    }
+    out.insert("ok".into(), Value::Bool(true));
+    Ok(Value::Object(out))
+}
+
+fn xrefs(program: &StaticProgram, request: &Value, limit: usize, out: &mut Map<String, Value>) -> Result<()> {
     let address = parse_address(program, text(request, "address"))?;
     let cursor = text(request, "cursor");
     let skip = if cursor.is_empty() {
@@ -74,27 +96,85 @@ pub fn answer(program: &StaticProgram, request: &Value) -> Result<Value> {
     let more = refs.len() > skip.saturating_add(page.len());
     let rows: Vec<Value> = page
         .iter()
-        .map(|r| {
-            json!({
-                "from": format!("0x{}", r.from_text()),
-                "to": format!("0x{}", r.to_text()),
-                "type": r.ref_type,
-            })
-        })
+        .map(|r| json!({"from": format!("0x{}", r.from_text()), "to": format!("0x{}", r.to_text()), "type": r.ref_type}))
         .collect();
-    let mut out = Map::new();
-    out.insert("id".into(), Value::String(text(request, "id").to_owned()));
-    out.insert("program".into(), Value::String(info.name.clone()));
-    out.insert("sha256".into(), Value::String(info.sha256.clone()));
-    out.insert("image_base".into(), Value::String(format!("0x{}", address_text(info.image_base))));
-    out.insert("address_kind".into(), Value::String("VA".into()));
     out.insert("references".into(), Value::Array(rows));
     out.insert("truncated".into(), Value::Bool(more));
     if more {
         out.insert("next_cursor".into(), Value::String(format!("0x{:x}", skip + page.len())));
     }
-    out.insert("ok".into(), Value::Bool(true));
-    Ok(Value::Object(out))
+    Ok(())
+}
+
+fn index_allowed(program: &StaticProgram) -> Result<()> {
+    if program.located().stamp.len > INDEX_FILE_MAX {
+        return Err(Error::unsupported("program database too large to index per call; the warm engine is faster"));
+    }
+    Ok(())
+}
+
+/// `RusticQuery`: `getFunctionContaining(address)`, or an error the engine words.
+fn function(program: &StaticProgram, request: &Value, out: &mut Map<String, Value>) -> Result<()> {
+    index_allowed(program)?;
+    let address = parse_address(program, text(request, "address"))?;
+    let prog = program.facade();
+    let space = program.default_space();
+    let found = prog
+        .function_containing(&program.space_address(address))
+        .filter(|f| rows::is_internal(f, space))
+        .ok_or_else(|| Error::unsupported("no function contains the address (the engine words that error)"))?;
+    out.insert("function".into(), rows::function_row(prog, found, space)?);
+    Ok(())
+}
+
+/// `RusticQuery` `functions`: entry order from the cursor, at most 2000 scanned and `limit` rows per page.
+fn functions(program: &StaticProgram, request: &Value, limit: usize, out: &mut Map<String, Value>) -> Result<()> {
+    index_allowed(program)?;
+    let contains = text(request, "contains");
+    if !contains.is_ascii() {
+        return Err(Error::unsupported("non-ASCII filter (Java lower-cases with its own rules)"));
+    }
+    let cursor = text(request, "cursor");
+    let from = if cursor.is_empty() { 0 } else { parse_address(program, cursor)? };
+    let prog = program.facade();
+    let space = program.default_space();
+    let mut internal: Vec<(u64, &ghidra_progdb::query::FunctionInfo)> = prog
+        .functions()
+        .iter()
+        .filter(|f| rows::is_internal(f, space))
+        .filter_map(|f| match &f.entry {
+            Address::Space { offset, .. } => Some((*offset, f)),
+            _ => None,
+        })
+        .collect();
+    internal.sort_by_key(|(entry, _)| *entry);
+    let start = internal.partition_point(|(entry, _)| *entry < from);
+    let needle = contains.to_ascii_lowercase();
+    let mut rows_out = Vec::new();
+    let mut scanned = 0usize;
+    let mut last = None;
+    let mut at = start;
+    while at < internal.len() && scanned < 2000 && rows_out.len() < limit {
+        let (entry, f) = internal[at];
+        last = Some(entry);
+        scanned += 1;
+        at += 1;
+        let name = f.name.as_deref().ok_or_else(|| Error::unsupported("function without a computable name"))?;
+        if !name.is_ascii() {
+            return Err(Error::unsupported("non-ASCII function name"));
+        }
+        if name.to_ascii_lowercase().contains(&needle) {
+            rows_out.push(rows::function_row(prog, f, space)?);
+        }
+    }
+    let more = at < internal.len();
+    out.insert("functions".into(), Value::Array(rows_out));
+    out.insert("scanned".into(), json!(scanned));
+    out.insert("truncated".into(), Value::Bool(more));
+    if let (true, Some(last)) = (more, last) {
+        out.insert("next_cursor".into(), Value::String(format!("0x{}", address_text(last + 1))));
+    }
+    Ok(())
 }
 
 /// Open `program` in `project` and [`answer`], checking that the database file did not change while it was read.

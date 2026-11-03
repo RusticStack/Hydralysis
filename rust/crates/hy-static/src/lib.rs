@@ -15,6 +15,7 @@ mod call;
 mod error;
 mod layout;
 mod program;
+mod rows;
 
 pub use answer::{ACTIONS, answer, answer_in_project};
 pub use call::{call, call_json};

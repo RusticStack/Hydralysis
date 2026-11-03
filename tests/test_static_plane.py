@@ -109,6 +109,35 @@ class StaticPlane(unittest.TestCase):
             self.assertEqual(reply["target"], "flow")
         self.assertEqual(self.engine.calls, [], "the engine must not be touched for a static answer")
 
+    def test_function_rows_equal_the_engine_answers_recorded_from_the_real_engine(self):
+        truth = json.loads((FIXTURES / "engine" / "function.json").read_text(encoding="utf-8"))
+        answered = 0
+        for address, want in truth.items():
+            try:
+                got = self.ask("function", address)
+            except AskedTheEngine:
+                continue
+            self.assertEqual(got["function"], want["function"], address)
+            self.assertEqual(got["engine"]["mode"], "static")
+            answered += 1
+        self.assertGreater(answered, 380)
+        pages = json.loads((FIXTURES / "engine" / "functions.json").read_text(encoding="utf-8"))
+        cursor, seen = "", 0
+        for page in pages:
+            try:
+                got = self.ask("functions", "", limit=200, cursor=cursor)
+            except AskedTheEngine:
+                got = None
+            if got is not None:
+                self.assertEqual(got["functions"], page["functions"])
+                for key in ("scanned", "truncated", "next_cursor"):
+                    self.assertEqual(got.get(key), page.get(key))
+                seen += 1
+            if not page["truncated"]:
+                break
+            cursor = page["next_cursor"]
+        self.assertGreaterEqual(seen, 1)
+
     def test_paging_matches_one_big_page(self):
         groups = oracle_refs()
         address = max(groups, key=lambda key: len(groups[key]))
@@ -124,10 +153,14 @@ class StaticPlane(unittest.TestCase):
         self.assertEqual(paged, whole)
 
     def test_a_question_the_plane_cannot_answer_goes_to_the_engine(self):
-        for action in ("function", "functions", "decompile"):
+        for action in ("decompile", "types", "data"):
             with self.assertRaises(AskedTheEngine, msg=action):
                 self.ask(action, "0x140001030")
-        self.assertFalse(staticplane.supports("function"))
+        self.assertFalse(staticplane.supports("decompile"))
+        # a thiscall function: the plane declines (automatic `this`), the engine is asked
+        with self.assertRaises(AskedTheEngine):
+            self.ask("function", "0x140003c60")
+        self.assertIn("unsupported: calling convention that may add automatic parameters", staticplane.reasons())
 
     def test_unsupported_programs_fall_back_to_the_engine(self):
         # not the analysed program of this project: the index does not list it

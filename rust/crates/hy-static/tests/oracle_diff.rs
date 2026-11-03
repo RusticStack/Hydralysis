@@ -364,7 +364,7 @@ fn entry_point_references_print_like_the_engine() {
 #[test]
 fn what_the_plane_does_not_know_is_declined_not_guessed() {
     let p = analysed();
-    for action in ["function", "functions", "decompile", "blocks", "status", "stop", "type_edit", "data", "scan"] {
+    for action in ["decompile", "types", "type", "blocks", "status", "stop", "type_edit", "data", "scan"] {
         let mut r = request("0x140001030", 5, "");
         r["action"] = json!(action);
         assert!(matches!(answer(&p, &r), Err(Error::Unsupported(_))), "{action}");
@@ -436,7 +436,7 @@ fn the_json_entry_point_agrees_with_the_typed_api() {
         "answer",
         vec![{
             let mut r = request("0x1400014f0", 5, "");
-            r["action"] = json!("function");
+            r["action"] = json!("decompile");
             r
         }],
     );
