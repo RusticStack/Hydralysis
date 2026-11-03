@@ -105,7 +105,7 @@ class RustPeParity(unittest.TestCase):
             self.skipTest("no PE corpus present")
 
     def test_synthetic_images_and_errors(self):
-        from tests.test_pe import image as make
+        from test_pe import image as make
         for kwargs in ({}, {"machine": 0x1C4}, {"machine": 0x8664}):
             image = make(**kwargs)
             with self.subTest(kwargs=kwargs):

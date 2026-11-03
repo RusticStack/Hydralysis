@@ -118,7 +118,7 @@ class ExportHelpers(unittest.TestCase):
                              outcome(ew.parity, snapshot, selected, progress, impl="rust"), (snapshot, progress, selected))
 
     def test_body_hash(self):
-        from tests.test_pe import image
+        from test_pe import image
         pe = image(b"\x90" * 31 + b"\xc3")
         base = "0x400000"
         cases = [
