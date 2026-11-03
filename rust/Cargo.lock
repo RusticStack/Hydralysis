@@ -253,6 +253,63 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghidra-fmt-btree"
+version = "0.1.0"
+dependencies = [
+ "ghidra-fmt-bytes",
+ "ghidra-fmt-chain",
+ "ghidra-fmt-field",
+ "ghidra-fmt-gbf",
+]
+
+[[package]]
+name = "ghidra-fmt-bytes"
+version = "0.1.0"
+
+[[package]]
+name = "ghidra-fmt-chain"
+version = "0.1.0"
+dependencies = [
+ "ghidra-fmt-bytes",
+ "ghidra-fmt-gbf",
+]
+
+[[package]]
+name = "ghidra-fmt-db"
+version = "0.1.0"
+dependencies = [
+ "ghidra-fmt-btree",
+ "ghidra-fmt-bytes",
+ "ghidra-fmt-chain",
+ "ghidra-fmt-field",
+ "ghidra-fmt-gbf",
+]
+
+[[package]]
+name = "ghidra-fmt-field"
+version = "0.1.0"
+dependencies = [
+ "ghidra-fmt-bytes",
+]
+
+[[package]]
+name = "ghidra-fmt-gbf"
+version = "0.1.0"
+dependencies = [
+ "ghidra-fmt-bytes",
+]
+
+[[package]]
+name = "ghidra-progdb"
+version = "0.1.0"
+dependencies = [
+ "ghidra-fmt-bytes",
+ "ghidra-fmt-db",
+ "ghidra-fmt-field",
+ "ghidra-fmt-gbf",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -341,6 +398,18 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror",
+]
+
+[[package]]
+name = "hy-static"
+version = "0.1.0"
+dependencies = [
+ "ghidra-fmt-chain",
+ "ghidra-fmt-db",
+ "ghidra-fmt-field",
+ "ghidra-fmt-gbf",
+ "ghidra-progdb",
+ "serde_json",
 ]
 
 [[package]]

@@ -1,0 +1,19 @@
+[package]
+name = "hy-static"
+description = "Hydralysis static read plane: answers questions about an analysed Ghidra project straight from its database files, without a JVM"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ghidra-progdb = { path = "../../../native/vendor/ghidra-fmt/ghidra-progdb" }
+ghidra-fmt-gbf = { path = "../../../native/vendor/ghidra-fmt/ghidra-fmt-gbf" }
+ghidra-fmt-chain = { path = "../../../native/vendor/ghidra-fmt/ghidra-fmt-chain" }
+ghidra-fmt-field = { path = "../../../native/vendor/ghidra-fmt/ghidra-fmt-field" }
+ghidra-fmt-db = { path = "../../../native/vendor/ghidra-fmt/ghidra-fmt-db" }
+serde_json.workspace = true
+
+[lints]
+workspace = true

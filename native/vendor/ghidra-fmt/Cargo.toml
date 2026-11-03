@@ -1,0 +1,37 @@
+# Vendored from the Hydra Engine (Apache-2.0): Ghidra/Framework/HydraFormats, engine commit 75f489388b
+# (branch r/engine-fmt merged into h7/integration). See VENDORED.md. This file is the engine workspace
+# manifest reduced to the crates Hydralysis uses (no ghidra-fmt-pack); the crate manifests are unchanged.
+[workspace]
+resolver = "3"
+members = [
+    "ghidra-fmt-bytes",
+    "ghidra-fmt-gbf",
+    "ghidra-fmt-chain",
+    "ghidra-fmt-field",
+    "ghidra-fmt-btree",
+    "ghidra-fmt-db",
+    "ghidra-progdb",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+ghidra-fmt-bytes = { path = "ghidra-fmt-bytes" }
+ghidra-fmt-gbf = { path = "ghidra-fmt-gbf" }
+ghidra-fmt-chain = { path = "ghidra-fmt-chain" }
+ghidra-fmt-field = { path = "ghidra-fmt-field" }
+ghidra-fmt-btree = { path = "ghidra-fmt-btree" }
+ghidra-fmt-db = { path = "ghidra-fmt-db" }
+ghidra-progdb = { path = "ghidra-progdb" }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
