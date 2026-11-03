@@ -50,6 +50,10 @@ pub trait Host: Send + Sync {
     fn abandon_copy(&self, settings: &Settings, selected: &Target, state: Option<&Value>);
     /// `views._adopt_copy`: the switch to the rebased copy; closes every other copy of the view.
     fn adopt_copy(&self, settings: &Settings, selected: &Target, built: &Value) -> Result<()>;
+    /// `workcopy._attribution`: who the caller is (`{client, harness}`), recorded on every edit and revert.
+    fn attribution(&self) -> Value {
+        crate::settle::attribution()
+    }
     /// The publish job lookup for queue status.
     fn jobs(&self) -> &dyn JobLookup {
         &NoJobs

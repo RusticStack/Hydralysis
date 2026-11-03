@@ -36,7 +36,7 @@ import time
 import uuid
 from pathlib import Path
 
-from hydralysis import hydra, targets, workcopy
+from hydralysis import hydra, targets, viewnative, workcopy
 from hydralysis.backends import read_json, write_json
 from hydralysis.paths import root_path
 
@@ -149,6 +149,9 @@ def _unsaved(error: hydra.EngineError) -> bool:
 
 def _stage(settings: dict, source: Path) -> str:
     own = Path(__file__).with_name("scripts")
+    native = viewnative.native_views()
+    if native is not None:
+        return viewnative.call(native, "userscripts_stage", [{}, str(own), str(hydra.script_dirs(settings)[1]), str(source)])
     if (own / source.name).exists():
         raise ValueError("%s is the name of one of Hydralysis's own scripts; rename yours" % source.name)
     folder = hydra.script_dirs(settings)[1]
@@ -275,6 +278,9 @@ def run(settings: dict, target: str, script: str, args: list[str], timeout_s: in
 def list_scripts(settings: dict, target: str, name_filter: str = "") -> str:
     selected = targets.resolve(settings, target)
     folder = Path(selected.get("scripts") or "")
+    native = viewnative.native_views()
+    if native is not None:
+        return viewnative.call(native, "userscripts_list_scripts", [{}, target, selected.get("scripts") or None, str(folder), name_filter])
     if not selected.get("scripts") or not folder.is_dir():
         raise ValueError("target %s has no scripts directory" % target)
     rows = []
@@ -288,3 +294,17 @@ def list_scripts(settings: dict, target: str, name_filter: str = "") -> str:
                     break
             rows.append("%s  %s" % (path.name, usage))
     return "\n".join(rows) if rows else "no scripts in %s" % folder
+
+
+# ---- optional Rust implementation of the option rules (HYDRALYSIS_IMPL=rust) -------------------------------------------
+
+
+def _chosen(reply: dict):
+    """The native `choose` answers `{"isolation": ...}`, or `{"not_available": {...}}` for the refusal the original raises."""
+    if "not_available" in reply:
+        raise NotAvailable(reply["not_available"]["capability"], reply["not_available"]["message"])
+    return reply["isolation"]
+
+
+check_options = viewnative.routed("userscripts_check_options", check_options, prepare=lambda values: [{}] + values)
+choose = viewnative.routed("userscripts_choose", choose, prepare=lambda values: [{}] + values, finish=_chosen)

@@ -294,6 +294,45 @@ class Pool:
 
 # -- the process's pool -----------------------------------------------------------------------------------------------
 
+class NativePool:
+    """The pool of `dispatch` under `HYDRALYSIS_IMPL=rust`: `hy_views::viewpool::Pool` behind `hydralysis_native.ViewPool`.
+
+    It answers what `dispatch`, `disable`, `close_all` and the shutdown ask of a `Pool` (`send`, `broken`, `close_all`,
+    `shutdown`, `workers` with `pid` and `busy`). The worker command is asked of `command()` at each send, so a replaced
+    `command` is the one that runs. A test that builds `Pool()` itself, or replaces one of the pool's internals, gets the
+    Python pool: nothing here is reachable from it."""
+
+    def __init__(self, native):
+        self._pool = native.ViewPool(IDLE_S, KEEP_IDLE, STOP_GRACE_S, READY_TIMEOUT_S)
+
+    @classmethod
+    def make(cls):
+        if os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() != "rust":
+            return None
+        try:
+            import hydralysis_native as native
+        except ImportError:
+            return None
+        return cls(native) if hasattr(native, "ViewPool") else None
+
+    def send(self, path: Path, env: dict, max_workers: int) -> bool:
+        return self._pool.send(str(path), command(), {key: str(value) for key, value in env.items()}, max(1, int(max_workers)))
+
+    @property
+    def broken(self) -> bool:
+        return self._pool.broken
+
+    @property
+    def workers(self) -> list:
+        return self._pool.workers
+
+    def close_all(self) -> None:
+        self._pool.close_all()
+
+    def shutdown(self) -> None:
+        self._pool.shutdown()
+
+
 _POOL: Pool | None = None
 _POOL_LOCK = threading.Lock()
 _DISABLED = False
@@ -308,7 +347,7 @@ def dispatch(path: Path, env: dict, max_workers: int = 1) -> bool:
         if _DISABLED:
             return False
         if _POOL is None:
-            _POOL = Pool()
+            _POOL = NativePool.make() or Pool()
             atexit.register(_shutdown)
         pool = _POOL
     try:
