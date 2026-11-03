@@ -11,6 +11,7 @@ from their working copy (see workcopy.py).
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -59,9 +60,33 @@ _NO_LINEAGE_S = 5.0
 _NO_NEW_RECORDS = ("revert", "commit", "commit_revert", "commit_abort", "publish", "rebase")
 
 
+def _native(name: str):
+    """The Rust twin NAME (rust/crates/hy-query/src/session.rs) when HYDRALYSIS_IMPL=rust and it is built, else None."""
+    if os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() != "rust":
+        return None
+    try:
+        import hydralysis_native as native
+    except ImportError:
+        return None
+    return getattr(native, name, None)
+
+
+def _json_text(*values):
+    """The JSON text of each value, or None when one is not plain JSON data (the Python path then answers)."""
+    try:
+        return [json.dumps(value, ensure_ascii=False, allow_nan=False) for value in values]
+    except (TypeError, ValueError):
+        return None
+
+
 def accepted(action: str, response: dict) -> dict:
     """The engine's answer as the caller gets it: an error raises; a decompile the engine stopped on purpose is a partial
     result (it keeps `c`, `fragments`, `truncated`, `bytes_emitted`, `reason`) and gains a `decompile` summary."""
+    rust, texts = _native("session_accepted_rs"), None
+    if rust is not None and isinstance(response, dict) and isinstance(action, str):
+        texts = _json_text(response)
+    if texts is not None:
+        return json.loads(rust(action, texts[0]))
     if not response.get("ok"):
         partial = decompile_result.from_error(json.dumps(response)) if action == "decompile" else None
         if partial is None:
@@ -74,6 +99,10 @@ def accepted(action: str, response: dict) -> dict:
 
 def _public(value):
     """Engine credentials never enter MCP/status/export output."""
+    rust = _native("session_public_rs")
+    texts = _json_text(value) if rust is not None else None
+    if texts is not None:
+        return json.loads(rust(texts[0]))
     if isinstance(value, dict):
         return {key: _public(item) for key, item in value.items() if key not in ("ipc", "token", "secret")}
     if isinstance(value, list):
@@ -255,6 +284,10 @@ def _holding():
 
 def reader_lanes(settings: dict) -> int:
     """How many reader connections a hydra.4 process spreads its reads over (`readerLanes`, 1..64, default READER_LANES)."""
+    rust = _native("session_reader_lanes_rs")
+    texts = _json_text(settings) if rust is not None and isinstance(settings, dict) else None
+    if texts is not None:
+        return rust(texts[0])
     value = settings.get("readerLanes", settings.get("reader_lanes"))
     return value if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 64 else READER_LANES
 
@@ -328,6 +361,20 @@ def engine_decompile(engine: hydra.Engine, program: dict, request: dict, timeout
     caller set one of those, or when the script could not decompile at all ("No pcode", a timeout, a buffer overflow). That
     second answer can take minutes: unless INLINE (the job worker) the call raises DeferDecompile and the caller starts a job.
     The answer of a failed script is labelled `fallback`. Its fields are merged by `decompile_result.merge`."""
+    rust = _native("session_engine_decompile_rs")
+    texts = None
+    if rust is not None and isinstance(request, dict) and isinstance(response, dict) and isinstance(program.get("key"), str)             and isinstance(request.get("options") or {}, dict) and isinstance(timeout_s, int) and not isinstance(timeout_s, bool):
+        texts = _json_text(request, response)
+    if texts is not None:
+        kind, text = rust(engine, program["key"], texts[0], timeout_s, texts[1], bool(inline))
+        if kind == "answer":
+            answer = json.loads(text)
+            return response if answer == response else answer
+        if kind == "defer":
+            raise DeferDecompile(text)
+        if kind in ("type", "value"):
+            raise (TypeError if kind == "type" else ValueError)(text)
+        # "unsupported": a shape the port does not model; the original below answers.
     if request.get("action") != "decompile":
         return response
     options = request.get("options") or {}
