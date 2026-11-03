@@ -110,11 +110,37 @@ class LinkEventsParity(unittest.TestCase):
         rng = random.Random(2)
         events, tab = trace(rng, 60), table(rng)
         want = json.dumps(trace_bindings._link_events_py(copy.deepcopy(events), tab))
-        with patch.dict(os.environ, {"HYDRALYSIS_IMPL": "rust", "HYDRALYSIS_TRACE_HELD": "1"}):   # held back by default: see trace_native
+        with patch.dict(os.environ, {"HYDRALYSIS_IMPL": "rust"}):   # routed by default since the events are read in place
+            from hydralysis import trace_native
+            self.assertIsNotNone(trace_native.function("bindings_link_events"))
             self.assertEqual(json.dumps(trace_bindings.link_events(copy.deepcopy(events), tab)), want)
             events[0]["thread_gen"] = [1, 2]
             self.assertEqual(json.dumps(trace_bindings.link_events(copy.deepcopy(events), tab)),
                              json.dumps(trace_bindings._link_events_py(copy.deepcopy(events), tab)))
+
+    def test_thread_generations_that_share_text_or_sort_by_text(self):
+        """1 and "1" print alike (equal sort rank, different threads); "10" sorts before "9"; None prints as "None"."""
+        tab = {"rows": [{"script_name": "f", "status": "resolved", "native_rva": "rva:0x10"}]}
+        rng = random.Random(4)
+        for _ in range(60):
+            events = []
+            for number in range(rng.randint(0, 40)):
+                thread = rng.choice([1, "1", 9, "9", 10, "10", None, "None", "", -1, "aé", "Z"])
+                if rng.random() < 0.4:
+                    events.append({"event_id": number, "seq": rng.randint(0, 12), "thread_gen": thread, "payload": {"script_function": rng.choice(["f", "g"])}})
+                else:
+                    events.append({"event_id": number, "seq": rng.randint(0, 12), "thread_gen": thread, "kind": "core.function.enter", "rva": rng.choice([16, 17, "16", None])})
+            self.assertEqual(self.compare(events, tab, rng.choice([1, 2, 8]))[0], "ok")
+
+    def test_event_ids_and_names_are_returned_as_the_same_objects(self):
+        marker = ("an", "id")
+        events = [{"event_id": marker, "seq": 1, "thread_gen": 1, "payload": {"script_function": "f"}},
+                  {"seq": 2, "thread_gen": 1, "kind": "core.function.enter", "rva": 16}]
+        tab = {"rows": [{"script_name": "f", "status": "resolved", "native_rva": "rva:0x10"}]}
+        got = hydralysis_native.bindings_link_events(events, tab, 8)
+        self.assertIs(got["links"][0]["from"], marker)
+        self.assertIsNone(got["links"][0]["to"])
+        self.assertIs(got["links"][0]["script_function"], events[0]["payload"]["script_function"])
 
 
 if __name__ == "__main__":

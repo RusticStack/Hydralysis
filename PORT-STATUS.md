@@ -27,7 +27,7 @@ viewpool; its own benchmark says the hosted edit path is slower and stays opt-in
 | Module | Rust | Routing | Result |
 |---|---|---|---|
 | `trace_pairing.pair_report` | `hy-trace::pairing`, `native/src/trace/pairing.rs` | on with `HYDRALYSIS_IMPL=rust` | 5x to 36x faster, byte-identical |
-| `trace_bindings.link_events` | `hy-trace::bindings`, `native/src/trace/bindings.rs` | held back (`HYDRALYSIS_TRACE_HELD=1`) | 0.6x at 5k events, 1.5x at 300k, 2x memory: opt-in only |
+| `trace_bindings.link_events` | `hy-trace::bindings`, `native/src/trace/bindings.rs` | on with `HYDRALYSIS_IMPL=rust` | events read in place (no copies): 4.2x at 5k events, 2.5x at 50k, 3.2x at 300k, peak memory no higher than Python |
 | `runtime_snapshot.compare`, `.stable_sha256`, `.snapshot_id` | `hy-runtime::snapshot`, `hy-rt-py` (`snapshot_compare`, `snapshot_stable_sha256`, `snapshot_id`) | on with `HYDRALYSIS_IMPL=rust` | compare 3x, stable hash 3.8x to 6x, `snapshot_id` 1.6x to 3.7x (writes the canonical JSON straight from the Python objects, then hashes it) |
 | `runtime_decode.normalize`, `.decode`, `.decode_event`, `.layout_values` | `hy-runtime::decode` (pure helpers), `hy-rt-py` `decode_*` (reads the specs and captures from the Python objects, builds the answers as Python lists and dicts) | on with `HYDRALYSIS_IMPL=rust` (the `HYDRALYSIS_RUNTIME_HELD` gate is gone) | 1.3x to 2.5x at every benchmark size, same peak memory; single calls 0.8 us against 1.5 us (normalize), 0.75 against 1.8 (decode_event) |
 
@@ -44,12 +44,12 @@ from `GetProcessMemoryInfo`; the input is built before the timer and is the same
 | pair_report | 2k events | 9.4 / 30.0 | 1.8 / 31.1 | 5.3x |
 | pair_report | 20k | 342 / 42 | 26 / 51 | 13x |
 | pair_report | 100k | 7774 / 90 | 216 / 126 | 36x (+36 MB) |
-| link_events | 5k | 2.9 / 31.5 | 4.9 / 35.7 | 0.59x |
-| link_events | 50k | 91 / 54 | 60 / 82 | 1.5x |
-| link_events | 300k | 823 / 194 | 551 / 402 | 1.5x (2x memory) |
+| link_events (after r/hy-fast) | 5k | 3.4 / 31.8 | 0.8 / 31.8 | 4.2x |
+| link_events (after r/hy-fast) | 50k | 64 / 54.8 | 26 / 54.3 | 2.5x |
+| link_events (after r/hy-fast) | 300k | 650 / 194 | 203 / 174 | 3.2x |
 
 `pair_report` wins because the Python scans the owner values once per mirror event (quadratic); the Rust bisects the sorted
-owner events (same answer). `link_events` is linear in both; the Rust spends its time copying events out of Python, so it is held back.
+owner events (same answer). `link_events` is linear in both; it first spent its time copying events out of Python (0.59x at 5k, 1.5x at 300k, 2x memory), now reads five fields per event into a compact record and fetches `event_id` from the original event only for the answers.
 
 ## Remaining, ranked by hot-path relevance (not ported)
 

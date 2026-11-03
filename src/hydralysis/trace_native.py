@@ -23,9 +23,9 @@ def native():
 
 # Ported, tested against the Python and exposed by the extension, but not routed unless asked for: measured no faster than the
 # Python (the report builders and `shape` spend their time moving Python objects across, not in the logic; see
-# rust/crates/hy-trace/PORTING.md; `bindings_link_events` measured 0.7x at 5k events, 1.2x at 300k, see benchmarks/bench_trace_ports.py).
+# rust/crates/hy-trace/PORTING.md; `bindings_link_events` reads the events in place and is routed, see benchmarks/bench_trace_ports.py).
 # HYDRALYSIS_TRACE_HELD=1 routes them anyway; the parity tests do.
-HELD_BACK = ("reports_", "trace_shape", "bindings_")
+HELD_BACK = ("reports_", "trace_shape")
 
 
 def function(name: str):
