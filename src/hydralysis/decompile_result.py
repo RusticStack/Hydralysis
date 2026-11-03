@@ -187,3 +187,80 @@ def from_error(message: str) -> dict | None:
             or not (isinstance(reply.get("c"), str) or reply.get("fragments") or "bytes_emitted" in reply or "cut" in reply)):
         return None
     return reply
+
+
+# --- HYDRALYSIS_IMPL=rust ----------------------------------------------------------------------------------------
+# rust/crates/hy-query/src/decompile.rs answers the same functions; the switch is read on every call. Anything that is
+# not plain JSON data stays on the Python implementation below.
+
+def _rust_call(name: str, *args):
+    """The Rust result as parsed JSON, or NotImplemented when the switch is off or an argument is not JSON data."""
+    import os
+    if os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() != "rust":
+        return NotImplemented
+    try:
+        texts = [json.dumps(arg, ensure_ascii=False) for arg in args]
+        import hydralysis_native as native
+        function = getattr(native, name)
+    except (TypeError, ValueError, ImportError, AttributeError):
+        return NotImplemented
+    return function(*texts)
+
+
+def _delegate(python_impl, native_name, convert, accepts=lambda *a: True):
+    def method(*args):
+        if accepts(*args):
+            raw = _rust_call(native_name, *args)
+            if raw is not NotImplemented:
+                return convert(raw)
+        return python_impl(*args)
+    method.__name__ = python_impl.__name__
+    method.__doc__ = python_impl.__doc__
+    return method
+
+
+def _fragments_result(raw):
+    kept, note = json.loads(raw)
+    return kept, note
+
+
+fragments = _delegate(fragments, "decompile_fragments_rs", _fragments_result)
+summarize = _delegate(summarize, "decompile_summarize_rs", json.loads, lambda reply: isinstance(reply, dict))
+limitations = _delegate(limitations, "decompile_limitations_rs", list, lambda reply: isinstance(reply, dict))
+coverage = _delegate(coverage, "decompile_coverage_rs", json.loads, lambda reply: isinstance(reply, dict))
+def _merge_result(raw):
+    return json.loads(raw)
+
+
+def _delegate_merge(python_impl):
+    def method(response, reply):
+        if isinstance(response, dict) and isinstance(reply, dict):
+            raw = _rust_call("decompile_merge_rs", response, reply)
+            if raw is not NotImplemented:
+                return response if raw is None else json.loads(raw)   # unchanged: the same object, as in Python
+        return python_impl(response, reply)
+    method.__name__ = python_impl.__name__
+    method.__doc__ = python_impl.__doc__
+    return method
+
+
+merge = _delegate_merge(merge)
+
+
+def _delegate_from_error(python_impl):
+    def method(message):
+        import os
+        if isinstance(message, str) and os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() == "rust":
+            try:
+                import hydralysis_native as native
+                raw = native.decompile_from_error_rs(message)
+            except (ImportError, AttributeError):
+                return python_impl(message)
+            return None if raw is None else json.loads(raw)
+        return python_impl(message)
+    method.__name__ = python_impl.__name__
+    method.__doc__ = python_impl.__doc__
+    return method
+
+
+from_error = _delegate_from_error(from_error)

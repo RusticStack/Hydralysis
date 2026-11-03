@@ -22,7 +22,7 @@ pub const TRACE_PIN_FORMAT: &str = "hydralysis.trace-pin/1";
 /// Files whose bytes may differ between two exports of the same claims.
 pub const VOLATILE_FILES: &[&str] = &["manifest.json", "environment.json", "evidence.jsonl"];
 /// The version recorded in environment.json by default (`hydralysis.__version__`).
-pub const HYDRALYSIS_VERSION: &str = "0.7.0";
+pub const HYDRALYSIS_VERSION: &str = "0.8.0";
 
 pub const REA_BUNDLE_MAP: &[(&str, &str)] = &[
     ("records", "evidence.jsonl"),

@@ -386,3 +386,29 @@ def _edit(value: dict) -> dict:
     if not isinstance(edit_id, str) or not re.fullmatch(r"[0-9a-f]{32}", edit_id):
         raise ValueError("overlay id must be 32 lowercase hexadecimal characters")
     return {"id": edit_id, "address": address, "options": options}
+
+
+# --- HYDRALYSIS_IMPL=rust ----------------------------------------------------------------------------------------
+# rust/crates/hy-query/src/analysis.rs validates everything except the branches that read files or compile a Python
+# regex (diff, batch file, import_types/import_archive, scan regex); those, and any input that is not plain JSON data,
+# run the Python implementation below.
+
+def _delegating_validate(python_impl):
+    def validate(action, options, *, _record=False):
+        import os
+        if os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() == "rust" and (options is None or isinstance(options, dict)):
+            try:
+                import hydralysis_native as native
+                text = None if options is None else json.dumps(options, ensure_ascii=False)
+                return json.loads(native.validate_options_rs(action, text, _record))
+            except NotImplementedError:
+                pass
+            except (TypeError, ImportError, AttributeError):
+                pass
+        return python_impl(action, options, _record=_record)
+    validate.__name__ = python_impl.__name__
+    validate.__doc__ = python_impl.__doc__
+    return validate
+
+
+validate_options = _delegating_validate(validate_options)

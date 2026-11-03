@@ -263,3 +263,24 @@ def cancel(settings: dict, job_id: str, owner: str = "") -> dict:
                 update(path, state="cancelled", stage="cancelled while " + record["state"], cancel_requested=False,
                        complete=False, all_succeeded=False)
     return status(settings, job_id)
+
+
+# --- HYDRALYSIS_IMPL=rust ----------------------------------------------------------------------------------------
+def _delegating_code_sha256(python_impl):
+    names = ("query.py", "analysis.py", "exporting.py", "export_worker.py", "workcopy.py", "hydra.py", "targets.py",
+             "scripts/RusticQuery.java")
+
+    def code_sha256_():
+        if os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() == "rust":
+            try:
+                import hydralysis_native as native
+                return native.export_code_sha256_rs(str(Path(__file__).parent), list(names))
+            except (ImportError, AttributeError, OSError):
+                pass
+        return python_impl()
+    code_sha256_.__name__ = python_impl.__name__
+    code_sha256_.__doc__ = python_impl.__doc__
+    return code_sha256_
+
+
+code_sha256 = _delegating_code_sha256(code_sha256)

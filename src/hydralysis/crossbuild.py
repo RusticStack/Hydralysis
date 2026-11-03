@@ -470,3 +470,24 @@ def transfer_checks(prepared: list[dict], pairs: dict, source: dict, destination
     out.write_text(json.dumps(document, indent=2), encoding="utf-8")
     return {"rows": len(prepared), "candidates": len(candidates), "unplaced": len(missing),
             "review_required": True, "file": str(out)}
+
+
+# --- HYDRALYSIS_IMPL=rust ----------------------------------------------------------------------------------------
+def _delegating_match(python_impl):
+    def match_(source, destination):
+        import os
+        if os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() == "rust":
+            try:
+                import hydralysis_native as native
+                text = native.crossbuild_match_rs(json.dumps(source), json.dumps(destination))
+            except (ImportError, AttributeError, TypeError, ValueError):
+                text = None
+            if text is not None:
+                return {rva: (other, method) for rva, other, method in json.loads(text)}
+        return python_impl(source, destination)
+    match_.__name__ = python_impl.__name__
+    match_.__doc__ = python_impl.__doc__
+    return match_
+
+
+match = _delegating_match(match)

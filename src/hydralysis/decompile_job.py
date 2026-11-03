@@ -27,6 +27,14 @@ TICK_S = 5.0
 
 
 def job_path(settings: dict, job_id: str) -> Path:
+    if os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() == "rust":
+        try:
+            import hydralysis_native as native
+            found = native.decompile_job_path_rs(str(root_path(settings)), job_id)
+        except (ImportError, AttributeError):
+            pass
+        else:
+            return Path(found)
     if not re.fullmatch(r"decompile-[0-9a-f]{12}", job_id):
         raise ValueError("invalid decompile job id")
     return root_path(settings) / "decompile-jobs" / job_id / "job.json"

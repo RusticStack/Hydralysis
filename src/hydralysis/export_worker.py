@@ -535,3 +535,78 @@ def run(path: Path, generation: str, runner_factory=QueryRunner):
 
 if __name__ == "__main__":
     run(Path(sys.argv[1]).resolve(), sys.argv[2])
+
+
+# --- HYDRALYSIS_IMPL=rust ----------------------------------------------------------------------------------------
+# rust/crates/hy-query/src/export.rs answers the pure parts (JSONL replay with rayon, body hashing, completeness
+# helpers). Anything that is not plain JSON data, or an input shape the Rust code does not read, stays on Python.
+
+def _rust_native():
+    if os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() != "rust":
+        return None
+    try:
+        import hydralysis_native as native
+    except ImportError:
+        return None
+    return native if hasattr(native, "export_replay_rs") else None
+
+
+def _with_rust(python_impl, rust_impl):
+    def method(*args, **kwargs):
+        native = _rust_native()
+        if native is not None:
+            try:
+                answer = rust_impl(native, *args, **kwargs)
+            except TypeError:
+                answer = NotImplemented
+            if answer is not NotImplemented:
+                return answer
+        return python_impl(*args, **kwargs)
+    method.__name__ = python_impl.__name__
+    method.__doc__ = python_impl.__doc__
+    return method
+
+
+def _rust_replay(native, path, record):
+    output = output_path(path, record)
+    if not output.exists():
+        return NotImplemented
+    raw = json.loads(native.export_replay_rs(str(output), record["id"], record["provenance"]["sha256"],
+                                             record["options"]["mode"], json.dumps(record["provenance"]),
+                                             MAX_OUTPUT_BYTES, MAX_ROW_BYTES))
+    raw["keys"] = set(raw["keys"])
+    validate_imports(path, record, required=raw["completed"] > 0)
+    return raw
+
+
+def _rust_body_hash(native, response, image):
+    if image is None:
+        text = native.export_body_hash_rs(json.dumps(response))
+    else:
+        from hydralysis import pe
+        text = native.export_body_hash_rs(json.dumps(response), pe._native_image(image))
+    return NotImplemented if text is None else json.loads(text)
+
+
+def _rust_parity(native, snapshot, selected, progress):
+    keys = snapshot.get("keys")
+    if not isinstance(keys, list) or not all(isinstance(key, str) for key in keys) or not all(isinstance(key, str) for key in progress["keys"]):
+        return NotImplemented
+    if not isinstance(snapshot.get("count"), int) or isinstance(snapshot.get("count"), bool):
+        return NotImplemented
+    text = native.export_parity_rs(json.dumps(snapshot), selected["limit"], list(progress["keys"]),
+                                   progress["succeeded"], progress["failed"])
+    return NotImplemented if text is None else json.loads(text)
+
+
+def _rust_keys_sha256(native, keys):
+    return native.export_keys_sha256_rs(list(keys)) if all(isinstance(key, str) for key in keys) else NotImplemented
+
+
+replay = _with_rust(replay, _rust_replay)
+_sha = _with_rust(_sha, lambda native, path: native.export_sha256_file_rs(str(path)))
+body_hash = _with_rust(body_hash, _rust_body_hash)
+decompile_row = _with_rust(decompile_row, lambda native, response: json.loads(native.export_decompile_row_rs(json.dumps(response))))
+partial = _with_rust(partial, lambda native, response: native.export_partial_rs(json.dumps(response)))
+keys_sha256 = _with_rust(keys_sha256, _rust_keys_sha256)
+parity = _with_rust(parity, _rust_parity)

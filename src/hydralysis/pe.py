@@ -570,3 +570,65 @@ def parse_rva(text: str, image_base: int = 0x140000000) -> int:
 def _body(text: str) -> str:
     """A section of a combined answer, without the repeated image header."""
     return chr(10).join(line for line in text.splitlines() if not line.startswith("#"))
+
+
+# --- HYDRALYSIS_IMPL=rust ----------------------------------------------------------------------------------------
+# The Rust port (rust/crates/hy-pe, hy-disasm, hy-query; bound in native/src/pe.rs) answers the same methods with the
+# same text. The switch is read on every call so a test can flip it; Python stays the default and the reference.
+
+_NATIVE_METHODS = (
+    "header", "rva_to_offset", "_available", "read_rva", "string_at", "loaded_bytes", "disasm", "callers", "xrefs",
+    "find_strings", "sections_text", "imports_text", "exports_text", "sigscan", "callees", "inspect", "function_of",
+)
+
+
+def rust_impl_enabled() -> bool:
+    import os
+    return os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() == "rust"
+
+
+def _native_image(image: "Image"):
+    cached = image.__dict__.get("_native_cache")
+    if cached is None or cached[0] is not image.data:
+        import hydralysis_native as native
+        cached = (image.data, native.NativeImage.from_bytes(image.path.name, image.data))
+        image.__dict__["_native_cache"] = cached
+    handle = cached[1]
+    evidence = getattr(image, "_address_resolution", None)
+    if evidence:
+        import json
+        handle.address_resolution = json.dumps(evidence, ensure_ascii=False)
+    else:
+        handle.address_resolution = None
+    return handle
+
+
+def _delegating(name: str, python_impl):
+    native_name = {"_available": "available"}.get(name, name)
+
+    def method(self, *args, **kwargs):
+        if not rust_impl_enabled():
+            return python_impl(self, *args, **kwargs)
+        return getattr(_native_image(self), native_name)(*args, **kwargs)
+
+    method.__name__ = name
+    method.__doc__ = python_impl.__doc__
+    return method
+
+
+for _name in _NATIVE_METHODS:
+    setattr(Image, _name, _delegating(_name, getattr(Image, _name)))
+del _name
+
+
+_python_fingerprint = Image.fingerprint
+
+
+def _fingerprint(self) -> dict:
+    if not rust_impl_enabled():
+        return _python_fingerprint(self)
+    import json
+    return json.loads(_native_image(self).fingerprint_json())
+
+
+Image.fingerprint = _fingerprint
