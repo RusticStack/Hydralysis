@@ -216,6 +216,14 @@ class EngineRetryPolicy(unittest.TestCase):
         self.assertEqual(len(self.sent("script", "decompile")), 2)
         self.assertGreater(self.daemon.sessions, sessions)
 
+    def test_read_actions_are_marked_pure_and_overlay_state_is_not(self):
+        from hydralysis import query
+        base = {"address": "0x140001000", "limit": 1, "cursor": "", "contains": "", "timeout_s": 5, "options": {}}
+        query.run_script(self.writer, self.program, dict(base, id="p", action="decompile"), 5)
+        self.assertTrue(self.sent("script", "decompile")[-1].get("pure"))
+        query.run_script(self.writer, self.program, dict(base, id="q", action="overlay_state"), 5)
+        self.assertNotIn("pure", self.sent("script", "overlay_state")[-1])
+
     def test_read_commands_are_retried_through_oserror_and_closed(self):
         for oserror in (False, True):
             with self.subTest(oserror=oserror):
