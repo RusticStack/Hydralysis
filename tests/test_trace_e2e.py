@@ -257,7 +257,13 @@ class M1(unittest.TestCase):
         self.assertTrue(all(g["reason"] == "budget" for g in gaps))
         self.assertEqual(sum(g["dropped"] for g in gaps), sampling["skipped"])                 # every skipped hit is cited, exactly
         calls = [e for e in events if not e["kind"].startswith("core.capture.") and e["kind"] != "core.marker"]
-        self.assertTrue(any(e["confidence"] == "sampled" for e in calls))                       # kept while thinned: labelled
+        thinned = {row["probe"] for row in sampling["sites"] if row["stride"] > 1}
+        thinned_calls = [e for e in calls if (e.get("payload") or {}).get("site") in thinned]
+        # A site thinned only at the very end may have no kept record before the capture stops; the wire mapping
+        # (F_SAMPLED -> confidence "sampled") is covered deterministically by tests.test_trace_wire. Every record
+        # that does come from a thinned site must carry the label.
+        self.assertTrue(all(e["confidence"] == "sampled" for e in thinned_calls),
+                        [(e["kind"], e["confidence"]) for e in thinned_calls if e["confidence"] != "sampled"][:5])
         total = sum(r["hits"] for r in sampling["sites"])
         self.assertEqual(total, sampling["skipped"] + sum(r["kept"] for r in sampling["sites"]))
         self.assertEqual(health["verify"]["outcome"], "clean")
