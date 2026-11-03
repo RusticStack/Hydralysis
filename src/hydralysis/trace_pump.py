@@ -25,6 +25,11 @@ from pathlib import Path
 
 from hydralysis import durable, trace_canon
 
+try:  # optional Rust chain walk (native/src/trace/segment.rs); HYDRALYSIS_NATIVE=0 or a missing wheel uses the Python loop below
+    from hydralysis_native import scan_chain as _scan_chain  # type: ignore[import-not-found]
+except ImportError:
+    _scan_chain = None
+
 BATCH_EVENTS = 200
 POLL_S = 0.02
 
@@ -63,7 +68,15 @@ class SegmentTail:
             return []
         out: list[dict] = []
         cursor = 0
+        fast = _scan_chain if os.environ.get("HYDRALYSIS_NATIVE", "1") != "0" else None
         while len(out) < limit:
+            if fast is not None:
+                # The Rust walk takes every line it can vouch for (CRC, numbering, link, hash of the line's own bytes); it
+                # stops in front of the first it cannot, which the code below judges exactly as before.
+                cursor, self.count, self.head, events, stopped = fast(data, cursor, self.count, self.head, self.skip, limit - len(out))
+                out.extend(events)
+                if not stopped:
+                    break
             end = data.find(b"\n", cursor)
             if end < 0:
                 break

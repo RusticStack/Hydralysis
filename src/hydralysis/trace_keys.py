@@ -30,6 +30,13 @@ instead of returning, for a caller that must not proceed on a partial answer.
 
 from __future__ import annotations
 
+import os
+
+try:  # optional Rust twin of `annotate` (native/src/trace/keys.rs); HYDRALYSIS_NATIVE=0 or a missing wheel uses the Python below
+    from hydralysis_native import annotate_events as _annotate_events  # type: ignore[import-not-found]
+except ImportError:
+    _annotate_events = None
+
 
 class RoleResolverRefused(ValueError):
     """A role resolver of the profile cannot be evaluated from these events."""
@@ -64,7 +71,25 @@ def _matches(index: int, phase: dict, event: dict) -> bool:
 
 
 def annotate(events: list[dict], profile, *, strict: bool = False) -> tuple[list[dict], dict]:
-    """(events with frame/phase/role stamped, a report of what was and was not resolved). EVENTS are not modified."""
+    """(events with frame/phase/role stamped, a report of what was and was not resolved). EVENTS are not modified.
+
+    The native twin gives the same answer; whatever it does not understand (an event or profile of an unexpected shape) it
+    refuses and this function then runs the Python below, which answers or raises exactly as it always did."""
+    if _annotate_events is not None and type(events) is list and os.environ.get("HYDRALYSIS_NATIVE", "1") != "0":
+        try:
+            data = profile.data
+            out, report = _annotate_events(events, list(data.get("roles", [])), list(data.get("phases", [])), strict, _norm_rva)
+        except Exception:  # noqa: BLE001 - the Python implementation is the specification and the fallback
+            pass
+        else:
+            if out is None:
+                raise RoleResolverRefused(report["refused_resolvers"])
+            return out, report
+    return annotate_python(events, profile, strict=strict)
+
+
+def annotate_python(events: list[dict], profile, *, strict: bool = False) -> tuple[list[dict], dict]:
+    """`annotate` in Python (the specification the native twin is tested against)."""
     data = profile.data
     roles = data.get("roles", [])
     phases = data.get("phases", [])
