@@ -59,23 +59,14 @@ fn query(pid: u32) -> Result<(u64, String, bool), IdentityError> {
         if h.is_null() {
             let e = io::Error::last_os_error();
             // 87 = ERROR_INVALID_PARAMETER: no such pid. Access denied stays an error, not "gone".
-            return Err(if e.raw_os_error() == Some(87) {
-                IdentityError::Gone
-            } else {
-                IdentityError::Os(e)
-            });
+            return Err(if e.raw_os_error() == Some(87) { IdentityError::Gone } else { IdentityError::Os(e) });
         }
         let h = Owned(h);
         let alive = WaitForSingleObject(h.0, 0) == WAIT_TIMEOUT;
         if !alive {
             return Ok((0, String::new(), false));
         }
-        let (mut c, mut x, mut k, mut u) = (
-            core::mem::zeroed(),
-            core::mem::zeroed(),
-            core::mem::zeroed(),
-            core::mem::zeroed(),
-        );
+        let (mut c, mut x, mut k, mut u) = (core::mem::zeroed(), core::mem::zeroed(), core::mem::zeroed(), core::mem::zeroed());
         if GetProcessTimes(h.0, &mut c, &mut x, &mut k, &mut u) == 0 {
             return Err(IdentityError::Os(io::Error::last_os_error()));
         }
@@ -95,11 +86,7 @@ impl ProcessIdentity {
         if !alive {
             return Err(IdentityError::Gone);
         }
-        Ok(ProcessIdentity {
-            pid,
-            created,
-            image,
-        })
+        Ok(ProcessIdentity { pid, created, image })
     }
 
     /// Ok when the pid still names the same live process. Any doubt other than a confirmed exit is an error, never
@@ -110,16 +97,10 @@ impl ProcessIdentity {
             return Err(IdentityError::Gone);
         }
         if created != self.created {
-            return Err(IdentityError::Reused {
-                was: self.created,
-                now: created,
-            });
+            return Err(IdentityError::Reused { was: self.created, now: created });
         }
         if !image.eq_ignore_ascii_case(&self.image) {
-            return Err(IdentityError::ImageChanged {
-                was: self.image.clone(),
-                now: image,
-            });
+            return Err(IdentityError::ImageChanged { was: self.image.clone(), now: image });
         }
         if !alive {
             return Err(IdentityError::Gone);
@@ -129,10 +110,7 @@ impl ProcessIdentity {
 
     /// True only when the process is confirmed absent or the pid was reused.
     pub fn is_gone(&self) -> bool {
-        matches!(
-            self.verify(),
-            Err(IdentityError::Gone) | Err(IdentityError::Reused { .. })
-        )
+        matches!(self.verify(), Err(IdentityError::Gone) | Err(IdentityError::Reused { .. }))
     }
 }
 
@@ -150,16 +128,9 @@ mod tests {
 
     #[test]
     fn detects_exit_and_reuse() {
-        let mut c = std::process::Command::new("cmd.exe")
-            .args(["/c", "exit", "0"])
-            .spawn()
-            .unwrap();
+        let mut c = std::process::Command::new("cmd.exe").args(["/c", "exit", "0"]).spawn().unwrap();
         let id = ProcessIdentity::capture(c.id()).unwrap_or_else(|e| match e {
-            IdentityError::Gone => ProcessIdentity {
-                pid: c.id(),
-                created: 0,
-                image: String::new(),
-            },
+            IdentityError::Gone => ProcessIdentity { pid: c.id(), created: 0, image: String::new() },
             e => panic!("{e}"),
         });
         c.wait().unwrap();
@@ -167,10 +138,7 @@ mod tests {
         assert!(id.is_gone() || id.created == 0);
         // A forged creation time must read as reuse.
         let mine = ProcessIdentity::capture(std::process::id()).unwrap();
-        let forged = ProcessIdentity {
-            created: mine.created + 1,
-            ..mine
-        };
+        let forged = ProcessIdentity { created: mine.created + 1, ..mine };
         assert!(matches!(forged.verify(), Err(IdentityError::Reused { .. })));
         assert!(forged.is_gone());
     }

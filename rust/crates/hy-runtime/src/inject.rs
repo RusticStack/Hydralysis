@@ -29,24 +29,10 @@ fn wide(s: &str) -> Vec<u16> {
 ///
 /// # Safety
 /// `start` must be a valid thread entry point in the target process.
-pub unsafe fn run_remote(
-    process: HANDLE,
-    start: usize,
-    param: *const core::ffi::c_void,
-    timeout_ms: u32,
-) -> io::Result<u32> {
+pub unsafe fn run_remote(process: HANDLE, start: usize, param: *const core::ffi::c_void, timeout_ms: u32) -> io::Result<u32> {
     unsafe {
-        let f: unsafe extern "system" fn(*mut core::ffi::c_void) -> u32 =
-            core::mem::transmute(start);
-        let t = CreateRemoteThread(
-            process,
-            core::ptr::null(),
-            0,
-            Some(f),
-            param,
-            0,
-            core::ptr::null_mut(),
-        );
+        let f: unsafe extern "system" fn(*mut core::ffi::c_void) -> u32 = core::mem::transmute(start);
+        let t = CreateRemoteThread(process, core::ptr::null(), 0, Some(f), param, 0, core::ptr::null_mut());
         if t.is_null() {
             return Err(at("CreateRemoteThread"));
         }
@@ -55,10 +41,7 @@ pub unsafe fn run_remote(
         GetExitCodeThread(t, &mut code);
         CloseHandle(t);
         if w != WAIT_OBJECT_0 {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "remote thread did not finish",
-            ));
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "remote thread did not finish"));
         }
         Ok(code)
     }
@@ -75,24 +58,11 @@ pub unsafe fn load_library(process: HANDLE, pid: u32, dll: &Path) -> io::Result<
     unsafe {
         let path: Vec<u16> = dll.as_os_str().encode_wide().chain(Some(0)).collect();
         let bytes = path.len() * 2;
-        let remote = VirtualAllocEx(
-            process,
-            core::ptr::null(),
-            bytes,
-            MEM_COMMIT | MEM_RESERVE,
-            PAGE_READWRITE,
-        );
+        let remote = VirtualAllocEx(process, core::ptr::null(), bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         if remote.is_null() {
             return Err(at("VirtualAllocEx"));
         }
-        if WriteProcessMemory(
-            process,
-            remote,
-            path.as_ptr().cast(),
-            bytes,
-            core::ptr::null_mut(),
-        ) == 0
-        {
+        if WriteProcessMemory(process, remote, path.as_ptr().cast(), bytes, core::ptr::null_mut()) == 0 {
             return Err(at("WriteProcessMemory"));
         }
         let k32 = GetModuleHandleW(wide("kernel32.dll").as_ptr());
@@ -115,14 +85,9 @@ pub fn module_base(pid: u32, name: &str) -> io::Result<usize> {
         let mut e: MODULEENTRY32W = core::mem::zeroed();
         e.dwSize = core::mem::size_of::<MODULEENTRY32W>() as u32;
         let mut ok = Module32FirstW(snap, &mut e);
-        let mut found = Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "module not in target",
-        ));
+        let mut found = Err(io::Error::new(io::ErrorKind::NotFound, "module not in target"));
         while ok != 0 {
-            let n = String::from_utf16_lossy(
-                &e.szModule[..e.szModule.iter().position(|&c| c == 0).unwrap_or(0)],
-            );
+            let n = String::from_utf16_lossy(&e.szModule[..e.szModule.iter().position(|&c| c == 0).unwrap_or(0)]);
             if n.eq_ignore_ascii_case(name) {
                 found = Ok(e.modBaseAddr as usize);
                 break;

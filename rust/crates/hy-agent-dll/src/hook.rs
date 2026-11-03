@@ -46,14 +46,7 @@ fn alloc_near(site: usize, size: usize) -> Option<usize> {
             if cand < lo || cand > hi {
                 continue;
             }
-            let ptr = unsafe {
-                VirtualAlloc(
-                    cand as *const _,
-                    size,
-                    MEM_RESERVE | MEM_COMMIT,
-                    PAGE_EXECUTE_READWRITE,
-                )
-            };
+            let ptr = unsafe { VirtualAlloc(cand as *const _, size, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) };
             if !ptr.is_null() {
                 return Some(ptr as usize);
             }
@@ -81,10 +74,7 @@ pub unsafe fn prepare(site: u16, cfg: *mut u8, addr: usize) -> Result<Prepared, 
             stolen.push(i);
         }
         for i in &stolen {
-            if matches!(
-                i.flow_control(),
-                FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch
-            ) {
+            if matches!(i.flow_control(), FlowControl::ConditionalBranch | FlowControl::UnconditionalBranch) {
                 let t = i.near_branch_target() as usize;
                 if t > addr && t < addr + len {
                     return Err(p::ERR_DECODE);
@@ -158,12 +148,7 @@ pub unsafe fn prepare(site: u16, cfg: *mut u8, addr: usize) -> Result<Prepared, 
         for b in patch.iter_mut().take(len).skip(5) {
             *b = 0x90;
         }
-        Ok(Prepared {
-            addr,
-            len,
-            orig,
-            patch,
-        })
+        Ok(Prepared { addr, len, orig, patch })
     }
 }
 
@@ -220,13 +205,7 @@ pub unsafe fn retire(pr: &Prepared) -> Result<(), u32> {
 }
 
 /// The full save / call / restore sequence. `counted`: the inline gate already counted the hit and decided to keep it.
-fn emit_main(
-    a: &mut CodeAssembler,
-    hook: u64,
-    stack: bool,
-    extra: i32,
-    counted: bool,
-) -> Result<(), u32> {
+fn emit_main(a: &mut CodeAssembler, hook: u64, stack: bool, extra: i32, counted: bool) -> Result<(), u32> {
     enc(a.pushfq())?;
     for r in [rax, rcx, rdx, r8, r9, r10, r11] {
         enc(a.push(r))?;
@@ -283,12 +262,7 @@ pub unsafe fn make_return_stub() -> Result<usize, u32> {
         enc(a.pop(rdx))?;
         enc(a.pop(rax))?;
         enc(a.ret())?;
-        let mem = VirtualAlloc(
-            core::ptr::null(),
-            4096,
-            MEM_RESERVE | MEM_COMMIT,
-            PAGE_EXECUTE_READWRITE,
-        ) as usize;
+        let mem = VirtualAlloc(core::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE) as usize;
         if mem == 0 {
             return Err(p::ERR_NO_STUB_ROOM);
         }
@@ -301,24 +275,13 @@ pub unsafe fn make_return_stub() -> Result<usize, u32> {
 
 #[inline(always)]
 unsafe fn arg(fr: *const u64, i: usize) -> u64 {
-    unsafe {
-        if i < 4 {
-            *fr.add(5 - i)
-        } else {
-            *fr.add(9 + i)
-        }
-    }
+    unsafe { if i < 4 { *fr.add(5 - i) } else { *fr.add(9 + i) } }
 }
 
 /// Read up to `want` bytes of a buffer. Returns `(length kept, extra record flags, failed)`. A wide string stops after
 /// its UTF-16 terminator, a C string before its NUL; a read cut by an unmapped page keeps what was readable.
 #[inline(always)]
-unsafe fn capture(
-    dst: *mut MaybeUninit<u8>,
-    src: u64,
-    want: usize,
-    mode: u32,
-) -> (usize, u8, bool) {
+unsafe fn capture(dst: *mut MaybeUninit<u8>, src: u64, want: usize, mode: u32) -> (usize, u8, bool) {
     unsafe {
         if want == 0 {
             return (0, 0, false);
@@ -407,11 +370,7 @@ unsafe extern "system" fn on_hit(h: *const Hook, fr: *const u64, saved: *const u
                 }
             });
         }
-        let e: &mut Entry = if shadow_entry.is_null() {
-            &mut *local.as_mut_ptr()
-        } else {
-            &mut *shadow_entry
-        };
+        let e: &mut Entry = if shadow_entry.is_null() { &mut *local.as_mut_ptr() } else { &mut *shadow_entry };
         // Only the scalar fields are written eagerly; the arrays are filled up to their used length.
         e.site = h.site;
         // A record kept while the sampling policy was thinning this site says so.
@@ -475,8 +434,7 @@ unsafe extern "system" fn on_hit(h: *const Hook, fr: *const u64, saved: *const u
         }
         e.nstack = 0;
         if flags & p::F_STACK != 0 {
-            let depth =
-                ((cfg.add(p::S_STACK_DEPTH) as *const u32).read() as usize).min(p::MAX_STACK);
+            let depth = ((cfg.add(p::S_STACK_DEPTH) as *const u32).read() as usize).min(p::MAX_STACK);
             e.nstack = walk(h.addr, slot, saved, depth, e.stack.as_mut_ptr() as *mut u64) as u8;
         }
         e.tsc = ring::now();
@@ -493,13 +451,7 @@ unsafe extern "system" fn on_hit(h: *const Hook, fr: *const u64, saved: *const u
 }
 
 /// Collect up to `depth` return addresses starting with the one at `slot` (the hooked function's caller).
-unsafe fn walk(
-    site_addr: usize,
-    slot: *mut u64,
-    saved: *const u64,
-    depth: usize,
-    out: *mut u64,
-) -> usize {
+unsafe fn walk(site_addr: usize, slot: *mut u64, saved: *const u64, depth: usize, out: *mut u64) -> usize {
     unsafe {
         #[repr(C, align(16))]
         struct Ctx(CONTEXT);
@@ -528,16 +480,7 @@ unsafe fn walk(
             } else {
                 let mut handler = core::ptr::null_mut();
                 let mut frame = 0u64;
-                RtlVirtualUnwind(
-                    0,
-                    image,
-                    ctx.Rip,
-                    rf,
-                    ctx,
-                    &mut handler,
-                    &mut frame,
-                    core::ptr::null_mut(),
-                );
+                RtlVirtualUnwind(0, image, ctx.Rip, rf, ctx, &mut handler, &mut frame, core::ptr::null_mut());
             }
             if ctx.Rip == 0 {
                 break;
@@ -575,12 +518,7 @@ unsafe extern "system" fn on_return(frame: *mut u64) {
             let e = &mut s.ents[s.depth];
             orig = e.ret_addr;
             if e.buf_on_return {
-                let (n, more, failed) = capture(
-                    e.buf.as_mut_ptr(),
-                    e.buf_ptr,
-                    e.buf_len as usize,
-                    e.buf_mode,
-                );
+                let (n, more, failed) = capture(e.buf.as_mut_ptr(), e.buf_ptr, e.buf_len as usize, e.buf_mode);
                 e.buflen = n as u16;
                 e.rec_flags |= more;
                 if failed {

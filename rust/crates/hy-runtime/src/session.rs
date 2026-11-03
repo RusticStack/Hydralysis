@@ -151,11 +151,7 @@ fn wide(s: &str) -> Vec<u16> {
 
 fn named_event(name: &str, manual: bool) -> io::Result<HANDLE> {
     let h = unsafe { CreateEventW(core::ptr::null(), manual as i32, 0, wide(name).as_ptr()) };
-    if h.is_null() {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(h)
-    }
+    if h.is_null() { Err(io::Error::last_os_error()) } else { Ok(h) }
 }
 
 unsafe fn put_site(view: *mut u8, i: usize, s: &SiteSpec) {
@@ -188,8 +184,7 @@ unsafe fn put_site(view: *mut u8, i: usize, s: &SiteSpec) {
 impl Session {
     fn build(process: HANDLE, thread: HANDLE, pid: u32, sites: &[SiteSpec]) -> io::Result<Session> {
         unsafe {
-            let identity =
-                ProcessIdentity::capture(pid).map_err(|e| io::Error::other(e.to_string()))?;
+            let identity = ProcessIdentity::capture(pid).map_err(|e| io::Error::other(e.to_string()))?;
             let sec_name = wide(&format!("Local\\hy_agent_{pid}"));
             let section = CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
@@ -202,8 +197,7 @@ impl Session {
             if section.is_null() {
                 return Err(io::Error::last_os_error());
             }
-            let view = MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, proto::SECTION_SIZE).Value
-                as *mut u8;
+            let view = MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, proto::SECTION_SIZE).Value as *mut u8;
             if view.is_null() {
                 return Err(io::Error::last_os_error());
             }
@@ -214,9 +208,8 @@ impl Session {
             }
             let cmd_ev = named_event(&format!("Local\\hy_cmd_{pid}"), false)?;
             let rsp_ev = named_event(&format!("Local\\hy_rsp_{pid}"), false)?;
-            let bp_ev = (0..proto::MAX_PAUSE)
-                .map(|i| named_event(&format!("Local\\hy_bp_{pid}_{i}"), true))
-                .collect::<io::Result<Vec<_>>>()?;
+            let bp_ev =
+                (0..proto::MAX_PAUSE).map(|i| named_event(&format!("Local\\hy_bp_{pid}_{i}"), true)).collect::<io::Result<Vec<_>>>()?;
             Ok(Session {
                 process,
                 thread,
@@ -229,10 +222,7 @@ impl Session {
                 rsp_ev,
                 bp_ev,
                 tails: vec![0; proto::MAX_RINGS],
-                counters: Counters {
-                    sites: vec![SiteCounters::default(); proto::MAX_SITES],
-                    ..Default::default()
-                },
+                counters: Counters { sites: vec![SiteCounters::default(); proto::MAX_SITES], ..Default::default() },
                 next_event: 0,
                 first_seen: HashMap::new(),
                 seq: 0,
@@ -248,27 +238,14 @@ impl Session {
     }
 
     /// As `spawn`, with the child's stdout and stderr redirected to `stdout` (created or truncated) when given.
-    pub fn spawn_with(
-        exe: &Path,
-        args: &[String],
-        sites: &[SiteSpec],
-        stdout: Option<&Path>,
-    ) -> io::Result<Session> {
-        let opts = SpawnOpts {
-            stdout: stdout.map(Path::to_path_buf),
-            ..Default::default()
-        };
+    pub fn spawn_with(exe: &Path, args: &[String], sites: &[SiteSpec], stdout: Option<&Path>) -> io::Result<Session> {
+        let opts = SpawnOpts { stdout: stdout.map(Path::to_path_buf), ..Default::default() };
         Session::spawn_opts(exe, args, sites, &opts)
     }
 
     /// Spawn suspended with a working directory and an environment block when given (the environment replaces the
     /// parent's, as Frida's `envp` does).
-    pub fn spawn_opts(
-        exe: &Path,
-        args: &[String],
-        sites: &[SiteSpec],
-        opts: &SpawnOpts,
-    ) -> io::Result<Session> {
+    pub fn spawn_opts(exe: &Path, args: &[String], sites: &[SiteSpec], opts: &SpawnOpts) -> io::Result<Session> {
         let stdout = opts.stdout.as_deref();
         unsafe {
             let mut cmd = format!("\"{}\"", exe.display());
@@ -285,34 +262,19 @@ impl Session {
             let mut inherit = 0;
             if let Some(path) = stdout {
                 let sa = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
-                    nLength: core::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>(
-                    ) as u32,
+                    nLength: core::mem::size_of::<windows_sys::Win32::Security::SECURITY_ATTRIBUTES>() as u32,
                     lpSecurityDescriptor: core::ptr::null_mut(),
                     bInheritHandle: 1,
                 };
                 let pw: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-                out_handle = windows_sys::Win32::Storage::FileSystem::CreateFileW(
-                    pw.as_ptr(),
-                    0x4000_0000,
-                    3,
-                    &sa,
-                    2,
-                    0x80,
-                    core::ptr::null_mut(),
-                );
+                out_handle =
+                    windows_sys::Win32::Storage::FileSystem::CreateFileW(pw.as_ptr(), 0x4000_0000, 3, &sa, 2, 0x80, core::ptr::null_mut());
                 if out_handle == INVALID_HANDLE_VALUE {
                     return Err(io::Error::last_os_error());
                 }
                 let nul: Vec<u16> = wide("NUL");
-                let stdin = windows_sys::Win32::Storage::FileSystem::CreateFileW(
-                    nul.as_ptr(),
-                    0x8000_0000,
-                    3,
-                    &sa,
-                    3,
-                    0x80,
-                    core::ptr::null_mut(),
-                );
+                let stdin =
+                    windows_sys::Win32::Storage::FileSystem::CreateFileW(nul.as_ptr(), 0x8000_0000, 3, &sa, 3, 0x80, core::ptr::null_mut());
                 si.dwFlags = 0x100; // STARTF_USESTDHANDLES
                 si.hStdOutput = out_handle;
                 si.hStdError = out_handle;
@@ -331,10 +293,7 @@ impl Session {
                 }
                 b
             });
-            let cwdw: Option<Vec<u16>> = opts
-                .cwd
-                .as_ref()
-                .map(|c| c.as_os_str().encode_wide().chain(Some(0)).collect());
+            let cwdw: Option<Vec<u16>> = opts.cwd.as_ref().map(|c| c.as_os_str().encode_wide().chain(Some(0)).collect());
             let created = CreateProcessW(
                 exew.as_ptr(),
                 cmdw.as_mut_ptr(),
@@ -342,9 +301,7 @@ impl Session {
                 core::ptr::null(),
                 inherit,
                 CREATE_SUSPENDED | if env_block.is_some() { 0x400 } else { 0 },
-                env_block
-                    .as_ref()
-                    .map_or(core::ptr::null(), |b| b.as_ptr() as *const _),
+                env_block.as_ref().map_or(core::ptr::null(), |b| b.as_ptr() as *const _),
                 cwdw.as_ref().map_or(core::ptr::null(), |c| c.as_ptr()),
                 &si,
                 &mut pi,
@@ -402,14 +359,12 @@ impl Session {
         }
         unsafe {
             let image = std::fs::read(dll).map_err(|e| ctx("reading the agent", e))?;
-            let (rva, _) = pe_exports::find_export(&image, "hy_agent_init")
-                .ok_or_else(|| io::Error::other("agent has no hy_agent_init"))?;
+            let (rva, _) =
+                pe_exports::find_export(&image, "hy_agent_init").ok_or_else(|| io::Error::other("agent has no hy_agent_init"))?;
             // A process resumed a moment ago may still be starting up; CreateRemoteThread then reports access denied
             // (5) or not-enough-memory (8). Retry for a short, bounded time. A process we spawned suspended never
             // needs this.
-            let retry = |e: &io::Error, tries: u32| {
-                tries < 200 && matches!(e.raw_os_error(), Some(5) | Some(8))
-            };
+            let retry = |e: &io::Error, tries: u32| tries < 200 && matches!(e.raw_os_error(), Some(5) | Some(8));
             let mut tries = 0;
             let base = loop {
                 match inject::load_library(self.process, self.pid, dll) {
@@ -423,12 +378,7 @@ impl Session {
             };
             tries = 0;
             let code = loop {
-                match inject::run_remote(
-                    self.process,
-                    base + rva as usize,
-                    core::ptr::null(),
-                    20_000,
-                ) {
+                match inject::run_remote(self.process, base + rva as usize, core::ptr::null(), 20_000) {
                     Ok(c) => break c,
                     Err(e) if retry(&e, tries) => {
                         tries += 1;
@@ -438,10 +388,7 @@ impl Session {
                 }
             };
             if code != 0 || self.rd32(proto::H_STATUS) != 1 {
-                return Err(io::Error::other(format!(
-                    "agent init failed: code {code}, status {}",
-                    self.rd32(proto::H_STATUS)
-                )));
+                return Err(io::Error::other(format!("agent init failed: code {code}, status {}", self.rd32(proto::H_STATUS))));
             }
             self.clock = Clock::new(
                 self.rd32(proto::H_USE_QPC) != 0,
@@ -512,10 +459,7 @@ impl Session {
                     return Ok((mb.add(proto::MB_RESULT) as *const u32).read_volatile());
                 }
                 if Instant::now() >= deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "agent did not answer",
-                    ));
+                    return Err(io::Error::new(io::ErrorKind::TimedOut, "agent did not answer"));
                 }
             }
         }
@@ -534,25 +478,19 @@ impl Session {
         if idx >= proto::MAX_SITES {
             return Ok(Err(proto::ERR_BAD_SITE));
         }
-        self.identity
-            .verify()
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        self.identity.verify().map_err(|e| io::Error::other(e.to_string()))?;
         unsafe { put_site(self.view, idx, spec) };
-        Ok(
-            match self.control(proto::CMD_ARM_SITE, idx as u64, Duration::from_secs(30))? {
-                0 => Ok(()),
-                c => Err(c),
-            },
-        )
+        Ok(match self.control(proto::CMD_ARM_SITE, idx as u64, Duration::from_secs(30))? {
+            0 => Ok(()),
+            c => Err(c),
+        })
     }
 
     pub fn retire_site(&mut self, idx: usize) -> io::Result<Result<(), u32>> {
-        Ok(
-            match self.control(proto::CMD_RETIRE_SITE, idx as u64, Duration::from_secs(30))? {
-                0 => Ok(()),
-                c => Err(c),
-            },
-        )
+        Ok(match self.control(proto::CMD_RETIRE_SITE, idx as u64, Duration::from_secs(30))? {
+            0 => Ok(()),
+            c => Err(c),
+        })
     }
 
     /// Restore every patched site (agent stays loaded, recording stops).
@@ -613,12 +551,7 @@ impl Session {
                 (r.add(proto::R_TAIL) as *mut u32).write_volatile(t);
                 if state == proto::RING_RETIRED && t == head {
                     // The owner is gone and everything it wrote is read: hand the ring back.
-                    let _ = state_a.compare_exchange(
-                        proto::RING_RETIRED,
-                        proto::RING_FREE,
-                        Ordering::AcqRel,
-                        Ordering::Relaxed,
-                    );
+                    let _ = state_a.compare_exchange(proto::RING_RETIRED, proto::RING_FREE, Ordering::AcqRel, Ordering::Relaxed);
                 }
             }
         }
@@ -669,12 +602,7 @@ impl Session {
             .map(|i| unsafe {
                 let r = self.view.add(proto::ring_offset(i));
                 let u = |o: usize| (r.add(o) as *const u32).read_volatile() as u64;
-                (
-                    i as u32,
-                    u(proto::R_SEQ),
-                    u(proto::R_DROPPED),
-                    u(proto::R_READ_FAILED),
-                )
+                (i as u32, u(proto::R_SEQ), u(proto::R_DROPPED), u(proto::R_READ_FAILED))
             })
             .collect()
     }
@@ -752,10 +680,7 @@ impl Session {
         if slot >= proto::MAX_PAUSE || self.rd32(proto::pause_offset(slot) + proto::P_STATE) != 1 {
             return false;
         }
-        self.wr32(
-            proto::pause_offset(slot) + proto::P_ACTION,
-            if auto { 2 } else { 1 },
-        );
+        self.wr32(proto::pause_offset(slot) + proto::P_ACTION, if auto { 2 } else { 1 });
         unsafe { SetEvent(self.bp_ev[slot]) };
         true
     }
@@ -763,15 +688,8 @@ impl Session {
     /// The breakpoint watchdog: continue every thread parked longer than `limit` (30 s by default in the product).
     /// Returns the slots released.
     pub fn watchdog(&mut self, limit: Duration) -> Vec<usize> {
-        let late: Vec<usize> = self
-            .paused()
-            .into_iter()
-            .filter(|p| p.parked_for >= limit)
-            .map(|p| p.slot)
-            .collect();
-        late.into_iter()
-            .filter(|&s| self.continue_breakpoint(s, true))
-            .collect()
+        let late: Vec<usize> = self.paused().into_iter().filter(|p| p.parked_for >= limit).map(|p| p.slot).collect();
+        late.into_iter().filter(|&s| self.continue_breakpoint(s, true)).collect()
     }
 
     fn thread_ids(&self) -> Vec<u32> {
@@ -838,16 +756,9 @@ impl Session {
             e.dwSize = core::mem::size_of::<MODULEENTRY32W>() as u32;
             let mut out = Vec::new();
             let mut ok = Module32FirstW(snap, &mut e);
-            let s = |w: &[u16]| {
-                String::from_utf16_lossy(&w[..w.iter().position(|&c| c == 0).unwrap_or(w.len())])
-            };
+            let s = |w: &[u16]| String::from_utf16_lossy(&w[..w.iter().position(|&c| c == 0).unwrap_or(w.len())]);
             while ok != 0 {
-                out.push(ModuleInfo {
-                    name: s(&e.szModule),
-                    path: s(&e.szExePath),
-                    base: e.modBaseAddr as u64,
-                    size: e.modBaseSize,
-                });
+                out.push(ModuleInfo { name: s(&e.szModule), path: s(&e.szExePath), base: e.modBaseAddr as u64, size: e.modBaseSize });
                 ok = Module32NextW(snap, &mut e);
             }
             CloseHandle(snap);
@@ -859,15 +770,7 @@ impl Session {
     pub fn read_memory(&self, address: u64, len: usize) -> io::Result<Vec<u8>> {
         let mut buf = vec![0u8; len];
         let mut got = 0usize;
-        let ok = unsafe {
-            ReadProcessMemory(
-                self.process,
-                address as *const _,
-                buf.as_mut_ptr().cast(),
-                len,
-                &mut got,
-            )
-        };
+        let ok = unsafe { ReadProcessMemory(self.process, address as *const _, buf.as_mut_ptr().cast(), len, &mut got) };
         if ok == 0 || got != len {
             return Err(io::Error::last_os_error());
         }
@@ -876,15 +779,7 @@ impl Session {
 
     pub(crate) fn write_raw(&self, address: u64, bytes: &[u8]) -> io::Result<()> {
         let mut put = 0usize;
-        let ok = unsafe {
-            WriteProcessMemory(
-                self.process,
-                address as *const _,
-                bytes.as_ptr().cast(),
-                bytes.len(),
-                &mut put,
-            )
-        };
+        let ok = unsafe { WriteProcessMemory(self.process, address as *const _, bytes.as_ptr().cast(), bytes.len(), &mut put) };
         if ok == 0 || put != bytes.len() {
             return Err(io::Error::last_os_error());
         }
@@ -895,24 +790,10 @@ impl Session {
     pub fn query(&self, address: u64) -> io::Result<(u64, u64, u32)> {
         unsafe {
             let mut mbi: MEMORY_BASIC_INFORMATION = core::mem::zeroed();
-            if VirtualQueryEx(
-                self.process,
-                address as *const _,
-                &mut mbi,
-                core::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
-            ) == 0
-            {
+            if VirtualQueryEx(self.process, address as *const _, &mut mbi, core::mem::size_of::<MEMORY_BASIC_INFORMATION>()) == 0 {
                 return Err(io::Error::last_os_error());
             }
-            Ok((
-                mbi.BaseAddress as u64,
-                mbi.RegionSize as u64,
-                if mbi.State == MEM_COMMIT {
-                    mbi.Protect
-                } else {
-                    0
-                },
-            ))
+            Ok((mbi.BaseAddress as u64, mbi.RegionSize as u64, if mbi.State == MEM_COMMIT { mbi.Protect } else { 0 }))
         }
     }
 
@@ -930,9 +811,7 @@ impl Drop for Session {
     fn drop(&mut self) {
         unsafe {
             self.wr32(proto::H_SHUTDOWN, 1);
-            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
-                Value: self.view.cast(),
-            });
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.view.cast() });
             CloseHandle(self.section);
             for h in [self.cmd_ev, self.rsp_ev] {
                 CloseHandle(h);

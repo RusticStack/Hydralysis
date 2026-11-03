@@ -32,12 +32,7 @@ impl Phase {
         use Phase::*;
         matches!(
             (self, to),
-            (Arming, Armed)
-                | (Arming, Disarming)
-                | (Armed, Disarming)
-                | (Disarming, Clear)
-                | (Disarming, Tainted)
-                | (Tainted, Disarming)
+            (Arming, Armed) | (Arming, Disarming) | (Armed, Disarming) | (Disarming, Clear) | (Disarming, Tainted) | (Tainted, Disarming)
         )
     }
 }
@@ -89,27 +84,12 @@ impl Drop for Thread {
 }
 
 /// Set or clear one slot on a thread. Returns the DR7 read back afterwards, `None` when the thread is gone.
-fn program_thread(
-    tid: u32,
-    slot: usize,
-    program: Option<(u64, u64)>,
-) -> Result<Option<u64>, std::io::Error> {
+fn program_thread(tid: u32, slot: usize, program: Option<(u64, u64)>) -> Result<Option<u64>, std::io::Error> {
     unsafe {
-        let h = OpenThread(
-            THREAD_SUSPEND_RESUME
-                | THREAD_GET_CONTEXT
-                | THREAD_SET_CONTEXT
-                | THREAD_QUERY_INFORMATION,
-            0,
-            tid,
-        );
+        let h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION, 0, tid);
         if h.is_null() {
             let e = std::io::Error::last_os_error();
-            return if e.raw_os_error() == Some(87) {
-                Ok(None)
-            } else {
-                Err(e)
-            };
+            return if e.raw_os_error() == Some(87) { Ok(None) } else { Err(e) };
         }
         let t = Thread(h);
         if SuspendThread(t.0) == u32::MAX {
@@ -122,12 +102,7 @@ fn program_thread(
             if GetThreadContext(t.0, ctx) == 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            let dr = [
-                &mut ctx.Dr0 as *mut u64,
-                &mut ctx.Dr1,
-                &mut ctx.Dr2,
-                &mut ctx.Dr3,
-            ];
+            let dr = [&mut ctx.Dr0 as *mut u64, &mut ctx.Dr1, &mut ctx.Dr2, &mut ctx.Dr3];
             match program {
                 Some((addr, bits)) => {
                     dr[slot].write(addr);
@@ -159,11 +134,7 @@ fn program_thread(
 /// Read DR7 of a thread without changing it. `None` when the thread is gone or cannot be suspended.
 fn read_thread_dr7(tid: u32) -> Option<u64> {
     unsafe {
-        let h = OpenThread(
-            THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
-            0,
-            tid,
-        );
+        let h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, 0, tid);
         if h.is_null() {
             return None;
         }
@@ -181,44 +152,20 @@ fn read_thread_dr7(tid: u32) -> Option<u64> {
 
 impl Session {
     /// Arm a hardware watch. Needs the policy gate; size 1/2/4/8, naturally aligned, data memory only.
-    pub fn arm_watch(
-        &mut self,
-        gate: &Gate,
-        address: u64,
-        size: u32,
-        kind: Kind,
-        limit: u32,
-    ) -> Result<usize, MemError> {
+    pub fn arm_watch(&mut self, gate: &Gate, address: u64, size: u32, kind: Kind, limit: u32) -> Result<usize, MemError> {
         if ![1, 2, 4, 8].contains(&size) || !address.is_multiple_of(size as u64) {
-            return Err(MemError::BadRequest(
-                "a watch is 1, 2, 4 or 8 bytes and naturally aligned".into(),
-            ));
+            return Err(MemError::BadRequest("a watch is 1, 2, 4 or 8 bytes and naturally aligned".into()));
         }
-        self.identity
-            .verify()
-            .map_err(|e| MemError::BadRequest(e.to_string()))?;
+        self.identity.verify().map_err(|e| MemError::BadRequest(e.to_string()))?;
         if let Gate::Authorized(a) = gate {
             let module = self.module_of(address);
-            a.check(Action::Watch, address, size as u64, module.as_ref())
-                .map_err(MemError::Refused)?;
+            a.check(Action::Watch, address, size as u64, module.as_ref()).map_err(MemError::Refused)?;
         }
         self.require_data_span(address, size as u64)?;
         let slot = (0..SLOTS)
-            .find(|&i| {
-                self.watch.slots[i]
-                    .as_ref()
-                    .is_none_or(|w| w.phase == Phase::Clear)
-            })
-            .ok_or_else(|| {
-                MemError::BadRequest("all four debug-register slots are in use".into())
-            })?;
-        self.watch.slots[slot] = Some(WatchSlot {
-            address,
-            size,
-            kind,
-            phase: Phase::Arming,
-            threads: HashSet::new(),
-        });
+            .find(|&i| self.watch.slots[i].as_ref().is_none_or(|w| w.phase == Phase::Clear))
+            .ok_or_else(|| MemError::BadRequest("all four debug-register slots are in use".into()))?;
+        self.watch.slots[slot] = Some(WatchSlot { address, size, kind, phase: Phase::Arming, threads: HashSet::new() });
         // The agent's handler owns every single-step from now on; publish the slot before any register is set.
         let w = proto::watch_offset(slot);
         self.wr32(w + proto::W_HITS, 0);
@@ -254,18 +201,11 @@ impl Session {
     pub fn sync_watch_threads(&mut self) {
         let tids = self.threads();
         for slot in 0..SLOTS {
-            let Some(w) = self.watch.slots[slot]
-                .as_ref()
-                .filter(|w| w.phase == Phase::Armed)
-            else {
+            let Some(w) = self.watch.slots[slot].as_ref().filter(|w| w.phase == Phase::Armed) else {
                 continue;
             };
             let (addr, bits) = (w.address, dr7_bits(slot, w.size, w.kind));
-            for &tid in tids
-                .iter()
-                .filter(|t| !w.threads.contains(t))
-                .collect::<Vec<_>>()
-            {
+            for &tid in tids.iter().filter(|t| !w.threads.contains(t)).collect::<Vec<_>>() {
                 if let Ok(Some(dr7)) = program_thread(tid, slot, Some((addr, bits)))
                     && dr7 & bits == bits
                 {
@@ -282,10 +222,7 @@ impl Session {
             return Err(MemError::BadRequest(format!("slot {slot} is not in use")));
         };
         if !w.phase.can_move_to(Phase::Disarming) {
-            return Err(MemError::BadRequest(format!(
-                "slot {slot} is {:?}",
-                w.phase
-            )));
+            return Err(MemError::BadRequest(format!("slot {slot} is {:?}", w.phase)));
         }
         w.phase = Phase::Disarming;
         let mask = dr7_mask(slot);
@@ -330,13 +267,8 @@ impl Session {
 
     /// The threads a slot has been programmed into (sorted).
     pub fn watch_threads(&self, slot: usize) -> Vec<u32> {
-        let mut v: Vec<u32> = self
-            .watch
-            .slots
-            .get(slot)
-            .and_then(|w| w.as_ref())
-            .map(|w| w.threads.iter().copied().collect())
-            .unwrap_or_default();
+        let mut v: Vec<u32> =
+            self.watch.slots.get(slot).and_then(|w| w.as_ref()).map(|w| w.threads.iter().copied().collect()).unwrap_or_default();
         v.sort_unstable();
         v
     }
@@ -347,11 +279,7 @@ impl Session {
 
     /// True when any slot is tainted: detach is refused unless the owner forces it.
     pub fn watch_tainted(&self) -> bool {
-        self.watch
-            .slots
-            .iter()
-            .flatten()
-            .any(|w| w.phase == Phase::Tainted)
+        self.watch.slots.iter().flatten().any(|w| w.phase == Phase::Tainted)
     }
 }
 
@@ -374,18 +302,9 @@ mod tests {
     #[test]
     fn dr7_encoding() {
         // slot 1, 4 bytes, write: L1 = bit 2; RW1 = 01 at 20; LEN1 = 11 at 22.
-        assert_eq!(
-            dr7_bits(1, 4, Kind::Write),
-            (1 << 2) | (0b01 << 20) | (0b11 << 22)
-        );
-        assert_eq!(
-            dr7_bits(0, 8, Kind::ReadWrite),
-            1 | (0b11 << 16) | (0b10 << 18)
-        );
-        assert_eq!(
-            dr7_mask(2) & dr7_bits(2, 2, Kind::Write),
-            dr7_bits(2, 2, Kind::Write)
-        );
+        assert_eq!(dr7_bits(1, 4, Kind::Write), (1 << 2) | (0b01 << 20) | (0b11 << 22));
+        assert_eq!(dr7_bits(0, 8, Kind::ReadWrite), 1 | (0b11 << 16) | (0b10 << 18));
+        assert_eq!(dr7_mask(2) & dr7_bits(2, 2, Kind::Write), dr7_bits(2, 2, Kind::Write));
     }
 }
 
@@ -394,9 +313,6 @@ mod abi {
     #[test]
     fn context_is_16_aligned() {
         assert_eq!(core::mem::align_of::<super::Ctx>(), 16);
-        assert_eq!(
-            core::mem::size_of::<windows_sys::Win32::System::Diagnostics::Debug::CONTEXT>(),
-            1232
-        );
+        assert_eq!(core::mem::size_of::<windows_sys::Win32::System::Diagnostics::Debug::CONTEXT>(), 1232);
     }
 }

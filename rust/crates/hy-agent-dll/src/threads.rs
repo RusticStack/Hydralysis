@@ -15,9 +15,7 @@ pub struct Stopped {
 impl Stopped {
     /// True when any stopped thread's instruction pointer lies in `[lo, hi)`, or could not be read (unproven = unsafe).
     pub fn any_in(&self, lo: usize, hi: usize) -> bool {
-        self.handles
-            .iter()
-            .any(|&(_, rip)| rip == u64::MAX || (rip as usize >= lo && (rip as usize) < hi))
+        self.handles.iter().any(|&(_, rip)| rip == u64::MAX || (rip as usize >= lo && (rip as usize) < hi))
     }
 }
 
@@ -40,11 +38,7 @@ pub fn suspend_others() -> Result<Stopped, ()> {
         let me = GetCurrentThreadId();
         let control = {
             let sec = crate::ring::section();
-            if sec.is_null() {
-                0
-            } else {
-                (sec.add(p::H_AGENT_TID) as *const u32).read_volatile()
-            }
+            if sec.is_null() { 0 } else { (sec.add(p::H_AGENT_TID) as *const u32).read_volatile() }
         };
         let pid = GetCurrentProcessId();
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
@@ -62,9 +56,7 @@ pub fn suspend_others() -> Result<Stopped, ()> {
             ok = Thread32Next(snap, &mut e);
         }
         CloseHandle(snap);
-        let mut out = Stopped {
-            handles: Vec::with_capacity(tids.len()),
-        };
+        let mut out = Stopped { handles: Vec::with_capacity(tids.len()) };
         for tid in tids {
             let h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, 0, tid);
             if h.is_null() {
@@ -77,11 +69,7 @@ pub fn suspend_others() -> Result<Stopped, ()> {
             let mut c: Ctx = core::mem::zeroed();
             c.0.ContextFlags = CONTEXT_CONTROL_AMD64;
             // A context that cannot be read proves nothing: u64::MAX makes `any_in` refuse the patch.
-            let rip = if GetThreadContext(h, &mut c.0) != 0 {
-                c.0.Rip
-            } else {
-                u64::MAX
-            };
+            let rip = if GetThreadContext(h, &mut c.0) != 0 { c.0.Rip } else { u64::MAX };
             out.handles.push((h, rip));
         }
         Ok(out)

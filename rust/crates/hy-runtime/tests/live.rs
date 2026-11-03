@@ -23,11 +23,8 @@ fn agent_dll() -> PathBuf {
         .get_or_init(|| {
             let exe = std::env::current_exe().unwrap();
             let dir = exe.parent().unwrap().parent().unwrap().to_path_buf();
-            let mut cmd = std::process::Command::new(
-                std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()),
-            );
-            cmd.args(["build", "-p", "hy-agent-dll"])
-                .current_dir(env!("CARGO_MANIFEST_DIR"));
+            let mut cmd = std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()));
+            cmd.args(["build", "-p", "hy-agent-dll"]).current_dir(env!("CARGO_MANIFEST_DIR"));
             if !cfg!(debug_assertions) {
                 cmd.arg("--release");
             }
@@ -40,17 +37,13 @@ fn agent_dll() -> PathBuf {
 }
 
 fn fixtures() -> PathBuf {
-    std::env::var_os("HY_FIXTURES")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"E:\Projects\Hydra\_logs\r\hy-runtime\fx"))
+    std::env::var_os("HY_FIXTURES").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"E:\Projects\Hydra\_logs\r\hy-runtime\fx"))
 }
 
 fn work(name: &str) -> PathBuf {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let d = std::env::temp_dir()
-        .join("hy-runtime-tests")
-        .join(format!("{name}-{}-{n}", std::process::id()));
+    let d = std::env::temp_dir().join("hy-runtime-tests").join(format!("{name}-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
     d
 }
@@ -61,10 +54,7 @@ fn map_rva(map: &str, name: &str) -> u64 {
         .find_map(|l| l.trim().strip_prefix("Preferred load address is "))
         .map(|h| u64::from_str_radix(h.trim(), 16).unwrap())
         .expect("preferred base in map");
-    let line = map
-        .lines()
-        .find(|l| l.split_whitespace().nth(1) == Some(name))
-        .unwrap_or_else(|| panic!("{name} not in map"));
+    let line = map.lines().find(|l| l.split_whitespace().nth(1) == Some(name)).unwrap_or_else(|| panic!("{name} not in map"));
     u64::from_str_radix(line.split_whitespace().nth(2).unwrap(), 16).unwrap() - base
 }
 
@@ -86,12 +76,7 @@ impl Frameloop {
     }
     fn site(&self, name: &str, flags: u32, nargs: u32) -> SiteSpec {
         let rva = map_rva(&self.map, name);
-        let mut s = SiteSpec::new(
-            rva,
-            pe_exports::bytes_at_rva(&self.image, rva as u32, 16)
-                .unwrap()
-                .to_vec(),
-        );
+        let mut s = SiteSpec::new(rva, pe_exports::bytes_at_rva(&self.image, rva as u32, 16).unwrap().to_vec());
         s.flags = flags;
         s.nargs = nargs;
         s
@@ -126,10 +111,7 @@ fn text(p: &Path) -> String {
 }
 
 fn kv(out: &str, key: &str) -> String {
-    out.split_whitespace()
-        .find_map(|w| w.strip_prefix(key))
-        .map(str::to_string)
-        .unwrap_or_else(|| panic!("{key} not in {out:?}"))
+    out.split_whitespace().find_map(|w| w.strip_prefix(key)).map(str::to_string).unwrap_or_else(|| panic!("{key} not in {out:?}"))
 }
 
 fn hy_fixture() -> PathBuf {
@@ -142,14 +124,8 @@ fn fixture_info() -> (u64, Vec<u8>, u64) {
     s.resume();
     wait_exit(&mut s, Duration::from_secs(20), |_| {});
     let t = text(&out);
-    let bytes = (0..16)
-        .map(|i| u8::from_str_radix(&kv(&t, "BYTES=")[2 * i..2 * i + 2], 16).unwrap())
-        .collect();
-    (
-        u64::from_str_radix(&kv(&t, "RVA="), 16).unwrap(),
-        bytes,
-        u64::from_str_radix(&kv(&t, "CELL="), 16).unwrap(),
-    )
+    let bytes = (0..16).map(|i| u8::from_str_radix(&kv(&t, "BYTES=")[2 * i..2 * i + 2], 16).unwrap()).collect();
+    (u64::from_str_radix(&kv(&t, "RVA="), 16).unwrap(), bytes, u64::from_str_radix(&kv(&t, "CELL="), 16).unwrap())
 }
 
 fn wait_for(path: &Path, needle: &str, timeout: Duration) -> String {
@@ -170,12 +146,7 @@ fn wait_for(path: &Path, needle: &str, timeout: Duration) -> String {
 fn args_and_return_capture() {
     let fl = Frameloop::new();
     let out = work("args").join("out.txt");
-    let mut s = spawn_armed(
-        &fl.exe,
-        &["--frames=300"],
-        &[fl.site("fx_job_callback", proto::F_RETURN, 1)],
-        &out,
-    );
+    let mut s = spawn_armed(&fl.exe, &["--frames=300"], &[fl.site("fx_job_callback", proto::F_RETURN, 1)], &out);
     assert_eq!(s.site_status(0), (proto::SITE_ARMED, 0));
     s.resume();
     let hits = run_collect(&mut s, Duration::from_secs(30));
@@ -188,15 +159,9 @@ fn args_and_return_capture() {
         assert!(h.tsc_end >= h.tsc && h.tsc > 0);
         assert_ne!(h.ret_addr, 0);
     }
-    assert!(
-        hits.windows(2).all(|w| w[1].ring_seq == w[0].ring_seq + 1),
-        "ring_seq is contiguous"
-    );
+    assert!(hits.windows(2).all(|w| w[1].ring_seq == w[0].ring_seq + 1), "ring_seq is contiguous");
     let c = s.counters();
-    assert_eq!(
-        (c.sites[0].hits, c.sites[0].kept, c.dropped, c.unreturned),
-        (300, 300, 0, 0)
-    );
+    assert_eq!((c.sites[0].hits, c.sites[0].kept, c.dropped, c.unreturned), (300, 300, 0, 0));
     assert!(text(&out).contains("callback_sum=44850"), "{}", text(&out));
 }
 
@@ -210,15 +175,9 @@ fn sampling_counts_every_skip_exactly() {
     s.resume();
     let hits = run_collect(&mut s, Duration::from_secs(30));
     let c = s.counters();
-    assert_eq!(
-        (c.sites[0].hits, c.sites[0].kept, c.sites[0].skipped()),
-        (200, 50, 150)
-    );
+    assert_eq!((c.sites[0].hits, c.sites[0].kept, c.sites[0].skipped()), (200, 50, 150));
     assert_eq!(hits.len(), 50);
-    assert_eq!(
-        hits.iter().map(|h| h.args[0]).collect::<Vec<_>>(),
-        (0..200).step_by(4).collect::<Vec<u64>>()
-    );
+    assert_eq!(hits.iter().map(|h| h.args[0]).collect::<Vec<_>>(), (0..200).step_by(4).collect::<Vec<u64>>());
 }
 
 #[test]
@@ -228,12 +187,7 @@ fn stack_walk_reports_the_caller() {
     let mut site = fl.site("fx_job_callback", proto::F_STACK, 1);
     site.stack_depth = 4;
     let mut s = spawn_armed(&fl.exe, &["--frames=20"], &[site], &out);
-    let main = s
-        .modules()
-        .unwrap()
-        .into_iter()
-        .find(|m| m.name.eq_ignore_ascii_case("frameloop.exe"))
-        .unwrap();
+    let main = s.modules().unwrap().into_iter().find(|m| m.name.eq_ignore_ascii_case("frameloop.exe")).unwrap();
     s.resume();
     let hits = run_collect(&mut s, Duration::from_secs(30));
     assert_eq!(hits.len(), 20);
@@ -263,26 +217,14 @@ fn export_hook_with_buffer_capture() {
     site.buf_len_arg = 2;
     site.buf_max = 256;
     let times_arg = format!("--times={}", times.display());
-    let mut s = spawn_armed(
-        &fl.exe,
-        &["--frames=40", &times_arg],
-        &[site],
-        &dir.join("out.txt"),
-    );
-    assert_eq!(
-        s.site_status(0),
-        (proto::SITE_ARMED, 0),
-        "export hook must arm"
-    );
+    let mut s = spawn_armed(&fl.exe, &["--frames=40", &times_arg], &[site], &dir.join("out.txt"));
+    assert_eq!(s.site_status(0), (proto::SITE_ARMED, 0), "export hook must arm");
     s.resume();
     let hits = run_collect(&mut s, Duration::from_secs(30));
     assert_eq!(s.exit_code(), Some(0));
     let file = std::fs::read(&times).unwrap();
     assert_eq!(file.len(), 320);
-    let h = hits
-        .iter()
-        .find(|h| h.args.get(2) == Some(&320))
-        .unwrap_or_else(|| panic!("no 320-byte WriteFile in {} hits", hits.len()));
+    let h = hits.iter().find(|h| h.args.get(2) == Some(&320)).unwrap_or_else(|| panic!("no 320-byte WriteFile in {} hits", hits.len()));
     assert_eq!(h.buf, file[..256], "buffer captured at the call");
     assert_eq!(h.retval & 0xFFFF_FFFF, 1, "WriteFile returned TRUE");
 }
@@ -311,23 +253,14 @@ fn guards_refuse_before_any_byte_is_written() {
     let fl = Frameloop::new();
     let out = work("guards").join("out.txt");
     let mut s = spawn_armed(&fl.exe, &["--frames=30"], &sites, &out);
-    let want = [
-        proto::ERR_BYTES_MISMATCH,
-        proto::ERR_EXPORT_MISMATCH,
-        proto::ERR_MODULE_BASE,
-        proto::ERR_NO_MODULE,
-        proto::ERR_BAD_SITE,
-    ];
+    let want = [proto::ERR_BYTES_MISMATCH, proto::ERR_EXPORT_MISMATCH, proto::ERR_MODULE_BASE, proto::ERR_NO_MODULE, proto::ERR_BAD_SITE];
     for (i, code) in want.iter().enumerate() {
         assert_eq!(s.site_status(i), (proto::SITE_FAILED, *code), "site {i}");
     }
     assert_eq!(s.site_status(5), (proto::SITE_ARMED, 0));
     s.resume();
     let hits = run_collect(&mut s, Duration::from_secs(30));
-    assert!(
-        hits.iter().all(|h| h.site == 5),
-        "only the proven site records"
-    );
+    assert!(hits.iter().all(|h| h.site == 5), "only the proven site records");
     assert_eq!(s.exit_code(), Some(0));
 }
 
@@ -336,31 +269,18 @@ fn arm_and_retire_while_threads_run() {
     let fl = Frameloop::new();
     let dir = work("live-arm");
     let out = dir.join("out.txt");
-    let mut s = Session::spawn_with(
-        &fl.exe,
-        &["--frames=3000".into(), "--sleep-ms=1".into()],
-        &[],
-        Some(&out),
-    )
-    .unwrap();
+    let mut s = Session::spawn_with(&fl.exe, &["--frames=3000".into(), "--sleep-ms=1".into()], &[], Some(&out)).unwrap();
     s.resume();
     std::thread::sleep(Duration::from_millis(150));
     s.inject(&agent_dll()).unwrap();
     s.ping().unwrap();
     let mut hits = s.drain();
     assert!(hits.is_empty());
-    assert_eq!(
-        s.arm_site(0, &fl.site("fx_job_callback", proto::F_RETURN, 1))
-            .unwrap(),
-        Ok(())
-    );
+    assert_eq!(s.arm_site(0, &fl.site("fx_job_callback", proto::F_RETURN, 1)).unwrap(), Ok(()));
     let t0 = Instant::now();
     while hits.len() < 100 {
         hits.extend(s.drain());
-        assert!(
-            t0.elapsed() < Duration::from_secs(20),
-            "no hits after a live arm"
-        );
+        assert!(t0.elapsed() < Duration::from_secs(20), "no hits after a live arm");
         std::thread::sleep(Duration::from_millis(2));
     }
     assert_eq!(s.retire_site(0).unwrap(), Ok(()));
@@ -368,24 +288,12 @@ fn arm_and_retire_while_threads_run() {
     let after_retire = hits.len();
     std::thread::sleep(Duration::from_millis(150));
     hits.extend(s.drain());
-    assert!(
-        hits.len() <= after_retire + 1,
-        "a retired site stops recording ({} -> {})",
-        after_retire,
-        hits.len()
-    );
+    assert!(hits.len() <= after_retire + 1, "a retired site stops recording ({} -> {})", after_retire, hits.len());
     wait_exit(&mut s, Duration::from_secs(60), |s| hits.extend(s.drain()));
     assert_eq!(s.exit_code(), Some(0));
     assert!(hits.len() < 3000 && hits.len() >= 100);
-    assert!(
-        hits.windows(2).all(|w| w[1].args[0] == w[0].args[0] + 1),
-        "no hit lost or duplicated between arm and retire"
-    );
-    assert!(
-        text(&out).contains("callback_sum=4498500"),
-        "{}",
-        text(&out)
-    ); // 3000*2999/2: the hooked code computed correctly
+    assert!(hits.windows(2).all(|w| w[1].args[0] == w[0].args[0] + 1), "no hit lost or duplicated between arm and retire");
+    assert!(text(&out).contains("callback_sum=4498500"), "{}", text(&out)); // 3000*2999/2: the hooked code computed correctly
 }
 
 // ---------------------------------------------------------------- rings, breakpoints
@@ -404,11 +312,7 @@ fn thread_exit_frees_the_ring_for_reuse() {
     let c = s.counters();
     assert_eq!(hits.len(), 900);
     assert_eq!((c.dropped, c.no_ring), (0, 0));
-    assert!(
-        s.ring_count() < 64,
-        "300 threads shared {} rings",
-        s.ring_count()
-    );
+    assert!(s.ring_count() < 64, "300 threads shared {} rings", s.ring_count());
     assert!(text(&out).contains("DONE"));
 }
 
@@ -432,15 +336,8 @@ fn breakpoint_parks_until_continued() {
     assert_eq!(p.frame[5], 7, "rcx of the hit is in the parked frame");
     assert_ne!(p.tid, 0);
     std::thread::sleep(Duration::from_millis(300));
-    assert!(
-        s.running() && !text(&out).contains("AFTER"),
-        "the thread is held"
-    );
-    assert!(
-        s.events()
-            .iter()
-            .any(|e| e.kind == proto::EV_BREAKPOINT && e.slot as usize == p.slot)
-    );
+    assert!(s.running() && !text(&out).contains("AFTER"), "the thread is held");
+    assert!(s.events().iter().any(|e| e.kind == proto::EV_BREAKPOINT && e.slot as usize == p.slot));
     assert!(s.continue_breakpoint(p.slot, false));
     wait_exit(&mut s, Duration::from_secs(20), |_| {});
     assert!(text(&out).contains("AFTER"));
@@ -471,10 +368,8 @@ fn watchdog_releases_a_parked_thread() {
 // ---------------------------------------------------------------- memory write and watch
 
 fn auth_for(module: &str, rva_start: u64, rva_end: u64, actions: &[&str]) -> Authorization {
-    normalize(
-        &json!({"sha256": "0".repeat(64), "actions": actions, "max_size": 8,
-        "ranges": [{"module": module, "rva_start": rva_start, "rva_end": rva_end}]}),
-    )
+    normalize(&json!({"sha256": "0".repeat(64), "actions": actions, "max_size": 8,
+        "ranges": [{"module": module, "rva_start": rva_start, "rva_end": rva_end}]}))
     .unwrap()
 }
 
@@ -491,45 +386,15 @@ fn cas_write_undo_and_refusals() {
     let gate = Gate::Fixture;
 
     // refusals leave memory alone
-    assert!(matches!(
-        s.write_cas(&gate, addr, &v(0x9999), &v(1), "a good enough reason"),
-        Err(MemError::CasMismatch { .. })
-    ));
-    assert!(matches!(
-        s.write_cas(&gate, addr, &v(0x1111), &v(1), "short"),
-        Err(MemError::BadRequest(_))
-    ));
-    assert!(matches!(
-        s.write_cas(
-            &gate,
-            base + rva,
-            &[0u8; 8],
-            &v(1),
-            "patching code is refused"
-        ),
-        Err(MemError::ExecutableRange(_))
-    ));
+    assert!(matches!(s.write_cas(&gate, addr, &v(0x9999), &v(1), "a good enough reason"), Err(MemError::CasMismatch { .. })));
+    assert!(matches!(s.write_cas(&gate, addr, &v(0x1111), &v(1), "short"), Err(MemError::BadRequest(_))));
+    assert!(matches!(s.write_cas(&gate, base + rva, &[0u8; 8], &v(1), "patching code is refused"), Err(MemError::ExecutableRange(_))));
     assert_eq!(s.read_memory(addr, 8).unwrap(), v(0x1111));
 
     // owner authorization: the module+rva range of the cell, then a range that misses it
-    let exe_name = hy_fixture()
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .into_owned();
-    let outside = Gate::Authorized(auth_for(
-        &exe_name,
-        cell_rva + 0x100,
-        cell_rva + 0x200,
-        &["write"],
-    ));
-    match s.write_cas(
-        &outside,
-        addr,
-        &v(0x1111),
-        &v(0x2222),
-        "outside the declared range",
-    ) {
+    let exe_name = hy_fixture().file_name().unwrap().to_string_lossy().into_owned();
+    let outside = Gate::Authorized(auth_for(&exe_name, cell_rva + 0x100, cell_rva + 0x200, &["write"]));
+    match s.write_cas(&outside, addr, &v(0x1111), &v(0x2222), "outside the declared range") {
         Err(MemError::Refused(r)) => assert_eq!(r.code, "outside_authorized_range"),
         other => panic!("{other:?}"),
     }
@@ -538,92 +403,33 @@ fn cas_write_undo_and_refusals() {
         matches!(s.write_cas(&watch_only, addr, &v(0x1111), &v(0x2222), "watch only build"), Err(MemError::Refused(r)) if r.code == "action_not_authorized")
     );
     let inside = Gate::Authorized(auth_for(&exe_name, cell_rva, cell_rva + 8, &["write"]));
-    let id = s
-        .write_cas(
-            &inside,
-            addr,
-            &v(0x1111),
-            &v(0x2222),
-            "authorized write inside range",
-        )
-        .unwrap();
+    let id = s.write_cas(&inside, addr, &v(0x1111), &v(0x2222), "authorized write inside range").unwrap();
     assert_eq!(s.read_memory(addr, 8).unwrap(), v(0x2222));
     assert_eq!(s.undo_log()[0].mode, "authorized");
     s.undo_write(&inside, id).unwrap();
     assert_eq!(s.read_memory(addr, 8).unwrap(), v(0x1111));
 
     // DIVERGED: something else changed the cell after our write
-    let id2 = s
-        .write_cas(
-            &gate,
-            addr,
-            &v(0x1111),
-            &v(0x2222),
-            "first write of the pair",
-        )
-        .unwrap();
-    s.write_cas(&gate, addr, &v(0x2222), &v(0x4444), "someone else's write")
-        .unwrap();
+    let id2 = s.write_cas(&gate, addr, &v(0x1111), &v(0x2222), "first write of the pair").unwrap();
+    s.write_cas(&gate, addr, &v(0x2222), &v(0x4444), "someone else's write").unwrap();
     match s.undo_write(&gate, id2) {
         Err(MemError::Diverged { found }) => assert_eq!(found, v(0x4444)),
         other => panic!("{other:?}"),
     }
-    assert_eq!(
-        s.read_memory(addr, 8).unwrap(),
-        v(0x4444),
-        "diverged undo writes nothing"
-    );
+    assert_eq!(s.read_memory(addr, 8).unwrap(), v(0x4444), "diverged undo writes nothing");
 
     // malformed requests, unmapped spans, a missing undo entry
-    let bad =
-        |r: Result<u32, MemError>| matches!(r, Err(MemError::BadRequest(_)) | Err(MemError::Os(_)));
-    assert!(bad(s.write_cas(
-        &gate,
-        addr,
-        &v(0x4444)[..4],
-        &v(1),
-        "length mismatch case"
-    )));
-    assert!(bad(s.write_cas(
-        &gate,
-        addr,
-        &[],
-        &[],
-        "empty request is refused"
-    )));
-    assert!(bad(s.write_cas(
-        &gate,
-        0x10,
-        &[0],
-        &[1],
-        "an unmapped address"
-    )));
-    assert!(matches!(
-        s.undo_write(&gate, 999),
-        Err(MemError::UnknownUndo(999))
-    ));
+    let bad = |r: Result<u32, MemError>| matches!(r, Err(MemError::BadRequest(_)) | Err(MemError::Os(_)));
+    assert!(bad(s.write_cas(&gate, addr, &v(0x4444)[..4], &v(1), "length mismatch case")));
+    assert!(bad(s.write_cas(&gate, addr, &[], &[], "empty request is refused")));
+    assert!(bad(s.write_cas(&gate, 0x10, &[0], &[1], "an unmapped address")));
+    assert!(matches!(s.undo_write(&gate, 999), Err(MemError::UnknownUndo(999))));
     // undo is range-checked: an authorization that no longer covers the entry refuses it
-    let id3 = s
-        .write_cas(
-            &gate,
-            addr,
-            &v(0x4444),
-            &v(0x5555),
-            "entry for the narrowing case",
-        )
-        .unwrap();
-    let narrowed = Gate::Authorized(auth_for(
-        &exe_name,
-        cell_rva + 0x100,
-        cell_rva + 0x200,
-        &["write"],
-    ));
-    assert!(
-        matches!(s.undo_write(&narrowed, id3), Err(MemError::Refused(r)) if r.code == "outside_authorized_range")
-    );
+    let id3 = s.write_cas(&gate, addr, &v(0x4444), &v(0x5555), "entry for the narrowing case").unwrap();
+    let narrowed = Gate::Authorized(auth_for(&exe_name, cell_rva + 0x100, cell_rva + 0x200, &["write"]));
+    assert!(matches!(s.undo_write(&narrowed, id3), Err(MemError::Refused(r)) if r.code == "outside_authorized_range"));
     assert_eq!(s.read_memory(addr, 8).unwrap(), v(0x5555));
-    s.write_cas(&gate, addr, &v(0x5555), &v(0x3333), "let the target finish")
-        .unwrap();
+    s.write_cas(&gate, addr, &v(0x5555), &v(0x3333), "let the target finish").unwrap();
     wait_exit(&mut s, Duration::from_secs(20), |_| {});
     assert!(text(&out).contains("SAW"));
     assert_eq!(s.exit_code(), Some(0));
@@ -639,13 +445,8 @@ fn watch_records_writes_from_old_and_new_threads_and_disarms_clean() {
     let t = wait_for(&out, "ADDR=", Duration::from_secs(20));
     let addr = u64::from_str_radix(&kv(&t, "ADDR="), 16).unwrap();
     // misuse is refused before anything is armed
-    assert!(matches!(
-        s.arm_watch(&Gate::Fixture, addr + 1, 8, Kind::Write, 100),
-        Err(MemError::BadRequest(_))
-    ));
-    let slot = s
-        .arm_watch(&Gate::Fixture, addr, 8, Kind::Write, 100)
-        .unwrap();
+    assert!(matches!(s.arm_watch(&Gate::Fixture, addr + 1, 8, Kind::Write, 100), Err(MemError::BadRequest(_))));
+    let slot = s.arm_watch(&Gate::Fixture, addr, 8, Kind::Write, 100).unwrap();
     let mut events = Vec::new();
     let mut hits_seen = 0;
     wait_exit(&mut s, Duration::from_secs(60), |s| {
@@ -654,32 +455,13 @@ fn watch_records_writes_from_old_and_new_threads_and_disarms_clean() {
         hits_seen = s.watch_hits(slot);
     });
     events.extend(s.events());
-    let watch_events: Vec<_> = events
-        .iter()
-        .filter(|e| e.kind == proto::EV_WATCH_HIT)
-        .collect();
-    assert_eq!(
-        s.exit_code(),
-        Some(0),
-        "no 0x80000004: the handler absorbed every trap"
-    );
-    assert_eq!(
-        hits_seen.max(s.watch_hits(slot)),
-        6,
-        "five writes from the main thread, one from the late thread"
-    );
+    let watch_events: Vec<_> = events.iter().filter(|e| e.kind == proto::EV_WATCH_HIT).collect();
+    assert_eq!(s.exit_code(), Some(0), "no 0x80000004: the handler absorbed every trap");
+    assert_eq!(hits_seen.max(s.watch_hits(slot)), 6, "five writes from the main thread, one from the late thread");
     assert_eq!(watch_events.len(), 6);
-    assert!(
-        watch_events
-            .iter()
-            .all(|e| e.data[2] == addr && e.data[3] & 1 != 0)
-    );
+    assert!(watch_events.iter().all(|e| e.data[2] == addr && e.data[3] & 1 != 0));
     let tids: std::collections::HashSet<u32> = watch_events.iter().map(|e| e.tid).collect();
-    assert_eq!(
-        tids.len(),
-        2,
-        "the late thread was covered by sync_watch_threads"
-    );
+    assert_eq!(tids.len(), 2, "the late thread was covered by sync_watch_threads");
 }
 
 #[test]
@@ -690,55 +472,25 @@ fn disarm_reads_back_every_thread_and_clears() {
     s.resume();
     let t = wait_for(&out, "ADDR=", Duration::from_secs(20));
     let addr = u64::from_str_radix(&kv(&t, "ADDR="), 16).unwrap();
-    let slot = s
-        .arm_watch(&Gate::Fixture, addr, 8, Kind::ReadWrite, 10)
-        .unwrap();
+    let slot = s.arm_watch(&Gate::Fixture, addr, 8, Kind::ReadWrite, 10).unwrap();
     assert!(!s.watch_tainted());
     assert_eq!(s.disarm_watch(slot).unwrap(), Phase::Clear);
-    assert!(
-        matches!(s.disarm_watch(slot), Err(MemError::BadRequest(_))),
-        "clear is final"
-    );
+    assert!(matches!(s.disarm_watch(slot), Err(MemError::BadRequest(_))), "clear is final");
     // an independent DR7 readback agrees with the state machine: armed shows the slot, clear does not
-    let armed = s
-        .arm_watch(&Gate::Fixture, addr, 8, Kind::Write, 10)
-        .unwrap();
+    let armed = s.arm_watch(&Gate::Fixture, addr, 8, Kind::Write, 10).unwrap();
     let (rows, unreadable) = s.read_dr7();
-    assert!(
-        unreadable.is_empty(),
-        "every thread readable: {unreadable:?}"
-    );
+    assert!(unreadable.is_empty(), "every thread readable: {unreadable:?}");
     assert!(!rows.is_empty());
-    assert!(
-        rows.iter()
-            .all(|&(_, dr7)| dr7 & (0b11 << (2 * armed)) != 0),
-        "slot {armed} is enabled on every thread: {rows:x?}"
-    );
+    assert!(rows.iter().all(|&(_, dr7)| dr7 & (0b11 << (2 * armed)) != 0), "slot {armed} is enabled on every thread: {rows:x?}");
     let covered = s.watch_threads(armed);
-    assert_eq!(
-        covered.len(),
-        rows.len(),
-        "the covered set is the readable set"
-    );
+    assert_eq!(covered.len(), rows.len(), "the covered set is the readable set");
     assert_eq!(s.disarm_watch(armed).unwrap(), Phase::Clear);
     let (rows, _) = s.read_dr7();
-    assert!(
-        rows.iter()
-            .all(|&(_, dr7)| dr7 & (0b11 << (2 * armed)) == 0)
-    );
+    assert!(rows.iter().all(|&(_, dr7)| dr7 & (0b11 << (2 * armed)) == 0));
     // the slot is reusable after a clear
-    let again = s
-        .arm_watch(&Gate::Fixture, addr, 4, Kind::Write, 10)
-        .unwrap();
+    let again = s.arm_watch(&Gate::Fixture, addr, 4, Kind::Write, 10).unwrap();
     assert_eq!(s.disarm_watch(again).unwrap(), Phase::Clear);
-    s.write_cas(
-        &Gate::Fixture,
-        addr,
-        &0x1111u64.to_le_bytes(),
-        &0x3333u64.to_le_bytes(),
-        "let the target finish",
-    )
-    .unwrap();
+    s.write_cas(&Gate::Fixture, addr, &0x1111u64.to_le_bytes(), &0x3333u64.to_le_bytes(), "let the target finish").unwrap();
     wait_exit(&mut s, Duration::from_secs(20), |_| {});
     assert_eq!(s.exit_code(), Some(0));
 }
@@ -761,25 +513,15 @@ fn the_loader_reports_a_module_loaded_and_unloaded_while_the_agent_is_in() {
     s.inject(&agent_dll()).unwrap();
     s.resume();
     let mut events = Vec::new();
-    wait_exit(&mut s, Duration::from_secs(30), |s| {
-        events.extend(s.events())
-    });
+    wait_exit(&mut s, Duration::from_secs(30), |s| events.extend(s.events()));
     events.extend(s.events());
-    let of = |kind: u16| {
-        events
-            .iter()
-            .filter(|e| e.kind == kind && event_name(&e.data) == "winmm.dll")
-            .collect::<Vec<_>>()
-    };
+    let of = |kind: u16| events.iter().filter(|e| e.kind == kind && event_name(&e.data) == "winmm.dll").collect::<Vec<_>>();
     let (loaded, unloaded) = (of(proto::EV_MODULE_LOAD), of(proto::EV_MODULE_UNLOAD));
     assert_eq!(loaded.len(), 1, "one load of winmm.dll: {events:?}");
     assert_eq!(unloaded.len(), 1, "one unload of winmm.dll");
     assert_eq!(loaded[0].data[0], unloaded[0].data[0], "same base");
     assert!(loaded[0].data[1] > 0, "the size of the image is reported");
-    assert!(
-        loaded[0].tsc < unloaded[0].tsc,
-        "in the order they happened"
-    );
+    assert!(loaded[0].tsc < unloaded[0].tsc, "in the order they happened");
 }
 
 // ---------------------------------------------------------------- identity
@@ -794,9 +536,6 @@ fn identity_follows_the_process() {
     assert!(id.image.to_lowercase().ends_with("hy-fixture.exe"));
     s.terminate();
     wait_exit(&mut s, Duration::from_secs(10), |_| {});
-    assert!(matches!(
-        s.verify_identity(),
-        Err(IdentityError::Gone) | Err(IdentityError::Reused { .. })
-    ));
+    assert!(matches!(s.verify_identity(), Err(IdentityError::Gone) | Err(IdentityError::Reused { .. })));
     assert!(id.is_gone());
 }

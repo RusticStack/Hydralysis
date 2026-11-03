@@ -18,9 +18,7 @@ pub extern "system" fn fx_hit(x: u64) -> u64 {
 static CELL: AtomicU64 = AtomicU64::new(0x1111);
 
 fn base() -> usize {
-    unsafe {
-        windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(core::ptr::null()) as usize
-    }
+    unsafe { windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(core::ptr::null()) as usize }
 }
 
 fn main() {
@@ -29,15 +27,8 @@ fn main() {
     match mode {
         "info" => {
             let f = fx_hit as *const () as usize;
-            let bytes: Vec<String> = (0..32)
-                .map(|i| format!("{:02x}", unsafe { *(f as *const u8).add(i) }))
-                .collect();
-            println!(
-                "RVA={:x} BYTES={} CELL={:x}",
-                f - base(),
-                bytes.join(""),
-                &CELL as *const AtomicU64 as usize - base()
-            );
+            let bytes: Vec<String> = (0..32).map(|i| format!("{:02x}", unsafe { *(f as *const u8).add(i) })).collect();
+            println!("RVA={:x} BYTES={} CELL={:x}", f - base(), bytes.join(""), &CELL as *const AtomicU64 as usize - base());
         }
         "churn" => {
             let n: u64 = args[2].parse().unwrap();
@@ -100,11 +91,7 @@ fn main() {
             println!("DONE");
         }
         "write" => {
-            println!(
-                "ADDR={:x} BASE={:x}",
-                &CELL as *const AtomicU64 as usize,
-                base()
-            );
+            println!("ADDR={:x} BASE={:x}", &CELL as *const AtomicU64 as usize, base());
             for _ in 0..20_000 {
                 if CELL.load(Ordering::SeqCst) == 0x3333 {
                     println!("SAW");

@@ -76,10 +76,7 @@ pub struct Shadow {
 impl Shadow {
     pub const fn new() -> Shadow {
         const E: Entry = Entry::empty();
-        Shadow {
-            depth: 0,
-            ents: [E; p::SHADOW_DEPTH],
-        }
+        Shadow { depth: 0, ents: [E; p::SHADOW_DEPTH] }
     }
 }
 
@@ -130,11 +127,7 @@ pub unsafe fn my_ring() -> *mut u8 {
     } else {
         RING.with(|c| c.get())
     };
-    if r != 0 {
-        r as *mut u8
-    } else {
-        unsafe { claim() }
-    }
+    if r != 0 { r as *mut u8 } else { unsafe { claim() } }
 }
 
 #[cold]
@@ -147,15 +140,7 @@ unsafe fn claim() -> *mut u8 {
         }
         for i in 0..p::MAX_RINGS {
             let r = sec.add(p::ring_offset(i));
-            if a32(r, p::R_STATE)
-                .compare_exchange(
-                    p::RING_FREE,
-                    p::RING_OWNED,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-            {
+            if a32(r, p::R_STATE).compare_exchange(p::RING_FREE, p::RING_OWNED, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
                 (r.add(p::R_TID) as *mut u32).write(teb_tid());
                 for s in 0..p::MAX_SITES {
                     (r.add(p::RING_CTR + s * p::CTR_SIZE + 16) as *mut u64).write(0); // next
@@ -207,9 +192,7 @@ unsafe fn reserve(ring: *mut u8, total: usize) -> (*mut u8, u32) {
         let pad = if to_end < total { to_end } else { 0 };
         let need = pad + total;
         let tail = a32(ring, p::R_TAIL).load(Ordering::Acquire);
-        if (head.wrapping_sub(tail) as usize) + need > p::RING_DATA
-            && !wait_for_room(ring, head, need)
-        {
+        if (head.wrapping_sub(tail) as usize) + need > p::RING_DATA && !wait_for_room(ring, head, need) {
             bump32(ring, p::R_DROPPED);
             return (core::ptr::null_mut(), 0);
         }
@@ -228,10 +211,7 @@ unsafe fn reserve(ring: *mut u8, total: usize) -> (*mut u8, u32) {
 #[inline(never)]
 unsafe fn wait_for_room(ring: *mut u8, head: u32, need: usize) -> bool {
     unsafe {
-        let fits = || {
-            (head.wrapping_sub(a32(ring, p::R_TAIL).load(Ordering::Acquire)) as usize) + need
-                <= p::RING_DATA
-        };
+        let fits = || (head.wrapping_sub(a32(ring, p::R_TAIL).load(Ordering::Acquire)) as usize) + need <= p::RING_DATA;
         let shed = a32(ring, p::R_SHED);
         if shed.load(Ordering::Relaxed) != 0 {
             let used = head.wrapping_sub(a32(ring, p::R_TAIL).load(Ordering::Acquire)) as usize;
@@ -263,14 +243,7 @@ unsafe fn wait_for_room(ring: *mut u8, head: u32, need: usize) -> bool {
 
 /// Complete and publish `e` (the entry data) with the return data (zeros / `returned = false` for entry-only).
 #[inline(always)]
-pub unsafe fn emit(
-    ring: *mut u8,
-    e: &Entry,
-    returned: bool,
-    tsc_end: u64,
-    retval: u64,
-    last_error: u32,
-) {
+pub unsafe fn emit(ring: *mut u8, e: &Entry, returned: bool, tsc_end: u64, retval: u64, last_error: u32) {
     unsafe {
         let nargs = e.nargs as usize;
         let nstack = e.nstack as usize;

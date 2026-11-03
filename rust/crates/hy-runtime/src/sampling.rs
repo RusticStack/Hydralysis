@@ -30,12 +30,7 @@ pub struct Policy {
 
 impl Default for Policy {
     fn default() -> Policy {
-        Policy {
-            mode: Mode::Adaptive,
-            rate_budget: DEFAULT_RATE_BUDGET,
-            interval: Duration::from_millis(25),
-            exact_sites: HashSet::new(),
-        }
+        Policy { mode: Mode::Adaptive, rate_budget: DEFAULT_RATE_BUDGET, interval: Duration::from_millis(25), exact_sites: HashSet::new() }
     }
 }
 
@@ -92,11 +87,7 @@ impl Sampler {
     /// A site's `skipped` count as reported: only a site that was ever thinned can have skipped a hit (this keeps
     /// exact mode from reporting a phantom skip for a hit that was counted but not yet kept when the counters were read).
     pub fn reported_skipped(&self, site: usize, hits: u64, kept: u64) -> u64 {
-        if self.thinned[site] {
-            hits.saturating_sub(kept)
-        } else {
-            0
-        }
+        if self.thinned[site] { hits.saturating_sub(kept) } else { 0 }
     }
 
     fn apply(&mut self, site: usize, stride: u32, out: &mut Vec<(usize, u32)>) {
@@ -120,11 +111,7 @@ impl Sampler {
             Mode::Fixed(n) => {
                 let s = pow2_ge(n as f64);
                 for site in 0..self.sites {
-                    let want = if self.policy.exact_sites.contains(&site) {
-                        1
-                    } else {
-                        s
-                    };
+                    let want = if self.policy.exact_sites.contains(&site) { 1 } else { s };
                     self.apply(site, want, &mut out);
                 }
                 return out;
@@ -138,11 +125,7 @@ impl Sampler {
         };
         let dt = now.duration_since(last).as_secs_f64();
         // The first moments decide whether a hot site fills a ring before the policy has seen it: look sooner then.
-        let wait = if now.duration_since(t0) < Duration::from_millis(500) {
-            0.005
-        } else {
-            self.policy.interval.as_secs_f64()
-        };
+        let wait = if now.duration_since(t0) < Duration::from_millis(500) { 0.005 } else { self.policy.interval.as_secs_f64() };
         if dt < wait {
             return out;
         }
@@ -192,13 +175,7 @@ impl Sampler {
 mod tests {
     use super::*;
 
-    fn feed(
-        s: &mut Sampler,
-        t: Instant,
-        secs: f64,
-        hits: &[u64],
-        dropped: u64,
-    ) -> Vec<(usize, u32)> {
+    fn feed(s: &mut Sampler, t: Instant, secs: f64, hits: &[u64], dropped: u64) -> Vec<(usize, u32)> {
         s.step(t + Duration::from_secs_f64(secs), hits, dropped)
     }
 
@@ -209,11 +186,7 @@ mod tests {
         assert!(feed(&mut s, t, 0.0, &[0, 0], 0).is_empty());
         assert!(feed(&mut s, t, 0.1, &[1000, 500], 0).is_empty()); // 10k/s and 5k/s, budget 120k/s
         assert_eq!((s.stride(0), s.stride(1)), (1, 1));
-        assert_eq!(
-            s.reported_skipped(0, 10, 7),
-            0,
-            "never thinned: no phantom skip"
-        );
+        assert_eq!(s.reported_skipped(0, 10, 7), 0, "never thinned: no phantom skip");
     }
 
     #[test]
@@ -223,19 +196,11 @@ mod tests {
         feed(&mut s, t, 0.0, &[0, 0], 0);
         // site 0: 1.2M hits/s, site 1: 10k hits/s, budget 120k/s
         let ch = feed(&mut s, t, 1.0, &[1_200_000, 10_000], 0);
-        assert_eq!(
-            ch,
-            vec![(0, 16)],
-            "stride is a power of two covering rate/share"
-        );
+        assert_eq!(ch, vec![(0, 16)], "stride is a power of two covering rate/share");
         assert_eq!(s.stride(1), 1);
         assert_eq!(s.reported_skipped(0, 100, 70), 30);
         assert_eq!((s.rate(0), s.rate(1)), (1_200_000.0, 10_000.0));
-        assert_eq!(
-            s.rate(9),
-            0.0,
-            "a site the sampler does not own has no rate"
-        );
+        assert_eq!(s.rate(9), 0.0, "a site the sampler does not own has no rate");
     }
 
     #[test]
@@ -251,22 +216,9 @@ mod tests {
 
     #[test]
     fn fixed_and_exact_modes() {
-        let mut f = Sampler::new(
-            Policy {
-                mode: Mode::Fixed(5),
-                exact_sites: [1].into(),
-                ..Policy::default()
-            },
-            2,
-        );
+        let mut f = Sampler::new(Policy { mode: Mode::Fixed(5), exact_sites: [1].into(), ..Policy::default() }, 2);
         assert_eq!(f.step(Instant::now(), &[0, 0], 0), vec![(0, 8)]);
-        let mut e = Sampler::new(
-            Policy {
-                mode: Mode::Exact,
-                ..Policy::default()
-            },
-            2,
-        );
+        let mut e = Sampler::new(Policy { mode: Mode::Exact, ..Policy::default() }, 2);
         assert!(e.step(Instant::now(), &[9, 9], 0).is_empty());
     }
 }

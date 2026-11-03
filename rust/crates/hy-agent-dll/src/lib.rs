@@ -5,9 +5,7 @@
 #![cfg(windows)]
 
 #[cfg(not(target_arch = "x86_64"))]
-compile_error!(
-    "hy-agent-dll currently implements the x86-64 hook engine only; the x86 stub is not written yet"
-);
+compile_error!("hy-agent-dll currently implements the x86-64 hook engine only; the x86 stub is not written yet");
 
 mod hook;
 mod modules;
@@ -27,11 +25,7 @@ use windows_sys::Win32::System::Performance::*;
 use windows_sys::Win32::System::Threading::*;
 
 #[unsafe(no_mangle)]
-pub extern "system" fn DllMain(
-    _h: *mut core::ffi::c_void,
-    _reason: u32,
-    _res: *mut core::ffi::c_void,
-) -> i32 {
+pub extern "system" fn DllMain(_h: *mut core::ffi::c_void, _reason: u32, _res: *mut core::ffi::c_void) -> i32 {
     TRUE
 }
 
@@ -71,15 +65,11 @@ unsafe fn arm_site(idx: usize) -> u32 {
         }
         let rva = (cfg.add(p::S_RVA) as *const u64).read_unaligned() as usize;
         let want_base = (cfg.add(p::S_BASE) as *const u64).read_unaligned() as usize;
-        let expect_len =
-            ((cfg.add(p::S_EXPECT_LEN) as *const u32).read_unaligned() as usize).min(32);
+        let expect_len = ((cfg.add(p::S_EXPECT_LEN) as *const u32).read_unaligned() as usize).min(32);
         let module = cstr_field(cfg, p::S_MODULE, 64);
         let export = cstr_field(cfg, p::S_EXPORT, 64);
-        let handle = if module.is_empty() {
-            GetModuleHandleW(core::ptr::null())
-        } else {
-            GetModuleHandleW(wide(&module).as_ptr())
-        } as usize;
+        let handle =
+            if module.is_empty() { GetModuleHandleW(core::ptr::null()) } else { GetModuleHandleW(wide(&module).as_ptr()) } as usize;
         if handle == 0 {
             return fail(p::ERR_NO_MODULE);
         }
@@ -90,9 +80,7 @@ unsafe fn arm_site(idx: usize) -> u32 {
         if !export.is_empty() {
             let mut name = export.clone().into_bytes();
             name.push(0);
-            let found = GetProcAddress(handle as _, name.as_ptr())
-                .map(|f| f as usize)
-                .unwrap_or(0);
+            let found = GetProcAddress(handle as _, name.as_ptr()).map(|f| f as usize).unwrap_or(0);
             if found != addr {
                 return fail(p::ERR_EXPORT_MISMATCH);
             }
@@ -103,15 +91,7 @@ unsafe fn arm_site(idx: usize) -> u32 {
         }
         let mut live = [0u8; 32];
         let mut got = 0usize;
-        if ReadProcessMemory(
-            -1isize as _,
-            addr as *const _,
-            live.as_mut_ptr().cast(),
-            expect_len,
-            &mut got,
-        ) == 0
-            || got != expect_len
-        {
+        if ReadProcessMemory(-1isize as _, addr as *const _, live.as_mut_ptr().cast(), expect_len, &mut got) == 0 || got != expect_len {
             return fail(p::ERR_BYTES_MISMATCH);
         }
         let expect = core::slice::from_raw_parts(cfg.add(p::S_EXPECT), expect_len);
@@ -209,11 +189,7 @@ unsafe extern "system" fn control_main(_arg: *mut core::ffi::c_void) -> u32 {
 pub unsafe extern "system" fn hy_agent_init(_param: *mut core::ffi::c_void) -> u32 {
     unsafe {
         let pid = GetCurrentProcessId();
-        let h = OpenFileMappingW(
-            FILE_MAP_ALL_ACCESS,
-            FALSE,
-            wide(&format!("Local\\hy_agent_{pid}")).as_ptr(),
-        );
+        let h = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, wide(&format!("Local\\hy_agent_{pid}")).as_ptr());
         if h.is_null() {
             return p::ERR_SECTION;
         }
@@ -245,11 +221,7 @@ pub unsafe extern "system" fn hy_agent_init(_param: *mut core::ffi::c_void) -> u
             QueryPerformanceCounter(&mut qb);
             let tb = core::arch::x86_64::_rdtsc();
             let us = ((qb - qa) as f64 / f as f64 * 1e6).max(1.0);
-            let per_us = if invariant {
-                (tb - ta) as f64 / us
-            } else {
-                f as f64 / 1e6
-            };
+            let per_us = if invariant { (tb - ta) as f64 / us } else { f as f64 / 1e6 };
             (base.add(p::H_STALL_BUDGET) as *mut u64).write((per_us * 200.0) as u64);
         }
         let tls = TlsAlloc();
@@ -262,21 +234,11 @@ pub unsafe extern "system" fn hy_agent_init(_param: *mut core::ffi::c_void) -> u
             Err(c) => return c,
         }
         for i in 0..p::MAX_PAUSE {
-            pause::EVENTS[i].store(
-                open_event(format!("Local\\hy_bp_{pid}_{i}")) as usize,
-                Ordering::Release,
-            );
+            pause::EVENTS[i].store(open_event(format!("Local\\hy_bp_{pid}_{i}")) as usize, Ordering::Release);
         }
         AddVectoredExceptionHandler(1, Some(watch::veh));
         modules::register();
-        let t = CreateThread(
-            core::ptr::null(),
-            0,
-            Some(control_main),
-            core::ptr::null(),
-            0,
-            core::ptr::null_mut(),
-        );
+        let t = CreateThread(core::ptr::null(), 0, Some(control_main), core::ptr::null(), 0, core::ptr::null_mut());
         if t.is_null() {
             return p::ERR_SECTION;
         }

@@ -39,12 +39,7 @@ pub unsafe extern "system" fn veh(ep: *mut EXCEPTION_POINTERS) -> i32 {
             let limit = (w.add(p::W_LIMIT) as *const u32).read_volatile();
             if limit == 0 || n < limit {
                 let addr = (w.add(p::W_ADDR) as *const u64).read_volatile();
-                ring::push_event(
-                    p::EV_WATCH_HIT,
-                    0,
-                    s as u32,
-                    [(*ctx).Rip, dr6, addr, bits as u64, 0],
-                );
+                ring::push_event(p::EV_WATCH_HIT, 0, s as u32, [(*ctx).Rip, dr6, addr, bits as u64, 0]);
             }
         }
         (*ctx).Dr6 = 0;

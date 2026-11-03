@@ -32,10 +32,7 @@ fn map_rva(map: &str, name: &str) -> u64 {
         .find_map(|l| l.trim().strip_prefix("Preferred load address is "))
         .map(|h| u64::from_str_radix(h.trim(), 16).unwrap())
         .unwrap();
-    let line = map
-        .lines()
-        .find(|l| l.split_whitespace().nth(1) == Some(name))
-        .unwrap();
+    let line = map.lines().find(|l| l.split_whitespace().nth(1) == Some(name)).unwrap();
     u64::from_str_radix(line.split_whitespace().nth(2).unwrap(), 16).unwrap() - base
 }
 
@@ -56,12 +53,7 @@ struct Run {
 
 fn read_times(path: &Path, wall: f64, hits: u64, dropped: u64) -> Run {
     let d = std::fs::read(path).expect("times file");
-    let mut us: Vec<f64> = d
-        .as_chunks::<8>()
-        .0
-        .iter()
-        .map(|c| u64::from_le_bytes(*c) as f64 / FREQ * 1e6)
-        .collect();
+    let mut us: Vec<f64> = d.as_chunks::<8>().0.iter().map(|c| u64::from_le_bytes(*c) as f64 / FREQ * 1e6).collect();
     us.sort_by(|a, b| a.partial_cmp(b).unwrap());
     Run {
         p50: pct(&us, 0.5),
@@ -79,26 +71,16 @@ fn run(exe: &Path, args: &[String], sites: &[SiteSpec], dll: Option<&Path>, time
     let _ = std::fs::remove_file(times);
     let mut a = args.to_vec();
     a.push(format!("--times={}", times.display()));
-    let mut s =
-        Session::spawn_with(exe, &a, sites, Some(&times.with_extension("txt"))).expect("spawn");
+    let mut s = Session::spawn_with(exe, &a, sites, Some(&times.with_extension("txt"))).expect("spawn");
     if let Some(dll) = dll {
         s.inject(dll).expect("inject");
         for i in 0..sites.len() {
-            assert_eq!(
-                s.site_status(i).0,
-                hy_runtime::proto::SITE_ARMED,
-                "site {i} refused: {:?}",
-                s.site_status(i)
-            );
+            assert_eq!(s.site_status(i).0, hy_runtime::proto::SITE_ARMED, "site {i} refused: {:?}", s.site_status(i));
         }
     }
     let mut sampler = Sampler::new(
         Policy {
-            mode: if std::env::var("HY_SAMPLING").is_ok_and(|v| v == "exact") {
-                Mode::Exact
-            } else {
-                Mode::Adaptive
-            },
+            mode: if std::env::var("HY_SAMPLING").is_ok_and(|v| v == "exact") { Mode::Exact } else { Mode::Adaptive },
             ..Policy::default()
         },
         sites.len(),
@@ -106,10 +88,7 @@ fn run(exe: &Path, args: &[String], sites: &[SiteSpec], dll: Option<&Path>, time
     let t0 = Instant::now();
     s.resume();
     let mut hits = 0u64;
-    let every: u64 = std::env::var("HY_DRAIN_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1);
+    let every: u64 = std::env::var("HY_DRAIN_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
     while s.running() {
         if dll.is_some() && every > 0 {
             hits += s.drain_with(|_| {});
@@ -160,12 +139,7 @@ fn main() {
         .iter()
         .map(|n| {
             let rva = map_rva(&map, n);
-            let mut s = SiteSpec::new(
-                rva,
-                pe_exports::bytes_at_rva(&image, rva as u32, 16)
-                    .unwrap()
-                    .to_vec(),
-            );
+            let mut s = SiteSpec::new(rva, pe_exports::bytes_at_rva(&image, rva as u32, 16).unwrap().to_vec());
             s.nargs = 1;
             s
         })
@@ -190,13 +164,7 @@ fn main() {
                 off[r].p50, on[r].p50, on[r].hits, on[r].dropped
             );
         }
-        let ov = |f: &dyn Fn(&Run) -> f64| {
-            median(
-                (0..rounds)
-                    .map(|i| (f(&on[i]) - f(&off[i])) / f(&off[i]))
-                    .collect(),
-            )
-        };
+        let ov = |f: &dyn Fn(&Run) -> f64| median((0..rounds).map(|i| (f(&on[i]) - f(&off[i])) / f(&off[i])).collect());
         println!("== {w} ({rounds} rounds) ==");
         println!(
             "frame p50 {:.2} -> {:.2} us  mean {:.2} -> {:.2} us  p99 {:.2} -> {:.2} us",

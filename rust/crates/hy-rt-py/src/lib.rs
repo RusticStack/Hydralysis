@@ -35,8 +35,7 @@ fn gate_of(authorization: Option<&str>) -> PyResult<Gate> {
     match authorization {
         None => Ok(Gate::Fixture),
         Some(text) => {
-            let v: serde_json::Value =
-                serde_json::from_str(text).map_err(|e| PyValueError::new_err(e.to_string()))?;
+            let v: serde_json::Value = serde_json::from_str(text).map_err(|e| PyValueError::new_err(e.to_string()))?;
             let a = hy_runtime::authorize::normalize(&v).map_err(PyValueError::new_err)?;
             Ok(Gate::Authorized(a))
         }
@@ -81,10 +80,7 @@ struct RtSession {
 
 impl RtSession {
     fn with<T>(&self, f: impl FnOnce(&mut Session) -> PyResult<T>) -> PyResult<T> {
-        let mut g = self
-            .inner
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("session lock poisoned"))?;
+        let mut g = self.inner.lock().map_err(|_| PyRuntimeError::new_err("session lock poisoned"))?;
         match g.as_mut() {
             Some(s) => f(s),
             None => Err(PyRuntimeError::new_err("session is closed")),
@@ -109,10 +105,7 @@ impl RtSession {
         if hits.is_empty() {
             return Ok(());
         }
-        let mut stash = self
-            .stash
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("stash lock poisoned"))?;
+        let mut stash = self.stash.lock().map_err(|_| PyRuntimeError::new_err("stash lock poisoned"))?;
         for h in hits {
             if h.site >= OBSERVE_BASE {
                 stash.observe.push(h);
@@ -127,10 +120,7 @@ impl RtSession {
     }
 }
 
-fn opt<'py, T: for<'a> FromPyObject<'a, 'py, Error = PyErr>>(
-    d: &Bound<'py, PyDict>,
-    k: &str,
-) -> PyResult<Option<T>> {
+fn opt<'py, T: for<'a> FromPyObject<'a, 'py, Error = PyErr>>(d: &Bound<'py, PyDict>, k: &str) -> PyResult<Option<T>> {
     match d.get_item(k)? {
         Some(v) if !v.is_none() => Ok(Some(v.extract::<T>()?)),
         _ => Ok(None),
@@ -158,9 +148,7 @@ fn site_spec(d: &Bound<'_, PyDict>) -> PyResult<SiteSpec> {
         flags |= proto::F_PAUSE;
     }
     if let Some(b) = d.get_item("buf")?.filter(|b| !b.is_none()) {
-        let b = b
-            .cast::<PyDict>()
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        let b = b.cast::<PyDict>().map_err(|e| PyValueError::new_err(e.to_string()))?;
         s.buf_ptr_arg = opt::<i32>(b, "ptr_arg")?.unwrap_or(-1);
         s.buf_len_arg = opt::<i32>(b, "len_arg")?.unwrap_or(-1);
         s.buf_fixed = opt(b, "fixed")?.unwrap_or(0);
@@ -199,22 +187,14 @@ impl RtSession {
         env: Option<Vec<(String, String)>>,
         stdout: Option<String>,
     ) -> PyResult<RtSession> {
-        let opts = SpawnOpts {
-            stdout: stdout.map(PathBuf::from),
-            cwd: cwd.map(PathBuf::from),
-            env,
-        };
-        let s = py
-            .detach(|| Session::spawn_opts(std::path::Path::new(&exe), &argv, &[], &opts))
-            .map_err(os)?;
+        let opts = SpawnOpts { stdout: stdout.map(PathBuf::from), cwd: cwd.map(PathBuf::from), env };
+        let s = py.detach(|| Session::spawn_opts(std::path::Path::new(&exe), &argv, &[], &opts)).map_err(os)?;
         Ok(RtSession::wrap(s))
     }
 
     #[staticmethod]
     fn attach(py: Python<'_>, pid: u32) -> PyResult<RtSession> {
-        Ok(RtSession::wrap(
-            py.detach(|| Session::attach(pid, &[])).map_err(os)?,
-        ))
+        Ok(RtSession::wrap(py.detach(|| Session::attach(pid, &[])).map_err(os)?))
     }
 
     /// Inject the agent library and start it.
@@ -244,19 +224,11 @@ impl RtSession {
     }
 
     fn verify_identity(&self) -> PyResult<()> {
-        self.with(|s| {
-            s.verify_identity()
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
-        })
+        self.with(|s| s.verify_identity().map_err(|e| PyRuntimeError::new_err(e.to_string())))
     }
 
     /// Arm site `idx` from a spec dict. Returns `(ok, error_code)`.
-    fn arm_site(
-        &self,
-        py: Python<'_>,
-        idx: usize,
-        spec: &Bound<'_, PyDict>,
-    ) -> PyResult<(bool, u32)> {
+    fn arm_site(&self, py: Python<'_>, idx: usize, spec: &Bound<'_, PyDict>) -> PyResult<(bool, u32)> {
         if idx >= proto::MAX_SITES {
             return Err(PyValueError::new_err("site index out of range"));
         }
@@ -294,23 +266,11 @@ impl RtSession {
 
     /// Drain the rings into batches in the wire format of `trace_wire.py`, each at most `max_bytes` of records,
     /// numbered from `first_seq`. Empty when nothing was pending. Every header carries the cumulative counters.
-    fn drain_wire<'py>(
-        &self,
-        py: Python<'py>,
-        producer_gen: u32,
-        first_seq: u32,
-        max_bytes: usize,
-    ) -> PyResult<Vec<Bound<'py, PyBytes>>> {
+    fn drain_wire<'py>(&self, py: Python<'py>, producer_gen: u32, first_seq: u32, max_bytes: usize) -> PyResult<Vec<Bound<'py, PyBytes>>> {
         let batches = py.detach(|| {
             self.with(|s| {
                 self.pull(s)?;
-                let hits = std::mem::take(
-                    &mut self
-                        .stash
-                        .lock()
-                        .map_err(|_| PyRuntimeError::new_err("stash lock poisoned"))?
-                        .trace,
-                );
+                let hits = std::mem::take(&mut self.stash.lock().map_err(|_| PyRuntimeError::new_err("stash lock poisoned"))?.trace);
                 if hits.is_empty() {
                     return Ok(Vec::new());
                 }
@@ -345,14 +305,7 @@ impl RtSession {
                     *seq = seq.wrapping_add(1);
                 };
                 for h in &hits {
-                    let times = (
-                        clock.to_qpc(h.tsc),
-                        if h.tsc_end == 0 {
-                            0
-                        } else {
-                            clock.to_qpc(h.tsc_end)
-                        },
-                    );
+                    let times = (clock.to_qpc(h.tsc), if h.tsc_end == 0 { 0 } else { clock.to_qpc(h.tsc_end) });
                     let rec = wire_record(times, h);
                     if !body.is_empty() && body.len() + rec.len() > cap {
                         flush(&mut body, &mut n, &mut seq);
@@ -374,13 +327,7 @@ impl RtSession {
             self.with(|s| {
                 self.pull(s)?;
                 let clock = s.clock;
-                let taken = std::mem::take(
-                    &mut self
-                        .stash
-                        .lock()
-                        .map_err(|_| PyRuntimeError::new_err("stash lock poisoned"))?
-                        .observe,
-                );
+                let taken = std::mem::take(&mut self.stash.lock().map_err(|_| PyRuntimeError::new_err("stash lock poisoned"))?.observe);
                 Ok(taken
                     .into_iter()
                     .map(|h| {
@@ -413,22 +360,13 @@ impl RtSession {
     /// Choose the sampling policy: `mode` is "adaptive", "exact" or "fixed" (with `stride`); `exact_sites` are site
     /// indexes never thinned.
     #[pyo3(signature = (mode, rate_budget, stride, interval_ms, exact_sites=Vec::new()))]
-    fn configure_sampling(
-        &self,
-        mode: &str,
-        rate_budget: f64,
-        stride: u32,
-        interval_ms: u64,
-        exact_sites: Vec<usize>,
-    ) -> PyResult<()> {
+    fn configure_sampling(&self, mode: &str, rate_budget: f64, stride: u32, interval_ms: u64, exact_sites: Vec<usize>) -> PyResult<()> {
         let mode = match mode {
             "adaptive" => Mode::Adaptive,
             "exact" => Mode::Exact,
             "fixed" => Mode::Fixed(stride.max(1)),
             other => {
-                return Err(PyValueError::new_err(format!(
-                    "unknown sampling mode {other:?}"
-                )));
+                return Err(PyValueError::new_err(format!("unknown sampling mode {other:?}")));
             }
         };
         let policy = Policy {
@@ -437,20 +375,14 @@ impl RtSession {
             interval: Duration::from_millis(interval_ms.max(1)),
             exact_sites: exact_sites.into_iter().collect::<HashSet<_>>(),
         };
-        *self
-            .sampler
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("sampler lock poisoned"))? =
+        *self.sampler.lock().map_err(|_| PyRuntimeError::new_err("sampler lock poisoned"))? =
             Some(Sampler::new(policy, usize::from(OBSERVE_BASE)));
         Ok(())
     }
 
     /// One step of the sampling policy (a no-op until configured). New strides are applied to the agent's sites.
     fn sampling_tick(&self) -> PyResult<()> {
-        let mut g = self
-            .sampler
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("sampler lock poisoned"))?;
+        let mut g = self.sampler.lock().map_err(|_| PyRuntimeError::new_err("sampler lock poisoned"))?;
         let Some(sampler) = g.as_mut() else {
             return Ok(());
         };
@@ -464,10 +396,7 @@ impl RtSession {
     /// `(policy_changes, effective_budget, [(site, hits, kept, skipped, stride, rate_per_s)])` for every site slot (the
     /// caller picks the armed ones). Sites from `OBSERVE_BASE` up are not the sampler's: stride 1, rate 0.
     fn sampling_report(&self) -> PyResult<SamplingReport> {
-        let g = self
-            .sampler
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("sampler lock poisoned"))?;
+        let g = self.sampler.lock().map_err(|_| PyRuntimeError::new_err("sampler lock poisoned"))?;
         let c = self.with(|s| Ok(s.counters()))?;
         let (changes, effective) = g.as_ref().map_or((0, 0.0), |x| (x.changes, x.effective));
         let rows = c
@@ -476,11 +405,7 @@ impl RtSession {
             .enumerate()
             .map(|(i, x)| {
                 let (skipped, stride, rate) = match g.as_ref() {
-                    Some(y) if i < usize::from(OBSERVE_BASE) => (
-                        y.reported_skipped(i, x.hits, x.kept),
-                        y.stride(i),
-                        y.rate(i),
-                    ),
+                    Some(y) if i < usize::from(OBSERVE_BASE) => (y.reported_skipped(i, x.hits, x.kept), y.stride(i), y.rate(i)),
                     _ => (0, 1, 0.0),
                 };
                 (i, x.hits, x.kept, skipped, stride, rate)
@@ -531,30 +456,13 @@ impl RtSession {
     fn events(&self) -> PyResult<Vec<(u16, u16, u32, u32, Vec<u64>, u64)>> {
         self.with(|s| {
             let clock = s.clock;
-            Ok(s.events()
-                .into_iter()
-                .map(|e| {
-                    (
-                        e.kind,
-                        e.site,
-                        e.tid,
-                        e.slot,
-                        e.data.to_vec(),
-                        clock.to_qpc(e.tsc),
-                    )
-                })
-                .collect())
+            Ok(s.events().into_iter().map(|e| (e.kind, e.site, e.tid, e.slot, e.data.to_vec(), clock.to_qpc(e.tsc))).collect())
         })
     }
 
     /// Parked threads: `(slot, tid, site, parked_seconds)`.
     fn paused(&self) -> PyResult<Vec<(usize, u32, u32, f64)>> {
-        self.with(|s| {
-            Ok(s.paused()
-                .into_iter()
-                .map(|p| (p.slot, p.tid, p.site, p.parked_for.as_secs_f64()))
-                .collect())
-        })
+        self.with(|s| Ok(s.paused().into_iter().map(|p| (p.slot, p.tid, p.site, p.parked_for.as_secs_f64())).collect()))
     }
 
     #[pyo3(signature = (slot, auto=false))]
@@ -588,10 +496,7 @@ impl RtSession {
     /// Every thread as `(tid, state, {register: value})`; the state is Frida's name, the registers are empty for a
     /// thread that could not be stopped for the read.
     #[allow(clippy::type_complexity)]
-    fn thread_report<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Vec<(u32, &'static str, Bound<'py, PyDict>)>> {
+    fn thread_report<'py>(&self, py: Python<'py>) -> PyResult<Vec<(u32, &'static str, Bound<'py, PyDict>)>> {
         let report = py.detach(|| self.with(|s| Ok(s.thread_report())))?;
         report
             .into_iter()
@@ -605,12 +510,7 @@ impl RtSession {
             .collect()
     }
 
-    fn read_memory<'py>(
-        &self,
-        py: Python<'py>,
-        address: u64,
-        size: usize,
-    ) -> PyResult<Bound<'py, PyBytes>> {
+    fn read_memory<'py>(&self, py: Python<'py>, address: u64, size: usize) -> PyResult<Bound<'py, PyBytes>> {
         let v = py.detach(|| self.with(|s| s.read_memory(address, size).map_err(os)))?;
         Ok(PyBytes::new(py, &v))
     }
@@ -623,19 +523,9 @@ impl RtSession {
     /// Compare-and-swap with the policy gate. `authorization` is the JSON of the build's entry, or None for the
     /// fixture gate. Returns the undo id.
     #[pyo3(signature = (address, expect, value, reason, authorization=None))]
-    fn write_cas(
-        &self,
-        address: u64,
-        expect: Vec<u8>,
-        value: Vec<u8>,
-        reason: String,
-        authorization: Option<String>,
-    ) -> PyResult<u32> {
+    fn write_cas(&self, address: u64, expect: Vec<u8>, value: Vec<u8>, reason: String, authorization: Option<String>) -> PyResult<u32> {
         let gate = gate_of(authorization.as_deref())?;
-        self.with(|s| {
-            s.write_cas(&gate, address, &expect, &value, &reason)
-                .map_err(mem)
-        })
+        self.with(|s| s.write_cas(&gate, address, &expect, &value, &reason).map_err(mem))
     }
 
     #[pyo3(signature = (id, authorization=None))]
@@ -646,22 +536,13 @@ impl RtSession {
 
     /// Arm a hardware watch (`kind` is "write" or "rw"); returns the slot.
     #[pyo3(signature = (address, size, kind, limit, authorization=None))]
-    fn arm_watch(
-        &self,
-        address: u64,
-        size: u32,
-        kind: &str,
-        limit: u32,
-        authorization: Option<String>,
-    ) -> PyResult<usize> {
+    fn arm_watch(&self, address: u64, size: u32, kind: &str, limit: u32, authorization: Option<String>) -> PyResult<usize> {
         let gate = gate_of(authorization.as_deref())?;
         let kind = match kind {
             "write" => Kind::Write,
             "rw" | "readwrite" => Kind::ReadWrite,
             other => {
-                return Err(PyValueError::new_err(format!(
-                    "unknown watch kind {other:?}"
-                )));
+                return Err(PyValueError::new_err(format!("unknown watch kind {other:?}")));
             }
         };
         self.with(|s| s.arm_watch(&gate, address, size, kind, limit).map_err(mem))

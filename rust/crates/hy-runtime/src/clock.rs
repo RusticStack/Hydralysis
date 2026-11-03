@@ -14,13 +14,7 @@ pub struct Clock {
 
 impl Clock {
     pub fn new(use_qpc: bool, tsc0: u64, qpc0: u64, freq: u64) -> Clock {
-        Clock {
-            use_qpc,
-            tsc0,
-            qpc0,
-            freq,
-            ratio: 0.0,
-        }
+        Clock { use_qpc, tsc0, qpc0, freq, ratio: 0.0 }
     }
 
     /// Refine the ratio from a fresh `(tsc, qpc)` pair taken on the host (the TSC is machine-wide).
@@ -39,11 +33,7 @@ impl Clock {
 
     /// A span of record-clock ticks in QueryPerformanceCounter ticks.
     pub fn span_to_qpc(&self, ticks: u64) -> u64 {
-        if self.use_qpc {
-            ticks
-        } else {
-            (ticks as f64 * self.ratio) as u64
-        }
+        if self.use_qpc { ticks } else { (ticks as f64 * self.ratio) as u64 }
     }
 
     /// A record timestamp in QueryPerformanceCounter ticks. Zero before the first usable refinement.

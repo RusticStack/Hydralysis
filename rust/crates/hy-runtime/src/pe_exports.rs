@@ -23,12 +23,7 @@ pub fn find_export(image: &[u8], name: &str) -> Option<(u32, bool)> {
     let to_off = |rva: u32| -> Option<usize> {
         for i in 0..nsec {
             let s = sec + i * 40;
-            let (vsize, va, raw_size, raw) = (
-                u32at(image, s + 8)?,
-                u32at(image, s + 12)?,
-                u32at(image, s + 16)?,
-                u32at(image, s + 20)?,
-            );
+            let (vsize, va, raw_size, raw) = (u32at(image, s + 8)?, u32at(image, s + 12)?, u32at(image, s + 16)?, u32at(image, s + 20)?);
             if rva >= va && rva < va + vsize.max(raw_size) {
                 return Some((rva - va + raw) as usize);
             }
@@ -37,11 +32,7 @@ pub fn find_export(image: &[u8], name: &str) -> Option<(u32, bool)> {
     };
     let e = to_off(exp_rva)?;
     let nnames = u32at(image, e + 24)? as usize;
-    let (funcs, names, ords) = (
-        u32at(image, e + 28)?,
-        u32at(image, e + 32)?,
-        u32at(image, e + 36)?,
-    );
+    let (funcs, names, ords) = (u32at(image, e + 28)?, u32at(image, e + 32)?, u32at(image, e + 36)?);
     let (f_off, n_off, o_off) = (to_off(funcs)?, to_off(names)?, to_off(ords)?);
     for i in 0..nnames {
         let no = to_off(u32at(image, n_off + 4 * i)?)?;
@@ -61,12 +52,7 @@ pub fn rva_to_offset(image: &[u8], rva: u32) -> Option<usize> {
     let sec = pe + 24 + u16at(image, pe + 20)? as usize;
     for i in 0..nsec {
         let s = sec + i * 40;
-        let (vsize, va, raw_size, raw) = (
-            u32at(image, s + 8)?,
-            u32at(image, s + 12)?,
-            u32at(image, s + 16)?,
-            u32at(image, s + 20)?,
-        );
+        let (vsize, va, raw_size, raw) = (u32at(image, s + 8)?, u32at(image, s + 12)?, u32at(image, s + 16)?, u32at(image, s + 20)?);
         if rva >= va && rva < va + vsize.max(raw_size) {
             return Some((rva - va + raw) as usize);
         }

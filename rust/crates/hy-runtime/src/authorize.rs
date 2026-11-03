@@ -62,16 +62,10 @@ pub struct ModuleRef {
 fn num(v: Option<&Value>, what: &str) -> Result<u64, String> {
     let parse = |s: &str| -> Option<u64> {
         let s = s.trim();
-        if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-            u64::from_str_radix(h, 16).ok()
-        } else {
-            s.parse().ok()
-        }
+        if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) { u64::from_str_radix(h, 16).ok() } else { s.parse().ok() }
     };
     match v {
-        Some(Value::Number(n)) => n
-            .as_u64()
-            .ok_or_else(|| format!("{what} is negative or not an integer")),
+        Some(Value::Number(n)) => n.as_u64().ok_or_else(|| format!("{what} is negative or not an integer")),
         Some(Value::String(s)) => parse(s).ok_or_else(|| format!("{what} is not a number: {s:?}")),
         other => Err(format!("{what} is not a number: {other:?}")),
     }
@@ -80,16 +74,8 @@ fn num(v: Option<&Value>, what: &str) -> Result<u64, String> {
 /// One validated entry. The error says what is wrong.
 pub fn normalize(entry: &Value) -> Result<Authorization, String> {
     let obj = entry.as_object().ok_or("an authorization is an object")?;
-    let sha = obj
-        .get("sha256")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_lowercase();
-    if sha.len() != 64
-        || !sha
-            .bytes()
-            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
-    {
+    let sha = obj.get("sha256").and_then(Value::as_str).unwrap_or("").to_lowercase();
+    if sha.len() != 64 || !sha.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
         return Err("sha256 must be 64 hex characters (the exact build)".into());
     }
     let listed = obj
@@ -110,16 +96,11 @@ pub fn normalize(entry: &Value) -> Result<Authorization, String> {
     }
     actions.sort_by_key(|a| a.name());
     let max_size = match obj.get("max_size") {
-        Some(Value::Number(n)) if n.as_u64().is_some_and(|v| (1..=MAX_SIZE).contains(&v)) => {
-            n.as_u64().unwrap()
-        }
+        Some(Value::Number(n)) if n.as_u64().is_some_and(|v| (1..=MAX_SIZE).contains(&v)) => n.as_u64().unwrap(),
         _ => return Err(format!("max_size must be an integer 1..{MAX_SIZE}")),
     };
-    let ranges_in = obj
-        .get("ranges")
-        .and_then(Value::as_array)
-        .filter(|r| !r.is_empty())
-        .ok_or("ranges must declare at least one bounded range")?;
+    let ranges_in =
+        obj.get("ranges").and_then(Value::as_array).filter(|r| !r.is_empty()).ok_or("ranges must declare at least one bounded range")?;
     let mut ranges = Vec::new();
     for item in ranges_in {
         let r = item.as_object().ok_or("a range is an object")?;
@@ -128,39 +109,17 @@ pub fn normalize(entry: &Value) -> Result<Authorization, String> {
             if module.is_empty() || r.contains_key("va_start") {
                 return Err("a range is module+rva_start+rva_end or va_start+va_end".into());
             }
-            (
-                Some(module.to_lowercase()),
-                num(r.get("rva_start"), "rva_start")?,
-                num(r.get("rva_end"), "rva_end")?,
-            )
+            (Some(module.to_lowercase()), num(r.get("rva_start"), "rva_start")?, num(r.get("rva_end"), "rva_end")?)
         } else {
-            (
-                None,
-                num(r.get("va_start"), "va_start")?,
-                num(r.get("va_end"), "va_end")?,
-            )
+            (None, num(r.get("va_start"), "va_start")?, num(r.get("va_end"), "va_end")?)
         };
         if end <= start || end - start > MAX_RANGE {
-            return Err(format!(
-                "a range must be 1..{MAX_RANGE} bytes (start < end)"
-            ));
+            return Err(format!("a range must be 1..{MAX_RANGE} bytes (start < end)"));
         }
         ranges.push(Range { module, start, end });
     }
-    let note: String = obj
-        .get("note")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .chars()
-        .take(200)
-        .collect();
-    Ok(Authorization {
-        sha256: sha,
-        actions,
-        max_size,
-        ranges,
-        note,
-    })
+    let note: String = obj.get("note").and_then(Value::as_str).unwrap_or("").chars().take(200).collect();
+    Ok(Authorization { sha256: sha, actions, max_size, ranges, note })
 }
 
 /// The entry for the build, or why there is none. An invalid entry for this build is reported, never trusted.
@@ -177,11 +136,7 @@ pub fn lookup(settings: &Value, digest: &str) -> Result<Authorization, String> {
     };
     let mut problem = String::new();
     for item in listed {
-        let sha = item
-            .get("sha256")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_lowercase();
+        let sha = item.get("sha256").and_then(Value::as_str).unwrap_or("").to_lowercase();
         if digest.is_empty() || sha != digest {
             continue;
         }
@@ -190,22 +145,12 @@ pub fn lookup(settings: &Value, digest: &str) -> Result<Authorization, String> {
             Err(e) => problem = format!("the entry for this build is invalid: {e}"),
         }
     }
-    Err(if problem.is_empty() {
-        "this build's SHA-256 is not in runtime_authorized_targets".into()
-    } else {
-        problem
-    })
+    Err(if problem.is_empty() { "this build's SHA-256 is not in runtime_authorized_targets".into() } else { problem })
 }
 
 impl Authorization {
     /// Refuse unless the action, the size and the whole span are inside a declared range.
-    pub fn check(
-        &self,
-        action: Action,
-        address: u64,
-        size: u64,
-        module: Option<&ModuleRef>,
-    ) -> Result<(), Refusal> {
+    pub fn check(&self, action: Action, address: u64, size: u64, module: Option<&ModuleRef>) -> Result<(), Refusal> {
         if !self.actions.contains(&action) {
             return Err(Refusal {
                 code: "action_not_authorized",
@@ -216,27 +161,18 @@ impl Authorization {
                 ),
             });
         }
-        let cap = if action == Action::Watch {
-            self.max_size.min(MAX_WATCH_SIZE)
-        } else {
-            self.max_size
-        };
+        let cap = if action == Action::Watch { self.max_size.min(MAX_WATCH_SIZE) } else { self.max_size };
         if size > cap {
             return Err(Refusal {
                 code: "size_exceeds_authorization",
-                detail: format!(
-                    "{size} bytes exceeds the authorized {cap} for {}",
-                    action.name()
-                ),
+                detail: format!("{size} bytes exceeds the authorized {cap} for {}", action.name()),
             });
         }
         let name = module.map(|m| m.name.to_lowercase());
         for r in &self.ranges {
             let (lo, hi) = match (&r.module, module) {
                 (None, _) => (r.start, r.end),
-                (Some(m), Some(mr)) if name.as_deref() == Some(m.as_str()) => {
-                    (mr.base + r.start, mr.base + r.end)
-                }
+                (Some(m), Some(mr)) if name.as_deref() == Some(m.as_str()) => (mr.base + r.start, mr.base + r.end),
                 _ => continue,
             };
             if lo <= address && address + size <= hi {
@@ -245,29 +181,21 @@ impl Authorization {
         }
         Err(Refusal {
             code: "outside_authorized_range",
-            detail: format!(
-                "span {address:#x}+{size} is not inside any declared range of this build"
-            ),
+            detail: format!("span {address:#x}+{size} is not inside any declared range of this build"),
         })
     }
 }
 
 /// 'x64', 'x86' or '' from the PE header at the start of a file.
 pub fn pe_arch(head: &[u8]) -> &'static str {
-    let le32 = |o: usize| {
-        head.get(o..o + 4)
-            .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
-    };
+    let le32 = |o: usize| head.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
     let Some(off) = le32(0x3c).map(|v| v as usize) else {
         return "";
     };
     if head.get(..2) != Some(b"MZ") || head.get(off..off + 4) != Some(b"PE\0\0") {
         return "";
     }
-    match head
-        .get(off + 4..off + 6)
-        .map(|b| u16::from_le_bytes(b.try_into().unwrap()))
-    {
+    match head.get(off + 4..off + 6).map(|b| u16::from_le_bytes(b.try_into().unwrap())) {
         Some(0x8664) => "x64",
         Some(0x14c) => "x86",
         _ => "",
@@ -279,11 +207,7 @@ pub fn valid_stamp(stamp: &Value, digest: &str, arch: &str, tool: &str, iteratio
     stamp.get("result").and_then(Value::as_str) == Some("pass")
         && stamp.get("target_sha256").and_then(Value::as_str) == Some(digest)
         && stamp.get("arch").and_then(Value::as_str) == Some(arch)
-        && stamp
-            .get("frida")
-            .and_then(Value::as_str)
-            .or_else(|| stamp.get("agent").and_then(Value::as_str))
-            == Some(tool)
+        && stamp.get("frida").and_then(Value::as_str).or_else(|| stamp.get("agent").and_then(Value::as_str)) == Some(tool)
         && stamp.get("iterations").and_then(Value::as_u64).unwrap_or(0) >= iterations
 }
 
@@ -303,31 +227,12 @@ mod tests {
     #[test]
     fn normalizes_and_checks() {
         let a = normalize(&entry()).unwrap();
-        let m = ModuleRef {
-            name: "game.exe".into(),
-            base: 0x7ff6_0000_0000,
-        };
-        a.check(Action::Write, 0x7ff6_001f_0000, 8, Some(&m))
-            .unwrap();
+        let m = ModuleRef { name: "game.exe".into(), base: 0x7ff6_0000_0000 };
+        a.check(Action::Write, 0x7ff6_001f_0000, 8, Some(&m)).unwrap();
         a.check(Action::Watch, 0x7ff6_0020_0000, 8, None).unwrap();
-        assert_eq!(
-            a.check(Action::Write, 0x7ff6_001f_0000, 9, Some(&m))
-                .unwrap_err()
-                .code,
-            "size_exceeds_authorization"
-        );
-        assert_eq!(
-            a.check(Action::Write, 0x7ff6_001f_3ffd, 8, Some(&m))
-                .unwrap_err()
-                .code,
-            "outside_authorized_range"
-        );
-        assert_eq!(
-            a.check(Action::Write, 0x7ff6_001f_0000, 8, None)
-                .unwrap_err()
-                .code,
-            "outside_authorized_range"
-        );
+        assert_eq!(a.check(Action::Write, 0x7ff6_001f_0000, 9, Some(&m)).unwrap_err().code, "size_exceeds_authorization");
+        assert_eq!(a.check(Action::Write, 0x7ff6_001f_3ffd, 8, Some(&m)).unwrap_err().code, "outside_authorized_range");
+        assert_eq!(a.check(Action::Write, 0x7ff6_001f_0000, 8, None).unwrap_err().code, "outside_authorized_range");
     }
 
     #[test]
@@ -335,12 +240,7 @@ mod tests {
         let mut e = entry();
         e["max_size"] = json!(64);
         let a = normalize(&e).unwrap();
-        assert_eq!(
-            a.check(Action::Watch, 0x7ff6_0020_0000, 16, None)
-                .unwrap_err()
-                .code,
-            "size_exceeds_authorization"
-        );
+        assert_eq!(a.check(Action::Watch, 0x7ff6_0020_0000, 16, None).unwrap_err().code, "size_exceeds_authorization");
         a.check(Action::Write, 0x7ff6_0020_0000, 16, None).unwrap();
     }
 
@@ -349,12 +249,7 @@ mod tests {
         let mut e = entry();
         e["actions"] = json!(["write"]);
         let a = normalize(&e).unwrap();
-        assert_eq!(
-            a.check(Action::Watch, 0x7ff6_0020_0000, 4, None)
-                .unwrap_err()
-                .code,
-            "action_not_authorized"
-        );
+        assert_eq!(a.check(Action::Watch, 0x7ff6_0020_0000, 4, None).unwrap_err().code, "action_not_authorized");
     }
 
     #[test]
@@ -366,14 +261,8 @@ mod tests {
             ("max_size", json!(65)),
             ("max_size", json!(true)),
             ("ranges", json!([])),
-            (
-                "ranges",
-                json!([{"va_start": 1, "va_end": 1 + MAX_RANGE + 1}]),
-            ),
-            (
-                "ranges",
-                json!([{"module": "a.exe", "va_start": 1, "rva_start": 1, "rva_end": 2}]),
-            ),
+            ("ranges", json!([{"va_start": 1, "va_end": 1 + MAX_RANGE + 1}])),
+            ("ranges", json!([{"module": "a.exe", "va_start": 1, "rva_start": 1, "rva_end": 2}])),
         ] {
             let mut e = entry();
             e[k] = v;
@@ -383,37 +272,13 @@ mod tests {
 
     #[test]
     fn lookup_reports_why() {
-        assert!(
-            lookup(&json!({}), SHA)
-                .unwrap_err()
-                .contains("empty or missing")
-        );
-        assert!(
-            lookup(&json!({"runtime_authorized_targets": 3}), SHA)
-                .unwrap_err()
-                .contains("must be a list")
-        );
-        assert!(
-            lookup(
-                &json!({"runtime_authorized_targets": [entry()]}),
-                &"0".repeat(64)
-            )
-            .unwrap_err()
-            .contains("not in")
-        );
+        assert!(lookup(&json!({}), SHA).unwrap_err().contains("empty or missing"));
+        assert!(lookup(&json!({"runtime_authorized_targets": 3}), SHA).unwrap_err().contains("must be a list"));
+        assert!(lookup(&json!({"runtime_authorized_targets": [entry()]}), &"0".repeat(64)).unwrap_err().contains("not in"));
         let mut bad = entry();
         bad["max_size"] = json!(0);
-        assert!(
-            lookup(&json!({"runtime_authorized_targets": [bad]}), SHA)
-                .unwrap_err()
-                .contains("is invalid")
-        );
-        assert_eq!(
-            lookup(&json!({"runtime_authorized_targets": [entry()]}), SHA)
-                .unwrap()
-                .max_size,
-            8
-        );
+        assert!(lookup(&json!({"runtime_authorized_targets": [bad]}), SHA).unwrap_err().contains("is invalid"));
+        assert_eq!(lookup(&json!({"runtime_authorized_targets": [entry()]}), SHA).unwrap().max_size, 8);
     }
 
     #[test]

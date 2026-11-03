@@ -54,10 +54,7 @@ impl std::fmt::Display for MemError {
             MemError::CasMismatch { found } => {
                 write!(f, "compare failed: memory holds {found:02x?}")
             }
-            MemError::Diverged { found } => write!(
-                f,
-                "DIVERGED: memory now holds {found:02x?}; not overwritten"
-            ),
+            MemError::Diverged { found } => write!(f, "DIVERGED: memory now holds {found:02x?}; not overwritten"),
             MemError::Readback { found } => write!(f, "readback mismatch: {found:02x?}"),
             MemError::UnknownUndo(i) => write!(f, "no undo entry {i}"),
             MemError::Os(e) => write!(f, "{e}"),
@@ -101,10 +98,7 @@ impl Session {
             .ok()?
             .into_iter()
             .find(|m| address >= m.base && address < m.base + m.size as u64)
-            .map(|m| ModuleRef {
-                name: m.name,
-                base: m.base,
-            })
+            .map(|m| ModuleRef { name: m.name, base: m.base })
     }
 
     /// Refuse when any byte of the span lies in an executable (or unmapped) region.
@@ -114,9 +108,7 @@ impl Session {
         while at < end {
             let (base, size, protect) = self.query(at)?;
             if protect == 0 {
-                return Err(MemError::BadRequest(format!(
-                    "{at:#x} is not committed memory"
-                )));
+                return Err(MemError::BadRequest(format!("{at:#x} is not committed memory")));
             }
             if protect & EXEC != 0 {
                 return Err(MemError::ExecutableRange(at));
@@ -126,43 +118,23 @@ impl Session {
         Ok(())
     }
 
-    fn gate_check(
-        &self,
-        gate: &Gate,
-        action: Action,
-        address: u64,
-        size: u64,
-    ) -> Result<(), MemError> {
+    fn gate_check(&self, gate: &Gate, action: Action, address: u64, size: u64) -> Result<(), MemError> {
         if let Gate::Authorized(a) = gate {
             let module = self.module_of(address);
-            a.check(action, address, size, module.as_ref())
-                .map_err(MemError::Refused)?;
+            a.check(action, address, size, module.as_ref()).map_err(MemError::Refused)?;
         }
         Ok(())
     }
 
     /// Compare-and-swap `expect` -> `value` at `address`. Returns the undo id.
-    pub fn write_cas(
-        &mut self,
-        gate: &Gate,
-        address: u64,
-        expect: &[u8],
-        value: &[u8],
-        reason: &str,
-    ) -> Result<u32, MemError> {
+    pub fn write_cas(&mut self, gate: &Gate, address: u64, expect: &[u8], value: &[u8], reason: &str) -> Result<u32, MemError> {
         if value.is_empty() || value.len() > MAX_WRITE || expect.len() != value.len() {
-            return Err(MemError::BadRequest(format!(
-                "expect and value must be the same size, 1..{MAX_WRITE} bytes"
-            )));
+            return Err(MemError::BadRequest(format!("expect and value must be the same size, 1..{MAX_WRITE} bytes")));
         }
         if reason.trim().chars().count() < MIN_REASON {
-            return Err(MemError::BadRequest(format!(
-                "a write needs a reason of at least {MIN_REASON} characters"
-            )));
+            return Err(MemError::BadRequest(format!("a write needs a reason of at least {MIN_REASON} characters")));
         }
-        self.identity
-            .verify()
-            .map_err(|e| MemError::BadRequest(e.to_string()))?;
+        self.identity.verify().map_err(|e| MemError::BadRequest(e.to_string()))?;
         self.gate_check(gate, Action::Write, address, value.len() as u64)?;
         self.require_data_span(address, value.len() as u64)?;
         let found = self.read_memory(address, value.len())?;
@@ -189,19 +161,12 @@ impl Session {
 
     /// Undo write `id` unless the memory changed since (then `Diverged`, nothing written). Range-checked like a write.
     pub fn undo_write(&mut self, gate: &Gate, id: u32) -> Result<(), MemError> {
-        let idx = self
-            .memory
-            .log
-            .iter()
-            .position(|e| e.id == id && e.state == UndoState::Applied)
-            .ok_or(MemError::UnknownUndo(id))?;
+        let idx = self.memory.log.iter().position(|e| e.id == id && e.state == UndoState::Applied).ok_or(MemError::UnknownUndo(id))?;
         let (address, old, new) = {
             let e = &self.memory.log[idx];
             (e.address, e.old.clone(), e.new.clone())
         };
-        self.identity
-            .verify()
-            .map_err(|e| MemError::BadRequest(e.to_string()))?;
+        self.identity.verify().map_err(|e| MemError::BadRequest(e.to_string()))?;
         self.gate_check(gate, Action::Write, address, old.len() as u64)?;
         self.require_data_span(address, old.len() as u64)?;
         let found = self.read_memory(address, old.len())?;

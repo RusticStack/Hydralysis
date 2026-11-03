@@ -18,10 +18,7 @@ pub unsafe fn park(site: u16, fr: *const u64) {
         let sec = ring::section();
         for (i, event) in EVENTS.iter().enumerate() {
             let slot = sec.add(p::pause_offset(i));
-            if st(slot, p::P_STATE)
-                .compare_exchange(0, CLAIMING, Ordering::AcqRel, Ordering::Relaxed)
-                .is_err()
-            {
+            if st(slot, p::P_STATE).compare_exchange(0, CLAIMING, Ordering::AcqRel, Ordering::Relaxed).is_err() {
                 continue;
             }
             (slot.add(p::P_TID) as *mut u32).write(ring::teb_tid());
@@ -34,12 +31,7 @@ pub unsafe fn park(site: u16, fr: *const u64) {
                 ResetEvent(ev);
             }
             st(slot, p::P_STATE).store(1, Ordering::Release);
-            ring::push_event(
-                p::EV_BREAKPOINT,
-                site,
-                i as u32,
-                [*fr.add(8), *fr.add(5), *fr.add(4), 0, 0],
-            );
+            ring::push_event(p::EV_BREAKPOINT, site, i as u32, [*fr.add(8), *fr.add(5), *fr.add(4), 0, 0]);
             if !ev.is_null() {
                 let r = WaitForSingleObject(ev, p::PAUSE_HARD_LIMIT_MS);
                 if r == WAIT_TIMEOUT && st(slot, p::P_ACTION).load(Ordering::Acquire) == 0 {

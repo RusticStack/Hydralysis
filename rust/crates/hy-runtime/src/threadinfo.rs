@@ -74,17 +74,11 @@ fn u64_at(b: &[u8], o: usize) -> Option<u64> {
 pub fn parse_thread_states(buf: &[u8], pid: u32) -> HashMap<u32, ThreadState> {
     let mut out = HashMap::new();
     let mut at = 0usize;
-    while let (Some(next), Some(count), Some(owner)) =
-        (u32_at(buf, at), u32_at(buf, at + 4), u64_at(buf, at + 0x50))
-    {
+    while let (Some(next), Some(count), Some(owner)) = (u32_at(buf, at), u32_at(buf, at + 4), u64_at(buf, at + 0x50)) {
         if owner == u64::from(pid) {
             for i in 0..count as usize {
                 let t = at + PROCESS_INFO_SIZE + i * THREAD_INFO_SIZE;
-                if let (Some(tid), Some(state), Some(reason)) = (
-                    u64_at(buf, t + 48),
-                    u32_at(buf, t + 68),
-                    u32_at(buf, t + 72),
-                ) {
+                if let (Some(tid), Some(state), Some(reason)) = (u64_at(buf, t + 48), u32_at(buf, t + 68), u32_at(buf, t + 72)) {
                     out.insert(tid as u32, ThreadState::from_kernel(state, reason));
                 }
             }
@@ -103,14 +97,7 @@ fn system_process_buffer() -> Option<Vec<u8>> {
     for _ in 0..8 {
         let mut buf = vec![0u8; size];
         let mut needed = 0u32;
-        let status = unsafe {
-            NtQuerySystemInformation(
-                SYSTEM_PROCESS_INFORMATION_CLASS,
-                buf.as_mut_ptr(),
-                size as u32,
-                &mut needed,
-            )
-        };
+        let status = unsafe { NtQuerySystemInformation(SYSTEM_PROCESS_INFORMATION_CLASS, buf.as_mut_ptr(), size as u32, &mut needed) };
         if status >= 0 {
             return Some(buf);
         }
@@ -128,11 +115,7 @@ struct Ctx(CONTEXT);
 
 fn read_regs(tid: u32) -> Vec<(&'static str, u64)> {
     unsafe {
-        let h = OpenThread(
-            THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
-            0,
-            tid,
-        );
+        let h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, 0, tid);
         if h.is_null() {
             return Vec::new();
         }
@@ -176,20 +159,14 @@ impl Session {
     /// Every thread with its scheduler state and registers. The agent's own control thread is never suspended: it
     /// is reported without registers.
     pub fn thread_report(&self) -> Vec<ThreadReport> {
-        let states = system_process_buffer()
-            .map(|b| parse_thread_states(&b, self.pid))
-            .unwrap_or_default();
+        let states = system_process_buffer().map(|b| parse_thread_states(&b, self.pid)).unwrap_or_default();
         let agent = self.rd32(proto::H_AGENT_TID);
         self.threads()
             .into_iter()
             .map(|tid| ThreadReport {
                 tid,
                 state: states.get(&tid).copied().unwrap_or(ThreadState::Running),
-                regs: if tid == agent {
-                    Vec::new()
-                } else {
-                    read_regs(tid)
-                },
+                regs: if tid == agent { Vec::new() } else { read_regs(tid) },
             })
             .collect()
     }

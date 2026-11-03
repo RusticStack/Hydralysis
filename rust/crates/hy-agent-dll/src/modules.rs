@@ -32,33 +32,20 @@ type Callback = unsafe extern "system" fn(u32, *const Notification, *mut c_void)
 
 #[link(name = "ntdll", kind = "raw-dylib")]
 unsafe extern "system" {
-    fn LdrRegisterDllNotification(
-        flags: u32,
-        callback: Callback,
-        context: *mut c_void,
-        cookie: *mut *mut c_void,
-    ) -> i32;
+    fn LdrRegisterDllNotification(flags: u32, callback: Callback, context: *mut c_void, cookie: *mut *mut c_void) -> i32;
 }
 
 /// Pack up to 24 characters of a UTF-16 name into three little-endian words, NUL padded.
 pub fn pack_name(name: &[u16]) -> [u64; 3] {
     let mut bytes = [0u8; 24];
     for (slot, &c) in bytes.iter_mut().zip(name) {
-        *slot = if (1..0x80).contains(&c) {
-            c as u8
-        } else {
-            b'?'
-        };
+        *slot = if (1..0x80).contains(&c) { c as u8 } else { b'?' };
     }
     let word = |i: usize| u64::from_le_bytes(bytes[8 * i..8 * i + 8].try_into().unwrap());
     [word(0), word(1), word(2)]
 }
 
-unsafe extern "system" fn on_notification(
-    reason: u32,
-    data: *const Notification,
-    _ctx: *mut c_void,
-) {
+unsafe extern "system" fn on_notification(reason: u32, data: *const Notification, _ctx: *mut c_void) {
     unsafe {
         let kind = match reason {
             REASON_LOADED => p::EV_MODULE_LOAD,
@@ -78,23 +65,9 @@ unsafe extern "system" fn on_notification(
             [0; 3]
         } else {
             let n = (*d.base_name).length as usize / 2;
-            pack_name(core::slice::from_raw_parts(
-                (*d.base_name).buffer,
-                n.min(24),
-            ))
+            pack_name(core::slice::from_raw_parts((*d.base_name).buffer, n.min(24)))
         };
-        ring::push_event(
-            kind,
-            0,
-            0,
-            [
-                d.dll_base as u64,
-                u64::from(d.size_of_image),
-                name[0],
-                name[1],
-                name[2],
-            ],
-        );
+        ring::push_event(kind, 0, 0, [d.dll_base as u64, u64::from(d.size_of_image), name[0], name[1], name[2]]);
     }
 }
 
@@ -121,9 +94,6 @@ mod tests {
         assert!(bytes[16..].iter().all(|&b| b == 0));
         let long = pack_name(&[b'a' as u16; 40]);
         assert_eq!(long, [u64::from_le_bytes(*b"aaaaaaaa"); 3]);
-        assert_eq!(
-            pack_name(&[0x4e2d, b'x' as u16])[0],
-            u64::from_le_bytes(*b"?x\0\0\0\0\0\0")
-        );
+        assert_eq!(pack_name(&[0x4e2d, b'x' as u16])[0], u64::from_le_bytes(*b"?x\0\0\0\0\0\0"));
     }
 }
