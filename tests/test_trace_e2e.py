@@ -218,7 +218,15 @@ class M1(unittest.TestCase):
         subprocess.run(["taskkill", "/F", "/PID", str(killed.pid)], capture_output=True)
         time.sleep(1.0)
         health = killed.stop()["trace"]["health"]
-        self.assertEqual(health["producer_state"], "ended-without-final-counters")        # the producer vanished: no final counters
+        # Frida's producer lives inside the target, so a killed target takes its final counters with it. The Rust runtime keeps
+        # the rings and counters in a mapping the host owns: after a kill the host still drains them and the final counters
+        # exist, which is the truth (a dead process cannot count another hit). Same checks either way; only this one word
+        # differs, by design (rust/crates/hy-runtime/PORTING.md, "failure_modes").
+        from hydralysis.runtime_device import implementation
+        lost_with_the_target = implementation() == "frida"
+        self.assertEqual(health["producer_state"], "ended-without-final-counters" if lost_with_the_target else "final")
+        if not lost_with_the_target:
+            self.assertEqual(health["transport"]["batches_missing"], 0)                   # every batch the host drained was delivered
         self.assertEqual(health["verify"]["outcome"], "clean")                              # what arrived is intact, and said to be incomplete
         self.assertGreater(health["producer"]["attempted"], 100)
 

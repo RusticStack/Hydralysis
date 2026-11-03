@@ -6,6 +6,7 @@ use pyo3::prelude::*;
 mod engine;
 mod pe;
 mod session;
+mod static_plane;
 mod trace;
 mod views;
 use pyo3::types::PyBytes;
@@ -55,6 +56,7 @@ fn hydralysis_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     pe::register(module)?;
     session::register(module)?;
     views::register(module)?;
+    static_plane::register(module)?;
     module.add("ABI", "abi3-py313")?;
     Ok(())
 }

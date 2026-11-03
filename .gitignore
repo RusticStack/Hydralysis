@@ -13,3 +13,4 @@ test-work/
 rusticre.local.json
 src/hydralysis/bin/
 native/hydralysis-mcp/target/
+native/target/

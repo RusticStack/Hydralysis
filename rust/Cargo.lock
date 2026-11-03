@@ -253,6 +253,63 @@ dependencies = [
 ]
 
 [[package]]
+name = "ghidra-fmt-btree"
+version = "0.1.0"
+dependencies = [
+ "ghidra-fmt-bytes",
+ "ghidra-fmt-chain",
+ "ghidra-fmt-field",
+ "ghidra-fmt-gbf",
+]
+
+[[package]]
+name = "ghidra-fmt-bytes"
+version = "0.1.0"
+
+[[package]]
+name = "ghidra-fmt-chain"
+version = "0.1.0"
+dependencies = [
+ "ghidra-fmt-bytes",
+ "ghidra-fmt-gbf",
+]
+
+[[package]]
+name = "ghidra-fmt-db"
+version = "0.1.0"
+dependencies = [
+ "ghidra-fmt-btree",
+ "ghidra-fmt-bytes",
+ "ghidra-fmt-chain",
+ "ghidra-fmt-field",
+ "ghidra-fmt-gbf",
+]
+
+[[package]]
+name = "ghidra-fmt-field"
+version = "0.1.0"
+dependencies = [
+ "ghidra-fmt-bytes",
+]
+
+[[package]]
+name = "ghidra-fmt-gbf"
+version = "0.1.0"
+dependencies = [
+ "ghidra-fmt-bytes",
+]
+
+[[package]]
+name = "ghidra-progdb"
+version = "0.1.0"
+dependencies = [
+ "ghidra-fmt-bytes",
+ "ghidra-fmt-db",
+ "ghidra-fmt-field",
+ "ghidra-fmt-gbf",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -287,6 +344,19 @@ name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
+
+[[package]]
+name = "hy-agent-dll"
+version = "0.1.0"
+dependencies = [
+ "hy-agent-proto",
+ "iced-x86",
+ "windows-sys",
+]
+
+[[package]]
+name = "hy-agent-proto"
+version = "0.1.0"
 
 [[package]]
 name = "hy-core"
@@ -344,6 +414,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "hy-rt-py"
+version = "0.1.0"
+dependencies = [
+ "hy-runtime",
+ "pyo3",
+ "serde_json",
+ "windows-sys",
+]
+
+[[package]]
+name = "hy-runtime"
+version = "0.1.0"
+dependencies = [
+ "hy-agent-proto",
+ "serde_json",
+ "windows-sys",
+]
+
+[[package]]
+name = "hy-static"
+version = "0.1.0"
+dependencies = [
+ "ghidra-fmt-chain",
+ "ghidra-fmt-db",
+ "ghidra-fmt-field",
+ "ghidra-fmt-gbf",
+ "ghidra-progdb",
+ "serde_json",
+]
+
+[[package]]
 name = "hy-store"
 version = "0.1.0"
 dependencies = [
@@ -371,6 +472,15 @@ dependencies = [
  "tempfile",
  "thiserror",
  "windows-sys",
+]
+
+[[package]]
+name = "iced-x86"
+version = "1.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c23ad4d19dca41180e835ef6fbd2c1ee655777eca086ad80dd517e0513322879"
+dependencies = [
+ "lazy_static",
 ]
 
 [[package]]
@@ -408,6 +518,12 @@ dependencies = [
  "futures-util",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "lazy_static"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "libc"
@@ -512,6 +628,7 @@ version = "0.27.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b455933107de8642b4487ed26d912c2d899dec6114884214a0b3bb3be9261ea6"
 dependencies = [
+ "python3-dll-a",
  "target-lexicon",
 ]
 
@@ -548,6 +665,15 @@ dependencies = [
  "pyo3-build-config",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "python3-dll-a"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d80ba7540edb18890d444c5aa8e1f1f99b1bdf26fb26ae383135325f4a36042b"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

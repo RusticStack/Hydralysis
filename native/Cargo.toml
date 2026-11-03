@@ -20,6 +20,7 @@ itoa = "1"
 hydra-client = { path = "vendor/hydra-client" }
 hy-query = { path = "../rust/crates/hy-query" }
 hy-views = { path = "../rust/crates/hy-views" }
+hy-static = { path = "../rust/crates/hy-static" }
 
 [profile.release]
 lto = true
