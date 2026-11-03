@@ -558,8 +558,11 @@ class ThroughTheAgent(unittest.TestCase):
         address = hex(self.base(agent) + self.cell_rva)
         gate = self.gate(agent)
         armed = agent.handle("watch", {"_gate": gate, "op": "arm", "address": address, "size": 8, "reason": "watch the fixture cell"})["watch"]
-        time.sleep(0.8)                                  # the five writes are done and the late thread exists
-        added = agent.handle("watch", {"_gate": gate, "op": "rearm", "watch": armed["id"]})
+        # The late thread is created by the fixture some time after arming (0.8 s on a quiet machine, longer under load):
+        # rearm until it is covered, bounded, rather than once after a fixed sleep.
+        added = self.until("the thread created after arming is covered by rearm",
+                           lambda: (lambda r: r if r["added"] else None)(
+                               agent.handle("watch", {"_gate": gate, "op": "rearm", "watch": armed["id"]})), 30)
         self.assertTrue(added["added"], "the thread created after arming is covered by rearm")
         self.until("six writes seen", lambda: agent.handle("watch", {"_gate": gate, "op": "list"})["watches"][0]["hits"] >= 6, 30)
         done = agent.handle("watch", {"_gate": gate, "op": "disarm", "watch": armed["id"]})
