@@ -243,7 +243,7 @@ def cross_layer_edges(table: dict) -> list[dict]:
     return edges
 
 
-def link_events(events: list[dict], table: dict, *, window: int = 8) -> dict:
+def _link_events_py(events: list[dict], table: dict, *, window: int = 8) -> dict:
     """Trace use: link each script-VM event to the native function event it invoked.
 
     A VM event carries `payload.script_function` (the name the script called). The invoked native is the first
@@ -313,3 +313,23 @@ def x64_call_site_args(memory, call_va: int, *, window: int = 40) -> dict:
             if code[offset:offset + len(prefix)] == prefix and end <= window and index not in found:
                 found[index] = {"index": index, "constant": int.from_bytes(code[offset + len(prefix):end], "little")}
     return {"site": _site(call_rva), "args": [found[i] for i in sorted(found)]}
+
+
+# ---- optional Rust implementation (HYDRALYSIS_IMPL=rust) ------------------------------------------------------------------
+# crates/hy-trace (`bindings`, bound in native/src/trace/bindings.rs). `_link_events_py` stays the specification: the Rust one
+# gives the same answer for the event shapes the producers emit and raises `TraceFallback` for any other, which runs it.
+
+def link_events(events: list[dict], table: dict, *, window: int = 8) -> dict:
+    """`_link_events_py`, in Rust when `HYDRALYSIS_IMPL=rust` and the events and table are of a modelled shape."""
+    from hydralysis import trace_native
+
+    routine = trace_native.function("bindings_link_events")
+    if routine is not None and type(events) is list and type(window) is int:
+        try:
+            return routine(events, table, window)
+        except (trace_native.native().TraceFallback, OverflowError):
+            pass
+    return _link_events_py(events, table, window=window)
+
+
+link_events.__doc__ = _link_events_py.__doc__

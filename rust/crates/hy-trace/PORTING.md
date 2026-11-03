@@ -126,3 +126,23 @@ Run on branch `r/hy-trace` (logs in `E:\Projects\Hydra\_logs\h7\trace\`):
 * `tools/run_tests.py -k test_trace` (385 tests, including the four `*_native` parity files): `HYDRALYSIS_IMPL` unset, OK;
   `HYDRALYSIS_IMPL=rust`, OK. (The failures once known in `test_trace_e2e` M1 and `test_trace_gates` M2 did not occur.)
 * Extensions built with `cargo build --release` in `native/` (`hydralysis_native.dll` copied to `src\hydralysis_native.pyd`).
+
+## pairing and bindings (r/hy-py2rs)
+
+| Python | Rust |
+|---|---|
+| `trace_pairing.pair_report` | `pairing::pair_report` (binding `pairing_pair_report`; routed with `HYDRALYSIS_IMPL=rust`) |
+| `trace_bindings.link_events` | `bindings::link_events` (binding `bindings_link_events`; held back, `HYDRALYSIS_TRACE_HELD=1`) |
+
+Tests: `tests/test_rust_parity_pairing.py`, `tests/test_rust_parity_bindings.py` (seeded sessions, shape mutations, JSON text compared
+with key order) and the unit tests in each module.
+
+Preserved quirks: CPython's compensated `sum` (3.12+) and float `//` are reproduced operation for operation, so the `mean_abs` and
+calibration numbers have the same bits; `max()` keeps the first of equal values; outages and the report keys keep the Python's order.
+
+Deliberate difference: the owner's latest value at each mirror time is found by bisection over the time-sorted owner events instead
+of a scan per mirror event (same answer, no longer quadratic).
+
+Not modelled (the Rust raises `TraceFallback` and the Python answers or raises as before): numeric text in `t_mono_ns`, integers
+beyond 2^53, float or boolean keys and sequence numbers, a payload that is not a dict, a thread generation that is a pair, an RVA
+that is not `int(text[4:], 16)` text, any missing required field (the Python raises `KeyError`; the fallback reproduces that).

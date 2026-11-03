@@ -1554,9 +1554,11 @@ impl SegmentEncoder {
     }
 }
 
+mod bindings;
 mod hashes;
 mod importer;
 mod keys;
+mod pairing;
 mod port;
 mod pump;
 mod reports;
@@ -1582,6 +1584,8 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     hashes::register(module)?;
     reports::register(module)?;
+    pairing::register(module)?;
+    bindings::register(module)?;
     watchdog::register(module)?;
     importer::register(module)?;
     Ok(())
