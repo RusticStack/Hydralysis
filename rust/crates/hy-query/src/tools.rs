@@ -18,19 +18,12 @@ fn err<T>(msg: impl Into<String>) -> Result<T> {
 
 /// Python `"%#x" % n` (negative values print as `-0x..`).
 pub fn hex(n: i128) -> String {
-    if n < 0 {
-        format!("-{:#x}", -n)
-    } else {
-        format!("{n:#x}")
-    }
+    if n < 0 { format!("-{:#x}", -n) } else { format!("{n:#x}") }
 }
 
 fn decoder(img: &Image) -> Result<Decoder> {
     if img.machine != 0x14C && img.machine != 0x8664 {
-        return err(format!(
-            "instruction decoding supports x86/x64 only; PE machine is {:#x}",
-            img.machine
-        ));
+        return err(format!("instruction decoding supports x86/x64 only; PE machine is {:#x}", img.machine));
     }
     Decoder::new(img.bits).map_err(|e| PeError::Value(e.to_string()))
 }
@@ -44,21 +37,12 @@ fn rip_note(img: &Image, address: u64, size: usize, op_str: &str) -> String {
     let Some((_, after)) = op_str.split_once("rip") else {
         return String::new();
     };
-    let disp_text: String = after
-        .split(']')
-        .next()
-        .unwrap_or("")
-        .chars()
-        .filter(|c| *c != ' ')
-        .collect();
+    let disp_text: String = after.split(']').next().unwrap_or("").chars().filter(|c| *c != ' ').collect();
     let (neg, digits) = match disp_text.strip_prefix('-') {
         Some(d) => (true, d),
         None => (false, disp_text.strip_prefix('+').unwrap_or(&disp_text)),
     };
-    let digits = digits
-        .strip_prefix("0x")
-        .or_else(|| digits.strip_prefix("0X"))
-        .unwrap_or(digits);
+    let digits = digits.strip_prefix("0x").or_else(|| digits.strip_prefix("0X")).unwrap_or(digits);
     let Ok(mut disp) = i128::from_str_radix(digits, 16) else {
         return String::new();
     };
@@ -85,18 +69,13 @@ pub fn disasm(img: &Image, rva: i64, count: i64) -> Result<String> {
     let want = (count.saturating_mul(16)).min(img.available(rva) as i64);
     let blob = img.read_rva(rva, want)?;
     let mut lines = vec![img.header()];
-    let insns = md
-        .decode(blob, rva as u64, count as usize)
-        .map_err(|e| PeError::Value(e.to_string()))?;
+    let insns = md.decode(blob, rva as u64, count as usize).map_err(|e| PeError::Value(e.to_string()))?;
     if insns.is_empty() {
         lines.push(format!("(no instructions at {})", hex(i128::from(rva))));
     }
     for i in &insns {
         let note = rip_note(img, i.address, i.size, &i.op_str);
-        lines.push(format!(
-            "rva:{:#010x}: {} {}{}",
-            i.address, i.mnemonic, i.op_str, note
-        ));
+        lines.push(format!("rva:{:#010x}: {} {}{}", i.address, i.mnemonic, i.op_str, note));
     }
     Ok(join(lines))
 }
@@ -121,16 +100,8 @@ pub fn callers(img: &Image, target: i64, limit: i64) -> Result<String> {
                 let site = i64::from(section.virtual_address) + index as i64;
                 let dest = site + 5 + i64::from(rel);
                 if dest == target {
-                    let kind = if raw[index] == 0xE8 {
-                        "E8 call candidate"
-                    } else {
-                        "E9 jump candidate"
-                    };
-                    hits.push(format!(
-                        "rva:{} {kind} -> rva:{}",
-                        hex(site.into()),
-                        hex(dest.into())
-                    ));
+                    let kind = if raw[index] == 0xE8 { "E8 call candidate" } else { "E9 jump candidate" };
+                    hits.push(format!("rva:{} {kind} -> rva:{}", hex(site.into()), hex(dest.into())));
                     if limit_cmp(hits.len(), limit) {
                         break 'outer;
                     }
@@ -141,12 +112,7 @@ pub fn callers(img: &Image, target: i64, limit: i64) -> Result<String> {
     }
     let mut lines = vec![
         img.header(),
-        format!(
-            "{} byte candidate(s) -> {}; instruction boundaries unverified; limit {}",
-            hits.len(),
-            hex(target.into()),
-            limit
-        ),
+        format!("{} byte candidate(s) -> {}; instruction boundaries unverified; limit {}", hits.len(), hex(target.into()), limit),
     ];
     lines.extend(hits.iter().cloned());
     if limit_cmp(hits.len(), limit) {
@@ -171,11 +137,7 @@ pub fn xrefs(img: &Image, target: i64, limit: i64) -> Result<String> {
                     let site = base + i as i64;
                     let dest = site + 7 + i64::from(disp);
                     if dest == target {
-                        hits.push(format!(
-                            "rva:{} -> rva:{}",
-                            hex(site.into()),
-                            hex(dest.into())
-                        ));
+                        hits.push(format!("rva:{} -> rva:{}", hex(site.into()), hex(dest.into())));
                     }
                     if limit_cmp(hits.len(), limit) {
                         break 'outer;
@@ -208,14 +170,7 @@ pub fn xrefs(img: &Image, target: i64, limit: i64) -> Result<String> {
 fn xrefs_abs(img: &Image, target: i64, limit: i64) -> Result<String> {
     let abs = img.base as i128 + i128::from(target);
     let Ok(abs) = u32::try_from(abs) else {
-        return Err(PeError::Overflow(
-            if abs < 0 {
-                "can't convert negative int to unsigned"
-            } else {
-                "int too big to convert"
-            }
-            .into(),
-        ));
+        return Err(PeError::Overflow(if abs < 0 { "can't convert negative int to unsigned" } else { "int too big to convert" }.into()));
     };
     let needle = abs.to_le_bytes();
     let finder = memchr::memmem::Finder::new(&needle);
@@ -224,29 +179,16 @@ fn xrefs_abs(img: &Image, target: i64, limit: i64) -> Result<String> {
         let raw = img.section_data(section);
         let mut start = 0usize;
         while (hits.len() as i64) < limit {
-            let Some(found) = raw
-                .get(start..)
-                .and_then(|w| finder.find(w))
-                .map(|f| f + start)
-            else {
+            let Some(found) = raw.get(start..).and_then(|w| finder.find(w)).map(|f| f + start) else {
                 break;
             };
-            hits.push(format!(
-                "rva:{} -> rva:{}",
-                hex((i64::from(section.virtual_address) + found as i64).into()),
-                hex(target.into())
-            ));
+            hits.push(format!("rva:{} -> rva:{}", hex((i64::from(section.virtual_address) + found as i64).into()), hex(target.into())));
             start = found + 1;
         }
     }
     let mut lines = vec![
         img.header(),
-        format!(
-            "{} absolute byte candidate(s) -> {}; instruction boundaries unverified; limit {}",
-            hits.len(),
-            hex(target.into()),
-            limit
-        ),
+        format!("{} absolute byte candidate(s) -> {}; instruction boundaries unverified; limit {}", hits.len(), hex(target.into()), limit),
     ];
     lines.extend(hits.iter().cloned());
     if limit_cmp(hits.len(), limit) {
@@ -305,11 +247,7 @@ pub fn find_strings(img: &Image, pattern: &str, limit: i64) -> Result<String> {
     for section in &img.sections {
         let raw = img.section_data(section);
         for encoding in ["ascii", "utf-16le"] {
-            let runs = if encoding == "ascii" {
-                ascii_runs(raw)
-            } else {
-                wide_runs(raw)
-            };
+            let runs = if encoding == "ascii" { ascii_runs(raw) } else { wide_runs(raw) };
             for (s, e) in runs {
                 let text: String = if encoding == "ascii" {
                     String::from_utf8_lossy(&raw[s..e]).into_owned()
@@ -321,14 +259,7 @@ pub fn find_strings(img: &Image, pattern: &str, limit: i64) -> Result<String> {
                 }
                 let rva = i64::from(section.virtual_address) + s as i64;
                 let chars = text.chars().count();
-                let clipped = if chars > 512 {
-                    format!(
-                        "{} [text truncated]",
-                        text.chars().take(512).collect::<String>()
-                    )
-                } else {
-                    text
-                };
+                let clipped = if chars > 512 { format!("{} [text truncated]", text.chars().take(512).collect::<String>()) } else { text };
                 lines.push(format!("rva:{rva:#x} {encoding} {clipped}"));
                 count += 1;
                 if count >= limit {
@@ -377,12 +308,7 @@ pub fn imports_text(img: &Image, limit: i64, pattern: &str) -> Result<String> {
     let wanted = if pattern.is_empty() {
         None
     } else {
-        Some(
-            regex::RegexBuilder::new(pattern)
-                .case_insensitive(true)
-                .build()
-                .map_err(|e| PeError::Value(e.to_string()))?,
-        )
+        Some(regex::RegexBuilder::new(pattern).case_insensitive(true).build().map_err(|e| PeError::Value(e.to_string()))?)
     };
     let mut lines = vec![img.header()];
     let mut count = 0i64;
@@ -438,10 +364,7 @@ pub fn sigscan(img: &Image, pattern: &str, limit: i64) -> Result<String> {
         let raw = img.section_data(section);
         let room = (limit - hits.len() as i64).max(0) as usize;
         for offset in find_pattern(raw, &expect, room)? {
-            hits.push(format!(
-                "rva:{:#x}",
-                i64::from(section.virtual_address) + offset as i64
-            ));
+            hits.push(format!("rva:{:#x}", i64::from(section.virtual_address) + offset as i64));
             if limit_cmp(hits.len(), limit) {
                 break;
             }
@@ -450,10 +373,7 @@ pub fn sigscan(img: &Image, pattern: &str, limit: i64) -> Result<String> {
             break;
         }
     }
-    let mut lines = vec![
-        img.header(),
-        format!("{} hit(s) for {}", hits.len(), pattern),
-    ];
+    let mut lines = vec![img.header(), format!("{} hit(s) for {}", hits.len(), pattern)];
     lines.extend(hits.iter().cloned());
     if limit_cmp(hits.len(), limit) {
         lines.push(LIMIT_MSG.to_string());
@@ -467,29 +387,15 @@ pub fn callees(img: &Image, rva: i64, limit: i64) -> Result<String> {
         None => (
             rva,
             rva + (0x200usize).min(img.available(rva)) as i64,
-            format!(
-                "no pdata; linear decode from caller-supplied start {} (unverified), at most 0x200 bytes",
-                hex(rva.into())
-            ),
+            format!("no pdata; linear decode from caller-supplied start {} (unverified), at most 0x200 bytes", hex(rva.into())),
         ),
-        Some((b, e)) => (
-            i64::from(b),
-            i64::from(e),
-            format!("function {:#x}-{:#x}", b, e),
-        ),
+        Some((b, e)) => (i64::from(b), i64::from(e), format!("function {:#x}-{:#x}", b, e)),
     };
     let blob = img.read_rva(begin, (end - begin).max(0))?;
     let mut hits: Vec<String> = Vec::new();
-    for insn in md
-        .decode(blob, begin as u64, usize::MAX)
-        .map_err(|e| PeError::Value(e.to_string()))?
-    {
+    for insn in md.decode(blob, begin as u64, usize::MAX).map_err(|e| PeError::Value(e.to_string()))? {
         if let Some(target) = insn.direct_call {
-            hits.push(format!(
-                "rva:{:#x} call rva:{}",
-                insn.address,
-                hex(target.into())
-            ));
+            hits.push(format!("rva:{:#x} call rva:{}", insn.address, hex(target.into())));
             if limit_cmp(hits.len(), limit) {
                 break;
             }
@@ -498,11 +404,7 @@ pub fn callees(img: &Image, rva: i64, limit: i64) -> Result<String> {
     let mut lines = vec![
         img.header(),
         scope,
-        format!(
-            "{} decoded direct call(s); linear decode is not a complete control-flow graph; limit {}",
-            hits.len(),
-            limit
-        ),
+        format!("{} decoded direct call(s); linear decode is not a complete control-flow graph; limit {}", hits.len(), limit),
     ];
     lines.extend(hits.iter().cloned());
     if limit_cmp(hits.len(), limit) {
@@ -522,22 +424,14 @@ pub fn function_of(img: &Image, rva: i64) -> Result<String> {
         return Ok(join(lines));
     };
     let first = img.read_rva(i64::from(begin), i64::from((end - begin).min(32)))?;
-    lines.push(format!(
-        "function {:#x}-{:#x} size {:#x}",
-        begin,
-        end,
-        end - begin
-    ));
+    lines.push(format!("function {:#x}-{:#x} size {:#x}", begin, end, end - begin));
     lines.push(format!("prologue {}", crate::prologue::format_bytes(first)));
     Ok(join(lines))
 }
 
 /// A section of a combined answer without the repeated image header.
 fn body(text: &str) -> String {
-    text.lines()
-        .filter(|l| !l.starts_with('#'))
-        .collect::<Vec<_>>()
-        .join("\n")
+    text.lines().filter(|l| !l.starts_with('#')).collect::<Vec<_>>().join("\n")
 }
 
 pub fn inspect(img: &Image, rva: i64) -> Result<String> {

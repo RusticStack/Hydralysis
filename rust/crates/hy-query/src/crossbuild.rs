@@ -41,12 +41,7 @@ impl Row {
         let o = v.as_object()?;
         let int = |k: &str| o.get(k).and_then(Value::as_i64);
         let list = |k: &str| o.get(k).and_then(Value::as_array).cloned();
-        let callees = o
-            .get("callees")?
-            .as_array()?
-            .iter()
-            .map(|c| c.as_str().map(String::from))
-            .collect::<Option<Vec<_>>>()?;
+        let callees = o.get("callees")?.as_array()?.iter().map(|c| c.as_str().map(String::from)).collect::<Option<Vec<_>>>()?;
         let heads = match o.get("heads") {
             None | Some(Value::Null) => Vec::new(),
             Some(Value::Array(a)) => a.clone(),
@@ -71,11 +66,7 @@ impl Row {
 }
 
 fn similar(a: &Row, b: &Row, ratio: f64) -> bool {
-    let (small, large) = if a.size <= b.size {
-        (a.size, b.size)
-    } else {
-        (b.size, a.size)
-    };
+    let (small, large) = if a.size <= b.size { (a.size, b.size) } else { (b.size, a.size) };
     large == 0 || (large - small) as f64 / large as f64 <= ratio
 }
 
@@ -83,11 +74,7 @@ type Rows = IndexMap<String, Row>;
 type Pairs = IndexMap<String, (String, &'static str)>;
 
 /// `_unique`: key -> rva for keys that occur once among the rows not excluded.
-fn unique(
-    rows: &Rows,
-    key: &dyn Fn(&Row) -> Option<String>,
-    excluded: &dyn Fn(&str) -> bool,
-) -> IndexMap<String, String> {
+fn unique(rows: &Rows, key: &dyn Fn(&Row) -> Option<String>, excluded: &dyn Fn(&str) -> bool) -> IndexMap<String, String> {
     let mut seen: IndexMap<String, Option<String>> = IndexMap::new();
     for (rva, row) in rows {
         if excluded(rva) {
@@ -102,9 +89,7 @@ fn unique(
             }
         }
     }
-    seen.into_iter()
-        .filter_map(|(k, v)| v.map(|r| (k, r)))
-        .collect()
+    seen.into_iter().filter_map(|(k, v)| v.map(|r| (k, r))).collect()
 }
 
 fn tup(values: &[&[Value]]) -> String {
@@ -154,124 +139,36 @@ pub fn match_builds(source: &Rows, destination: &Rows) -> Pairs {
     }
 
     let s = |v: &Value| v.clone();
-    let k_exact1 = |r: &Row, _: &Pairs| {
-        (r.size >= 24 && r.complete() && truthy(&r.bytes)).then(|| r.bytes.to_string())
-    };
+    let k_exact1 = |r: &Row, _: &Pairs| (r.size >= 24 && r.complete() && truthy(&r.bytes)).then(|| r.bytes.to_string());
     let k_exact2 = |r: &Row, _: &Pairs| {
-        (r.size >= 8 && r.complete() && (!r.strings.is_empty() || !r.imports.is_empty())).then(
-            || {
-                Value::Array(vec![
-                    s(&r.bytes),
-                    Value::Array(r.strings.clone()),
-                    Value::Array(r.imports.clone()),
-                ])
-                .to_string()
-            },
-        )
+        (r.size >= 8 && r.complete() && (!r.strings.is_empty() || !r.imports.is_empty()))
+            .then(|| Value::Array(vec![s(&r.bytes), Value::Array(r.strings.clone()), Value::Array(r.imports.clone())]).to_string())
     };
     let k_shape1 = |r: &Row, _: &Pairs| {
-        (r.instructions >= 6 && r.complete())
-            .then(|| Value::Array(vec![s(&r.shape), Value::from(r.size)]).to_string())
+        (r.instructions >= 6 && r.complete()).then(|| Value::Array(vec![s(&r.shape), Value::from(r.size)]).to_string())
     };
-    let k_anchor1 = |r: &Row, _: &Pairs| {
-        (!r.strings.is_empty() || r.imports.len() >= 2).then(|| tup(&[&r.strings, &r.imports]))
-    };
+    let k_anchor1 = |r: &Row, _: &Pairs| (!r.strings.is_empty() || r.imports.len() >= 2).then(|| tup(&[&r.strings, &r.imports]));
     let k_anchor2 = |r: &Row, _: &Pairs| {
-        (r.constants.len() >= 2).then(|| {
-            Value::Array(vec![
-                Value::Array(r.constants.clone()),
-                Value::from(floor_div(r.instructions, 4)),
-            ])
-            .to_string()
-        })
+        (r.constants.len() >= 2)
+            .then(|| Value::Array(vec![Value::Array(r.constants.clone()), Value::from(floor_div(r.instructions, 4))]).to_string())
     };
-    let k_shape2 = |r: &Row, _: &Pairs| {
-        (r.instructions >= 12 && r.complete() && truthy(&r.shape)).then(|| r.shape.to_string())
-    };
-    let k_heads = |r: &Row, _: &Pairs| {
-        (!r.heads.is_empty()).then(|| Value::Array(r.heads.clone()).to_string())
-    };
+    let k_shape2 = |r: &Row, _: &Pairs| (r.instructions >= 12 && r.complete() && truthy(&r.shape)).then(|| r.shape.to_string());
+    let k_heads = |r: &Row, _: &Pairs| (!r.heads.is_empty()).then(|| Value::Array(r.heads.clone()).to_string());
     let sim = |a: &Row, b: &Row| similar(a, b, 0.3);
     let sim9 = |a: &Row, b: &Row| similar(a, b, 0.9);
 
-    phase(
-        "exact",
-        source,
-        destination,
-        &mut pairs,
-        &mut taken,
-        &k_exact1,
-        None,
-        None,
-    );
-    phase(
-        "exact",
-        source,
-        destination,
-        &mut pairs,
-        &mut taken,
-        &k_exact2,
-        None,
-        None,
-    );
-    phase(
-        "shape",
-        source,
-        destination,
-        &mut pairs,
-        &mut taken,
-        &k_shape1,
-        None,
-        None,
-    );
-    phase(
-        "anchors",
-        source,
-        destination,
-        &mut pairs,
-        &mut taken,
-        &k_anchor1,
-        None,
-        Some(&sim),
-    );
-    phase(
-        "anchors",
-        source,
-        destination,
-        &mut pairs,
-        &mut taken,
-        &k_anchor2,
-        None,
-        Some(&sim),
-    );
-    phase(
-        "shape",
-        source,
-        destination,
-        &mut pairs,
-        &mut taken,
-        &k_shape2,
-        None,
-        Some(&sim),
-    );
-    phase(
-        "strings",
-        source,
-        destination,
-        &mut pairs,
-        &mut taken,
-        &k_heads,
-        None,
-        Some(&sim9),
-    );
+    phase("exact", source, destination, &mut pairs, &mut taken, &k_exact1, None, None);
+    phase("exact", source, destination, &mut pairs, &mut taken, &k_exact2, None, None);
+    phase("shape", source, destination, &mut pairs, &mut taken, &k_shape1, None, None);
+    phase("anchors", source, destination, &mut pairs, &mut taken, &k_anchor1, None, Some(&sim));
+    phase("anchors", source, destination, &mut pairs, &mut taken, &k_anchor2, None, Some(&sim));
+    phase("shape", source, destination, &mut pairs, &mut taken, &k_shape2, None, Some(&sim));
+    phase("strings", source, destination, &mut pairs, &mut taken, &k_heads, None, Some(&sim9));
 
     // Call graph: the k-th callee of a matched pair, when both are unmatched and alike.
     for _ in 0..8 {
         let mut added = 0;
-        let snapshot: Vec<(String, String)> = pairs
-            .iter()
-            .map(|(k, v)| (k.clone(), v.0.clone()))
-            .collect();
+        let snapshot: Vec<(String, String)> = pairs.iter().map(|(k, v)| (k.clone(), v.0.clone())).collect();
         for (rva, other) in snapshot {
             let (left, right) = (&source[&rva].callees, &destination[&other].callees);
             if left.len() != right.len() {
@@ -319,16 +216,7 @@ pub fn match_builds(source: &Rows, destination: &Rows) -> Pairs {
             })
         };
         let sim5 = |a: &Row, b: &Row| similar(a, b, 0.5);
-        phase(
-            "callees",
-            source,
-            destination,
-            &mut pairs,
-            &mut taken,
-            &translated,
-            Some(&own),
-            Some(&sim5),
-        );
+        phase("callees", source, destination, &mut pairs, &mut taken, &translated, Some(&own), Some(&sim5));
         if pairs.len() == before {
             break;
         }
@@ -349,12 +237,7 @@ pub fn match_builds(source: &Rows, destination: &Rows) -> Pairs {
             }
             let known: Vec<&String> = callers_of
                 .get(rva)
-                .map(|set| {
-                    set.iter()
-                        .filter(|c| pairs.contains_key(**c))
-                        .map(|c| &pairs[*c].0)
-                        .collect()
-                })
+                .map(|set| set.iter().filter(|c| pairs.contains_key(**c)).map(|c| &pairs[*c].0).collect())
                 .unwrap_or_default();
             if known.is_empty() {
                 continue;
@@ -364,11 +247,7 @@ pub fn match_builds(source: &Rows, destination: &Rows) -> Pairs {
                 let options: HashSet<&String> = destination[caller]
                     .callees
                     .iter()
-                    .filter(|c| {
-                        destination.contains_key(*c)
-                            && !taken.contains(*c)
-                            && similar(row, &destination[*c], 0.35)
-                    })
+                    .filter(|c| destination.contains_key(*c) && !taken.contains(*c) && similar(row, &destination[*c], 0.35))
                     .collect();
                 candidates = Some(match candidates {
                     None => options,
@@ -400,7 +279,5 @@ pub fn match_builds(source: &Rows, destination: &Rows) -> Pairs {
 /// Parse a JSON object of rva -> row; None when any row is not in the shape `match` reads.
 pub fn rows_from_json(v: &Value) -> Option<Rows> {
     let o = v.as_object()?;
-    o.iter()
-        .map(|(k, r)| Row::from_json(r).map(|row| (k.clone(), row)))
-        .collect()
+    o.iter().map(|(k, r)| Row::from_json(r).map(|row| (k.clone(), row))).collect()
 }

@@ -29,11 +29,7 @@ pub fn py_int0(text: &str) -> Option<i128> {
     } else {
         (10, lower.as_str())
     };
-    if digits.is_empty()
-        || digits.starts_with('_')
-        || digits.ends_with('_')
-        || digits.contains("__")
-    {
+    if digits.is_empty() || digits.starts_with('_') || digits.ends_with('_') || digits.contains("__") {
         return None;
     }
     // base-prefixed literals may carry one underscore right after the prefix: "0x_ff"
@@ -97,10 +93,7 @@ pub fn fragments(value: Option<&Value>) -> (Vec<Value>, String) {
         let obj = item.as_object();
         let start = obj.and_then(|o| o.get("start")).and_then(address);
         let end = obj.and_then(|o| o.get("end")).and_then(address);
-        let class = obj
-            .and_then(|o| o.get("class"))
-            .and_then(Value::as_str)
-            .filter(|c| CLASSES.contains(c));
+        let class = obj.and_then(|o| o.get("class")).and_then(Value::as_str).filter(|c| CLASSES.contains(c));
         let (Some(o), Some(s), Some(e), Some(_)) = (obj, start, end, class) else {
             bad += 1;
             continue;
@@ -143,56 +136,26 @@ pub fn summarize(reply: &Value) -> Map<String, Value> {
     let Some(r) = reply.as_object() else {
         return Map::new();
     };
-    let named = [
-        "fragments",
-        "bytes_emitted",
-        "reason",
-        "cut",
-        "budget",
-        "next_offset",
-        "partial",
-    ];
+    let named = ["fragments", "bytes_emitted", "reason", "cut", "budget", "next_offset", "partial"];
     if !(is_true(r.get("truncated")) || named.iter().any(|n| r.contains_key(*n))) {
         return Map::new();
     }
     let (kept, note) = fragments(r.get("fragments"));
     let mut out = Map::new();
-    out.insert(
-        "partial".into(),
-        Value::Bool(is_true(r.get("truncated")) || is_true(r.get("partial"))),
-    );
+    out.insert("partial".into(), Value::Bool(is_true(r.get("truncated")) || is_true(r.get("partial"))));
     if let Some(Value::String(s)) = r.get("reason")
         && !s.is_empty()
     {
-        out.insert(
-            "reason".into(),
-            json!(s.chars().take(200).collect::<String>()),
-        );
+        out.insert("reason".into(), json!(s.chars().take(200).collect::<String>()));
     }
     if let Some(n) = is_int(r.get("bytes_emitted")) {
         out.insert("bytes_emitted".into(), json!(n));
     }
     if let Some(Value::Object(cut)) = r.get("cut") {
-        out.insert(
-            "cut".into(),
-            pick(
-                cut,
-                &[
-                    "kind",
-                    "response_bytes_read",
-                    "c_recovered",
-                    "c_chars",
-                    "c_lines",
-                    "c_returned_chars",
-                ],
-            ),
-        );
+        out.insert("cut".into(), pick(cut, &["kind", "response_bytes_read", "c_recovered", "c_chars", "c_lines", "c_returned_chars"]));
     }
     if let Some(Value::Object(budget)) = r.get("budget") {
-        out.insert(
-            "budget".into(),
-            pick(budget, &["mode", "bytes", "mb", "in_flight"]),
-        );
+        out.insert("budget".into(), pick(budget, &["mode", "bytes", "mb", "in_flight"]));
     }
     for name in ["offset", "next_offset"] {
         if let Some(n) = is_int(r.get(name)) {
@@ -207,8 +170,7 @@ pub fn summarize(reply: &Value) -> Map<String, Value> {
         for item in &kept {
             let class = item["class"].as_str().unwrap_or("");
             let idx = CLASSES.iter().position(|c| *c == class).unwrap_or(0);
-            totals[idx] +=
-                address(&item["end"]).unwrap_or(0) - address(&item["start"]).unwrap_or(0);
+            totals[idx] += address(&item["end"]).unwrap_or(0) - address(&item["start"]).unwrap_or(0);
         }
         let mut ft = Map::new();
         for (i, c) in CLASSES.iter().enumerate() {
@@ -238,21 +200,14 @@ pub fn limitations(reply: &Value) -> Vec<&'static str> {
     let summary = summarize(reply);
     let mut codes = Vec::new();
     if is_true(reply.get("truncated")) {
-        let auto = reply
-            .get("budget")
-            .and_then(Value::as_object)
-            .is_some_and(|b| b.get("mode") == Some(&json!("auto")));
+        let auto = reply.get("budget").and_then(Value::as_object).is_some_and(|b| b.get("mode") == Some(&json!("auto")));
         codes.push(if auto { LIMIT_BUDGET } else { LIMIT_TRUNCATED });
     }
     if summary.get("next_offset").is_some_and(Value::is_u64) {
         codes.push(LIMIT_PAGED);
     }
     let fb = summary.get("fragment_bytes").and_then(Value::as_object);
-    let nonzero = |k: &str| {
-        fb.and_then(|f| f.get(k))
-            .and_then(Value::as_i64)
-            .is_some_and(|n| n != 0)
-    };
+    let nonzero = |k: &str| fb.and_then(|f| f.get(k)).and_then(Value::as_i64).is_some_and(|n| n != 0);
     if nonzero("data") || nonzero("unknown") {
         codes.push(LIMIT_NON_CODE);
     }
@@ -264,11 +219,7 @@ fn coverage_codes(reply: &Value) -> Vec<&'static str> {
     if is_true(reply.get("truncated")) {
         codes.retain(|c| *c != LIMIT_NON_CODE);
     }
-    if codes.is_empty() {
-        vec![LIMIT_NON_CODE]
-    } else {
-        codes
-    }
+    if codes.is_empty() { vec![LIMIT_NON_CODE] } else { codes }
 }
 
 pub fn coverage(reply: &Value) -> Value {
@@ -289,44 +240,21 @@ pub fn merge(response: &Value, reply: &Value) -> Option<Value> {
         return None;
     };
     let mut carried = Map::new();
-    for name in [
-        "partial",
-        "reason",
-        "fragments",
-        "bytes_emitted",
-        "cut",
-        "budget",
-        "offset",
-        "next_offset",
-    ] {
+    for name in ["partial", "reason", "fragments", "bytes_emitted", "cut", "budget", "offset", "next_offset"] {
         if let Some(v) = rep.get(name) {
             carried.insert(name.into(), v.clone());
         }
     }
     if rep.get("completed") == Some(&Value::Bool(false)) && is_true(rep.get("truncated")) {
         let mut out = Map::new();
-        for name in [
-            "id",
-            "program",
-            "sha256",
-            "image_base",
-            "address_kind",
-            "overlay_state",
-            "engine",
-            "function",
-        ] {
+        for name in ["id", "program", "sha256", "image_base", "address_kind", "overlay_state", "engine", "function"] {
             if let Some(v) = resp.get(name) {
                 out.insert(name.into(), v.clone());
             }
         }
         out.insert("ok".into(), Value::Bool(false));
         out.insert("truncated".into(), Value::Bool(true));
-        out.insert(
-            "error".into(),
-            rep.get("error")
-                .cloned()
-                .unwrap_or_else(|| json!("decompile stopped at the size bound")),
-        );
+        out.insert("error".into(), rep.get("error").cloned().unwrap_or_else(|| json!("decompile stopped at the size bound")));
         for name in ["c", "signature", "chars"] {
             if let Some(v) = rep.get(name) {
                 out.insert(name.into(), v.clone());
@@ -346,15 +274,7 @@ pub fn merge(response: &Value, reply: &Value) -> Option<Value> {
     let mut merged = resp.clone();
     if resp.get("ok") == Some(&Value::Bool(false)) {
         merged = Map::new();
-        for name in [
-            "id",
-            "program",
-            "sha256",
-            "image_base",
-            "address_kind",
-            "overlay_state",
-            "engine",
-        ] {
+        for name in ["id", "program", "sha256", "image_base", "address_kind", "overlay_state", "engine"] {
             if let Some(v) = resp.get(name) {
                 merged.insert(name.into(), v.clone());
             }
@@ -380,13 +300,8 @@ pub fn merge(response: &Value, reply: &Value) -> Option<Value> {
         merged.insert("total_characters".into(), chars);
         merged.insert("max_characters".into(), json!(text_len));
     }
-    let clipped = resp.get("ok") != Some(&Value::Bool(false))
-        && truthy(resp.get("truncated"))
-        && !rep.contains_key("offset");
-    merged.insert(
-        "truncated".into(),
-        Value::Bool(clipped || is_true(rep.get("truncated"))),
-    );
+    let clipped = resp.get("ok") != Some(&Value::Bool(false)) && truthy(resp.get("truncated")) && !rep.contains_key("offset");
+    merged.insert("truncated".into(), Value::Bool(clipped || is_true(rep.get("truncated"))));
     Some(Value::Object(merged))
 }
 
@@ -398,11 +313,7 @@ pub fn from_error(message: &str) -> Option<Value> {
         return None;
     }
     let has_text = matches!(r.get("c"), Some(Value::String(_)));
-    if !(has_text
-        || truthy(r.get("fragments"))
-        || r.contains_key("bytes_emitted")
-        || r.contains_key("cut"))
-    {
+    if !(has_text || truthy(r.get("fragments")) || r.contains_key("bytes_emitted") || r.contains_key("cut")) {
         return None;
     }
     Some(reply)

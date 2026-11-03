@@ -59,18 +59,13 @@ fn text(v: Option<&Value>, name: &str, maximum: usize, required: bool) -> Res<St
             }
             Ok(s.clone())
         }
-        _ => bad(format!(
-            "{name} must be text of at most {maximum} characters"
-        )),
+        _ => bad(format!("{name} must be text of at most {maximum} characters")),
     }
 }
 
 fn integer(v: Option<&Value>, name: &str, low: i128, high: i128) -> Res<i64> {
     if let Some(Value::Number(n)) = v {
-        let value = n
-            .as_i64()
-            .map(i128::from)
-            .or_else(|| n.as_u64().map(i128::from));
+        let value = n.as_i64().map(i128::from).or_else(|| n.as_u64().map(i128::from));
         if let Some(x) = value
             && low <= x
             && x <= high
@@ -109,11 +104,7 @@ fn str_of(v: &Value) -> String {
 }
 
 fn keys_outside(obj: &Map<String, Value>, allowed: &[&str]) -> Vec<String> {
-    let mut v: Vec<String> = obj
-        .keys()
-        .filter(|k| !allowed.contains(&k.as_str()))
-        .cloned()
-        .collect();
+    let mut v: Vec<String> = obj.keys().filter(|k| !allowed.contains(&k.as_str())).cloned().collect();
     v.sort();
     v
 }
@@ -190,26 +181,10 @@ fn allowed_for(action: &str, record: bool) -> Option<Vec<&'static str>> {
         "type" => vec!["path"],
         "pcode" => vec!["nodes"],
         "diff" => vec!["against", "against_view", "checks"],
-        "vcalls" => vec![
-            "offset",
-            "receiver_from",
-            "receiver_type",
-            "receiver_global",
-            "vtable",
-        ],
+        "vcalls" => vec!["offset", "receiver_from", "receiver_type", "receiver_global", "vtable"],
         "writes" => vec!["offset", "receiver_type"],
         "orphans" => vec!["referenced_only"],
-        "trace" => vec![
-            "seed",
-            "direction",
-            "depth",
-            "nodes",
-            "functions",
-            "argument",
-            "brief",
-            "callers",
-            "debug",
-        ],
+        "trace" => vec!["seed", "direction", "depth", "nodes", "functions", "argument", "brief", "callers", "debug"],
         "type_edit" => {
             let mut b = vec![
                 "kind",
@@ -236,13 +211,7 @@ fn allowed_for(action: &str, record: bool) -> Option<Vec<&'static str>> {
             ];
             if record {
                 b.extend(BATCH_PROVENANCE);
-                b.extend([
-                    "corpus_sha256",
-                    "corpus_bytes",
-                    "corpus_input",
-                    "archive_sha256",
-                    "archive_bytes",
-                ]);
+                b.extend(["corpus_sha256", "corpus_bytes", "corpus_input", "archive_sha256", "archive_bytes"]);
             }
             b
         }
@@ -253,11 +222,7 @@ fn allowed_for(action: &str, record: bool) -> Option<Vec<&'static str>> {
 }
 
 /// `validate_options(action, options, _record=record)`. `options` is None or an object (checked by the caller).
-pub fn validate_options(
-    action: &str,
-    options: Option<&Map<String, Value>>,
-    record: bool,
-) -> Res<Value> {
+pub fn validate_options(action: &str, options: Option<&Map<String, Value>>, record: bool) -> Res<Value> {
     let empty = Map::new();
     let options = options.unwrap_or(&empty);
     let Some(allowed) = allowed_for(action, record) else {
@@ -273,12 +238,7 @@ pub fn validate_options(
     let mut out = options.clone();
     match action {
         "decompile" => {
-            let v = integer(
-                Some(out.get("max_characters").unwrap_or(&json!(32000))),
-                "max_characters",
-                1,
-                2_097_152,
-            )?;
+            let v = integer(Some(out.get("max_characters").unwrap_or(&json!(32000))), "max_characters", 1, 2_097_152)?;
             out.insert("max_characters".into(), json!(v));
             if out.contains_key("max_result_mb") {
                 let v = integer(out.get("max_result_mb"), "max_result_mb", 1, MAX_RESULT_MB)?;
@@ -323,12 +283,7 @@ pub fn validate_options(
             }
         }
         "vcalls" | "writes" => {
-            let offset = text(
-                Some(out.get("offset").unwrap_or(&json!(""))),
-                "offset",
-                32,
-                true,
-            )?;
+            let offset = text(Some(out.get("offset").unwrap_or(&json!(""))), "offset", 32, true)?;
             if !offset_ok(&offset) {
                 return bad("vcalls offset is the slot's byte offset, such as 0xc0");
             }
@@ -355,34 +310,17 @@ pub fn validate_options(
             }
         }
         "pcode" | "trace" => {
-            let v = integer(
-                Some(out.get("nodes").unwrap_or(&json!(80))),
-                "nodes",
-                1,
-                200,
-            )?;
+            let v = integer(Some(out.get("nodes").unwrap_or(&json!(80))), "nodes", 1, 200)?;
             out.insert("nodes".into(), json!(v));
             if action == "trace" {
-                let seed = text(
-                    Some(out.get("seed").unwrap_or(&json!(""))),
-                    "seed",
-                    512,
-                    false,
-                )?;
+                let seed = text(Some(out.get("seed").unwrap_or(&json!(""))), "seed", 512, false)?;
                 out.insert("seed".into(), json!(seed));
-                let direction = out
-                    .get("direction")
-                    .cloned()
-                    .unwrap_or_else(|| json!("backward"));
+                let direction = out.get("direction").cloned().unwrap_or_else(|| json!("backward"));
                 if direction != json!("backward") && direction != json!("forward") {
                     return bad("direction must be backward or forward");
                 }
                 out.insert("direction".into(), direction);
-                for (name, default, lo, hi) in [
-                    ("depth", 5, 1, 32),
-                    ("functions", 1, 1, 8),
-                    ("callers", 0, 0, 4),
-                ] {
+                for (name, default, lo, hi) in [("depth", 5, 1, 32), ("functions", 1, 1, 8), ("callers", 0, 0, 4)] {
                     let v = integer(Some(out.get(name).unwrap_or(&json!(default))), name, lo, hi)?;
                     out.insert(name.into(), json!(v));
                 }
@@ -399,18 +337,14 @@ pub fn validate_options(
             if out.get("show").is_some_and(|s| s != &json!("changes")) {
                 return bad("status show must be changes");
             }
-            if (out.contains_key("since") || out.contains_key("state"))
-                && out.get("show") != Some(&json!("changes"))
-            {
+            if (out.contains_key("since") || out.contains_key("state")) && out.get("show") != Some(&json!("changes")) {
                 return bad("status since and state belong to show=changes");
             }
             if out.contains_key("since") {
                 integer(out.get("since"), "since", 0, 1 << 31)?;
             }
             if let Some(s) = out.get("state")
-                && !["pending", "committed", "all"]
-                    .iter()
-                    .any(|k| s == &json!(k))
+                && !["pending", "committed", "all"].iter().any(|k| s == &json!(k))
             {
                 return bad("status state must be pending, committed or all");
             }
@@ -427,15 +361,8 @@ fn type_edit(mut out: Map<String, Value>, record: bool) -> Res<Value> {
         integer(out.get("expect_revision"), "expect_revision", 0, 1 << 31)?;
     }
     if kind == Some(json!("revert")) {
-        if !keys_outside(
-            &out,
-            &["kind", "ids", "expect_revision", "source", "cascade"],
-        )
-        .is_empty()
-        {
-            return bad(
-                "revert takes ids (overlay or batch ids), optional expect_revision and cascade",
-            );
+        if !keys_outside(&out, &["kind", "ids", "expect_revision", "source", "cascade"]).is_empty() {
+            return bad("revert takes ids (overlay or batch ids), optional expect_revision and cascade");
         }
         if out.get("cascade").is_some_and(|t| !is_bool(t)) {
             return bad("cascade must be a boolean");
@@ -444,19 +371,13 @@ fn type_edit(mut out: Map<String, Value>, record: bool) -> Res<Value> {
             Some(Value::Array(ids)) => {
                 (1..=MAX_OVERLAYS).contains(&ids.len())
                     && ids.iter().all(|i| {
-                        i.as_str().is_some_and(|s| {
-                            s.len() == 32
-                                && s.bytes()
-                                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-                        })
+                        i.as_str().is_some_and(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
                     })
             }
             _ => false,
         };
         if !ok {
-            return bad(format!(
-                "revert ids must be 1..{MAX_OVERLAYS} overlay or batch ids"
-            ));
+            return bad(format!("revert ids must be 1..{MAX_OVERLAYS} overlay or batch ids"));
         }
         return Ok(Value::Object(out));
     }
@@ -464,9 +385,7 @@ fn type_edit(mut out: Map<String, Value>, record: bool) -> Res<Value> {
         return Err(Invalid::Fallback); // Python raises TypeError (unhashable) here; keep that behaviour
     }
     let kind_s = match &kind {
-        Some(Value::String(s)) if TYPE_KINDS.contains(&s.as_str()) || s == "import_archive" => {
-            s.clone()
-        }
+        Some(Value::String(s)) if TYPE_KINDS.contains(&s.as_str()) || s == "import_archive" => s.clone(),
         _ => return bad("unknown type_edit kind"),
     };
     let kind_fields: Vec<&str> = match kind_s.as_str() {
@@ -493,12 +412,7 @@ fn type_edit(mut out: Map<String, Value>, record: bool) -> Res<Value> {
     if !keys_outside(&out, &allowed).is_empty() {
         return bad(format!("options do not belong to type_edit kind {kind_s}"));
     }
-    let source = text(
-        Some(out.get("source").unwrap_or(&json!(""))),
-        "source",
-        4096,
-        true,
-    )?;
+    let source = text(Some(out.get("source").unwrap_or(&json!(""))), "source", 4096, true)?;
     out.insert("source".into(), json!(source));
     if kind_s == "batch" {
         return batch(&out, record);
@@ -514,17 +428,8 @@ fn type_edit(mut out: Map<String, Value>, record: bool) -> Res<Value> {
     };
     for name in ["path", "prototype", "variable", "type", "name", "comment"] {
         if out.contains_key(name) || required.contains(&name) {
-            let max = if name == "prototype" || name == "comment" {
-                8192
-            } else {
-                512
-            };
-            let v = text(
-                Some(out.get(name).unwrap_or(&json!(""))),
-                name,
-                max,
-                required.contains(&name),
-            )?;
+            let max = if name == "prototype" || name == "comment" { 8192 } else { 512 };
+            let v = text(Some(out.get(name).unwrap_or(&json!(""))), name, max, required.contains(&name))?;
             out.insert(name.into(), json!(v));
         }
     }
@@ -543,38 +448,17 @@ fn type_edit(mut out: Map<String, Value>, record: bool) -> Res<Value> {
         let mut clean_fields = Vec::new();
         let mut names = std::collections::HashSet::new();
         for field in &fields {
-            let Some(f) = field
-                .as_object()
-                .filter(|f| keys_outside(f, &["offset", "type", "name", "length"]).is_empty())
-            else {
+            let Some(f) = field.as_object().filter(|f| keys_outside(f, &["offset", "type", "name", "length"]).is_empty()) else {
                 return bad("each field accepts offset, type, name and optional length");
             };
             let offset = integer(f.get("offset"), "field offset", 0, i128::from(size) - 1)?;
             let mut clean = Map::new();
             clean.insert("offset".into(), json!(offset));
-            clean.insert(
-                "type".into(),
-                json!(text(
-                    Some(f.get("type").unwrap_or(&json!(""))),
-                    "field type",
-                    512,
-                    true
-                )?),
-            );
-            let name = text(
-                Some(f.get("name").unwrap_or(&json!(""))),
-                "field name",
-                512,
-                true,
-            )?;
+            clean.insert("type".into(), json!(text(Some(f.get("type").unwrap_or(&json!(""))), "field type", 512, true)?));
+            let name = text(Some(f.get("name").unwrap_or(&json!(""))), "field name", 512, true)?;
             clean.insert("name".into(), json!(name));
             if f.contains_key("length") {
-                let l = integer(
-                    f.get("length"),
-                    "field length",
-                    1,
-                    i128::from(size) - i128::from(offset),
-                )?;
+                let l = integer(f.get("length"), "field length", 1, i128::from(size) - i128::from(offset))?;
                 clean.insert("length".into(), json!(l));
             }
             if !names.insert(name) {
@@ -585,30 +469,12 @@ fn type_edit(mut out: Map<String, Value>, record: bool) -> Res<Value> {
         out.insert("fields".into(), Value::Array(clean_fields));
     }
     if kind_s.starts_with("function_") {
-        let expect = text(
-            Some(out.get("expect").unwrap_or(&json!(""))),
-            "expect",
-            192,
-            true,
-        )?;
+        let expect = text(Some(out.get("expect").unwrap_or(&json!(""))), "expect", 192, true)?;
         let bytes: Vec<&str> = expect.split_whitespace().collect();
-        if !(1..=64).contains(&bytes.len())
-            || bytes
-                .iter()
-                .any(|b| !(b.len() == 2 && b.bytes().all(|c| c.is_ascii_hexdigit())))
-        {
+        if !(1..=64).contains(&bytes.len()) || bytes.iter().any(|b| !(b.len() == 2 && b.bytes().all(|c| c.is_ascii_hexdigit()))) {
             return bad("function edits require 1..64 exact expected bytes; wildcards are refused");
         }
-        out.insert(
-            "expect".into(),
-            json!(
-                bytes
-                    .iter()
-                    .map(|b| b.to_uppercase())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            ),
-        );
+        out.insert("expect".into(), json!(bytes.iter().map(|b| b.to_uppercase()).collect::<Vec<_>>().join(" ")));
         if kind_s != "function_delete" {
             let ranges = match out.get("ranges") {
                 Some(Value::Array(r)) if (1..=64).contains(&r.len()) => r.clone(),
@@ -617,10 +483,7 @@ fn type_edit(mut out: Map<String, Value>, record: bool) -> Res<Value> {
             let mut clean = Vec::new();
             let mut occupied: Vec<(u128, u128)> = Vec::new();
             for item in &ranges {
-                let Some(o) = item
-                    .as_object()
-                    .filter(|o| o.len() == 2 && o.contains_key("start") && o.contains_key("end"))
-                else {
+                let Some(o) = item.as_object().filter(|o| o.len() == 2 && o.contains_key("start") && o.contains_key("end")) else {
                     return bad("each function range requires start and end VAs");
                 };
                 let mut parsed = [0u128; 2];
@@ -629,8 +492,7 @@ fn type_edit(mut out: Map<String, Value>, record: bool) -> Res<Value> {
                     if !is_addr(&v) {
                         return bad("range addresses must be numeric Ghidra VAs");
                     }
-                    parsed[i] = u128::from_str_radix(v.strip_prefix("0x").unwrap_or(&v), 16)
-                        .map_err(|_| Invalid::Fallback)?;
+                    parsed[i] = u128::from_str_radix(v.strip_prefix("0x").unwrap_or(&v), 16).map_err(|_| Invalid::Fallback)?;
                 }
                 let [start, end] = parsed;
                 if end < start || occupied.iter().any(|&(ps, pe)| start <= pe && end >= ps) {
@@ -664,31 +526,16 @@ fn batch(value: &Map<String, Value>, recorded: bool) -> Res<Value> {
             return bad("batch input exceeds 256 KiB");
         }
     }
-    let present: Vec<&str> = BATCH_PROVENANCE
-        .iter()
-        .copied()
-        .filter(|k| value.contains_key(*k))
-        .collect();
+    let present: Vec<&str> = BATCH_PROVENANCE.iter().copied().filter(|k| value.contains_key(*k)).collect();
     if !present.is_empty() {
         if !recorded || present.len() != BATCH_PROVENANCE.len() {
             return bad("batch provenance must be a complete normalized record");
         }
-        result.insert(
-            "input_file".into(),
-            json!(text(value.get("input_file"), "input_file", 32768, true)?),
-        );
-        result.insert(
-            "input_file_sha256".into(),
-            json!(digest(value.get("input_file_sha256"))?),
-        );
+        result.insert("input_file".into(), json!(text(value.get("input_file"), "input_file", 32768, true)?));
+        result.insert("input_file_sha256".into(), json!(digest(value.get("input_file_sha256"))?));
         result.insert(
             "input_file_bytes".into(),
-            json!(integer(
-                value.get("input_file_bytes"),
-                "input_file_bytes",
-                1,
-                MAX_BATCH_BYTES as i128
-            )?),
+            json!(integer(value.get("input_file_bytes"), "input_file_bytes", 1, MAX_BATCH_BYTES as i128)?),
         );
     }
     let list = match &edits {
@@ -697,15 +544,10 @@ fn batch(value: &Map<String, Value>, recorded: bool) -> Res<Value> {
     };
     let mut clean = Vec::new();
     for (index, item) in list.iter().enumerate() {
-        let Some(o) = item.as_object().filter(|o| {
-            keys_outside(o, &["address", "options"]).is_empty() && o.contains_key("options")
-        }) else {
+        let Some(o) = item.as_object().filter(|o| keys_outside(o, &["address", "options"]).is_empty() && o.contains_key("options")) else {
             return bad(format!("batch edit {index} requires address and options"));
         };
-        let Some(child) = o["options"]
-            .as_object()
-            .filter(|c| c.get("kind") != Some(&json!("batch")))
-        else {
+        let Some(child) = o["options"].as_object().filter(|c| c.get("kind") != Some(&json!("batch"))) else {
             return bad("nested batches are refused");
         };
         let mut merged = Map::new();
@@ -714,12 +556,7 @@ fn batch(value: &Map<String, Value>, recorded: bool) -> Res<Value> {
             merged.insert(k.clone(), v.clone());
         }
         let child = validate_options("type_edit", Some(&merged), recorded)?;
-        let address = text(
-            Some(o.get("address").unwrap_or(&json!(""))),
-            "batch address",
-            128,
-            false,
-        )?;
+        let address = text(Some(o.get("address").unwrap_or(&json!(""))), "batch address", 128, false)?;
         if !address.is_empty() && !is_addr(&address) {
             return bad("batch addresses must be numeric Ghidra VAs");
         }

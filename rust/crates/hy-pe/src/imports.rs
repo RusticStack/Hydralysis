@@ -22,18 +22,12 @@ pub struct Export {
 const MAX_NAME: usize = 0x200;
 
 fn valid_function_name(s: &[u8], relaxed: bool) -> bool {
-    let extra: &[u8] = if relaxed {
-        b"!\"#$%&'()*+,-./:<>?[\\]^_`{|}~@"
-    } else {
-        b"._?@$()<>"
-    };
-    s.iter()
-        .all(|c| c.is_ascii_alphanumeric() || extra.contains(c))
+    let extra: &[u8] = if relaxed { b"!\"#$%&'()*+,-./:<>?[\\]^_`{|}~@" } else { b"._?@$()<>" };
+    s.iter().all(|c| c.is_ascii_alphanumeric() || extra.contains(c))
 }
 
 fn valid_dos_filename(s: &[u8]) -> bool {
-    s.iter()
-        .all(|c| c.is_ascii_alphanumeric() || b"!#$%&'()-@^_`{}~+,.;=[]\\/ ".contains(c))
+    s.iter().all(|c| c.is_ascii_alphanumeric() || b"!#$%&'()-@^_`{}~+,.;=[]\\/ ".contains(c))
 }
 
 impl Image {
@@ -66,11 +60,7 @@ impl Image {
                 let Some(toff) = self.map_rva_loose(cursor) else {
                     break;
                 };
-                let thunk = if ptr == 8 {
-                    u64_at(d, toff)
-                } else {
-                    u32_at(d, toff).map(u64::from)
-                };
+                let thunk = if ptr == 8 { u64_at(d, toff) } else { u32_at(d, toff).map(u64::from) };
                 let Some(thunk) = thunk else { break };
                 if thunk == 0 {
                     break;
@@ -85,17 +75,8 @@ impl Image {
                     }
                     entries.push((None, Some((thunk & 0xFFFF) as u16), slot));
                 } else {
-                    let hint_name = thunk
-                        & if ptr == 8 {
-                            0x7FFF_FFFF_FFFF_FFFF
-                        } else {
-                            0x7FFF_FFFF
-                        };
-                    if self
-                        .map_rva_loose(hint_name)
-                        .and_then(|o| u16_at(d, o))
-                        .is_none()
-                    {
+                    let hint_name = thunk & if ptr == 8 { 0x7FFF_FFFF_FFFF_FFFF } else { 0x7FFF_FFFF };
+                    if self.map_rva_loose(hint_name).and_then(|o| u16_at(d, o)).is_none() {
                         break;
                     }
                     let name = self.c_bytes_at(hint_name + 2, MAX_NAME).unwrap_or(b"");
@@ -112,10 +93,7 @@ impl Image {
                 }
                 continue;
             }
-            let mut dll = self
-                .c_bytes_at(u64::from(name_rva), MAX_NAME)
-                .unwrap_or(b"")
-                .to_vec();
+            let mut dll = self.c_bytes_at(u64::from(name_rva), MAX_NAME).unwrap_or(b"").to_vec();
             if !valid_dos_filename(&dll) {
                 dll = b"*invalid*".to_vec();
             }
@@ -129,12 +107,7 @@ impl Image {
                 {
                     name = crate::ordlookup::lookup(&dll, o);
                 }
-                out.push(Import {
-                    dll: dll.clone(),
-                    name,
-                    ordinal,
-                    slot_rva,
-                });
+                out.push(Import { dll: dll.clone(), name, ordinal, slot_rva });
             }
         }
         out
@@ -160,11 +133,7 @@ impl Image {
             let o = self.map_rva_loose(u64::from(r))?;
             Some(clamp(d, o, (count as usize).saturating_mul(width)))
         };
-        let (Some(names), Some(ords), Some(funcs)) = (
-            slice(aon, nnames, 4),
-            slice(aoo, nnames, 2),
-            slice(aof, nfunc, 4),
-        ) else {
+        let (Some(names), Some(ords), Some(funcs)) = (slice(aon, nnames, 4), slice(aoo, nnames, 2), slice(aof, nfunc, 4)) else {
             return out;
         };
         let mut named = std::collections::HashSet::new();
@@ -182,9 +151,7 @@ impl Image {
             let Some(name_rva) = u32_at(names, i * 4) else {
                 continue;
             };
-            let name = self
-                .c_bytes_at(u64::from(name_rva), MAX_NAME)
-                .unwrap_or(b"");
+            let name = self.c_bytes_at(u64::from(name_rva), MAX_NAME).unwrap_or(b"");
             if !valid_function_name(name, true) {
                 break;
             }
@@ -205,11 +172,7 @@ impl Image {
             if address == 0 {
                 continue;
             }
-            out.push(Export {
-                ordinal: base.wrapping_add(idx),
-                address,
-                name: None,
-            });
+            out.push(Export { ordinal: base.wrapping_add(idx), address, name: None });
         }
         out
     }

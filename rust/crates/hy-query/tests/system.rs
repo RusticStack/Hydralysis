@@ -13,11 +13,7 @@ fn tmp(name: &str) -> std::path::PathBuf {
 fn properties_skip_comments_and_strip_quotes() {
     let dir = tmp("props");
     let path = dir.join("release");
-    fs::write(
-        &path,
-        "A=1\n# c=2\n  #d=3\nB = \"x y\" \nnoeq\nC=a=b\r\nD=\"q\"\r",
-    )
-    .unwrap();
+    fs::write(&path, "A=1\n# c=2\n  #d=3\nB = \"x y\" \nnoeq\nC=a=b\r\nD=\"q\"\r").unwrap();
     let got = properties(&path);
     let pairs: Vec<_> = got.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     assert_eq!(pairs, [("A", "1"), ("B", "x y"), ("C", "a=b"), ("D", "q")]);
@@ -30,12 +26,8 @@ fn children_sorted_descending_and_pattern_limited() {
     for n in ["jdk-21", "jdk-25", "hydra-12", "hydra-x", "other"] {
         fs::create_dir(dir.join(n)).unwrap();
     }
-    let names = |p: &str| -> Vec<String> {
-        children(&dir, p)
-            .iter()
-            .map(|x| x.file_name().unwrap().to_string_lossy().into_owned())
-            .collect()
-    };
+    let names =
+        |p: &str| -> Vec<String> { children(&dir, p).iter().map(|x| x.file_name().unwrap().to_string_lossy().into_owned()).collect() };
     assert_eq!(names("jdk*"), ["jdk-25", "jdk-21"]);
     assert_eq!(names("hydra-[0-9]*"), ["hydra-12"]);
 }

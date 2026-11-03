@@ -32,32 +32,15 @@ pub struct Decoder {
 
 impl Decoder {
     pub fn new(bits: u32) -> Result<Self, DisasmError> {
-        let mode = if bits == 32 {
-            ArchMode::Mode32
-        } else {
-            ArchMode::Mode64
-        };
-        let cs = Capstone::new()
-            .x86()
-            .mode(mode)
-            .detail(true)
-            .build()
-            .map_err(|e| DisasmError::Capstone(e.to_string()))?;
+        let mode = if bits == 32 { ArchMode::Mode32 } else { ArchMode::Mode64 };
+        let cs = Capstone::new().x86().mode(mode).detail(true).build().map_err(|e| DisasmError::Capstone(e.to_string()))?;
         Ok(Self { cs })
     }
 
     /// Decode linearly from `address`, stopping at the first undecodable byte (capstone default, no skipdata)
     /// or after `max` instructions.
-    pub fn decode(
-        &self,
-        code: &[u8],
-        address: u64,
-        max: usize,
-    ) -> Result<Vec<Decoded>, DisasmError> {
-        let insns = self
-            .cs
-            .disasm_all(code, address)
-            .map_err(|e| DisasmError::Capstone(e.to_string()))?;
+    pub fn decode(&self, code: &[u8], address: u64, max: usize) -> Result<Vec<Decoded>, DisasmError> {
+        let insns = self.cs.disasm_all(code, address).map_err(|e| DisasmError::Capstone(e.to_string()))?;
         let mut out = Vec::new();
         for insn in insns.iter().take(max) {
             out.push(self.to_decoded(insn));
@@ -67,23 +50,16 @@ impl Decoder {
 
     fn to_decoded(&self, insn: &Insn) -> Decoded {
         let mnemonic = insn.mnemonic().unwrap_or("").to_string();
-        let direct_call = (mnemonic == "call")
-            .then(|| self.cs.insn_detail(insn).ok())
-            .flatten()
-            .and_then(|detail| match detail.arch_detail().operands().first() {
+        let direct_call = (mnemonic == "call").then(|| self.cs.insn_detail(insn).ok()).flatten().and_then(|detail| {
+            match detail.arch_detail().operands().first() {
                 Some(ArchOperand::X86Operand(op)) => match op.op_type {
                     X86OperandType::Imm(v) => Some(v),
                     _ => None,
                 },
                 _ => None,
-            });
-        Decoded {
-            address: insn.address(),
-            size: insn.len(),
-            mnemonic,
-            op_str: insn.op_str().unwrap_or("").to_string(),
-            direct_call,
-        }
+            }
+        });
+        Decoded { address: insn.address(), size: insn.len(), mnemonic, op_str: insn.op_str().unwrap_or("").to_string(), direct_call }
     }
 }
 
@@ -105,9 +81,7 @@ mod tests {
     #[test]
     fn rip_relative_text_matches_capstone() {
         let d = Decoder::new(64).unwrap();
-        let out = d
-            .decode(&[0x48, 0x8D, 0x0D, 0x10, 0, 0, 0], 0x1000, 1)
-            .unwrap();
+        let out = d.decode(&[0x48, 0x8D, 0x0D, 0x10, 0, 0, 0], 0x1000, 1).unwrap();
         assert_eq!(out[0].op_str, "rcx, [rip + 0x10]");
     }
 

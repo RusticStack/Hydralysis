@@ -22,10 +22,7 @@ fn python_int_literals() {
 #[test]
 fn old_engine_replies_are_unchanged() {
     assert!(summarize(&json!({"ok": true, "truncated": false})).is_empty());
-    assert_eq!(
-        coverage(&json!({})),
-        json!({"status": "unknown", "reason": "the decompile reply carries no truncated/fragments fields"})
-    );
+    assert_eq!(coverage(&json!({})), json!({"status": "unknown", "reason": "the decompile reply carries no truncated/fragments fields"}));
 }
 
 #[test]
@@ -34,32 +31,16 @@ fn truncated_reply_is_partial_with_fragment_totals() {
         {"start": "0x10", "end": "0x20", "class": "code"}, {"start": "0x20", "end": "0x28", "class": "data"}, {"start": 3, "end": 1, "class": "code"}]});
     let s = summarize(&reply);
     assert_eq!(s["partial"], json!(true));
-    assert_eq!(
-        s["fragment_bytes"],
-        json!({"code": 16, "data": 8, "unknown": 0})
-    );
-    assert_eq!(
-        s["fragments_note"],
-        json!("1 malformed fragment(s) dropped")
-    );
-    assert_eq!(
-        limitations(&reply),
-        vec!["decompile_truncated", "non_code_fragments"]
-    );
-    assert_eq!(
-        coverage(&reply),
-        json!({"status": "partial", "limitations": ["decompile_truncated"]})
-    );
+    assert_eq!(s["fragment_bytes"], json!({"code": 16, "data": 8, "unknown": 0}));
+    assert_eq!(s["fragments_note"], json!("1 malformed fragment(s) dropped"));
+    assert_eq!(limitations(&reply), vec!["decompile_truncated", "non_code_fragments"]);
+    assert_eq!(coverage(&reply), json!({"status": "partial", "limitations": ["decompile_truncated"]}));
 }
 
 #[test]
 fn paging_and_merge() {
     let reply = json!({"completed": true, "c": "page", "offset": 4, "chars": 99, "next_offset": 8});
-    let merged = merge(
-        &json!({"ok": true, "c": "whole", "truncated": true}),
-        &reply,
-    )
-    .unwrap();
+    let merged = merge(&json!({"ok": true, "c": "whole", "truncated": true}), &reply).unwrap();
     assert_eq!(merged["c"], json!("page"));
     assert_eq!(merged["total_characters"], json!(99));
     assert_eq!(merged["truncated"], json!(false));
@@ -74,34 +55,11 @@ fn option_validation_bounds_and_fallbacks() {
     let ok = validate_options("decompile", None, false).unwrap();
     assert_eq!(ok, json!({"max_characters": 32000}));
     let err = validate_options("decompile", Some(&obj(json!({"max_characters": 0}))), false);
-    assert_eq!(
-        err,
-        Err(Invalid::Value(
-            "max_characters must be an integer in 1..2097152".into()
-        ))
-    );
+    assert_eq!(err, Err(Invalid::Value("max_characters must be an integer in 1..2097152".into())));
     let err = validate_options("function", Some(&obj(json!({"x": 1}))), false);
-    assert_eq!(
-        err,
-        Err(Invalid::Value(
-            "options are not supported for function".into()
-        ))
-    );
-    assert_eq!(
-        validate_options("diff", None, false),
-        Err(Invalid::Fallback)
-    );
-    assert_eq!(
-        validate_options("scan", Some(&obj(json!({"regex": "a"}))), false),
-        Err(Invalid::Fallback)
-    );
-    let t = validate_options(
-        "type_edit",
-        Some(&obj(
-            json!({"kind": "function_delete", "source": "d", "expect": "55 8b"}),
-        )),
-        false,
-    )
-    .unwrap();
+    assert_eq!(err, Err(Invalid::Value("options are not supported for function".into())));
+    assert_eq!(validate_options("diff", None, false), Err(Invalid::Fallback));
+    assert_eq!(validate_options("scan", Some(&obj(json!({"regex": "a"}))), false), Err(Invalid::Fallback));
+    let t = validate_options("type_edit", Some(&obj(json!({"kind": "function_delete", "source": "d", "expect": "55 8b"}))), false).unwrap();
     assert_eq!(t["expect"], json!("55 8B"));
 }

@@ -32,11 +32,8 @@ impl Image {
         };
         let d = self.data();
         let entries = |dir: usize| -> Vec<(u32, u32)> {
-            let n = u16_at(d, dir + 12).unwrap_or(0) as usize
-                + u16_at(d, dir + 14).unwrap_or(0) as usize;
-            (0..n.min(256))
-                .filter_map(|i| Some((u32_at(d, dir + 16 + i * 8)?, u32_at(d, dir + 20 + i * 8)?)))
-                .collect()
+            let n = u16_at(d, dir + 12).unwrap_or(0) as usize + u16_at(d, dir + 14).unwrap_or(0) as usize;
+            (0..n.min(256)).filter_map(|i| Some((u32_at(d, dir + 16 + i * 8)?, u32_at(d, dir + 20 + i * 8)?))).collect()
         };
         for (id, off) in entries(root) {
             if id != 16 || off & 0x8000_0000 == 0 {

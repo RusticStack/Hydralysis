@@ -12,18 +12,7 @@ use serde_json::Value;
 
 /// Python `str.splitlines` separators.
 fn is_line_break(c: char) -> bool {
-    matches!(
-        c,
-        '\n' | '\r'
-            | '\x0b'
-            | '\x0c'
-            | '\x1c'
-            | '\x1d'
-            | '\x1e'
-            | '\u{85}'
-            | '\u{2028}'
-            | '\u{2029}'
-    )
+    matches!(c, '\n' | '\r' | '\x0b' | '\x0c' | '\x1c' | '\x1d' | '\x1e' | '\u{85}' | '\u{2028}' | '\u{2029}')
 }
 
 fn splitlines(text: &str) -> Vec<&str> {
@@ -61,30 +50,21 @@ pub fn properties(path: &Path) -> IndexMap<String, String> {
         if let Some((key, value)) = line.split_once('=')
             && !line.trim_start().starts_with('#')
         {
-            result.insert(
-                key.trim().to_string(),
-                value.trim().trim_matches('"').to_string(),
-            );
+            result.insert(key.trim().to_string(), value.trim().trim_matches('"').to_string());
         }
     }
     result
 }
 
 fn fold(s: &str) -> String {
-    if cfg!(windows) {
-        s.to_lowercase()
-    } else {
-        s.to_string()
-    }
+    if cfg!(windows) { s.to_lowercase() } else { s.to_string() }
 }
 
 /// Only the shapes `backends` and `doctor` use: `prefix*` and `prefix[0-9]*`; case-insensitive on Windows like the OS glob.
 fn glob_matches(pattern: &str, name: &str) -> bool {
     let (name, pattern) = (fold(name), fold(pattern));
     if let Some(prefix) = pattern.strip_suffix("[0-9]*") {
-        return name
-            .strip_prefix(prefix)
-            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
+        return name.strip_prefix(prefix).is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
     }
     if let Some(prefix) = pattern.strip_suffix('*') {
         return name.starts_with(prefix);
@@ -100,11 +80,8 @@ pub fn children(root: &Path, pattern: &str) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(root) else {
         return Vec::new();
     };
-    let mut found: Vec<PathBuf> = entries
-        .flatten()
-        .filter(|e| glob_matches(pattern, &e.file_name().to_string_lossy()))
-        .map(|e| e.path())
-        .collect();
+    let mut found: Vec<PathBuf> =
+        entries.flatten().filter(|e| glob_matches(pattern, &e.file_name().to_string_lossy())).map(|e| e.path()).collect();
     found.sort_by_key(|p| fold(&p.to_string_lossy()));
     found.reverse();
     found
@@ -131,18 +108,14 @@ pub fn native_compatible(path: &Path) -> bool {
         if header.len() < 64 || &header[..2] != b"MZ" {
             return false;
         }
-        let offset = u64::from(u32::from_le_bytes([
-            header[60], header[61], header[62], header[63],
-        ]));
+        let offset = u64::from(u32::from_le_bytes([header[60], header[61], header[62], header[63]]));
         if handle.seek(SeekFrom::Start(offset)).is_err() {
             return false;
         }
         let Some(signature) = take(&mut handle, 6) else {
             return false;
         };
-        return signature.len() >= 6
-            && &signature[..4] == b"PE\0\0"
-            && signature[4..6] == [0x64, 0x86];
+        return signature.len() >= 6 && &signature[..4] == b"PE\0\0" && signature[4..6] == [0x64, 0x86];
     }
     if header.starts_with(&[0xcf, 0xfa, 0xed, 0xfe]) {
         return true;
@@ -187,28 +160,18 @@ pub fn instances(state: &Path) -> Vec<String> {
     let Ok(entries) = fs::read_dir(state) else {
         return Vec::new();
     };
-    let mut names: Vec<String> = entries
-        .flatten()
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .filter(|n| fold(n).ends_with(".json"))
-        .collect();
+    let mut names: Vec<String> =
+        entries.flatten().map(|e| e.file_name().to_string_lossy().to_string()).filter(|n| fold(n).ends_with(".json")).collect();
     names.sort_by_key(|s| fold(s));
     names
         .into_iter()
         .filter_map(|name| {
             let lower = name.to_lowercase();
-            if lower.ends_with(".launch.json")
-                || lower.ends_with(".supervisor.json")
-                || lower == "supervisor.json"
-            {
+            if lower.ends_with(".launch.json") || lower.ends_with(".supervisor.json") || lower == "supervisor.json" {
                 return None;
             }
             // Path(".json").stem is the whole name: a dotfile has no suffix.
-            let stem = if name.len() == 5 {
-                name.clone()
-            } else {
-                name[..name.len() - 5].to_string()
-            };
+            let stem = if name.len() == 5 { name.clone() } else { name[..name.len() - 5].to_string() };
             state.join(format!("{stem}.lock")).exists().then_some(stem)
         })
         .collect()
@@ -253,10 +216,7 @@ fn truthy(value: &Value) -> bool {
 /// `doctor._count_key`: how many dicts anywhere in `value` carry a truthy `key`.
 pub fn count_key(value: &Value, key: &str) -> u64 {
     match value {
-        Value::Object(map) => {
-            u64::from(map.get(key).is_some_and(truthy))
-                + map.values().map(|v| count_key(v, key)).sum::<u64>()
-        }
+        Value::Object(map) => u64::from(map.get(key).is_some_and(truthy)) + map.values().map(|v| count_key(v, key)).sum::<u64>(),
         Value::Array(items) => items.iter().map(|v| count_key(v, key)).sum(),
         _ => 0,
     }

@@ -4,6 +4,8 @@
 //! `engine_decompile` (the engine client is a Python object here, adapted to the `Engine` trait). The program cache
 //! itself stays in Python: `query._keys` / `_in_use` are read by many Python callers and tests.
 
+#![allow(clippy::result_large_err)] // the error type is pyo3's PyErr, which every #[pyfunction] must return
+
 use hy_query::session::{self, Engine, EngineError};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -47,18 +49,30 @@ impl Engine for PyEngine {
                 for (k, v) in fields {
                     kwargs.set_item(k, to_py(py, v)?)?;
                 }
-                match self.object.bind(py).call_method("call", (command,), Some(&kwargs)) {
+                match self
+                    .object
+                    .bind(py)
+                    .call_method("call", (command,), Some(&kwargs))
+                {
                     Ok(reply) => Ok(Ok(from_py(py, &reply)?)),
                     Err(e) => {
                         let value = e.value(py);
-                        if let (Ok(code), Ok(details)) = (value.getattr("code"), value.getattr("details")) {
+                        if let (Ok(code), Ok(details)) =
+                            (value.getattr("code"), value.getattr("details"))
+                        {
                             let code: String = code.extract()?;
-                            let message = value.getattr("message").and_then(|m| m.extract()).unwrap_or_default();
+                            let message = value
+                                .getattr("message")
+                                .and_then(|m| m.extract())
+                                .unwrap_or_default();
                             let details = match from_py(py, &details)? {
                                 Value::Object(m) => m,
                                 _ => Map::new(),
                             };
-                            let command = value.getattr("command").and_then(|m| m.extract()).unwrap_or_default();
+                            let command = value
+                                .getattr("command")
+                                .and_then(|m| m.extract())
+                                .unwrap_or_default();
                             let text = value.str()?.to_string();
                             return Ok(Err(EngineError {
                                 code,
@@ -130,14 +144,32 @@ fn session_engine_decompile_rs(
     inline: bool,
 ) -> PyResult<(&'static str, String)> {
     let (request, response) = (parse(request)?, parse(response)?);
-    let key = engine.bind(py).getattr("key").ok().and_then(|k| k.cast::<PyString>().ok().map(|s| s.to_string()));
+    let key = engine
+        .bind(py)
+        .getattr("key")
+        .ok()
+        .and_then(|k| k.cast::<PyString>().ok().map(|s| s.to_string()));
     let adapter = PyEngine {
         object: engine,
         key: key.unwrap_or_default(),
         fatal: Mutex::new(None),
     };
-    let outcome = py.detach(|| session::engine_decompile(&adapter, program_key, &request, timeout_s, &response, inline));
-    if let Some(error) = adapter.fatal.lock().unwrap_or_else(|p| p.into_inner()).take() {
+    let outcome = py.detach(|| {
+        session::engine_decompile(
+            &adapter,
+            program_key,
+            &request,
+            timeout_s,
+            &response,
+            inline,
+        )
+    });
+    if let Some(error) = adapter
+        .fatal
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
+    {
         return Err(error);
     }
     use session::DecompileError as E;

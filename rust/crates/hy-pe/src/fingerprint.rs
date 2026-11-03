@@ -21,9 +21,7 @@ pub struct Fingerprint {
     pub packing_status: String,
 }
 
-const PACKER_SECTIONS: [&str; 9] = [
-    ".bind", "upx0", "upx1", "upx2", ".aspack", ".adata", ".vmp0", ".vmp1", ".themida",
-];
+const PACKER_SECTIONS: [&str; 9] = [".bind", "upx0", "upx1", "upx2", ".aspack", ".adata", ".vmp0", ".vmp1", ".themida"];
 
 /// Shannon entropy, summed in first-seen byte order like Python's `Counter`.
 fn entropy(raw: &[u8]) -> f64 {
@@ -105,19 +103,9 @@ impl Image {
     /// The `# exe ...` provenance header (`Image.header()`).
     pub fn header(&self) -> String {
         let info = self.fingerprint();
-        let extra = info
-            .file_version
-            .as_ref()
-            .map(|v| format!(" version {v}"))
-            .unwrap_or_default();
-        let mut line = format!(
-            "# exe {} size {} tds {} sha256 {}{}",
-            info.exe, info.size, info.time_date_stamp, info.sha256, extra
-        );
-        line.push_str(&format!(
-            "\n# bits {} image_base {} entry_rva {}",
-            info.bits, info.image_base, info.entry_point_rva
-        ));
+        let extra = info.file_version.as_ref().map(|v| format!(" version {v}")).unwrap_or_default();
+        let mut line = format!("# exe {} size {} tds {} sha256 {}{}", info.exe, info.size, info.time_date_stamp, info.sha256, extra);
+        line.push_str(&format!("\n# bits {} image_base {} entry_rva {}", info.bits, info.image_base, info.entry_point_rva));
         line.push_str("\n# instruction/reference/string addresses are RVAs; pass them as rva:0x... to any Hydralysis tool");
         if let Some(evidence) = &self.address_resolution {
             line.push_str("\n# address map evidence: ");

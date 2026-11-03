@@ -93,16 +93,13 @@ pub struct Image {
 }
 
 pub(crate) fn u16_at(d: &[u8], o: usize) -> Option<u16> {
-    d.get(o..o.checked_add(2)?)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+    d.get(o..o.checked_add(2)?).map(|b| u16::from_le_bytes([b[0], b[1]]))
 }
 pub(crate) fn u32_at(d: &[u8], o: usize) -> Option<u32> {
-    d.get(o..o.checked_add(4)?)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    d.get(o..o.checked_add(4)?).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 pub(crate) fn u64_at(d: &[u8], o: usize) -> Option<u64> {
-    d.get(o..o.checked_add(8)?)
-        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
+    d.get(o..o.checked_add(8)?).map(|b| u64::from_le_bytes(b.try_into().unwrap()))
 }
 
 /// Python `data[start:start+len]`: clamped, never panics.
@@ -120,10 +117,7 @@ impl Image {
         // SAFETY: the map is read-only; callers must not truncate the file while an Image is alive
         // (same contract as any mmap reader; Python read the whole file instead).
         let map = unsafe { Mmap::map(&file)? };
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         Self::parse(name, Bytes::Map(map))
     }
 
@@ -153,11 +147,7 @@ impl Image {
         let (base, ndirs_off, dirs_off) = if magic == 0x20B {
             (u64_at(d, opt + 24).ok_or_else(trunc)?, opt + 108, opt + 112)
         } else {
-            (
-                u64::from(u32_at(d, opt + 28).ok_or_else(trunc)?),
-                opt + 92,
-                opt + 96,
-            )
+            (u64::from(u32_at(d, opt + 28).ok_or_else(trunc)?), opt + 92, opt + 96)
         };
         let size_of_image = u32_at(d, opt + 56).ok_or_else(trunc)?;
         let size_of_headers = u32_at(d, opt + 60).ok_or_else(trunc)?;
@@ -193,10 +183,7 @@ impl Image {
             return value("PE has no sections");
         }
         // Python's loop keeps the LAST ".text"; without one it falls back to the first section.
-        let text = sections
-            .iter()
-            .rposition(|s| s.name == ".text")
-            .unwrap_or(0);
+        let text = sections.iter().rposition(|s| s.name == ".text").unwrap_or(0);
         Ok(Self {
             file_name,
             bytes,
@@ -231,21 +218,13 @@ impl Image {
 
     /// Raw bytes of a section, clamped to the file (Python `data[ptr:ptr+size]`).
     pub fn section_data(&self, s: &Section) -> &[u8] {
-        clamp(
-            self.data(),
-            s.pointer_to_raw_data as usize,
-            s.size_of_raw_data as usize,
-        )
+        clamp(self.data(), s.pointer_to_raw_data as usize, s.size_of_raw_data as usize)
     }
 
     /// Sections with the execute bit, or the first section when none has it.
     pub fn executable_sections(&self) -> Vec<&Section> {
         let found: Vec<&Section> = self.sections.iter().filter(|s| s.is_executable()).collect();
-        if found.is_empty() {
-            self.sections.iter().take(1).collect()
-        } else {
-            found
-        }
+        if found.is_empty() { self.sections.iter().take(1).collect() } else { found }
     }
 
     /// File offset of `rva`, only inside the raw (file-backed) part of the first section that contains it.
@@ -255,8 +234,7 @@ impl Image {
             let size = i64::from(s.size_of_raw_data);
             if start <= rva && rva < start + size {
                 let offset = rva - start + i64::from(s.pointer_to_raw_data);
-                return (0 <= offset && (offset as usize) < self.data().len())
-                    .then_some(offset as usize);
+                return (0 <= offset && (offset as usize) < self.data().len()).then_some(offset as usize);
             }
         }
         None
@@ -282,16 +260,10 @@ impl Image {
             return value("RVA and size must be non-negative");
         }
         let Some(offset) = self.rva_to_offset(rva) else {
-            return value(format!(
-                "rva {:#x} is not in a section of {}",
-                rva, self.file_name
-            ));
+            return value(format!("rva {:#x} is not in a section of {}", rva, self.file_name));
         };
         if size as usize > self.available(rva) {
-            return value(format!(
-                "read at rva {:#x} size {:#x} crosses the file-backed section boundary",
-                rva, size
-            ));
+            return value(format!("read at rva {:#x} size {:#x} crosses the file-backed section boundary", rva, size));
         }
         Ok(clamp(self.data(), offset, size as usize))
     }
@@ -377,11 +349,7 @@ impl Image {
             for (i, b) in word.iter().enumerate() {
                 v |= u64::from(*b) << (8 * i);
             }
-            let v = if width == 4 {
-                u64::from((v as u32).wrapping_add(delta as u32))
-            } else {
-                v.wrapping_add(delta)
-            };
+            let v = if width == 4 { u64::from((v as u32).wrapping_add(delta as u32)) } else { v.wrapping_add(delta) };
             let fixed = v.to_le_bytes();
             for (i, byte) in fixed.iter().enumerate().take(width as usize) {
                 let pos = at + i as i64;
@@ -403,8 +371,7 @@ impl Image {
                 return (off < self.data().len()).then_some(off);
             }
         }
-        (rva < u64::from(self.size_of_headers) && (rva as usize) < self.data().len())
-            .then_some(rva as usize)
+        (rva < u64::from(self.size_of_headers) && (rva as usize) < self.data().len()).then_some(rva as usize)
     }
 
     /// NUL-terminated bytes at `rva` (at most `max`), via the loose mapping.
@@ -418,11 +385,7 @@ impl Image {
     /// pdata RUNTIME_FUNCTION `(begin, end, unwind)` at `index` of the exception-directory blob.
     pub fn runtime_function(blob: &[u8], index: usize) -> (u32, u32, u32) {
         let o = index * 12;
-        (
-            u32_at(blob, o).unwrap_or(0),
-            u32_at(blob, o + 4).unwrap_or(0),
-            u32_at(blob, o + 8).unwrap_or(0),
-        )
+        (u32_at(blob, o).unwrap_or(0), u32_at(blob, o + 4).unwrap_or(0), u32_at(blob, o + 8).unwrap_or(0))
     }
 
     /// `[begin, end)` of the pdata function containing `rva`, x64 images only.

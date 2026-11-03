@@ -21,13 +21,7 @@ mod win {
     unsafe extern "system" {
         pub fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
         pub fn GetExitCodeProcess(h: Handle, code: *mut u32) -> i32;
-        pub fn GetProcessTimes(
-            h: Handle,
-            c: *mut FileTime,
-            e: *mut FileTime,
-            k: *mut FileTime,
-            u: *mut FileTime,
-        ) -> i32;
+        pub fn GetProcessTimes(h: Handle, c: *mut FileTime, e: *mut FileTime, k: *mut FileTime, u: *mut FileTime) -> i32;
         pub fn CloseHandle(h: Handle) -> i32;
     }
 }
@@ -102,12 +96,9 @@ fn identity_os(pid: u32, started_ms: i64) -> bool {
     if fields.first() == Some(&"Z") || fields.len() < 20 {
         return false;
     }
-    let Some(boot) = read("/proc/stat".into()).and_then(|s| {
-        s.lines().find_map(|l| {
-            l.strip_prefix("btime ")
-                .and_then(|v| v.trim().parse::<f64>().ok())
-        })
-    }) else {
+    let Some(boot) =
+        read("/proc/stat".into()).and_then(|s| s.lines().find_map(|l| l.strip_prefix("btime ").and_then(|v| v.trim().parse::<f64>().ok())))
+    else {
         return false;
     };
     let Ok(start_ticks) = fields[19].parse::<f64>() else {
@@ -121,32 +112,18 @@ fn identity_os(pid: u32, started_ms: i64) -> bool {
 fn kill_tree(pid: u32) -> Result<(), String> {
     #[cfg(windows)]
     {
-        let out = run("taskkill.exe", &["/PID", &pid.to_string(), "/T", "/F"])
-            .map_err(|e| e.to_string())?;
+        let out = run("taskkill.exe", &["/PID", &pid.to_string(), "/T", "/F"]).map_err(|e| e.to_string())?;
         if out.status.success() {
             Ok(())
         } else {
-            let text = String::from_utf8_lossy(if out.stderr.is_empty() {
-                &out.stdout
-            } else {
-                &out.stderr
-            })
-            .trim()
-            .to_string();
+            let text = String::from_utf8_lossy(if out.stderr.is_empty() { &out.stdout } else { &out.stderr }).trim().to_string();
             Err(text)
         }
     }
     #[cfg(not(windows))]
     {
-        let out = Command::new("kill")
-            .args(["-KILL", &format!("-{pid}")])
-            .output()
-            .map_err(|e| e.to_string())?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
-        }
+        let out = Command::new("kill").args(["-KILL", &format!("-{pid}")]).output().map_err(|e| e.to_string())?;
+        if out.status.success() { Ok(()) } else { Err(String::from_utf8_lossy(&out.stderr).trim().to_string()) }
     }
 }
 
@@ -194,13 +171,8 @@ mod tests {
         let mut child = cmd.spawn().unwrap();
         let pid = child.id();
         // learn the creation time through the same API surface, then check tolerance and mismatch
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-        let found = (now_ms - 20_000..=now_ms + 1000)
-            .step_by(1)
-            .find(|ms| identity(pid, *ms));
+        let now_ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+        let found = (now_ms - 20_000..=now_ms + 1000).step_by(1).find(|ms| identity(pid, *ms));
         let started = found.expect("creation time within 20 s of now");
         assert!(identity(pid, started + 2));
         assert!(!identity(pid, started + 5000));

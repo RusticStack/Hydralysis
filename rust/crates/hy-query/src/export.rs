@@ -76,75 +76,45 @@ fn truthy(v: Option<&Value>) -> bool {
 }
 
 fn sha_text(s: &str) -> bool {
-    s.len() == 64
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Stage-one result of one line: everything up to and including the key type check.
 enum Line {
     Err(String),
-    Row {
-        key: String,
-        post: Result<(bool, bool), String>,
-    },
+    Row { key: String, post: Result<(bool, bool), String> },
 }
 
 #[allow(clippy::too_many_arguments)] // one line plus the record fields it is checked against
-fn check_line(
-    n: usize,
-    line: &[u8],
-    has_nl: bool,
-    job: &str,
-    build: &str,
-    mode: &str,
-    provenance: &Value,
-    max_row: usize,
-) -> Line {
+fn check_line(n: usize, line: &[u8], has_nl: bool, job: &str, build: &str, mode: &str, provenance: &Value, max_row: usize) -> Line {
     if line.len() > max_row {
-        return Line::Err(
-            "export JSONL row exceeds the 16 MiB replay budget; output preserved".into(),
-        );
+        return Line::Err("export JSONL row exceeds the 16 MiB replay budget; output preserved".into());
     }
     if !has_nl {
-        return Line::Err(format!(
-            "torn export JSONL tail at line {n}; output preserved for recovery"
-        ));
+        return Line::Err(format!("torn export JSONL tail at line {n}; output preserved for recovery"));
     }
     let Ok(row) = serde_json::from_slice::<Value>(line) else {
         return Line::Err(format!("invalid export JSONL line {n}; output preserved"));
     };
     let Some(obj) = row.as_object() else {
-        return Line::Err(format!(
-            "export JSONL line {n} is not an object; output preserved"
-        ));
+        return Line::Err(format!("export JSONL line {n} is not an object; output preserved"));
     };
     let is = |k: &str, want: &str| obj.get(k).and_then(Value::as_str) == Some(want);
-    if !(is("job", job)
-        && is("build_sha256", build)
-        && is("mode", mode)
-        && obj.get("provenance") == Some(provenance))
-    {
+    if !(is("job", job) && is("build_sha256", build) && is("mode", mode) && obj.get("provenance") == Some(provenance)) {
         return Line::Err(format!("export JSONL provenance mismatch at line {n}"));
     }
     let Some(key) = obj.get("key").and_then(Value::as_str) else {
-        return Line::Err(format!(
-            "duplicate or missing export key at line {n}; output preserved"
-        ));
+        return Line::Err(format!("duplicate or missing export key at line {n}; output preserved"));
     };
     let post = (|| {
         let state = obj.get("state").and_then(Value::as_str);
         if !matches!(state, Some("done" | "failed")) {
-            return Err(format!(
-                "invalid export row state at line {n}; output preserved"
-            ));
+            return Err(format!("invalid export row state at line {n}; output preserved"));
         }
         let done = state == Some("done");
         let response = obj.get("result").and_then(Value::as_object);
         if done && response.is_none() {
-            return Err(format!(
-                "completed export row lacks a result at line {n}; output preserved"
-            ));
+            return Err(format!("completed export row lacks a result at line {n}; output preserved"));
         }
         let has_c = response.is_some_and(|r| r.contains_key("c"));
         if has_c || obj.contains_key("c_sha256") || (done && mode == "decompile") {
@@ -153,18 +123,13 @@ fn check_line(
             match (c, expected) {
                 (Some(c), Some(e)) if sha_text(e) && sha256_hex(c.as_bytes()) == e => {}
                 _ => {
-                    return Err(format!(
-                        "export C SHA-256 mismatch at line {n}; output preserved"
-                    ));
+                    return Err(format!("export C SHA-256 mismatch at line {n}; output preserved"));
                 }
             }
         }
         Ok((done, truthy(obj.get("truncated"))))
     })();
-    Line::Row {
-        key: key.to_string(),
-        post,
-    }
+    Line::Row { key: key.to_string(), post }
 }
 
 /// `replay` over the output file (the caller has checked the file exists and resolved its path).
@@ -205,18 +170,7 @@ pub fn replay_file(
     let lines: Vec<Line> = spans
         .par_iter()
         .enumerate()
-        .map(|(i, &(s, e, nl))| {
-            check_line(
-                i + 1,
-                &data[s..e],
-                nl,
-                job,
-                build,
-                mode,
-                provenance,
-                max_row,
-            )
-        })
+        .map(|(i, &(s, e, nl))| check_line(i + 1, &data[s..e], nl, job, build, mode, provenance, max_row))
         .collect();
     let mut out = Progress::default();
     let mut seen: HashSet<String> = HashSet::new();
@@ -225,10 +179,7 @@ pub fn replay_file(
             Line::Err(m) => return Err(m),
             Line::Row { key, post } => {
                 if !seen.insert(key.clone()) {
-                    return Err(format!(
-                        "duplicate or missing export key at line {}; output preserved",
-                        i + 1
-                    ));
+                    return Err(format!("duplicate or missing export key at line {}; output preserved", i + 1));
                 }
                 let (done, truncated) = post?;
                 out.keys.push(key);
@@ -246,11 +197,7 @@ pub fn replay_file(
 }
 
 fn py_repr(s: &str) -> String {
-    let quote = if s.contains('\'') && !s.contains('"') {
-        '"'
-    } else {
-        '\''
-    };
+    let quote = if s.contains('\'') && !s.contains('"') { '"' } else { '\'' };
     let mut out = String::new();
     out.push(quote);
     for c in s.chars() {
@@ -263,9 +210,7 @@ fn py_repr(s: &str) -> String {
                 out.push('\\');
                 out.push(c);
             }
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
-                out.push_str(&format!("\\x{:02x}", c as u32))
-            }
+            c if (c as u32) < 0x20 || c as u32 == 0x7f => out.push_str(&format!("\\x{:02x}", c as u32)),
             c => out.push(c),
         }
     }
@@ -278,10 +223,7 @@ fn py_hex(text: &str) -> Result<u128, String> {
     let err = || format!("invalid literal for int() with base 16: {}", py_repr(text));
     let t = text.trim();
     let t = t.strip_prefix('+').unwrap_or(t);
-    let t = t
-        .strip_prefix("0x")
-        .or_else(|| t.strip_prefix("0X"))
-        .unwrap_or(t);
+    let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
     if t.is_empty() || t.starts_with('_') || t.ends_with('_') || t.contains("__") {
         return Err(err());
     }
@@ -376,12 +318,7 @@ fn parse_range(text: &str) -> Option<(u128, u128)> {
     let (a, b) = inner.split_once(',')?;
     let b = b.trim_start();
     let ok = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_hexdigit()) && s.len() <= 32;
-    (ok(a) && ok(b)).then(|| {
-        (
-            u128::from_str_radix(a, 16).unwrap(),
-            u128::from_str_radix(b, 16).unwrap(),
-        )
-    })
+    (ok(a) && ok(b)).then(|| (u128::from_str_radix(a, 16).unwrap(), u128::from_str_radix(b, 16).unwrap()))
 }
 
 /// `decompile_row`: the completeness fields of a decompile reply (empty for an engine without them).
@@ -406,9 +343,7 @@ pub fn partial(response: &Value) -> bool {
     while let Some(v) = pending.pop() {
         match v {
             Value::Object(o) => {
-                if o.get("truncated") == Some(&Value::Bool(true))
-                    || o.get("body_truncated") == Some(&Value::Bool(true))
-                {
+                if o.get("truncated") == Some(&Value::Bool(true)) || o.get("body_truncated") == Some(&Value::Bool(true)) {
                     return true;
                 }
                 pending.extend(o.values());
@@ -426,19 +361,8 @@ pub fn keys_sha256(keys: &[&str]) -> String {
 }
 
 /// `parity(snapshot, selected, progress)`; None when an input is not in the shape the Python code reads.
-pub fn parity(
-    snapshot: &Value,
-    limit: i64,
-    progress_keys: &[&str],
-    succeeded: i64,
-    failed: i64,
-) -> Option<Value> {
-    let keys: Vec<&str> = snapshot
-        .get("keys")?
-        .as_array()?
-        .iter()
-        .map(Value::as_str)
-        .collect::<Option<_>>()?;
+pub fn parity(snapshot: &Value, limit: i64, progress_keys: &[&str], succeeded: i64, failed: i64) -> Option<Value> {
+    let keys: Vec<&str> = snapshot.get("keys")?.as_array()?.iter().map(Value::as_str).collect::<Option<_>>()?;
     let count = snapshot.get("count")?.as_i64()?;
     let take = usize::try_from(limit.max(0)).ok()?.min(keys.len());
     let expected_keys = &keys[..take];
@@ -446,15 +370,9 @@ pub fn parity(
     let have: HashSet<&str> = progress_keys.iter().copied().collect();
     let expected = expected_keys.len() as i64;
     let missing = expected_keys.iter().filter(|k| !have.contains(**k)).count() as i64;
-    let unexpected = progress_keys
-        .iter()
-        .filter(|k| !listed.contains(**k))
-        .count() as i64;
+    let unexpected = progress_keys.iter().filter(|k| !listed.contains(**k)).count() as i64;
     let accounted = succeeded + failed;
-    let total = snapshot
-        .get("engine_function_total")
-        .cloned()
-        .unwrap_or(Value::Null);
+    let total = snapshot.get("engine_function_total").cloned().unwrap_or(Value::Null);
     // Python: isinstance(value, int) is true for bool as well
     let non_internal = match &total {
         Value::Bool(b) => json!(i64::from(*b) - count),

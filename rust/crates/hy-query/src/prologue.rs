@@ -16,10 +16,7 @@ fn is_hex_run(s: &str) -> bool {
 
 /// `parse_expect`: whitespace/comma/`\x` separated bytes, `0x` prefixes, packed hex runs, `?`/`??` wildcards.
 pub fn parse_expect(text: &str) -> Result<Expect> {
-    let cleaned = text
-        .replace(',', " ")
-        .replace("\\x", " ")
-        .replace("\\X", " ");
+    let cleaned = text.replace(',', " ").replace("\\x", " ").replace("\\X", " ");
     let parts: Vec<&str> = cleaned.split_whitespace().collect();
     if parts.is_empty() {
         return err("expect prologue is empty");
@@ -30,10 +27,7 @@ pub fn parse_expect(text: &str) -> Result<Expect> {
             out.push(None);
             continue;
         }
-        let part = part
-            .strip_prefix("0x")
-            .or_else(|| part.strip_prefix("0X"))
-            .unwrap_or(part);
+        let part = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")).unwrap_or(part);
         if part.len() <= 2 && is_hex_run(part) {
             out.push(Some(u8::from_str_radix(part, 16).unwrap()));
             continue;
@@ -49,16 +43,10 @@ pub fn parse_expect(text: &str) -> Result<Expect> {
             }
         }
         if !ok {
-            return err(format!(
-                "prologue requires whole hexadecimal bytes or ?? wildcards: {part}"
-            ));
+            return err(format!("prologue requires whole hexadecimal bytes or ?? wildcards: {part}"));
         }
         for pair in bytes.chunks(2) {
-            out.push(if pair == b"??" {
-                None
-            } else {
-                Some(u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-            });
+            out.push(if pair == b"??" { None } else { Some(u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap()) });
         }
     }
     if out.iter().all(Option::is_none) {
@@ -68,20 +56,14 @@ pub fn parse_expect(text: &str) -> Result<Expect> {
 }
 
 pub fn format_bytes(data: &[u8]) -> String {
-    data.iter()
-        .map(|b| format!("{b:02X}"))
-        .collect::<Vec<_>>()
-        .join(" ")
+    data.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
 }
 
 pub fn matches(data: &[u8], expect: &[Option<u8>]) -> bool {
     if expect.is_empty() || expect.iter().all(Option::is_none) || data.len() < expect.len() {
         return false;
     }
-    expect
-        .iter()
-        .enumerate()
-        .all(|(i, want)| want.is_none_or(|w| data[i] == w))
+    expect.iter().enumerate().all(|(i, want)| want.is_none_or(|w| data[i] == w))
 }
 
 /// `find_pattern`: all start offsets (first `limit`) of `pattern` in `haystack`, anchored on its longest literal run.
@@ -94,12 +76,7 @@ pub fn find_pattern(haystack: &[u8], pattern: &[Option<u8>], limit: usize) -> Re
     }
     let (mut anchor_start, mut anchor): (usize, Vec<u8>) = (0, Vec::new());
     let (mut run_start, mut run): (usize, Vec<u8>) = (0, Vec::new());
-    for (i, v) in pattern
-        .iter()
-        .copied()
-        .chain(std::iter::once(None))
-        .enumerate()
-    {
+    for (i, v) in pattern.iter().copied().chain(std::iter::once(None)).enumerate() {
         match v {
             None => {
                 if run.len() > anchor.len() {
@@ -116,14 +93,9 @@ pub fn find_pattern(haystack: &[u8], pattern: &[Option<u8>], limit: usize) -> Re
             }
         }
     }
-    let concrete: Vec<(usize, u8)> = pattern
-        .iter()
-        .enumerate()
-        .filter_map(|(i, v)| v.map(|b| (i, b)))
-        .collect();
+    let concrete: Vec<(usize, u8)> = pattern.iter().enumerate().filter_map(|(i, v)| v.map(|b| (i, b))).collect();
     let mut hits = Vec::new();
-    let stop =
-        haystack.len() as i64 - pattern.len() as i64 + anchor_start as i64 + anchor.len() as i64;
+    let stop = haystack.len() as i64 - pattern.len() as i64 + anchor_start as i64 + anchor.len() as i64;
     let mut start = anchor_start as i64;
     let finder = memchr::memmem::Finder::new(&anchor);
     while start <= stop - anchor.len() as i64 {
@@ -185,18 +157,10 @@ pub fn compare_table(
     let mut prepared = Vec::new();
     let mut total = 0usize;
     for (index, row) in rows.iter().enumerate() {
-        let Some(obj) = row.as_object().filter(|o| {
-            o.keys()
-                .all(|k| matches!(k.as_str(), "address" | "expect" | "name"))
-        }) else {
-            return err(format!(
-                "prologue row {index} accepts address, expect and optional name only"
-            ));
+        let Some(obj) = row.as_object().filter(|o| o.keys().all(|k| matches!(k.as_str(), "address" | "expect" | "name"))) else {
+            return err(format!("prologue row {index} accepts address, expect and optional name only"));
         };
-        let address = obj
-            .get("address")
-            .and_then(Value::as_str)
-            .filter(|a| !a.trim().is_empty() && a.chars().count() <= 128);
+        let address = obj.get("address").and_then(Value::as_str).filter(|a| !a.trim().is_empty() && a.chars().count() <= 128);
         let Some(address) = address else {
             return err(format!("prologue row {index} needs an address string"));
         };
@@ -205,31 +169,21 @@ pub fn compare_table(
             Some(v) => vec![v],
             None => vec![&Value::Null],
         };
-        let strs: Option<Vec<&str>> = alternatives
-            .iter()
-            .map(|v| v.as_str().filter(|s| s.chars().count() <= 32768))
-            .collect();
+        let strs: Option<Vec<&str>> = alternatives.iter().map(|v| v.as_str().filter(|s| s.chars().count() <= 32768)).collect();
         let strs = match strs {
             Some(s) if (1..=16).contains(&s.len()) => s,
             _ => {
-                return err(format!(
-                    "prologue row {index} needs an expect string or a list of 1..16 accepted alternatives"
-                ));
+                return err(format!("prologue row {index} needs an expect string or a list of 1..16 accepted alternatives"));
             }
         };
         let name = match obj.get("name") {
             None => "",
             Some(Value::String(s)) if s.chars().count() <= 256 => s.as_str(),
             _ => {
-                return err(format!(
-                    "prologue row {index} name must be at most 256 characters"
-                ));
+                return err(format!("prologue row {index} name must be at most 256 characters"));
             }
         };
-        let patterns: Vec<Expect> = strs
-            .iter()
-            .map(|s| parse_expect(s))
-            .collect::<Result<_>>()?;
+        let patterns: Vec<Expect> = strs.iter().map(|s| parse_expect(s)).collect::<Result<_>>()?;
         let longest = patterns.iter().map(Vec::len).max().unwrap_or(0);
         if longest > 4096 {
             return err(format!("prologue row {index} exceeds 4096 bytes"));
@@ -243,16 +197,9 @@ pub fn compare_table(
             return err(format!("prologue row {index} resolved to an invalid RVA"));
         }
         if image.rva_to_offset(rva).is_none() || longest > image.available(rva) {
-            return err(format!(
-                "prologue row {index} is outside a file-backed section"
-            ));
+            return err(format!("prologue row {index} is outside a file-backed section"));
         }
-        prepared.push(Prepared {
-            name: name.to_string(),
-            address: address.to_string(),
-            rva,
-            patterns,
-        });
+        prepared.push(Prepared { name: name.to_string(), address: address.to_string(), rva, patterns });
     }
     let fingerprint = fingerprint_json(image);
     let mut results = Vec::new();
@@ -262,27 +209,15 @@ pub fn compare_table(
         let actual = image.read_rva(p.rva, longest as i64)?;
         let which = p.patterns.iter().position(|pat| matches(actual, pat));
         matched += usize::from(which.is_some());
-        let show = |pat: &Expect| {
-            pat.iter()
-                .map(|v| v.map_or("??".to_string(), |b| format!("{b:02X}")))
-                .collect::<Vec<_>>()
-                .join(" ")
-        };
+        let show = |pat: &Expect| pat.iter().map(|v| v.map_or("??".to_string(), |b| format!("{b:02X}"))).collect::<Vec<_>>().join(" ");
         let mut row = Map::new();
         row.insert("name".into(), json!(p.name));
         row.insert("input_address".into(), json!(p.address));
         row.insert("rva".into(), json!(format!("rva:{:#x}", p.rva)));
-        row.insert(
-            "va".into(),
-            json!(format!("va:{:#x}", image.base + p.rva as u64)),
-        );
+        row.insert("va".into(), json!(format!("va:{:#x}", image.base + p.rva as u64)));
         row.insert(
             "expect".into(),
-            if p.patterns.len() > 1 {
-                json!(p.patterns.iter().map(show).collect::<Vec<_>>())
-            } else {
-                json!(show(&p.patterns[0]))
-            },
+            if p.patterns.len() > 1 { json!(p.patterns.iter().map(show).collect::<Vec<_>>()) } else { json!(show(&p.patterns[0])) },
         );
         row.insert("actual".into(), json!(format_bytes(actual)));
         row.insert("match".into(), json!(which.is_some()));
@@ -294,10 +229,7 @@ pub fn compare_table(
     let mut out = Map::new();
     out.insert("fingerprint".into(), fingerprint);
     out.insert("rows".into(), Value::Array(results));
-    out.insert(
-        "summary".into(),
-        json!({"checked": prepared.len(), "matched": matched, "failed": prepared.len() - matched}),
-    );
+    out.insert("summary".into(), json!({"checked": prepared.len(), "matched": matched, "failed": prepared.len() - matched}));
     out.insert("matched".into(), json!(matched == prepared.len()));
     Ok(Value::Object(out))
 }
@@ -309,10 +241,7 @@ pub fn compare(data: &[u8], expect_text: &str) -> Result<String> {
     Ok(if matches(got, &expect) {
         format!("PROLOGUE MATCH {}", format_bytes(got))
     } else {
-        format!(
-            "PROLOGUE MISMATCH expect {expect_text} got {}",
-            format_bytes(got)
-        )
+        format!("PROLOGUE MISMATCH expect {expect_text} got {}", format_bytes(got))
     })
 }
 

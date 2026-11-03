@@ -3,7 +3,7 @@
 //! `NativeImage` mirrors the text methods of `hydralysis.pe.Image`; `HYDRALYSIS_IMPL=rust` makes the Python class
 //! delegate here so the same inputs can be diffed byte for byte (tests/test_rust_parity.py).
 
-use hy_query::{Image, PeError, prologue, tools};
+use hy_query::{prologue, tools, Image, PeError};
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
@@ -31,7 +31,9 @@ impl NativeImage {
 
     #[staticmethod]
     fn open(path: &str) -> PyResult<Self> {
-        Ok(Self { inner: Image::open(path).map_err(py)? })
+        Ok(Self {
+            inner: Image::open(path).map_err(py)?,
+        })
     }
 
     #[setter]
@@ -52,10 +54,22 @@ impl NativeImage {
         self.inner.available(rva)
     }
     fn read_rva<'p>(&self, py_: Python<'p>, rva: i64, size: i64) -> PyResult<Bound<'p, PyBytes>> {
-        Ok(PyBytes::new(py_, self.inner.read_rva(rva, size).map_err(py)?))
+        Ok(PyBytes::new(
+            py_,
+            self.inner.read_rva(rva, size).map_err(py)?,
+        ))
     }
-    fn loaded_bytes<'p>(&self, py_: Python<'p>, rva: i64, size: i64, load_base: u64) -> PyResult<Bound<'p, PyBytes>> {
-        Ok(PyBytes::new(py_, &self.inner.loaded_bytes(rva, size, load_base).map_err(py)?))
+    fn loaded_bytes<'p>(
+        &self,
+        py_: Python<'p>,
+        rva: i64,
+        size: i64,
+        load_base: u64,
+    ) -> PyResult<Bound<'p, PyBytes>> {
+        Ok(PyBytes::new(
+            py_,
+            &self.inner.loaded_bytes(rva, size, load_base).map_err(py)?,
+        ))
     }
     #[pyo3(signature = (rva, limit=80))]
     fn string_at(&self, rva: i64, limit: usize) -> Option<String> {
@@ -110,7 +124,11 @@ fn parse_expect_rs(text: &str) -> PyResult<Vec<Option<u8>>> {
 }
 
 #[pyfunction]
-fn find_pattern_rs(haystack: &Bound<'_, PyBytes>, pattern: Vec<Option<u8>>, limit: usize) -> PyResult<Vec<usize>> {
+fn find_pattern_rs(
+    haystack: &Bound<'_, PyBytes>,
+    pattern: Vec<Option<u8>>,
+    limit: usize,
+) -> PyResult<Vec<usize>> {
     prologue::find_pattern(haystack.as_bytes(), &pattern, limit).map_err(py)
 }
 
@@ -138,7 +156,10 @@ fn decompile_fragments_rs(value: &str) -> PyResult<String> {
 
 #[pyfunction]
 fn decompile_limitations_rs(reply: &str) -> PyResult<Vec<String>> {
-    Ok(hy_query::decompile::limitations(&parse_json(reply)?).into_iter().map(String::from).collect())
+    Ok(hy_query::decompile::limitations(&parse_json(reply)?)
+        .into_iter()
+        .map(String::from)
+        .collect())
 }
 
 #[pyfunction]
@@ -148,7 +169,10 @@ fn decompile_coverage_rs(reply: &str) -> PyResult<String> {
 
 #[pyfunction]
 fn decompile_merge_rs(response: &str, reply: &str) -> PyResult<Option<String>> {
-    Ok(hy_query::decompile::merge(&parse_json(response)?, &parse_json(reply)?).map(|v| v.to_string()))
+    Ok(
+        hy_query::decompile::merge(&parse_json(response)?, &parse_json(reply)?)
+            .map(|v| v.to_string()),
+    )
 }
 
 #[pyfunction]
@@ -161,27 +185,49 @@ fn decompile_from_error_rs(message: &str) -> Option<String> {
 #[pyfunction]
 #[pyo3(signature = (action, options=None, record=false))]
 fn validate_options_rs(action: &str, options: Option<&str>, record: bool) -> PyResult<String> {
-    use hy_query::analysis::{Invalid, validate_options};
+    use hy_query::analysis::{validate_options, Invalid};
     let parsed = match options {
         None => None,
         Some(t) => match parse_json(t)? {
             serde_json::Value::Object(m) => Some(m),
-            _ => return Err(pyo3::exceptions::PyNotImplementedError::new_err("options is not an object")),
+            _ => {
+                return Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                    "options is not an object",
+                ))
+            }
         },
     };
     match validate_options(action, parsed.as_ref(), record) {
         Ok(v) => Ok(v.to_string()),
         Err(Invalid::Value(m)) => Err(PyValueError::new_err(m)),
-        Err(Invalid::Fallback) => Err(pyo3::exceptions::PyNotImplementedError::new_err("python only")),
+        Err(Invalid::Fallback) => Err(pyo3::exceptions::PyNotImplementedError::new_err(
+            "python only",
+        )),
     }
 }
 
 /// `export_worker.replay` over an existing output file: the progress as JSON, or ValueError with the Python text.
 #[pyfunction]
-fn export_replay_rs(path: &str, job: &str, build: &str, mode: &str, provenance: &str, max_output: u64, max_row: usize) -> PyResult<String> {
+fn export_replay_rs(
+    path: &str,
+    job: &str,
+    build: &str,
+    mode: &str,
+    provenance: &str,
+    max_output: u64,
+    max_row: usize,
+) -> PyResult<String> {
     let provenance = parse_json(provenance)?;
-    let p = hy_query::export::replay_file(std::path::Path::new(path), job, build, mode, &provenance, max_output, max_row)
-        .map_err(PyValueError::new_err)?;
+    let p = hy_query::export::replay_file(
+        std::path::Path::new(path),
+        job,
+        build,
+        mode,
+        &provenance,
+        max_output,
+        max_row,
+    )
+    .map_err(PyValueError::new_err)?;
     Ok(serde_json::json!({"keys": p.keys, "completed": p.completed, "succeeded": p.succeeded, "failed": p.failed,
                           "truncated": p.truncated}).to_string())
 }
@@ -189,11 +235,17 @@ fn export_replay_rs(path: &str, job: &str, build: &str, mode: &str, provenance: 
 /// `body_hash`; None when Python must answer.
 #[pyfunction]
 #[pyo3(signature = (response, image=None))]
-fn export_body_hash_rs(response: &str, image: Option<PyRef<'_, NativeImage>>) -> PyResult<Option<String>> {
-    Ok(match hy_query::export::body_hash(&parse_json(response)?, image.as_ref().map(|i| &i.inner)) {
-        hy_query::export::BodyHash::Done(v) => Some(v.to_string()),
-        hy_query::export::BodyHash::Unsupported => None,
-    })
+fn export_body_hash_rs(
+    response: &str,
+    image: Option<PyRef<'_, NativeImage>>,
+) -> PyResult<Option<String>> {
+    Ok(
+        match hy_query::export::body_hash(&parse_json(response)?, image.as_ref().map(|i| &i.inner))
+        {
+            hy_query::export::BodyHash::Done(v) => Some(v.to_string()),
+            hy_query::export::BodyHash::Unsupported => None,
+        },
+    )
 }
 
 #[pyfunction]
@@ -212,20 +264,31 @@ fn export_keys_sha256_rs(keys: Vec<String>) -> String {
 }
 
 #[pyfunction]
-fn export_parity_rs(snapshot: &str, limit: i64, progress_keys: Vec<String>, succeeded: i64, failed: i64) -> PyResult<Option<String>> {
+fn export_parity_rs(
+    snapshot: &str,
+    limit: i64,
+    progress_keys: Vec<String>,
+    succeeded: i64,
+    failed: i64,
+) -> PyResult<Option<String>> {
     let keys: Vec<&str> = progress_keys.iter().map(String::as_str).collect();
-    Ok(hy_query::export::parity(&parse_json(snapshot)?, limit, &keys, succeeded, failed).map(|v| v.to_string()))
+    Ok(
+        hy_query::export::parity(&parse_json(snapshot)?, limit, &keys, succeeded, failed)
+            .map(|v| v.to_string()),
+    )
 }
 
 #[pyfunction]
 fn export_sha256_file_rs(path: &str) -> PyResult<String> {
-    hy_query::export::sha256_file(std::path::Path::new(path)).map_err(|e| PyIOError::new_err(e.to_string()))
+    hy_query::export::sha256_file(std::path::Path::new(path))
+        .map_err(|e| PyIOError::new_err(e.to_string()))
 }
 
 #[pyfunction]
 fn export_code_sha256_rs(package: &str, names: Vec<String>) -> PyResult<String> {
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
-    hy_query::export::code_sha256(std::path::Path::new(package), &names).map_err(|e| PyIOError::new_err(e.to_string()))
+    hy_query::export::code_sha256(std::path::Path::new(package), &names)
+        .map_err(|e| PyIOError::new_err(e.to_string()))
 }
 
 /// `crossbuild.match`: a JSON list of [source rva, destination rva, method] in Python's order; None when a row
@@ -233,20 +296,34 @@ fn export_code_sha256_rs(package: &str, names: Vec<String>) -> PyResult<String> 
 #[pyfunction]
 fn crossbuild_match_rs(source: &str, destination: &str) -> PyResult<Option<String>> {
     use hy_query::crossbuild::{match_builds, rows_from_json};
-    let (Some(s), Some(d)) = (rows_from_json(&parse_json(source)?), rows_from_json(&parse_json(destination)?)) else {
+    let (Some(s), Some(d)) = (
+        rows_from_json(&parse_json(source)?),
+        rows_from_json(&parse_json(destination)?),
+    ) else {
         return Ok(None);
     };
     let pairs = match_builds(&s, &d);
-    let out: Vec<serde_json::Value> = pairs.iter().map(|(k, (o, m))| serde_json::json!([k, o, m])).collect();
+    let out: Vec<serde_json::Value> = pairs
+        .iter()
+        .map(|(k, (o, m))| serde_json::json!([k, o, m]))
+        .collect();
     Ok(Some(serde_json::Value::Array(out).to_string()))
 }
 
-pyo3::create_exception!(hydralysis_native, ClientRefusal, pyo3::exceptions::PyException);
+pyo3::create_exception!(
+    hydralysis_native,
+    ClientRefusal,
+    pyo3::exceptions::PyException
+);
 
 struct PyDispatch(Py<PyAny>);
 
 impl hy_query::client::Dispatch for PyDispatch {
-    fn call(&self, tool: &str, args: &serde_json::Value) -> Result<String, hy_query::client::DispatchError> {
+    fn call(
+        &self,
+        tool: &str,
+        args: &serde_json::Value,
+    ) -> Result<String, hy_query::client::DispatchError> {
         use hy_query::client::DispatchError;
         Python::attach(|py| match self.0.bind(py).call1((tool, args.to_string())) {
             Ok(v) => v.extract::<String>().map_err(|e| DispatchError {
@@ -256,13 +333,22 @@ impl hy_query::client::Dispatch for PyDispatch {
                 fatal: Some(Box::new(e)),
             }),
             Err(e) => {
-                let kind = e.get_type(py).name().map(|n| n.to_string()).unwrap_or_default();
+                let kind = e
+                    .get_type(py)
+                    .name()
+                    .map(|n| n.to_string())
+                    .unwrap_or_default();
                 let message = e.value(py).str().map(|s| s.to_string()).unwrap_or_default();
                 let caught = e.is_instance_of::<PyValueError>(py)
                     || e.is_instance_of::<PyIOError>(py)
                     || e.is_instance_of::<pyo3::exceptions::PyKeyError>(py)
                     || e.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py);
-                Err(DispatchError { kind, message, caught, fatal: Some(Box::new(e)) })
+                Err(DispatchError {
+                    kind,
+                    message,
+                    caught,
+                    fatal: Some(Box::new(e)),
+                })
             }
         })
     }
@@ -307,49 +393,118 @@ fn to_map(text: &str) -> PyResult<serde_json::Map<String, serde_json::Value>> {
 impl NativeClient {
     #[new]
     fn new(dispatch: Py<PyAny>) -> Self {
-        Self { inner: hy_query::client::Client::new(PyDispatch(dispatch)) }
+        Self {
+            inner: hy_query::client::Client::new(PyDispatch(dispatch)),
+        }
     }
     fn call(&self, py: Python<'_>, tool: &str, args: &str) -> PyResult<String> {
-        let a = self.inner.call(tool, &to_map(args)?).map_err(|e| client_err(py, e))?;
+        let a = self
+            .inner
+            .call(tool, &to_map(args)?)
+            .map_err(|e| client_err(py, e))?;
         Ok(a.into_value().to_string())
     }
     #[pyo3(signature = (target, action, address, options))]
-    fn try_query(&self, py: Python<'_>, target: &str, action: &str, address: &str, options: &str) -> PyResult<String> {
-        let r = self.inner.try_query(target, action, address, to_map(options)?).map_err(|e| client_err(py, e))?;
+    fn try_query(
+        &self,
+        py: Python<'_>,
+        target: &str,
+        action: &str,
+        address: &str,
+        options: &str,
+    ) -> PyResult<String> {
+        let r = self
+            .inner
+            .try_query(target, action, address, to_map(options)?)
+            .map_err(|e| client_err(py, e))?;
         Ok(r.unwrap_or(serde_json::Value::Null).to_string())
     }
     fn fingerprint(&self, py: Python<'_>, exe: &str) -> PyResult<String> {
-        Ok(self.inner.fingerprint(exe).map_err(|e| client_err(py, e))?.to_string())
+        Ok(self
+            .inner
+            .fingerprint(exe)
+            .map_err(|e| client_err(py, e))?
+            .to_string())
     }
-    fn read<'p>(&self, py: Python<'p>, exe: &str, address: &str, size: i64) -> PyResult<Bound<'p, PyBytes>> {
-        let b = self.inner.read(exe, address, size).map_err(|e| client_err(py, e))?;
+    fn read<'p>(
+        &self,
+        py: Python<'p>,
+        exe: &str,
+        address: &str,
+        size: i64,
+    ) -> PyResult<Bound<'p, PyBytes>> {
+        let b = self
+            .inner
+            .read(exe, address, size)
+            .map_err(|e| client_err(py, e))?;
         Ok(PyBytes::new(py, &b))
     }
     #[pyo3(signature = (exe, rows, sha256=None))]
-    fn check_prologues(&self, py: Python<'_>, exe: &str, rows: &str, sha256: Option<&str>) -> PyResult<String> {
+    fn check_prologues(
+        &self,
+        py: Python<'_>,
+        exe: &str,
+        rows: &str,
+        sha256: Option<&str>,
+    ) -> PyResult<String> {
         let rows = match parse_json(rows)? {
             serde_json::Value::Array(a) => a,
             _ => return Err(PyValueError::new_err("rows must be a list")),
         };
-        Ok(self.inner.check_prologues(exe, &rows, sha256).map_err(|e| client_err(py, e))?.to_string())
+        Ok(self
+            .inner
+            .check_prologues(exe, &rows, sha256)
+            .map_err(|e| client_err(py, e))?
+            .to_string())
     }
     fn disasm(&self, py: Python<'_>, exe: &str, address: &str, count: i64) -> PyResult<String> {
-        Ok(self.inner.disasm(exe, address, count).map_err(|e| client_err(py, e))?.to_string())
+        Ok(self
+            .inner
+            .disasm(exe, address, count)
+            .map_err(|e| client_err(py, e))?
+            .to_string())
     }
     fn inspect(&self, py: Python<'_>, exe: &str, address: &str) -> PyResult<String> {
-        Ok(self.inner.inspect(exe, address).map_err(|e| client_err(py, e))?.to_string())
+        Ok(self
+            .inner
+            .inspect(exe, address)
+            .map_err(|e| client_err(py, e))?
+            .to_string())
     }
     fn sigscan(&self, py: Python<'_>, exe: &str, pattern: &str, limit: i64) -> PyResult<String> {
-        Ok(self.inner.sigscan(exe, pattern, limit).map_err(|e| client_err(py, e))?.to_string())
+        Ok(self
+            .inner
+            .sigscan(exe, pattern, limit)
+            .map_err(|e| client_err(py, e))?
+            .to_string())
     }
-    fn query(&self, py: Python<'_>, target: &str, action: &str, address: &str, options: &str) -> PyResult<String> {
-        Ok(self.inner.query(target, action, address, to_map(options)?).map_err(|e| client_err(py, e))?.to_string())
+    fn query(
+        &self,
+        py: Python<'_>,
+        target: &str,
+        action: &str,
+        address: &str,
+        options: &str,
+    ) -> PyResult<String> {
+        Ok(self
+            .inner
+            .query(target, action, address, to_map(options)?)
+            .map_err(|e| client_err(py, e))?
+            .to_string())
     }
     fn runtime(&self, py: Python<'_>, action: &str, options: &str) -> PyResult<String> {
-        Ok(self.inner.runtime(action, parse_json(options)?).map_err(|e| client_err(py, e))?.to_string())
+        Ok(self
+            .inner
+            .runtime(action, parse_json(options)?)
+            .map_err(|e| client_err(py, e))?
+            .to_string())
     }
     fn evidence(&self, py: Python<'_>, args: &str) -> PyResult<String> {
-        Ok(self.inner.evidence(&to_map(args)?).map_err(|e| client_err(py, e))?.to_string())
+        Ok(self
+            .inner
+            .evidence(&to_map(args)?)
+            .map_err(|e| client_err(py, e))?
+            .to_string())
     }
 }
 
@@ -370,7 +525,9 @@ fn proc_terminate_tree_rs(pid: u32) -> PyResult<()> {
 
 #[pyfunction]
 fn system_properties_rs(path: &str) -> Vec<(String, String)> {
-    hy_query::system::properties(std::path::Path::new(path)).into_iter().collect()
+    hy_query::system::properties(std::path::Path::new(path))
+        .into_iter()
+        .collect()
 }
 
 #[pyfunction]
@@ -408,7 +565,8 @@ fn system_dir_size_rs(folder: &str) -> u64 {
 
 #[pyfunction]
 fn system_count_key_rs(value: &str, key: &str) -> PyResult<u64> {
-    let parsed: serde_json::Value = serde_json::from_str(value).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(value).map_err(|e| PyValueError::new_err(e.to_string()))?;
     Ok(hy_query::system::count_key(&parsed, key))
 }
 

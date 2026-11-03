@@ -26,11 +26,7 @@ pub const FALLBACK_TIMEOUT_S: i64 = 3600;
 /// `hydra.PATIENCE_S` in milliseconds.
 pub const PATIENCE_MS: i64 = 25_000;
 /// (RusticQuery option name, engine field name).
-pub const ENGINE_FIELDS: [(&str, &str); 3] = [
-    ("max_result_mb", "maxResultMb"),
-    ("max_result_kb", "maxResultKb"),
-    ("offset", "offset"),
-];
+pub const ENGINE_FIELDS: [(&str, &str); 3] = [("max_result_mb", "maxResultMb"), ("max_result_kb", "maxResultKb"), ("offset", "offset")];
 const GONE: [&str; 4] = ["no_program", "no_project", "not_found", "closed"];
 
 /// An `ok:false` answer from the engine (`hydra.EngineError`).
@@ -46,20 +42,12 @@ pub struct EngineError {
 
 impl EngineError {
     pub fn new(code: &str, message: &str, details: Map<String, Value>, command: &str) -> Self {
-        let text =
-            json!({"engine_error": code, "message": message, "command": command}).to_string();
-        Self {
-            code: code.into(),
-            message: message.into(),
-            details,
-            command: command.into(),
-            text,
-        }
+        let text = json!({"engine_error": code, "message": message, "command": command}).to_string();
+        Self { code: code.into(), message: message.into(), details, command: command.into(), text }
     }
     /// hydra.4's per-connection view cap: `busy` with resource `client_cap`.
     pub fn at_client_cap(&self) -> bool {
-        self.code == "busy"
-            && self.details.get("resource").and_then(Value::as_str) == Some("client_cap")
+        self.code == "busy" && self.details.get("resource").and_then(Value::as_str) == Some("client_cap")
     }
 }
 
@@ -82,11 +70,7 @@ pub trait Engine: Send + Sync {
 
 /// `hydra.patience_ms`.
 pub fn patience_ms(engine: &dyn Engine, default_ms: i64) -> i64 {
-    if engine.supports("queueInfo") {
-        default_ms.min(PATIENCE_MS)
-    } else {
-        default_ms
-    }
+    if engine.supports("queueInfo") { default_ms.min(PATIENCE_MS) } else { default_ms }
 }
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq)]
@@ -94,15 +78,8 @@ pub enum OpenError {
     #[error("{0}")]
     Engine(EngineError),
     /// Python `ValueError`: the opened program is not the target build.
-    #[error(
-        "{program} in {gpr} reports SHA-256 {got}, not the target build {wanted}; nothing was answered"
-    )]
-    WrongBuild {
-        program: String,
-        gpr: String,
-        got: String,
-        wanted: String,
-    },
+    #[error("{program} in {gpr} reports SHA-256 {got}, not the target build {wanted}; nothing was answered")]
+    WrongBuild { program: String, gpr: String, got: String, wanted: String },
     /// Python `KeyError`: the engine reply lacks a field the row needs.
     #[error("{0:?}")]
     Missing(String),
@@ -188,10 +165,7 @@ struct Flight {
 
 impl Flight {
     fn new() -> Self {
-        Self {
-            outcome: Mutex::new(None),
-            done: Condvar::new(),
-        }
+        Self { outcome: Mutex::new(None), done: Condvar::new() }
     }
     fn finish(&self, outcome: Outcome) {
         *lock(&self.outcome) = Some(outcome);
@@ -235,9 +209,7 @@ pub struct Holding<'a> {
 
 impl Drop for Holding<'_> {
     fn drop(&mut self) {
-        let marks = HELD
-            .with(|held| held.replace(self.previous.take()))
-            .unwrap_or_default();
+        let marks = HELD.with(|held| held.replace(self.previous.take())).unwrap_or_default();
         let mut state = lock(&self.registry.state);
         for mark in marks {
             match state.in_use.get_mut(&mark) {
@@ -266,29 +238,17 @@ impl Registry {
     /// `_holding()`.
     pub fn holding(&self) -> Holding<'_> {
         let previous = HELD.with(|held| held.replace(Some(Vec::new())));
-        Holding {
-            registry: self,
-            previous,
-        }
+        Holding { registry: self, previous }
     }
 
     /// Cached rows of one connection, oldest first (a test and diagnostics view of `_keys`).
     pub fn rows(&self, engine_key: &str) -> Vec<Row> {
-        lock(&self.state)
-            .keys
-            .iter()
-            .filter(|(k, _)| k.0 == engine_key)
-            .map(|(_, v)| v.clone())
-            .collect()
+        lock(&self.state).keys.iter().filter(|(k, _)| k.0 == engine_key).map(|(_, v)| v.clone()).collect()
     }
 
     /// `_in_use` as (connection key, program key, count), sorted.
     pub fn in_use(&self) -> Vec<(String, String, usize)> {
-        let mut v: Vec<_> = lock(&self.state)
-            .in_use
-            .iter()
-            .map(|((a, b), n)| (a.clone(), b.clone(), *n))
-            .collect();
+        let mut v: Vec<_> = lock(&self.state).in_use.iter().map(|((a, b), n)| (a.clone(), b.clone(), *n)).collect();
         v.sort();
         v
     }
@@ -307,12 +267,7 @@ impl Registry {
         sha256: &str,
         options: &OpenOptions,
     ) -> Result<Row, OpenError> {
-        let cache_key = CacheKey(
-            engine.key().to_string(),
-            windows_path(gpr).to_lowercase(),
-            program.to_string(),
-            options.writable,
-        );
+        let cache_key = CacheKey(engine.key().to_string(), windows_path(gpr).to_lowercase(), program.to_string(), options.writable);
         let flight = loop {
             let waiting = {
                 let mut state = lock(&self.state);
@@ -347,12 +302,7 @@ impl Registry {
             }
             // A refresh opens again itself after the open in flight, and so does a waiter whose opener was interrupted.
         };
-        let mut end = FlightEnd {
-            registry: self,
-            cache_key: cache_key.clone(),
-            flight,
-            outcome: None,
-        };
+        let mut end = FlightEnd { registry: self, cache_key: cache_key.clone(), flight, outcome: None };
         let result = self.open_now(engine, &cache_key, gpr, program, sha256, options);
         end.outcome = Some(Some(result.clone()));
         result
@@ -379,10 +329,7 @@ impl Registry {
                 engine.call("open_project", &f)?
             }
         };
-        let project_id = opened
-            .get("id")
-            .cloned()
-            .ok_or_else(|| OpenError::Missing("id".into()))?;
+        let project_id = opened.get("id").cloned().ok_or_else(|| OpenError::Missing("id".into()))?;
         let mut fields = Map::new();
         fields.insert("path".into(), json!(program));
         fields.insert("project".into(), project_id.clone());
@@ -396,9 +343,7 @@ impl Registry {
         }
         let info = match call_open(engine, wait, &fields) {
             Ok(info) => info,
-            Err(e) if e.at_client_cap() => {
-                self.open_after_eviction(engine, cache_key, &fields, wait, e)?
-            }
+            Err(e) if e.at_client_cap() => self.open_after_eviction(engine, cache_key, &fields, wait, e)?,
             Err(e) => return Err(e.into()),
         };
         let reported = info.get("sha256").map_or_else(String::new, py_str);
@@ -410,9 +355,7 @@ impl Registry {
                 wanted: sha256.into(),
             });
         }
-        let key = info
-            .get("key")
-            .ok_or_else(|| OpenError::Missing("key".into()))?;
+        let key = info.get("key").ok_or_else(|| OpenError::Missing("key".into()))?;
         let row = Row {
             key: py_str(key),
             project: project_id,
@@ -443,22 +386,11 @@ impl Registry {
         loop {
             let program = {
                 let state = lock(&self.state);
-                let rows: Vec<&Row> = state
-                    .keys
-                    .iter()
-                    .filter(|(k, _)| k.0 == engine.key() && *k != cache_key && !k.3)
-                    .map(|(_, v)| v)
-                    .collect();
+                let rows: Vec<&Row> =
+                    state.keys.iter().filter(|(k, _)| k.0 == engine.key() && *k != cache_key && !k.3).map(|(_, v)| v).collect();
                 let idle: Vec<&&Row> = rows
                     .iter()
-                    .filter(|r| {
-                        state
-                            .in_use
-                            .get(&(engine.key().to_string(), r.key.clone()))
-                            .copied()
-                            .unwrap_or(0)
-                            == 0
-                    })
+                    .filter(|r| state.in_use.get(&(engine.key().to_string(), r.key.clone())).copied().unwrap_or(0) == 0)
                     .collect();
                 match idle.first() {
                     Some(r) => r.key.clone(),
@@ -475,9 +407,7 @@ impl Registry {
             {
                 return Err(error.into());
             }
-            lock(&self.state)
-                .keys
-                .retain(|k, v| !(k.0 == engine.key() && v.key == program));
+            lock(&self.state).keys.retain(|k, v| !(k.0 == engine.key() && v.key == program));
             match call_open(engine, wait, fields) {
                 Ok(info) => return Ok(info),
                 Err(again) if again.at_client_cap() => error = again,
@@ -493,20 +423,14 @@ impl Registry {
 
     /// `_drop_program`: drop the rows of one daemon program on a connection.
     pub fn drop_program(&self, engine_key: &str, program: &str) {
-        lock(&self.state)
-            .keys
-            .retain(|k, v| !(k.0 == engine_key && v.key == program));
+        lock(&self.state).keys.retain(|k, v| !(k.0 == engine_key && v.key == program));
     }
 
     /// `_drop_rows_under`: drop a connection's rows of programs whose project lies under one of FOLDERS.
     pub fn drop_rows_under(&self, engine_key: &str, folders: &[&str]) {
         let roots: Vec<PathBuf> = folders.iter().map(|f| resolve(Path::new(f))).collect();
-        let rows: Vec<(CacheKey, Row)> = lock(&self.state)
-            .keys
-            .iter()
-            .filter(|(k, _)| k.0 == engine_key)
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+        let rows: Vec<(CacheKey, Row)> =
+            lock(&self.state).keys.iter().filter(|(k, _)| k.0 == engine_key).map(|(k, v)| (k.clone(), v.clone())).collect();
         // `resolve` asks the file system: outside the guard, and a row replaced meanwhile stays.
         let gone: Vec<(CacheKey, Row)> = rows
             .into_iter()
@@ -526,17 +450,12 @@ impl Registry {
     /// `forget_role`: every row of the role, the shared connection's and every pool entry's (`<root>|<role>|`).
     pub fn forget_role(&self, engine_key: &str) {
         let prefix = format!("{engine_key}|");
-        lock(&self.state)
-            .keys
-            .retain(|k, _| !(k.0 == engine_key || k.0.starts_with(&prefix)));
+        lock(&self.state).keys.retain(|k, _| !(k.0 == engine_key || k.0.starts_with(&prefix)));
     }
 
     /// `QueryRunner.reader`'s lane table: remember connection KEY as LANE of the shared reader SHARED.
     pub fn add_lane(&self, shared: &str, lane: i64, key: &str) {
-        lock(&self.lanes)
-            .entry(shared.to_string())
-            .or_default()
-            .insert(lane, key.to_string());
+        lock(&self.lanes).entry(shared.to_string()).or_default().insert(lane, key.to_string());
     }
 
     /// `readers`: the shared connection and the lanes made beside it, as connection keys.
@@ -549,11 +468,7 @@ impl Registry {
     }
 }
 
-fn call_open(
-    engine: &dyn Engine,
-    wait: i64,
-    fields: &Map<String, Value>,
-) -> Result<Value, EngineError> {
+fn call_open(engine: &dyn Engine, wait: i64, fields: &Map<String, Value>) -> Result<Value, EngineError> {
     let mut all = Map::new();
     all.insert("wait".into(), json!(wait));
     for (k, v) in fields {
@@ -578,10 +493,7 @@ pub fn py_str(v: &Value) -> String {
 pub fn windows_path(text: &str) -> String {
     let t = text.replace('/', "\\");
     let (prefix, rest) = split_drive(&t);
-    let parts: Vec<&str> = rest
-        .split('\\')
-        .filter(|p| !p.is_empty() && *p != ".")
-        .collect();
+    let parts: Vec<&str> = rest.split('\\').filter(|p| !p.is_empty() && *p != ".").collect();
     let rooted = rest.starts_with('\\');
     let mut out = String::from(prefix);
     // a UNC share is a drive with a root of its own: a share path always ends in a separator
@@ -624,10 +536,7 @@ fn resolve(path: &Path) -> PathBuf {
             }
             return base;
         }
-        match (
-            cur.file_name().map(|n| n.to_owned()),
-            cur.parent().map(Path::to_path_buf),
-        ) {
+        match (cur.file_name().map(|n| n.to_owned()), cur.parent().map(Path::to_path_buf)) {
             (Some(name), Some(parent)) if parent != cur => {
                 tail.push(name);
                 cur = parent;
@@ -651,11 +560,7 @@ pub fn accepted(action: &str, response: &Value) -> Result<Value, String> {
     let mut out = if ok {
         response.clone()
     } else {
-        let partial = if action == "decompile" {
-            decompile::from_error(&py_dumps_string(response))
-        } else {
-            None
-        };
+        let partial = if action == "decompile" { decompile::from_error(&py_dumps_string(response)) } else { None };
         match partial {
             None => return Err(py_dumps_string(&public(response))),
             Some(Value::Object(mut p)) => {
@@ -687,10 +592,7 @@ fn truthy(v: &Value) -> bool {
 pub fn public(value: &Value) -> Value {
     match value {
         Value::Object(m) => Value::Object(
-            m.iter()
-                .filter(|(k, _)| !matches!(k.as_str(), "ipc" | "token" | "secret"))
-                .map(|(k, v)| (k.clone(), public(v)))
-                .collect(),
+            m.iter().filter(|(k, _)| !matches!(k.as_str(), "ipc" | "token" | "secret")).map(|(k, v)| (k.clone(), public(v))).collect(),
         ),
         Value::Array(a) => Value::Array(a.iter().map(public).collect()),
         other => other.clone(),
@@ -699,9 +601,7 @@ pub fn public(value: &Value) -> Value {
 
 /// `reader_lanes`: 1..=64 from `readerLanes` / `reader_lanes`, else the default.
 pub fn reader_lanes(settings: &Value) -> i64 {
-    let value = settings
-        .get("readerLanes")
-        .or_else(|| settings.get("reader_lanes"));
+    let value = settings.get("readerLanes").or_else(|| settings.get("reader_lanes"));
     match value.and_then(|v| v.as_i64().filter(|_| v.is_i64() || v.is_u64())) {
         Some(n) if (1..=64).contains(&n) => n,
         _ => READER_LANES,
@@ -729,15 +629,8 @@ pub enum ScriptError {
 static REQUESTS: AtomicU64 = AtomicU64::new(0);
 
 fn unique_hex() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    format!(
-        "{:016x}{:08x}{:08x}",
-        nanos as u64,
-        std::process::id(),
-        REQUESTS.fetch_add(1, Ordering::Relaxed)
-    )
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    format!("{:016x}{:08x}{:08x}", nanos as u64, std::process::id(), REQUESTS.fetch_add(1, Ordering::Relaxed))
 }
 
 /// `run_script`: one RusticQuery run. Large requests travel as a file, not a command argument.
@@ -767,14 +660,7 @@ pub fn run_script(
     fields.insert("args".into(), json!([argument]));
     fields.insert("maxChars".into(), json!(MAX_CHARS));
     fields.insert("timeout".into(), json!(timeout_s + 5));
-    fields.insert(
-        "wait".into(),
-        json!(if wait_ms != 0 {
-            wait_ms
-        } else {
-            patience_ms(engine, BUSY_WAIT_MS)
-        }),
-    );
+    fields.insert("wait".into(), json!(if wait_ms != 0 { wait_ms } else { patience_ms(engine, BUSY_WAIT_MS) }));
     if engine.supports("laneHint") {
         fields.insert("lane".into(), json!("quick"));
     }
@@ -786,29 +672,15 @@ pub fn run_script(
         let _ = std::fs::remove_file(p);
     }
     let result = result?;
-    let output = result.get("output").map_or_else(String::new, |v| {
-        if v.is_null() {
-            "None".into()
-        } else {
-            py_str(v)
-        }
-    });
-    let line = py_splitlines(&output)
-        .into_iter()
-        .rfind(|l| l.starts_with('{'))
-        .map(str::to_string);
+    let output = result.get("output").map_or_else(String::new, |v| if v.is_null() { "None".into() } else { py_str(v) });
+    let line = py_splitlines(&output).into_iter().rfind(|l| l.starts_with('{')).map(str::to_string);
     let truncated = result.get("truncated").is_some_and(truthy);
     match line {
         Some(line) if !truncated => Ok((serde_json::from_str(&line)?, result)),
         _ => {
             let chars: Vec<char> = output.chars().collect();
             let tail: String = chars[chars.len().saturating_sub(2000)..].iter().collect();
-            Err(ScriptError::Incomplete {
-                truncated: result
-                    .get("truncated")
-                    .map_or_else(|| "None".into(), py_str),
-                tail,
-            })
+            Err(ScriptError::Incomplete { truncated: result.get("truncated").map_or_else(|| "None".into(), py_str), tail })
         }
     }
 }
@@ -819,18 +691,7 @@ pub fn py_splitlines(text: &str) -> Vec<&str> {
     let mut start = 0;
     let mut chars = text.char_indices().peekable();
     while let Some((i, c)) = chars.next() {
-        let boundary = matches!(
-            c,
-            '\n' | '\r'
-                | '\x0b'
-                | '\x0c'
-                | '\x1c'
-                | '\x1d'
-                | '\x1e'
-                | '\u{85}'
-                | '\u{2028}'
-                | '\u{2029}'
-        );
+        let boundary = matches!(c, '\n' | '\r' | '\x0b' | '\x0c' | '\x1c' | '\x1d' | '\x1e' | '\u{85}' | '\u{2028}' | '\u{2029}');
         if !boundary {
             continue;
         }
@@ -895,11 +756,7 @@ pub fn py_int(v: &Value) -> Result<i64, DecompileError> {
                 Err(unsupported("integer past 64 bits"))
             } else {
                 let f = n.as_f64().unwrap_or(0.0).trunc();
-                if f.is_finite() && f.abs() < 9.0e18 {
-                    Ok(f as i64)
-                } else {
-                    Err(unsupported("float past 64 bits"))
-                }
+                if f.is_finite() && f.abs() < 9.0e18 { Ok(f as i64) } else { Err(unsupported("float past 64 bits")) }
             }
         }
         Value::String(text) => {
@@ -912,17 +769,10 @@ pub fn py_int(v: &Value) -> Result<i64, DecompileError> {
                 && digits.bytes().all(|b| b.is_ascii_digit() || b == b'_');
             if well_formed {
                 let clean: String = t.chars().filter(|c| *c != '_').collect();
-                return clean
-                    .parse::<i64>()
-                    .map_err(|_| unsupported("integer past 64 bits"));
+                return clean.parse::<i64>().map_err(|_| unsupported("integer past 64 bits"));
             }
-            if text.is_ascii()
-                && !text.contains(['\'', '\\'])
-                && !text.chars().any(char::is_control)
-            {
-                return Err(DecompileError::Value(format!(
-                    "invalid literal for int() with base 10: '{text}'"
-                )));
+            if text.is_ascii() && !text.contains(['\'', '\\']) && !text.chars().any(char::is_control) {
+                return Err(DecompileError::Value(format!("invalid literal for int() with base 10: '{text}'")));
             }
             Err(unsupported("malformed number text"))
         }
@@ -932,9 +782,7 @@ pub fn py_int(v: &Value) -> Result<i64, DecompileError> {
                 Value::Array(_) => "list",
                 _ => "dict",
             };
-            Err(DecompileError::Type(format!(
-                "int() argument must be a string, a bytes-like object or a real number, not '{kind}'"
-            )))
+            Err(DecompileError::Type(format!("int() argument must be a string, a bytes-like object or a real number, not '{kind}'")))
         }
     }
 }
@@ -952,11 +800,7 @@ pub fn engine_decompile(
         return Ok(response.clone());
     }
     let empty = Map::new();
-    let options = request
-        .get("options")
-        .and_then(Value::as_object)
-        .filter(|o| !o.is_empty())
-        .unwrap_or(&empty);
+    let options = request.get("options").and_then(Value::as_object).filter(|o| !o.is_empty()).unwrap_or(&empty);
     let mut explicit = Map::new();
     for (name, engine_name) in ENGINE_FIELDS {
         if let Some(v) = options.get(name).filter(|v| !v.is_null()) {
@@ -978,31 +822,17 @@ pub fn engine_decompile(
         String::new()
     };
     if failed && !inline {
-        return Err(DeferDecompile {
-            reason: if reason.is_empty() {
-                "the script could not decompile".into()
-            } else {
-                reason
-            },
-        }
-        .into());
+        return Err(DeferDecompile { reason: if reason.is_empty() { "the script could not decompile".into() } else { reason } }.into());
     }
     let max_chars = match options.get("max_characters") {
         None => 32000,
         Some(v) => py_int(v)?,
     };
-    let timeout = if failed {
-        FALLBACK_TIMEOUT_S
-    } else {
-        timeout_s + 5
-    };
+    let timeout = if failed { FALLBACK_TIMEOUT_S } else { timeout_s + 5 };
     let started = Instant::now();
     let mut fields = Map::new();
     fields.insert("program".into(), json!(program_key));
-    fields.insert(
-        "address".into(),
-        request.get("address").cloned().unwrap_or(Value::Null),
-    );
+    fields.insert("address".into(), request.get("address").cloned().unwrap_or(Value::Null));
     fields.insert("timeout".into(), json!(timeout));
     fields.insert("maxChars".into(), json!(max_chars));
     for (k, v) in explicit {
@@ -1012,22 +842,14 @@ pub fn engine_decompile(
         Ok(r) => r,
         Err(error) => {
             let slow = matches!(error.code.as_str(), "timeout" | "deadline" | "timed_out")
-                || error
-                    .details
-                    .get("reason")
-                    .map_or_else(String::new, py_str)
-                    .to_lowercase()
-                    .contains("timeout")
+                || error.details.get("reason").map_or_else(String::new, py_str).to_lowercase().contains("timeout")
                 || error.message.to_lowercase().contains("timed out");
             if inline || !slow {
                 // a refusal keeps the script's answer; only a clock that ran out becomes a job
                 return Ok(response.clone());
             }
             let text: String = error.text.chars().take(300).collect();
-            return Err(DeferDecompile {
-                reason: format!("the engine decompile did not answer in {timeout} s: {text}"),
-            }
-            .into());
+            return Err(DeferDecompile { reason: format!("the engine decompile did not answer in {timeout} s: {text}") }.into());
         }
     };
     match decompile::merge(response, &reply) {
@@ -1035,10 +857,7 @@ pub fn engine_decompile(
         Some(mut merged) => {
             if failed && let Some(m) = merged.as_object_mut() {
                 let secs = (started.elapsed().as_secs_f64() * 10.0).round() / 10.0;
-                m.insert(
-                    "fallback".into(),
-                    json!({"via": "engine_decompile", "reason": reason, "engine_s": secs, "timeout_s": timeout}),
-                );
+                m.insert("fallback".into(), json!({"via": "engine_decompile", "reason": reason, "engine_s": secs, "timeout_s": timeout}));
             }
             Ok(merged)
         }

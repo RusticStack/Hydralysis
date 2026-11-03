@@ -9,6 +9,8 @@
 //! Replies are parsed by Python's `json.loads` from the engine's own bytes (key order and number forms stay what the
 //! Python library gave), and a request's fields are written in the order and the form `json.dumps` writes them.
 
+#![allow(clippy::result_large_err)] // the error type is pyo3's PyErr, which every #[pyfunction] must return
+
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use hydra_client::error::{code, Error as ClientError};
