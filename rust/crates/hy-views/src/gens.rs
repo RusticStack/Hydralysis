@@ -57,7 +57,7 @@ pub fn append_current(settings: &Settings, lineage_id: &str, record: &Map<String
 /// A reader never repairs: a torn tail shows an older consistent state; a mid-log gap resolves to the last good line.
 pub fn head(settings: &Settings, lineage_id: &str) -> Result<Map<String, Value>> {
     let log = current_log(settings, lineage_id)?;
-    let scan = log.scan();
+    let scan = log.scan()?;
     let status = scan.as_status();
     let Some(last) = scan.records.last() else {
         return Err(ViewError::new("no_lineage", format!("lineage {lineage_id} has no valid CURRENT.log line"))
@@ -78,7 +78,7 @@ pub fn head(settings: &Settings, lineage_id: &str) -> Result<Map<String, Value>>
 }
 
 pub fn history(settings: &Settings, lineage_id: &str) -> Result<Vec<Value>> {
-    Ok(current_log(settings, lineage_id)?.scan().records)
+    Ok(current_log(settings, lineage_id)?.scan()?.records)
 }
 
 /// `lineage.project_folder_of`: the folder of a `.gpr` path.

@@ -156,13 +156,13 @@ fn a_long_lived_writer_appends_again_after_a_killed_writer_left_a_fragment() {
         .unwrap();
     assert_eq!(killed.status.code(), Some(137));
     let log = lineage::current_log(&w.settings, &w.lid).unwrap();
-    assert!(log.scan().torn_tail.is_some());
+    assert!(log.scan().unwrap().torn_tail.is_some());
     assert_eq!(lineage::history(&w.settings, &w.lid).unwrap().len(), 2); // a reader ignores the fragment and never repairs
     assert_eq!(append("recover", Value::Null), 3); // A appends again: it repairs first
     let rows = lineage::history(&w.settings, &w.lid).unwrap();
     assert_eq!(rows.iter().map(|r| r["seq"].as_i64().unwrap()).collect::<Vec<_>>(), [1, 2, 3]);
-    assert!(log.scan().torn_tail.is_none());
-    assert!(log.scan().corrupt.is_none());
+    assert!(log.scan().unwrap().torn_tail.is_none());
+    assert!(log.scan().unwrap().corrupt.is_none());
     assert_eq!(log.repairs().len(), 1);
     let kept: Vec<_> = fs::read_dir(log.path.parent().unwrap())
         .unwrap()

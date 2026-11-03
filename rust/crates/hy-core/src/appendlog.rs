@@ -197,31 +197,73 @@ pub fn scan_bytes(data: &[u8]) -> Scan {
     scan_chunks([data.to_vec()], 0, true, None)
 }
 
-fn file_chunks(mut handle: File, start: u64, stop: u64) -> impl Iterator<Item = Vec<u8>> {
-    let mut remaining = stop.saturating_sub(start);
-    let positioned = handle.seek(SeekFrom::Start(start)).is_ok();
-    std::iter::from_fn(move || {
-        if !positioned || remaining == 0 {
+/// Chunks of a file from `start` to `stop`. A seek or read failure, or a file that ends before `stop`, ends the stream
+/// and is left in `error`: the caller must not take a short stream for a complete log.
+struct FileChunks {
+    handle: File,
+    remaining: u64,
+    error: Option<std::io::Error>,
+}
+
+impl FileChunks {
+    fn new(mut handle: File, start: u64, stop: u64) -> Self {
+        let error = handle.seek(SeekFrom::Start(start)).err();
+        FileChunks { handle, remaining: stop.saturating_sub(start), error }
+    }
+}
+
+impl Iterator for FileChunks {
+    type Item = Vec<u8>;
+
+    fn next(&mut self) -> Option<Vec<u8>> {
+        if self.error.is_some() || self.remaining == 0 {
             return None;
         }
-        let mut buffer = vec![0u8; remaining.min(CHUNK as u64) as usize];
-        let n = handle.read(&mut buffer).ok()?;
-        if n == 0 {
-            return None;
+        let mut buffer = vec![0u8; self.remaining.min(CHUNK as u64) as usize];
+        loop {
+            match self.handle.read(&mut buffer) {
+                Ok(0) => {
+                    self.error = Some(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("log ended {} bytes before the size it had when opened", self.remaining),
+                    ));
+                    return None;
+                }
+                Ok(n) => {
+                    buffer.truncate(n);
+                    self.remaining -= n as u64;
+                    return Some(buffer);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    self.error = Some(e);
+                    return None;
+                }
+            }
         }
-        buffer.truncate(n);
-        remaining -= n as u64;
-        Some(buffer)
-    })
+    }
 }
 
 /// Scan a log by streaming from byte `start` (a line start) to its size at the moment it was opened.
-pub fn scan_file(path: &Path, start: u64, collect: bool) -> Scan {
+///
+/// # Errors
+/// Any I/O failure other than the file not existing (sharing violation, permission, a read error part-way through):
+/// an unreadable log is never reported as an empty or shorter valid one. A missing file is an empty scan.
+pub fn scan_file(path: &Path, start: u64, collect: bool) -> std::io::Result<Scan> {
     SCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let Ok(handle) = File::open(path) else { return Scan::default() };
-    let stop = handle.metadata().map(|m| m.len()).unwrap_or(0);
+    let handle = match File::open(path) {
+        Ok(handle) => handle,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Scan::default()),
+        Err(e) => return Err(e),
+    };
+    let stop = handle.metadata()?.len();
     let start = if start > stop { 0 } else { start };
-    scan_chunks(file_chunks(handle, start, stop), start, collect, Some(stop))
+    let mut chunks = FileChunks::new(handle, start, stop);
+    let scan = scan_chunks(chunks.by_ref(), start, collect, Some(stop));
+    match chunks.error {
+        Some(e) => Err(e),
+        None => Ok(scan),
+    }
 }
 
 /// Every LF-terminated line of a file (a missing file yields nothing).
@@ -238,16 +280,19 @@ enum Tail {
 }
 
 /// Last valid line, reading from the end in growing windows; it trusts the tail.
-fn tail_last_valid(path: &Path) -> Tail {
-    let Ok(mut handle) = File::open(path) else { return Tail::Found(None) };
-    let size = handle.metadata().map(|m| m.len()).unwrap_or(0);
+fn tail_last_valid(path: &Path) -> std::io::Result<Tail> {
+    let mut handle = match File::open(path) {
+        Ok(handle) => handle,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Tail::Found(None)),
+        Err(e) => return Err(e),
+    };
+    let size = handle.metadata()?.len();
     let mut window = TAIL_WINDOW;
     loop {
         let start = size.saturating_sub(window);
         let mut data = vec![0u8; (size - start) as usize];
-        if handle.seek(SeekFrom::Start(start)).is_err() || handle.read_exact(&mut data).is_err() {
-            return Tail::Found(None);
-        }
+        handle.seek(SeekFrom::Start(start))?;
+        handle.read_exact(&mut data)?;
         let slice: &[u8] = if start > 0 {
             match data.iter().position(|&b| b == b'\n') {
                 None => &[],
@@ -260,14 +305,14 @@ fn tail_last_valid(path: &Path) -> Tail {
         lines.pop();
         for line in lines.into_iter().rev() {
             if let Some(record) = parse_line(line) {
-                return Tail::Found(Some(record));
+                return Ok(Tail::Found(Some(record)));
             }
         }
         if start == 0 {
-            return Tail::Found(None);
+            return Ok(Tail::Found(None));
         }
         if window >= TAIL_WINDOW_MAX {
-            return Tail::Unbounded;
+            return Ok(Tail::Unbounded);
         }
         window *= 4;
     }
@@ -294,26 +339,30 @@ impl AppendLog {
         AppendLog { path, lock_path, by: format!("pid:{}", std::process::id()), lock_timeout_s: LOCK_TIMEOUT_S, key }
     }
 
-    pub fn scan(&self) -> Scan {
-        scan_file(&self.path, 0, true)
+    /// Scan the whole log.
+    ///
+    /// # Errors
+    /// An I/O failure reading an existing log (see [`scan_file`]); a missing log is an empty scan.
+    pub fn scan(&self) -> Result<Scan> {
+        Ok(scan_file(&self.path, 0, true)?)
     }
 
     /// The valid prefix; a torn tail is ignored. Mid-log corruption is `LineageCorrupt`.
     pub fn read(&self) -> Result<Vec<Value>> {
-        let result = self.scan();
+        let result = self.scan()?;
         match result.corrupt {
             Some(c) => Err(Error::lineage_corrupt(&self.path, c.offset, result.records)),
             None => Ok(result.records),
         }
     }
 
-    pub fn status(&self) -> Value {
-        self.scan().as_status()
+    pub fn status(&self) -> Result<Value> {
+        Ok(self.scan()?.as_status())
     }
 
     /// The last valid record (tail only, bounded) or whole-log strict with `strict`.
     pub fn last(&self, strict: bool) -> Result<Option<Value>> {
-        if !strict && let Tail::Found(found) = tail_last_valid(&self.path) {
+        if !strict && let Tail::Found(found) = tail_last_valid(&self.path)? {
             return Ok(found);
         }
         Ok(self.read()?.pop())
@@ -371,7 +420,11 @@ impl AppendLog {
 
     /// The check made on every acquisition of the writer lock; returns the repair record, if one was made.
     pub fn check_tail(&self) -> Result<Option<Value>> {
-        let size = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        let size = match std::fs::metadata(&self.path) {
+            Ok(meta) => meta.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(e.into()),
+        };
         if size == 0 {
             self.remember(0);
             return Ok(None);
@@ -388,7 +441,7 @@ impl AppendLog {
         if start == size {
             return Ok(None);
         }
-        let result = scan_file(&self.path, start, false);
+        let result = scan_file(&self.path, start, false)?;
         if let Some(c) = result.corrupt {
             return Err(Error::lineage_corrupt(&self.path, c.offset, Vec::new()));
         }

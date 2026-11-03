@@ -190,7 +190,7 @@ pub fn reserved_generations(settings: &Settings, lineage_id: &str) -> Result<BTr
             let path = entry.path();
             if path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.ends_with(".intent.log")) {
                 taken.extend(
-                    hy_core::appendlog::AppendLog::new(path).scan().records.iter().filter_map(|r| r.get("gen").and_then(Value::as_i64)),
+                    hy_core::appendlog::AppendLog::new(path).scan()?.records.iter().filter_map(|r| r.get("gen").and_then(Value::as_i64)),
                 );
             }
         }

@@ -1,6 +1,8 @@
 //! Layout of the shared section the host creates and the injected agent fills (version 2).
 //!
-//! Section name `Local\hy_agent_<pid>`. Little-endian, naturally aligned.
+//! Section name `Local\hy_agent_<pid>_<tag>` (see [`object_name`]); the host passes the random 64-bit `<tag>` to
+//! `hy_agent_init` as the remote-thread parameter, so the names cannot be guessed from the pid.
+//! Little-endian, naturally aligned.
 //!
 //! ```text
 //! 0x00000  header           (status, counters, clock calibration)
@@ -89,8 +91,16 @@ pub const ERR_PROTECT: u32 = 14;
 pub const ERR_SUSPEND: u32 = 15;
 pub const ERR_THREAD_IN_SITE: u32 = 16;
 pub const ERR_BAD_SITE: u32 = 17;
+/// The agent hit an internal panic while serving the request (the target keeps running).
+pub const ERR_INTERNAL: u32 = 18;
 pub const ERR_UNSUPPORTED_ARCH: u32 = 100;
 pub const ERR_SECTION: u32 = 101;
+
+/// Name of a session kernel object: `kind` is `agent` (section), `cmd`, `rsp` or `bp_<n>`. The per-session random
+/// `tag` stops another process of the session from pre-creating the name for a known pid.
+pub fn object_name(kind: &str, pid: u32, tag: u64) -> String {
+    format!("Local\\hy_{kind}_{pid}_{tag:016x}")
+}
 
 // Mailbox.
 pub const MAILBOX_OFF: usize = 0x4400;
@@ -341,6 +351,13 @@ mod tests {
         bad[2] = K_HIT;
         bad[52] = 8; // claims args beyond the record
         assert!(decode_record(&bad).is_none());
+    }
+
+    #[test]
+    fn object_names_carry_pid_and_tag() {
+        assert_eq!(object_name("agent", 42, 0xAB), "Local\\hy_agent_42_00000000000000ab");
+        assert_ne!(object_name("cmd", 42, 1), object_name("cmd", 42, 2));
+        assert_ne!(object_name("cmd", 42, 1), object_name("rsp", 42, 1));
     }
 
     // The layout is checked at compile time.

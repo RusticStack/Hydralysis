@@ -444,10 +444,19 @@ def protected_generations(settings: dict, lineage_id: str, selected_stores: list
         keep.setdefault(number, "the revert target (the generation before the head)" if number == published[-1]
                         else "a generation the revert chain can reach (commit_revert walks back to generation 0)")
     bases = Path(root_path(settings)) / "bases"
-    for marker in bases.glob("*/*/COMPLETE.json") if bases.is_dir() else ():
+    for base in sorted(bases.glob("*/*")) if bases.is_dir() else ():
+        if not base.is_dir():
+            continue
+        marker = base / "COMPLETE.json"
+        # Fail closed: a marker that cannot be read (locked, empty, torn, mis-sealed with no backup) might be the base of
+        # a live view, so it stops the removal instead of silently unprotecting its generation. Only "no marker at all"
+        # (an unfinished, invisible base) protects nothing.
         try:
-            record = json.loads(marker.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            record, source = durable.read_sealed_info(marker, default={})
+        except (OSError, ValueError, durable.StoreCorrupt) as exc:
+            raise ValueError("cannot prove which generation the base marker %s protects: %s; nothing was removed"
+                             % (marker, exc)) from exc
+        if source == "missing":
             continue
         if isinstance(record.get("generation"), int) and record.get("lineage") == lineage_id:
             keep.setdefault(record["generation"], "the base of a live view")

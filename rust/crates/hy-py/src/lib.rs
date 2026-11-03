@@ -187,8 +187,9 @@ fn scan_bytes(data: &[u8]) -> String {
 
 #[pyfunction]
 #[pyo3(signature = (path, start=0, collect=true))]
-fn scan_file(py: Python<'_>, path: PathBuf, start: u64, collect: bool) -> String {
-    scan_json(&py.detach(|| appendlog::scan_file(&path, start, collect)))
+fn scan_file(py: Python<'_>, path: PathBuf, start: u64, collect: bool) -> PyResult<String> {
+    let scan = py.detach(|| appendlog::scan_file(&path, start, collect)).map_err(hy_core::Error::from).py(py)?;
+    Ok(scan_json(&scan))
 }
 
 // ---------------------------------------------------------------------------------------------- append log

@@ -394,6 +394,22 @@ class RemoveAndHandler(World, unittest.TestCase):
         self.assertTrue(done["removed"])
         self.assertFalse(folder.exists())
 
+    def test_an_unreadable_base_marker_blocks_removal_instead_of_unprotecting_its_generation(self):
+        lineage.generation_dir(self.settings, self.lid, 4).mkdir(parents=True)
+        base = Path(self.settings["root"]) / "bases" / "origin" / "key"
+        base.mkdir(parents=True)
+        for damaged in (b"", b"{not json", b"\x00\xff\xfe"):
+            (base / "COMPLETE.json").write_bytes(damaged)
+            with self.assertRaises(ValueError) as caught:
+                backups.protected_generations(self.settings, self.lid)
+            self.assertIn("cannot prove", str(caught.exception))
+            with self.assertRaises(ValueError):
+                backups.remove(self.settings, self.lid, {"generation": 4, "confirm": True})
+            self.assertTrue(lineage.generation_dir(self.settings, self.lid, 4).exists(), damaged)
+        # a base folder with no marker yet (unfinished) protects nothing and does not block
+        (base / "COMPLETE.json").unlink()
+        self.assertNotIn(4, backups.protected_generations(self.settings, self.lid))
+
     def test_the_revert_chain_stays_protected_after_a_revert_and_a_rolled_back_generation_is_removable(self):
         for number in (1, 2, 3):
             lineage.generation_dir(self.settings, self.lid, number).mkdir(parents=True)

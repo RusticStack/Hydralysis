@@ -152,6 +152,18 @@ pub unsafe fn prepare(site: u16, cfg: *mut u8, addr: usize) -> Result<Prepared, 
     }
 }
 
+/// One 8-byte store to `addr` that need not be 8-byte aligned. No `&AtomicU64` is formed (a reference to a misaligned
+/// atomic is undefined behaviour); a plain `mov` inside one cache line is a single atomic store on x86-64.
+///
+/// # Safety
+/// `addr..addr + 8` must be writable and lie within one 64-byte cache line.
+pub(crate) unsafe fn store_qword(addr: usize, value: u64) {
+    // SAFETY: the caller guarantees the range is writable; `mov` has no other requirements.
+    unsafe {
+        core::arch::asm!("mov qword ptr [{0}], {1}", in(reg) addr, in(reg) value, options(nostack, preserves_flags));
+    }
+}
+
 /// Write `bytes[..len]` over the site. The caller has the other threads suspended. When the first 8 bytes sit in one
 /// cache line the patch is a single atomic 8-byte store, so a thread that was not stopped (a thread created in the
 /// window) sees either the old or the new bytes.
@@ -165,8 +177,7 @@ pub unsafe fn write_site(addr: usize, bytes: &[u8; 16], len: usize) -> Result<()
             let cur = (addr as *const u64).read_unaligned();
             let mut word = cur.to_le_bytes();
             word[..len].copy_from_slice(&bytes[..len]);
-            let a = &*(addr as *const core::sync::atomic::AtomicU64);
-            a.store(u64::from_le_bytes(word), Ordering::SeqCst);
+            store_qword(addr, u64::from_le_bytes(word));
         } else {
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, len);
         }
@@ -328,6 +339,13 @@ unsafe fn capture(dst: *mut MaybeUninit<u8>, src: u64, want: usize, mode: u32) -
 
 /// Called by the stub with the saved registers. `fr[5]` rcx, `fr[4]` rdx, `fr[3]` r8, `fr[2]` r9, `fr[8]` return address.
 unsafe extern "system" fn on_hit(h: *const Hook, fr: *const u64, saved: *const u64, counted: u64) {
+    // A panic must not unwind through the stub (and out of an `extern "system"` fn, which aborts the target):
+    // the hit is lost, the target runs on.
+    // SAFETY: same contract as `on_hit_inner`; the stub passes valid frame pointers.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe { on_hit_inner(h, fr, saved, counted) }));
+}
+
+unsafe fn on_hit_inner(h: *const Hook, fr: *const u64, saved: *const u64, counted: u64) {
     unsafe {
         let h = &*h;
         let cfg = h.cfg;
@@ -533,5 +551,22 @@ unsafe extern "system" fn on_return(frame: *mut u64) {
             }
         });
         *frame.add(2) = orig;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn store_qword_writes_a_misaligned_word_without_touching_neighbours() {
+        #[repr(align(64))]
+        struct Line([u8; 64]);
+        let mut line = Line([0xAA; 64]);
+        let addr = line.0.as_mut_ptr() as usize + 3; // misaligned, still inside the cache line
+        // SAFETY: addr..addr+8 is inside `line`, which is writable and 64-byte aligned.
+        unsafe { store_qword(addr, 0x0102_0304_0506_0708) };
+        assert_eq!(&line.0[3..11], &0x0102_0304_0506_0708u64.to_le_bytes());
+        assert!(line.0[..3].iter().chain(&line.0[11..]).all(|&b| b == 0xAA));
     }
 }
