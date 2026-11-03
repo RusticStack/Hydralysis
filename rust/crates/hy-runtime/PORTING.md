@@ -1,7 +1,11 @@
 # Porting note: Frida scripts to the Rust runtime (`HYDRALYSIS_IMPL=rust`)
 
 Python and Frida stay the default. With the variable set, `runtime_device.get_local_device()` returns `rust_frida.RustDevice`,
-which answers the calls `RuntimeAgent` makes to a Frida device. Four script templates are recognised **by their text**
+which answers the calls `RuntimeAgent` makes to a Frida device.
+A configured Frida stand-in wins: a `frida` package that declares `HYDRALYSIS_STAND_IN = True` (tests/fakefrida) is a test double
+somebody put on the path on purpose, so `runtime_device` keeps the Frida-shaped device for it even under `HYDRALYSIS_IMPL=rust`;
+the Rust device is chosen only when none is configured (the real binding is not a stand-in). Rule and both directions:
+`tests/test_runtime_device.py`. Four script templates are recognised **by their text**
 (anything else raises `NotImplementedError`): CONTROL, the TRACE recorder, the observe/break probe, the memory agent.
 
 | Frida script | Rust runtime | Where |
@@ -55,6 +59,8 @@ which answers the calls `RuntimeAgent` makes to a Frida device. Four script temp
 `cargo test`, `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` cover the Rust side (live tests spawn
 `hy-fixture.exe`). The Python side: `tests/test_rust_runtime.py` (`ThroughTheWorker`, `ThroughTheAgent`, `Surface`), and the
 existing suites run unchanged with `HYDRALYSIS_IMPL=rust`. The fake-binding suites (`test_runtime*.py` on `tests/fakefrida`)
-do not go through the device, so the variable does not change what they test; `CaptureOverMCP` is the one that does (a real
-worker process), and under Rust it targets `hy-fixture.exe hits 5 FILE` instead of an idle `python.exe`, because the fake
-binding invents its five hits and the Rust device runs the real probe.
+do not go through the device, so the variable does not change what they test. The MCP suites that start a real worker process
+(`test_mcp_runtime.py`, `CaptureOverMCP`, `TwoHarnessesOneGame`) put the fake binding in the worker's backend folder; since a
+configured stand-in wins, they stay on the fake under `HYDRALYSIS_IMPL=rust` and test the transport, not the device. Their
+Rust-device counterparts are `tests/test_rust_runtime.py` (`ThroughTheWorker`, `ThroughTheAgent`) and
+`test_runtime_scenario_fixture.py`; `CaptureOverMCP`'s `hy-fixture.exe hits 5 FILE` branch is therefore no longer reached.
