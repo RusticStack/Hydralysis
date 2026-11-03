@@ -7,6 +7,7 @@ mod engine;
 mod pe;
 mod session;
 mod trace;
+mod views;
 use pyo3::types::PyBytes;
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -53,6 +54,7 @@ fn hydralysis_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     engine::register(module)?;
     pe::register(module)?;
     session::register(module)?;
+    views::register(module)?;
     module.add("ABI", "abi3-py313")?;
     Ok(())
 }
