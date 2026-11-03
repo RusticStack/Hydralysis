@@ -28,6 +28,8 @@ import time
 from ctypes import wintypes
 from pathlib import Path
 
+from hydralysis import trace_native
+
 k32 = ctypes.WinDLL("kernel32", use_last_error=True)
 psapi = ctypes.WinDLL("psapi", use_last_error=True)
 
@@ -367,7 +369,7 @@ def _walk(process, ctx, mods, depth: int, scan_bytes: int, unwinder: Unwinder | 
     return frames
 
 
-def capture_stacks(pid: int, depth: int = 24, scan_bytes: int = 4096) -> dict:
+def _capture_stacks_py(pid: int, depth: int = 24, scan_bytes: int = 4096) -> dict:
     """All thread stacks of ``pid``. Each thread is suspended only for the register read."""
     process = k32.OpenProcess(PROCESS_ACCESS, False, pid)
     if not process:
@@ -400,6 +402,21 @@ def capture_stacks(pid: int, depth: int = 24, scan_bytes: int = 4096) -> dict:
         k32.CloseHandle(process)
     return {"state": "captured", "pid": pid, "threads": threads, "modules": len(mods),
             "note": "no write into the target; threads were suspended only while registers were read; frames by the unwind tables"}
+
+
+def capture_stacks(pid: int, depth: int = 24, scan_bytes: int = 4096) -> dict:
+    """All thread stacks of ``pid``. Each thread is suspended only for the register read.
+
+    With ``HYDRALYSIS_IMPL=rust`` the capture, the module list and the unwind walk run in Rust (crate hy-trace, no GIL held);
+    arguments the port does not model reach the Python implementation above. ``pid`` must not be this process.
+    """
+    routine = trace_native.function("watchdog_capture_stacks")
+    if routine is not None and all(type(value) is int for value in (pid, depth, scan_bytes)):
+        try:
+            return routine(pid, depth, scan_bytes)
+        except trace_native.native().TraceFallback:
+            pass
+    return _capture_stacks_py(pid, depth, scan_bytes)
 
 
 # ---- the frame-stall watchdog ----------------------------------------------------------------------------------------

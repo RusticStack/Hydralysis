@@ -385,3 +385,103 @@ def edges_from_dispatch(events: list[dict], dispatch_sites: dict, *, receiver_cl
                                     "receiver_class": receiver_class(receiver) if receiver_class and receiver is not None else None,
                                     "basis": "next instrumented event on the same thread after the dispatch (%s)" % target["event_id"]}})
     return out
+
+
+# ---- optional Rust implementation (HYDRALYSIS_IMPL=rust) ------------------------------------------------------------
+# crates/hy-trace (bound in native/src/trace/reports.rs). The functions above stay the specification: the Rust ones give the
+# same answers for the event shapes the producers emit and raise `TraceFallback` for any other, which runs the Python.
+
+from hydralysis import trace_native  # noqa: E402
+
+_write_survival_py, _observed_edges_py, _hook_bypass_py = write_survival, observed_edges, hook_bypass
+_discovery_report_py, _field_writers_py = discovery_report, field_writers
+_from_engine_rows_py, _edges_from_dispatch_py = from_engine_rows, edges_from_dispatch
+
+
+def _native(name):
+    """(routine, the exceptions that mean "run the Python") for the Rust twin NAME, or (None, ())."""
+    routine = trace_native.function(name)
+    if routine is None:
+        return None, ()
+    return routine, (trace_native.native().TraceFallback, OverflowError)
+
+
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def write_survival(events: list[dict], *, field: str, consumer: str, phases: list[str] | None = None,
+                   gaps: list[dict] | None = None, representatives: int = 3) -> dict:
+    routine, errors = _native("reports_write_survival")
+    if routine is not None and isinstance(field, str) and isinstance(consumer, str) and _is_int(representatives):
+        try:
+            return routine(events, field, consumer, phases, gaps, representatives)
+        except errors:
+            pass
+    return _write_survival_py(events, field=field, consumer=consumer, phases=phases, gaps=gaps, representatives=representatives)
+
+
+def observed_edges(events: list[dict], *, static_candidates: dict | None = None, frames_per_edge: int = 5) -> dict:
+    routine, errors = _native("reports_observed_edges")
+    if routine is not None and _is_int(frames_per_edge):
+        try:
+            return routine(events, static_candidates, frames_per_edge)
+        except errors:
+            pass
+    return _observed_edges_py(events, static_candidates=static_candidates, frames_per_edge=frames_per_edge)
+
+
+def hook_bypass(events: list[dict], *, hook: str, field: str, siblings: list[str] | None = None,
+                observed: list[dict] | None = None, per_class: int = 5) -> dict:
+    routine, errors = _native("reports_hook_bypass")
+    if routine is not None and isinstance(hook, str) and isinstance(field, str) and _is_int(per_class):
+        try:
+            return routine(events, hook, field, siblings, observed, per_class)
+        except errors:
+            pass
+    return _hook_bypass_py(events, hook=hook, field=field, siblings=siblings, observed=observed, per_class=per_class)
+
+
+def discovery_report(*, exercised: list[dict], candidates: list[dict], observation_gaps: list[dict]) -> dict:
+    routine, errors = _native("reports_discovery")
+    if routine is not None:
+        try:
+            return routine(exercised, candidates, observation_gaps)
+        except errors:
+            pass
+    return _discovery_report_py(exercised=exercised, candidates=candidates, observation_gaps=observation_gaps)
+
+
+def field_writers(static_sites: list[dict], events: list[dict], *, object_addr: int, offset: int, size: int,
+                  names: dict | None = None, escape_kind: str = "app.escape", write_kinds=("core.state.write",),
+                  per_site: int = 3) -> dict:
+    routine, errors = _native("reports_field_writers")
+    if routine is not None and all(_is_int(v) for v in (object_addr, offset, size, per_site)) and isinstance(escape_kind, str) \
+            and isinstance(write_kinds, (list, tuple)):
+        try:
+            return routine(static_sites, events, object_addr, offset, size, names, escape_kind, write_kinds, per_site)
+        except errors:
+            pass
+    return _field_writers_py(static_sites, events, object_addr=object_addr, offset=offset, size=size, names=names,
+                             escape_kind=escape_kind, write_kinds=write_kinds, per_site=per_site)
+
+
+def from_engine_rows(rows: list[dict], *, names: dict | None = None, symbols: dict | None = None) -> list[dict]:
+    routine, errors = _native("reports_from_engine_rows")
+    if routine is not None:
+        try:
+            return routine(rows, names, symbols)
+        except errors:
+            pass
+    return _from_engine_rows_py(rows, names=names, symbols=symbols)
+
+
+def edges_from_dispatch(events: list[dict], dispatch_sites: dict, *, receiver_class=None, ignore=(),
+                        candidates: dict | None = None) -> list[dict]:
+    routine, errors = _native("reports_edges_from_dispatch")
+    if routine is not None and isinstance(ignore, (list, tuple)):
+        try:
+            return routine(events, dispatch_sites, receiver_class, ignore, candidates)
+        except errors:
+            pass
+    return _edges_from_dispatch_py(events, dispatch_sites, receiver_class=receiver_class, ignore=ignore, candidates=candidates)

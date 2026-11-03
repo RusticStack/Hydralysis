@@ -15,6 +15,8 @@ import re
 from functools import lru_cache
 from pathlib import Path
 
+from hydralysis import trace_native
+
 DIRECTORY = Path(__file__).resolve().parent / "trace_schema"
 _IGNORED = {"$schema", "$id", "title", "description", "$comment", "examples", "default"}
 _KNOWN = {"type", "enum", "const", "pattern", "minimum", "maximum", "minLength", "maxLength", "required", "properties",
@@ -97,6 +99,35 @@ def errors(instance, schema: dict, path: str = "$") -> list[str]:
     return found
 
 
+@lru_cache(maxsize=None)
+def _native_schema(name: str):
+    """The Rust-compiled schema NAME, or None when it cannot be judged there (an unsupported keyword or pattern)."""
+    module = trace_native.native()
+    if module is None or not hasattr(module, "NativeSchema"):
+        return None
+    try:
+        return module.NativeSchema(load(name))
+    except (module.TraceFallback, OverflowError):
+        return None
+
+
+def native_event_schema():
+    """The event schema compiled in Rust when ``HYDRALYSIS_IMPL=rust`` and the port can judge it, else None."""
+    if trace_native.native() is None:
+        return None
+    return _native_schema("event.schema.json")
+
+
 def validate_event(event: dict) -> list[str]:
-    """The reasons EVENT is not a valid producer event (empty when it is)."""
+    """The reasons EVENT is not a valid producer event (empty when it is).
+
+    With ``HYDRALYSIS_IMPL=rust`` a valid event is recognised in Rust; an event that is not valid (or has a shape the port
+    does not judge) goes through the Python validator, which words the reasons."""
+    compiled = native_event_schema()
+    if compiled is not None:
+        try:
+            if compiled.accepts(event):
+                return []
+        except (trace_native.native().TraceFallback, OverflowError):
+            pass
     return errors(event, load("event.schema.json"))

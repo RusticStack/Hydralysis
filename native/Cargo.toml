@@ -22,6 +22,7 @@ hy-query = { path = "../rust/crates/hy-query" }
 hy-engine = { path = "../rust/crates/hy-engine" }
 hy-views = { path = "../rust/crates/hy-views" }
 hy-static = { path = "../rust/crates/hy-static" }
+hy-trace = { path = "../rust/crates/hy-trace" }
 
 [profile.release]
 lto = true
