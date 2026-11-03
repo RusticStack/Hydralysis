@@ -136,3 +136,31 @@ Rust twins: hy-core/tests/durable.rs, hy-core/tests/durable_twins.rs, hy-store/t
 | test_store_v3::CrashWindow::test_a_kill_between_the_engine_apply_and_the_store_write_is_healed_by_the_marker | BB | passes under HYDRALYSIS_IMPL=rust (workcopy + storelog + durable on the Rust layer) | - |
 | test_native::Twin::test_python_twin_matches_the_reference_scan | BB | passes under HYDRALYSIS_IMPL=rust | durable_twins.rs::frame_lines_agree_with_the_per_line_parse + tests/test_rust_storage_parity.py::Logs::test_scan_of_mutated_logs_is_identical |
 | test_native::Twin::test_the_native_helper_matches_the_python_twin | BB | passes under HYDRALYSIS_IMPL=rust | as above (hydralysis_native.frame_lines is untouched by this work; the Rust port frame_lines is checked against the per-line parse) |
+
+## Python seams (branch r/hy-parityfix)
+
+White-box Python tests patch a Python object (`os.fsync`, `os.replace`, `durable.replace_file`, a private helper) and assert
+that it was called or reacted to. The Rust path does the work without calling it, so under `HYDRALYSIS_IMPL=rust` the routed
+function answers with the original Python function while a watched object is not the one captured at install. The guard is
+`src/hydralysis/_seams.py` (`Seam.active()`: `getattr(owner, name) is original` per watched pair; no allocation, a handful of
+pairs per call), so the production Rust path pays a few identity comparisons. No test was edited to make it pass.
+
+| Routed function | Python original runs while any of these is patched | Tests that need it |
+|---|---|---|
+| `durable.atomic_write`, `replace_file` | `os.fsync`, `os.replace`, `durable._replace_once`, `_move_file_ex`, `_sleep`, `NATIVE_MOVE`, `_write_file`, `_fsync_directory`, `_die`, `replace_file` | test_durable::AtomicWrite (5) |
+| `durable.write_sealed` | the above, plus `durable.atomic_write`, `_keep_previous` | test_durable::SealedJson::test_a_write_over_a_valid_record_fsyncs_the_record_only_not_its_backup |
+| `durable.inspect_file`, `read_sealed_info`, `read_sealed` | `durable.read_bytes`, `localio.read_bytes`, `localio._kernel` | test_localio::LocalMetadataReadTests::test_access_denied_keeps_native_code_and_filename_without_retry |
+| `AppendLog.append`, `repair` | the file seam, plus `os.write`, `AppendLog._raw_append`, `_check_tail`, `_repair_tail`, `_append_locked`, `durable.scan_file`, `file_lock`, `atomic_write` | test_durable::AppendLogTests (4), test_commit / test_backups::publish_torn |
+| `durable._VERIFIED` | not a guard: a mapping over the Rust memo (`get`, `[]`, `in`, `pop`, `clear`), so the Python fallback and the tests see the memo the Rust writer keeps | test_durable::AppendLogTests |
+| `storelog.save`, `known_edits` | the file, write and log seams, plus `durable.write_sealed`, `storelog._snapshot`, `_trim`, `_current`, `_fits` | test_storelog::Appending::test_the_row_is_fsynced_before_save_returns, ReviewFixes (3) |
+| `storelog.read` | `durable.scan_file`, `storelog._identity`, `_rows` | test_storelog::ReviewFixes::test_a_reader_whose_snapshot_was_replaced_twice_meanwhile_reads_again |
+| `lineage.append_current` | the log seams, plus `lineage.current_log` | test_commit / test_backups::FaultMatrix::publish_torn (measures `_raw_append`) |
+| `lineage.verify_head`, `tampered`, `status` | `lineage.verify_manifest`, `read_manifest`, `manifest_file_sha256`, `tree_hash`, `tree_files`, `_tree_signature`, `_verified_problems` | test_commit::Tamper::test_an_unchanged_generation_is_not_rehashed_and_a_changed_one_is |
+| `runtime_events.EventLog` | not a fallback (the log state is in Rust): while `os.write` is patched the records are written through `os.write` by a writer hook (`hy_store::events::EventLog::set_writer`), so the patched function fails the write and the counters and `error` say so | test_runtime_capture::EventChain / CaptureWindow (2) |
+
+Behaviour difference fixed in Rust, not guarded: the reason of an unreadable record file. Python words it
+`unparseable (<str(JSONDecodeError)>)`; serde_json words it differently, and test_exporting matches on Python's. `hy-core::pyjson`
+reproduces the CPython wording (messages, line/column/char, UnicodeDecodeError ranges) on the error path only;
+`tests/test_rust_pyjson.py` compares it with Python over 50 hand-picked and about 1400 mutated documents (and 300000 more were
+compared by hand: the only differences are documents with a lone surrogate escape, the known gap below). Known gap, unchanged: Python reads `NaN` / `Infinity` and lone
+surrogate escapes, which `serde_json::Value` cannot hold.

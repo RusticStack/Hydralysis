@@ -304,3 +304,54 @@ impl Decoder<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_error, utf8_error};
+
+    /// Each expected text was produced by `json.loads` on Python 3.15 (the differential test in tests/test_rust_pyjson.py
+    /// compares thousands of mutated documents; these pin the wording where no Python is at hand).
+    #[test]
+    fn json_refusals_read_as_python_words() {
+        let cases = [
+            ("{broken", "Expecting property name enclosed in double quotes: line 1 column 2 (char 1)"),
+            ("{\"a\": 1,}", "Illegal trailing comma before end of object: line 1 column 8 (char 7)"),
+            ("[1,]", "Illegal trailing comma before end of array: line 1 column 3 (char 2)"),
+            ("[1 2]", "Expecting ',' delimiter: line 1 column 4 (char 3)"),
+            ("{\"a\" 1}", "Expecting ':' delimiter: line 1 column 6 (char 5)"),
+            ("\"a\nb\"", "Invalid control character at: line 1 column 3 (char 2)"),
+            ("\"\\q\"", "Invalid \\escape: line 1 column 2 (char 1)"),
+            ("\"\\u12\"", "Invalid \\uXXXX escape: line 1 column 3 (char 2)"),
+            ("{\"a\": 1} x", "Extra data: line 1 column 10 (char 9)"),
+            ("[", "Expecting value: line 1 column 2 (char 1)"),
+            ("{\"a\": 1,\n \"b\": ?}", "Expecting value: line 2 column 7 (char 15)"),
+            ("\u{feff}{}", "Unexpected UTF-8 BOM (decode using utf-8-sig): line 1 column 1 (char 0)"),
+            ("{\"a\": tru}", "Expecting value: line 1 column 7 (char 6)"),
+        ];
+        for (document, expected) in cases {
+            assert_eq!(decode_error(document).as_deref(), Some(expected), "{document:?}");
+        }
+    }
+
+    #[test]
+    fn a_document_python_reads_is_not_an_error() {
+        for document in ["{}", "[1, 2.5e3, \"x\", null, true]", " {\"a\": {\"b\": []}} \n", "NaN", "[-Infinity]"] {
+            assert_eq!(decode_error(document), None, "{document:?}");
+        }
+    }
+
+    #[test]
+    fn utf8_refusals_read_as_python_words() {
+        assert_eq!(utf8_error(b"{}"), None);
+        assert_eq!(utf8_error(b"\xff").as_deref(), Some("'utf-8' codec can't decode byte 0xff in position 0: invalid start byte"));
+        assert_eq!(utf8_error(b"a\xc3").as_deref(), Some("'utf-8' codec can't decode byte 0xc3 in position 1: unexpected end of data"));
+        assert_eq!(
+            utf8_error(b"\xe2\x82").as_deref(),
+            Some("'utf-8' codec can't decode bytes in position 0-1: unexpected end of data")
+        );
+        assert_eq!(
+            utf8_error(b"\xe2\x82x").as_deref(),
+            Some("'utf-8' codec can't decode bytes in position 0-1: invalid continuation byte")
+        );
+    }
+}
