@@ -119,7 +119,7 @@ def _p(event: dict, name: str):
     return (event.get("payload") or {}).get(name)
 
 
-def pair_report(owner_events: list[dict], replica_events: list[dict], spec: dict | None = None) -> dict:
+def _pair_report_py(owner_events: list[dict], replica_events: list[dict], spec: dict | None = None) -> dict:
     """Owner and replica sessions captured at the same time, compared per correlated object (spec 15.5).
 
     Events are `{event_id, kind, t_mono_ns, payload}`. The clock relation comes from the shared sync markers
@@ -245,3 +245,23 @@ def pair_report(owner_events: list[dict], replica_events: list[dict], spec: dict
                replica_only=[o for o, v in objects.items() if v.get("status") == "replica_only"],
                note="three-valued per owner value: reflected, not_reflected, unknown; a silent replica is never agreement")
     return out
+
+
+# ---- optional Rust implementation (HYDRALYSIS_IMPL=rust) ------------------------------------------------------------------
+# crates/hy-trace (`pairing`, bound in native/src/trace/pairing.rs). `_pair_report_py` above stays the specification: the Rust
+# one gives the same bytes for the event shapes the producers emit and raises `TraceFallback` for any other, which runs it.
+
+def pair_report(owner_events: list[dict], replica_events: list[dict], spec: dict | None = None) -> dict:
+    """`_pair_report_py`, in Rust when `HYDRALYSIS_IMPL=rust` and the events are plain JSON of a modelled shape."""
+    from hydralysis import trace_native
+
+    routine = trace_native.function("pairing_pair_report")
+    if routine is not None and type(owner_events) is list and type(replica_events) is list:
+        try:
+            return routine(owner_events, replica_events, {**DEFAULT_SPEC, **(spec or {})})
+        except (trace_native.native().TraceFallback, OverflowError):
+            pass
+    return _pair_report_py(owner_events, replica_events, spec)
+
+
+pair_report.__doc__ = _pair_report_py.__doc__
