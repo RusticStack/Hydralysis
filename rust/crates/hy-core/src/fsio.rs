@@ -1,7 +1,7 @@
 //! Durable file IO (`durable.atomic_write` / `replace_file`, `localio.read_bytes`).
 //!
-//! `atomic_write` writes a sibling temporary file, fsyncs it and replaces the target (MoveFileExW with write-through
-//! on Windows; rename plus a directory fsync elsewhere). A permission or sharing error (an antivirus scan or an
+//! `atomic_write` writes a sibling temporary file, fsyncs it and replaces the target (a POSIX-semantics rename on
+//! Windows, so readers holding the target open do not block it; rename plus a directory fsync elsewhere). A permission or sharing error (an antivirus scan or an
 //! indexer holding the target) is retried with backoff.
 
 use crate::error::{Error, Result};
@@ -21,36 +21,19 @@ pub fn abspath(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Windows extended-length form for paths of 240 characters or more.
-#[cfg(windows)]
-fn extended(path: &Path) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt;
-    let abs = abspath(path);
-    let mut wide: Vec<u16> = abs.as_os_str().encode_wide().collect();
-    let verbatim: Vec<u16> = "\\\\?\\".encode_utf16().collect();
-    if wide.len() >= 240 && !wide.starts_with(&verbatim) {
-        let unc: Vec<u16> = "\\\\".encode_utf16().collect();
-        wide = if wide.starts_with(&unc) {
-            let mut v: Vec<u16> = "\\\\?\\UNC\\".encode_utf16().collect();
-            v.extend_from_slice(&wide[2..]);
-            v
-        } else {
-            let mut v = verbatim;
-            v.extend_from_slice(&wide);
-            v
-        };
-    }
-    wide.push(0);
-    wide
-}
-
+/// Replace with POSIX semantics (`std::fs::rename`: FileRenameInfoEx with FILE_RENAME_FLAG_POSIX_SEMANTICS, which Rust's
+/// std falls back from on a file system or Windows build that lacks it). `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` is refused
+/// with ERROR_ACCESS_DENIED for as long as any reader holds the destination open, even one that shares delete; with readers
+/// that always have it open (a slow disk, a scanner) a writer then fails after the whole retry budget. The POSIX rename
+/// unlinks the old file under its readers, who keep reading the version they opened. The bytes were fsynced before this
+/// call; the destination is flushed once more afterwards, as MOVEFILE_WRITE_THROUGH did, best effort.
 #[cfg(windows)]
 fn replace_once(source: &Path, destination: &Path) -> std::io::Result<()> {
-    use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW};
-    let (from, to) = (extended(source), extended(destination));
-    // SAFETY: both buffers are NUL-terminated UTF-16 that outlive the call.
-    let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) };
-    if ok == 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
+    fs::rename(source, destination)?;
+    if let Ok(handle) = OpenOptions::new().write(true).open(destination) {
+        let _ = handle.sync_all();
+    }
+    Ok(())
 }
 
 #[cfg(not(windows))]

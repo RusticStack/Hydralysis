@@ -164,3 +164,15 @@ reproduces the CPython wording (messages, line/column/char, UnicodeDecodeError r
 `tests/test_rust_pyjson.py` compares it with Python over 50 hand-picked and about 1400 mutated documents (and 300000 more were
 compared by hand: the only differences are documents with a lone surrogate escape, the known gap below). Known gap, unchanged: Python reads `NaN` / `Infinity` and lone
 surrogate escapes, which `serde_json::Value` cannot hold.
+
+## A write is never seen empty or torn (branch r/hy-parityfix)
+
+`hy-core/tests/atomic_stress.rs` (writers replace one COMPLETE.json-like path while readers loop; `HY_STRESS_SECS`, `HY_STRESS_DIR`
+to compare D: and E:, `HY_STRESS_NOISE` fsync threads for a slow disk) and `tests/test_atomic_stress.py` (writer processes, run under
+`HYDRALYSIS_IMPL=rust` and unset). A reader must see a complete earlier or later version: never empty, never mixed, never a record that
+needs its `.bak`. Measured: no reader ever saw a bad file (0.6 to 1.6 million reads per disk and implementation, 20 s per case). One hole found and fixed in
+Rust: `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` is refused with ERROR_ACCESS_DENIED for as long as a reader holds the destination open,
+even one that shares delete, so a writer facing readers that always have the file open gave up after its 10 s retry budget
+(`atomic_write_while_readers_hold_the_file_open`). `fsio::replace_once` on Windows is now a POSIX-semantics rename (`std::fs::rename`)
+followed by a best-effort flush of the destination, in place of MOVEFILE_WRITE_THROUGH. The Python reference still has the limit (a
+refused write, not a torn read); the Python stress test tolerates it only when `HYDRALYSIS_IMPL` is unset.
