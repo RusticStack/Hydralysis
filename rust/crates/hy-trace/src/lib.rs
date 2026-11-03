@@ -6,6 +6,8 @@
 //! accept the shapes the producers emit and answer [`Error::Unsupported`] for anything else, so the caller can run the
 //! Python implementation, which stays the specification. See `PORTING.md`.
 
+#[cfg(windows)]
+pub mod capture;
 pub mod hashes;
 pub mod pyfmt;
 pub mod reports;
