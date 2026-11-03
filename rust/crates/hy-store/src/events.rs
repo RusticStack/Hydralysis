@@ -255,7 +255,7 @@ pub struct EventLog {
     ring_bytes: usize,
     log_max_bytes: u64,
     durable_log: bool,
-    inject: Mutex<Option<(i32, String)>>,
+    writer: Mutex<Option<LineWriter>>,
     state: Mutex<State>,
 }
 
@@ -283,7 +283,7 @@ impl EventLog {
             ring_bytes,
             log_max_bytes,
             durable_log,
-            inject: Mutex::new(None),
+            writer: Mutex::new(None),
             state: Mutex::new(State {
                 ring: VecDeque::new(),
                 ring_size: 0,
@@ -375,18 +375,18 @@ impl EventLog {
             inc_counter(state, "log_full_dropped");
             return false;
         }
-        let injected = self.inject.lock().ok().and_then(|g| g.clone());
-        let written = self.open(state).and_then(|()| match state.file.as_mut() {
-            _ if injected.is_some() => {
-                let (code, text) = injected.clone().unwrap_or_default();
-                Err(std::io::Error::other(format!("[Errno {code}] {text}")))
-            }
-            Some(file) => file.write_all(&line),
-            None => Ok(()),
-        });
-        if let Err(error) = written {
+        let substitute = self.writer.lock().ok().and_then(|slot| slot.clone());
+        let written = match self.open(state) {
+            Err(error) => Err(format!("{}: {error}", io_error_name(&error))),
+            Ok(()) => match (&substitute, state.file.as_mut()) {
+                (Some(write), _) => write(&line),
+                (None, Some(file)) => file.write_all(&line).map_err(|error| format!("{}: {error}", io_error_name(&error))),
+                (None, None) => Ok(()),
+            },
+        };
+        if let Err(message) = written {
             inc_counter(state, "log_failed");
-            state.error = format!("{}: {error}", io_error_name(&error));
+            state.error = message;
             // The logical stream goes on; the file has a hole here and verify_log says so.
             state.head = hash;
             return false;
@@ -512,6 +512,9 @@ fn sync_locked(state: &mut State) {
     }
 }
 
+/// What writes one framed record in place of the log file's handle; `Err` carries the text for `error` (`Name: message`).
+pub type LineWriter = std::sync::Arc<dyn Fn(&[u8]) -> Result<(), String> + Send + Sync>;
+
 /// `FRAME` re-export check helper for tests: the exact bytes `_frame` produces.
 pub fn frame_bytes(record: &Value) -> Vec<u8> {
     let body = json::dumps(record, FRAME);
@@ -522,10 +525,11 @@ pub fn frame_bytes(record: &Value) -> Vec<u8> {
 }
 
 impl EventLog {
-    /// Test hook (the Python tests patch `os.write`): while set, every record write fails with this OS error.
-    pub fn inject_write_failure(&self, failure: Option<(i32, &str)>) {
-        if let Ok(mut slot) = self.inject.lock() {
-            *slot = failure.map(|(code, text)| (code, text.to_string()));
+    /// Seam for a caller that replaces how a record reaches the file (the Python tests patch `os.write`): while a writer is
+    /// set it is used instead of the file handle, and its `Err` is counted as a failed log write like an I/O error.
+    pub fn set_writer(&self, writer: Option<LineWriter>) {
+        if let Ok(mut slot) = self.writer.lock() {
+            *slot = writer;
         }
     }
 }

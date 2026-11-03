@@ -5,6 +5,7 @@
 //! * [`sealed`]: sealed JSON records with a `.bak` previous version.
 //! * [`appendlog`]: CRC-framed JSON-line logs with torn-tail repair.
 //! * [`lock`]: cross-process queued file locks.
+//! * [`pyjson`]: Python's wording of a JSON/UTF-8 decode refusal.
 //! * [`fault`]: the crash-injection test hook.
 
 pub mod appendlog;
@@ -13,6 +14,7 @@ pub mod fault;
 pub mod fsio;
 pub mod json;
 pub mod lock;
+pub mod pyjson;
 pub mod sealed;
 
 pub use error::{Error, Result};

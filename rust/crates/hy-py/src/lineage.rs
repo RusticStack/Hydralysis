@@ -332,6 +332,22 @@ impl PyEventLog {
         py.detach(|| self.inner.sync());
     }
 
+    /// Route every record write through `write(data: bytes)` (it raises `OSError` to fail it); `None` restores the file handle.
+    #[pyo3(signature = (write=None))]
+    fn set_writer(&self, write: Option<Py<PyAny>>) {
+        let writer = write.map(|callable| -> events::LineWriter {
+            Arc::new(move |line: &[u8]| {
+                Python::attach(|py| {
+                    callable.call1(py, (PyBytes::new(py, line),)).map(|_| ()).map_err(|error| {
+                        let name = error.get_type(py).name().map_or_else(|_| "OSError".to_string(), |n| n.to_string());
+                        format!("{name}: {}", error.value(py))
+                    })
+                })
+            })
+        });
+        self.inner.set_writer(writer);
+    }
+
     fn close(&self, py: Python<'_>) {
         py.detach(|| self.inner.close());
     }
