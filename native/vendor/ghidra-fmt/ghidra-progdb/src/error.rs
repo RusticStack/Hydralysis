@@ -41,6 +41,9 @@ pub enum ProgError {
     UnknownSpace(String),
     /// Structurally invalid contents.
     Corrupt(String),
+    /// A memory read Java refuses with `MemoryAccessException` (no block, uninitialized
+    /// bytes, nothing mapped, cyclic mapping).
+    MemoryAccess(String),
 }
 
 impl fmt::Display for ProgError {
@@ -65,6 +68,7 @@ impl fmt::Display for ProgError {
             }
             Self::UnknownSpace(n) => write!(f, "address space {n:?} was not described"),
             Self::Corrupt(m) => write!(f, "corrupt program database: {m}"),
+            Self::MemoryAccess(m) => write!(f, "memory access: {m}"),
         }
     }
 }
@@ -81,5 +85,11 @@ impl std::error::Error for ProgError {
 impl From<DbError> for ProgError {
     fn from(e: DbError) -> Self {
         Self::Db(e)
+    }
+}
+
+impl From<ghidra_fmt_chain::ChainError> for ProgError {
+    fn from(e: ghidra_fmt_chain::ChainError) -> Self {
+        Self::Db(DbError::from(e))
     }
 }

@@ -1,4 +1,4 @@
-# Vendored from the Hydra Engine (Apache-2.0): Ghidra/Framework/HydraFormats, engine commit 75f489388b
+# Vendored from the Hydra Engine (Apache-2.0): Ghidra/Framework/HydraFormats, engine commit 13e7458cc3
 # (branch r/engine-fmt merged into h7/integration). See VENDORED.md. This file is the engine workspace
 # manifest reduced to the crates Hydralysis uses (no ghidra-fmt-pack); the crate manifests are unchanged.
 [workspace]

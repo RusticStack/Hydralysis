@@ -160,9 +160,11 @@ and `export_worker.run`.
 | Python test | Class | Status |
 |---|---|---|
 | test_query.py (83) | BB | passes with `HYDRALYSIS_IMPL` unset (217 s) and `=rust` (234 s); the engine stand-ins are not real projects, so the plane declines and the engine path answers |
-| new: tests/test_static_plane.py (7) | PAR | xrefs of 61 addresses equal the Java oracle through `QueryRunner` with no engine call; paging; engine fallback for function/functions/decompile, a program not in the index, overlays, no switch |
+| new: tests/test_static_plane.py (9) | PAR | xrefs of 61 addresses equal the Java oracle through `QueryRunner` with no engine call; paging; `function`/`functions` answered natively; engine fallback for decompile/types/type/data, a program not in the index, overlays, no switch |
 | new: rust/crates/hy-static/tests/oracle_diff.rs (12) | PAR | Java oracle: references to/from, functions, symbols; PE image for bytes; JSON entry point |
-| benchmarks/static_plane.py | PAR | real engine: 200 xrefs queries, rows equal |
+| new: rust/crates/hy-static/tests/cache.rs (6) | PAR | cache: cached answers equal the engine's recorded rows, changed size/mtime invalidates, save file/journal declined, byte budget evicts LRU, no handle kept |
+| new: rust/crates/hy-static/tests/engine_truth.rs (3) | PAR | answers recorded from the real engine (`tests/fixtures/engine/*.json`): every `function` row the plane answers equals the engine's (397 of 405, 8 declined), `functions` pages likewise (1 of 3 answered, 2 declined for thiscall rows) |
+| benchmarks/static_plane.py | PAR | real engine: xrefs, function and functions requests, answers compared with the warm engine's, time per action cold and warm, memory |
 
 ## PE image seams (branch r/hy-parityfix)
 

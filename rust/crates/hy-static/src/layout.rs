@@ -35,6 +35,31 @@ pub struct Located {
     pub file_id: String,
     /// The stamp of the file when it was found.
     pub stamp: Stamp,
+    /// Every path whose state decides what was found: the database, the index and its journal (absent), the
+    /// properties file, the folder holding the database versions and `idata` itself. A change in any of them
+    /// (new version, journal or save file appearing, replaced index) changes its [`Mark`].
+    pub watch: Vec<PathBuf>,
+}
+
+/// What `stat` says about a path: length and write time, `None` for both when it does not exist. For a folder the
+/// write time changes when an entry is added, removed or renamed in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mark {
+    len: Option<u64>,
+    modified: Option<SystemTime>,
+}
+
+/// The [`Mark`] of `path` now. One `stat`; it opens no handle that outlives the call.
+pub fn mark_of(path: &Path) -> Mark {
+    match fs::metadata(path) {
+        Ok(meta) => Mark { len: Some(meta.len()), modified: meta.modified().ok() },
+        Err(_) => Mark { len: None, modified: None },
+    }
+}
+
+/// The marks of `paths`, in order.
+pub fn marks_of(paths: &[PathBuf]) -> Vec<Mark> {
+    paths.iter().map(|p| mark_of(p)).collect()
 }
 
 impl Located {
@@ -196,7 +221,9 @@ pub fn locate(project: &Path, program: &str) -> Result<Located> {
     let version = newest.ok_or_else(|| Error::unsupported("the item has no database version"))?;
     let gbf = db_dir.join(format!("db.{version}.gbf"));
     let stamp = stamp_of(&gbf)?;
-    Ok(Located { gbf, version, program_path, name: item.name, file_id: item.file_id, stamp })
+    let watch =
+        vec![gbf.clone(), idata.join("~index.jrn"), idata.join("~index.dat"), dir.join(format!("{id}.prp")), db_dir.clone(), idata.clone()];
+    Ok(Located { gbf, version, program_path, name: item.name, file_id: item.file_id, stamp, watch })
 }
 
 #[cfg(test)]

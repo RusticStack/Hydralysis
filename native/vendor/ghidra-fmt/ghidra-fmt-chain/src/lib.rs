@@ -336,6 +336,28 @@ impl ChainedBuffer {
         offset: i32,
         out: &mut [u8],
     ) -> Result<()> {
+        self.read_over(store, None, offset, out)
+    }
+
+    /// Read like `new ChainedBuffer(bufferMgr, id, base, 0)` does: parts that were never written
+    /// come from `base` at the same offset (a layered buffer over its original).
+    pub fn get_into_over<S: BufferStore + ?Sized>(
+        &self,
+        store: &S,
+        base: &ChainedBuffer,
+        offset: i32,
+        out: &mut [u8],
+    ) -> Result<()> {
+        self.read_over(store, Some(base), offset, out)
+    }
+
+    fn read_over<S: BufferStore + ?Sized>(
+        &self,
+        store: &S,
+        base: Option<&ChainedBuffer>,
+        offset: i32,
+        out: &mut [u8],
+    ) -> Result<()> {
         self.check_range(i64::from(offset), out.len())?;
         let ids = self.data_ids.as_deref().ok_or(ChainError::InvalidBuffer)?;
         let mut offset = offset as usize;
@@ -347,9 +369,10 @@ impl ChainedBuffer {
             let dest = &mut out[done..done + n];
             let id = *ids.get(index).ok_or(ChainError::OutOfBounds)?;
             if id < 0 {
-                match &self.source {
-                    Some(s) => s.src.read(i64::from(s.offset) + offset as i64, dest)?,
-                    None => dest.fill(0),
+                match (&self.source, base) {
+                    (Some(s), _) => s.src.read(i64::from(s.offset) + offset as i64, dest)?,
+                    (None, Some(b)) => b.get_into(store, offset as i32, dest)?,
+                    (None, None) => dest.fill(0),
                 }
             } else {
                 let buf = load(store, id)?;

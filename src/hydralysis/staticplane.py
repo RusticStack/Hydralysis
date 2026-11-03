@@ -55,10 +55,19 @@ def call(name: str, *args):
     return False, why
 
 
+_SUPPORTS: dict[str, bool] = {}
+
+
 def supports(action: str) -> bool:
-    """Whether the plane answers ACTION at all (it may still decline a given question)."""
-    ok, value = call("supports", action)
-    return bool(ok and value)
+    """Whether the plane answers ACTION at all (it may still decline a given question). Asked of the native module once
+    per action: the list is fixed in the binary."""
+    known = _SUPPORTS.get(action)
+    if known is None:
+        ok, value = call("supports", action)
+        known = bool(ok and value)
+        if ok:
+            _SUPPORTS[action] = known
+    return known
 
 
 def answer(gpr: str, program: str, request: dict) -> dict | None:
@@ -89,6 +98,18 @@ def last_reason() -> str | None:
 def reset() -> None:
     with _GUARD:
         _REASONS.clear()
+    _SUPPORTS.clear()
+
+
+def cache_stats() -> dict | None:
+    """Counters of the native process-wide cache (entries, bytes, budget, hits, misses, evictions, invalidations)."""
+    ok, value = call("cache_stats")
+    return value if ok else None
+
+
+def cache_clear() -> None:
+    """Drop the native cache's entries."""
+    call("cache_clear")
 
 
 def timed(gpr: str, program: str, request: dict) -> tuple[dict | None, float]:

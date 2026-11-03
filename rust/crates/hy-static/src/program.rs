@@ -6,10 +6,11 @@ use std::sync::{Arc, OnceLock};
 
 use ghidra_fmt_chain::{ByteSource, ChainedBuffer};
 use ghidra_fmt_gbf::BufferFile;
+use ghidra_progdb::query::Program;
 use ghidra_progdb::{Address, AddressSpaces, MemoryBlock, ProgramDb, RefKind, SourceType, SpaceDef, SubBlockKind};
 
 use crate::error::{Error, Result};
-use crate::layout::{self, Located};
+use crate::layout::{self, Located, Mark};
 
 /// The only language this plane answers for: the Windows x64 programs Hydralysis analyses.
 pub const LANGUAGE: &str = "x86:LE:64:default";
@@ -146,13 +147,45 @@ struct SymbolIndex {
     by_name: HashMap<String, Vec<usize>>,
 }
 
-/// An analysed program opened read-only from a project folder.
-pub struct StaticProgram {
-    db: ProgramDb<BufferFile>,
+/// What opening a program established, and nothing that holds the file: where it is, what it says about itself, its
+/// memory blocks and file-bytes buffer ids, and the [`Mark`]s of the files that decide it. It is what the cache keeps
+/// between calls; [`Meta::unchanged`] is the `stat`-only check that it still describes the files.
+pub struct Meta {
     located: Located,
     info: ProgramInfo,
     blocks: Vec<MemoryBlock>,
     file_bytes: BTreeMap<i64, FileBytesEntry>,
+    marks: Vec<Mark>,
+}
+
+impl Meta {
+    /// The program identity.
+    pub fn info(&self) -> &ProgramInfo {
+        &self.info
+    }
+
+    /// Where the database file is, and its stamp when it was found.
+    pub fn located(&self) -> &Located {
+        &self.located
+    }
+
+    /// True while every watched file and folder has the size and write time it had when this was read.
+    pub fn unchanged(&self) -> bool {
+        self.located.watch.iter().zip(&self.marks).all(|(path, mark)| layout::mark_of(path) == *mark)
+    }
+
+    /// An estimate of the bytes held.
+    pub fn size(&self) -> usize {
+        let blocks: usize = self.blocks.iter().map(|b| 256 + b.name.len() + b.sub_blocks.len() * 64).sum();
+        let ids: usize = self.file_bytes.values().map(|f| 64 + (f.original.len() + f.layered.len()) * 4).sum();
+        1024 + self.located.watch.len() * 200 + self.info.name.len() + self.info.program_path.len() + blocks + ids
+    }
+}
+
+/// An analysed program opened read-only from a project folder.
+pub struct StaticProgram {
+    prog: Program<BufferFile>,
+    meta: Arc<Meta>,
     symbols: OnceLock<std::result::Result<SymbolIndex, Error>>,
     functions: OnceLock<std::result::Result<Vec<FunctionInfo>, Error>>,
 }
@@ -166,8 +199,11 @@ impl StaticProgram {
     /// outside what this plane reads exactly; `Failed` when the files cannot be read.
     pub fn open(project: &Path, program: &str) -> Result<Self> {
         let located = layout::locate(project, program)?;
-        let store = BufferFile::open(&located.gbf, true)?;
-        let db = ProgramDb::open(store, x86_64_spaces())?;
+        // Marked before anything is read: a change during the read shows as a difference afterwards.
+        let marks = layout::marks_of(&located.watch);
+        // Lazy: no index is built until a question needs it, and the file is closed with the program.
+        let prog = Program::open_file_lazy(&located.gbf, x86_64_spaces())?;
+        let db = prog.db();
         let language = db.language_id().unwrap_or_default().to_owned();
         if language != LANGUAGE {
             return Err(Error::unsupported(format!("language {language:?} (only {LANGUAGE} is read)")));
@@ -178,7 +214,7 @@ impl StaticProgram {
                 return Err(Error::unsupported(format!("address space {:?} (overlay or unknown space)", entry.space_name)));
             }
         }
-        let options = options_of(&db)?;
+        let options = options_of(db)?;
         let flag = |key: &str| options.get(&format!("Program Information.{key}"));
         if flag("Analyzed").map(String::as_str) != Some("true") {
             return Err(Error::unsupported("the program is not marked analysed"));
@@ -200,32 +236,68 @@ impl StaticProgram {
                 return Err(Error::unsupported(format!("memory block {:?} is outside the default space", block.name)));
             }
         }
-        let file_bytes = read_file_bytes(&db)?;
-        Ok(Self { db, located, info, blocks, file_bytes, symbols: OnceLock::new(), functions: OnceLock::new() })
+        let file_bytes = read_file_bytes(db)?;
+        let meta = Arc::new(Meta { located, info, blocks, file_bytes, marks });
+        if !meta.unchanged() {
+            return Err(Error::failed("the project files changed while the program was opened"));
+        }
+        Ok(Self { prog, meta, symbols: OnceLock::new(), functions: OnceLock::new() })
+    }
+
+    /// Open the file again for a program whose [`Meta`] is already known (and still [`Meta::unchanged`]): only the
+    /// lazy reader is created, no table is read.
+    ///
+    /// # Errors
+    ///
+    /// `Failed` when the file cannot be opened.
+    pub fn open_with(meta: Arc<Meta>) -> Result<Self> {
+        let prog = Program::open_file_lazy(&meta.located.gbf, x86_64_spaces())?;
+        Ok(Self { prog, meta, symbols: OnceLock::new(), functions: OnceLock::new() })
+    }
+
+    /// What opening established, for keeping.
+    pub fn meta(&self) -> &Arc<Meta> {
+        &self.meta
+    }
+
+    /// The underlying reader.
+    pub fn db(&self) -> &ProgramDb<BufferFile> {
+        self.prog.db()
+    }
+
+    /// The query facade (lazy indexes) of the same file.
+    pub fn facade(&self) -> &Program<BufferFile> {
+        &self.prog
     }
 
     /// The program identity.
     pub fn info(&self) -> &ProgramInfo {
-        &self.info
+        &self.meta.info
     }
 
     /// Where the database file is, and its stamp when it was found.
     pub fn located(&self) -> &Located {
-        &self.located
+        &self.meta.located
     }
 
     /// The memory blocks, by start address.
     pub fn blocks(&self) -> &[MemoryBlock] {
-        &self.blocks
+        &self.meta.blocks
     }
 
-    fn space_address(&self, offset: u64) -> Address {
-        Address::Space { space: self.db.address_map().spaces().default_space.clone(), offset }
+    /// The default space name (`ram`).
+    pub fn default_space(&self) -> &str {
+        &self.db().address_map().spaces().default_space
+    }
+
+    /// An address in the default space.
+    pub fn space_address(&self, offset: u64) -> Address {
+        Address::Space { space: self.db().address_map().spaces().default_space.clone(), offset }
     }
 
     fn default_offset(&self, address: &Address) -> Option<u64> {
         match address {
-            Address::Space { space, offset } if *space == self.db.address_map().spaces().default_space => Some(*offset),
+            Address::Space { space, offset } if *space == self.db().address_map().spaces().default_space => Some(*offset),
             _ => None,
         }
     }
@@ -254,13 +326,13 @@ impl StaticProgram {
 
     /// `ReferenceManager.getReferencesTo(address)` in stored order.
     pub fn xrefs_to(&self, address: u64) -> Result<Vec<Xref>> {
-        let refs = self.db.references_to_at(&self.space_address(address))?;
+        let refs = self.db().references_to_at(&self.space_address(address))?;
         refs.iter().map(|r| self.xref_of(r)).collect()
     }
 
     /// `ReferenceManager.getReferencesFrom(address)` in stored order.
     pub fn xrefs_from(&self, address: u64) -> Result<Vec<Xref>> {
-        let refs = self.db.references_from_at(&self.space_address(address))?;
+        let refs = self.db().references_from_at(&self.space_address(address))?;
         refs.iter().map(|r| self.xref_of(r)).collect()
     }
 
@@ -269,7 +341,7 @@ impl StaticProgram {
             .get_or_init(|| {
                 let mut rows = Vec::new();
                 let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
-                for s in self.db.symbols()? {
+                for s in self.db().symbols()? {
                     let address = self.default_offset(&s.address);
                     let space = match &s.address {
                         Address::Space { space, .. } => space.clone(),
@@ -318,7 +390,7 @@ impl StaticProgram {
         let symbols = self.symbol_index()?;
         let by_id: HashMap<i64, &SymbolInfo> = symbols.rows.iter().map(|s| (s.id, s)).collect();
         let mut out = Vec::new();
-        for f in self.db.functions()? {
+        for f in self.db().functions()? {
             let Some(sym) = by_id.get(&f.id) else {
                 return Err(Error::failed("function without a symbol"));
             };
@@ -367,7 +439,7 @@ impl StaticProgram {
         if len > MAX_READ {
             return Err(Error::unsupported("read larger than the plane answers"));
         }
-        let store = self.db.database().store();
+        let store = self.db().database().store();
         let mut out = vec![0u8; len];
         let mut done = 0usize;
         while done < len {
@@ -388,10 +460,11 @@ impl StaticProgram {
             match sub.kind {
                 SubBlockKind::FileBytes => {
                     let fb = self
+                        .meta
                         .file_bytes
                         .get(&i64::from(sub.source_id))
                         .ok_or_else(|| Error::failed("memory part names a missing file bytes id"))?;
-                    read_layered(&self.located.gbf, fb, sub.source_offset + in_sub, dest)?;
+                    read_layered(&self.meta.located.gbf, fb, sub.source_offset + in_sub, dest)?;
                 }
                 SubBlockKind::Buffer => {
                     let buffer = ChainedBuffer::open(store, sub.source_id)?;
@@ -411,7 +484,7 @@ impl StaticProgram {
     }
 
     fn block_containing(&self, address: u64) -> Option<&MemoryBlock> {
-        self.blocks.iter().find(|b| match &b.start {
+        self.meta.blocks.iter().find(|b| match &b.start {
             Address::Space { offset, .. } => address >= *offset && address - offset < b.length as u64,
             _ => false,
         })

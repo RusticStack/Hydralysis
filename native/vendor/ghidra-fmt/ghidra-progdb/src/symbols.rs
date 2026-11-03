@@ -77,6 +77,8 @@ pub struct Symbol {
     pub primary_column: bool,
     /// Locator hash, when set.
     pub hash: Option<i64>,
+    /// The raw address key (`AddressMapDB` encoding) stored in the record.
+    pub address_key: i64,
     /// Data type id of a variable or parameter, when set.
     pub datatype_id: Option<i64>,
     /// Variable offset (stack offset or similar), when set.
@@ -147,6 +149,7 @@ pub(crate) fn read_symbols<S: BufferStore>(
             id,
             name: c.string(&rec, "Name")?.unwrap_or_default(),
             address: map.decode(addr_key)?,
+            address_key: addr_key,
             parent_id: c.long(&rec, "Namespace")?.unwrap_or(0),
             symbol_type: c.byte(&rec, "Symbol Type")?.unwrap_or(0) as u8,
             flags,

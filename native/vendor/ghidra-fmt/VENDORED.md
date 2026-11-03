@@ -2,7 +2,7 @@
 
 Original: `Ghidra/Framework/HydraFormats` of the Hydra Engine (RusticStack/hydra-engine, a fork of
 NationalSecurityAgency/ghidra), Apache-2.0 (`LICENSE`, `NOTICE` copied from the engine root).
-Source commit: `75f489388b` (`Merge branch 'r/engine-fmt' into h7/integration`), taken with `git archive`, so the
+Source commit: `13e7458cc3` (`Merge branch 'r/engine-fmt' into h7/integration`; round 1 was `75f489388b`), taken with `git archive`, so the
 snapshot is the committed tree, not the moving working tree of the lane.
 
 Kept: `ghidra-fmt-bytes`, `-gbf`, `-chain`, `-field`, `-btree`, `-db` and `ghidra-progdb` with their `PORTING.md`.
@@ -19,11 +19,11 @@ because the snapshot reads whole reference tables and Hydralysis needs a lookup 
 - `references::read_one` in `references.rs`: one reference list found by key in "TO REFS" / "FROM REFS";
 - `ProgramDb::references_to_at` / `references_from_at` in `lib.rs`.
 
-Nothing else is changed. The engine lane that owns the original is adding its own `query` facade and byte reader
-(`memread.rs`, `get_into_over` in `ghidra-fmt-chain`) in its working tree; this snapshot has neither, so
-`rust/crates/hy-static` reads layered file bytes through `ChainedBuffer::open_with_source`. On the next refresh, replace
-the additions by the engine's own lookups if they exist, and keep `rust/crates/hy-static/tests` passing (they compare
-against the Java oracle output, not against this code).
+Nothing else is changed. This snapshot has the engine's `query::Program` facade with lazy open (`open_file_lazy`);
+`rust/crates/hy-static` uses it for functions, bodies, parameters and data types. The facade's `xrefs_to` builds the whole
+reference table on first use, so xrefs keep using the additions above (one key lookup). On the next refresh, drop the
+additions if the engine grows an equivalent, and keep `rust/crates/hy-static/tests` passing (they compare against the Java
+oracle output and the real engine, not against this code).
 
 To refresh: `git -C <engine> archive <commit> Ghidra/Framework/HydraFormats`, copy the same seven crates, update the
 commit above and the row in `THIRD_PARTY.md`, rerun `cargo test -p hy-static` in `rust/`.

@@ -351,6 +351,7 @@ name = "ghidra-progdb"
 version = "0.1.0"
 dependencies = [
  "ghidra-fmt-bytes",
+ "ghidra-fmt-chain",
  "ghidra-fmt-db",
  "ghidra-fmt-field",
  "ghidra-fmt-gbf",
