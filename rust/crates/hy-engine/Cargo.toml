@@ -1,0 +1,23 @@
+[package]
+name = "hy-engine"
+description = "Hydralysis engine discovery, pin checks, tool-surface shaping and small leaf modules (hydra.py, api.py and friends) in Rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+hy-core = { path = "../hy-core" }
+hy-query = { path = "../hy-query" }
+serde_json.workspace = true
+sha2.workspace = true
+regex.workspace = true
+memchr = "2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
