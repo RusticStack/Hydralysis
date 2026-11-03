@@ -173,6 +173,9 @@ pub fn prologue_image_base(value: &Value) -> Res<i128> {
         Value::Number(n) if n.is_i64() || n.is_u64() => n.to_string(),
         _ => return Err(Failure::fallback("image_base is not a string or integer")),
     };
+    if text.contains('_') || !text.is_ascii() {
+        return Err(Failure::fallback("underscore or non-ASCII digits in image_base"));
+    }
     match hy_query::decompile::py_int0(&text) {
         Some(parsed) => Ok(parsed),
         None => match pytext::py_repr_simple(&text) {
@@ -390,6 +393,11 @@ pub fn parse_address(text: &str, base: u64) -> Res<Address> {
     let text = py_strip(text);
     if text.starts_with("name:") || text.starts_with("hash:") {
         return Ok(Address::Mapped);
+    }
+    // `int(text, 0)` also takes PEP 515 underscores after a prefix and any Unicode decimal digit; hy-query's reading of those
+    // differs, so the original decides
+    if text.contains('_') || !text.is_ascii() {
+        return Err(Failure::fallback("underscore or non-ASCII digits in an address"));
     }
     let rva = hy_query::prologue::parse_rva(text, base).map_err(|e| match e {
         hy_query::PeError::Value(message) => Failure::value(message),

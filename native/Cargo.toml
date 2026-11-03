@@ -19,6 +19,7 @@ serde_json = "1"
 itoa = "1"
 hydra-client = { path = "vendor/hydra-client" }
 hy-query = { path = "../rust/crates/hy-query" }
+hy-engine = { path = "../rust/crates/hy-engine" }
 hy-views = { path = "../rust/crates/hy-views" }
 
 [profile.release]
