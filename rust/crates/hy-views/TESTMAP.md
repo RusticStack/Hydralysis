@@ -64,6 +64,13 @@ remain Python-only.
 |---|---|---|
 | tests/py_rebase.rs | views.rebase on a lineage with a published generation: clean, converged, unprobed, conflict (unresolved), take_mine, keep, stale expect_revision. Engine calls are the same fake table on both sides (Python monkeypatches workcopy.heal/_sync/probe, query.open_program, _adopt_copy); result JSON and resulting store equal | test_views.py rebase cases |
 
-Still NOT differentially tested: merge, seal_changeset (compile-checked only). Not ported: publish job/drain, commits._commit,
+## Stage 5 (fourth session)
+tests/common/mod.rs holds the shared harness (Python runner, normaliser, the `Fake` host, the Python-side fake prelude).
+| Rust test | What it proves | Python tests it stands in for (white-box part) |
+|---|---|---|
+| tests/py_merge.rs | views.merge: clean (4 merged), mixed conflict (unresolved), take_mine, keep, no engine effects (before_unknown), pending destination (sync + refresh path), unknown-before refused/allowed, published_through, already-merged crash leftover, stale expect_revision. Result and both stores equal; new random ids masked | test_views.py merge cases |
+| tests/py_seal.rs | views.seal_changeset: sealed, reused (second identical publish), missing confirmation, revision_changed, nothing_to_commit, before_unknown refused/allowed, bad option. Result and the sealed file (read by Rust on both sides) equal | test_views.py seal/queue cases |
+
+Not ported (was: Still NOT differentially tested: merge, seal_changeset): publish job/drain, commits._commit,
 revert, workcopy, viewpool, userscripts, leader, PyO3 binding / HYDRALYSIS_IMPL=rust.
 Cargo.toml: the only machine-local paths are the hy-core / hy-store lines (marked TODO); switch to ../hy-core, ../hy-store at merge.

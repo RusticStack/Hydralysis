@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use hy_views::classify::Pair;
 use hy_views::error::Result;
@@ -13,97 +12,8 @@ use hy_views::store::{self, Store, Target};
 use hy_views::views::{self, Host};
 use serde_json::{Map, Value, json};
 
-fn python() -> Option<String> {
-    [
-        std::env::var("HYDRALYSIS_PYTHON").unwrap_or_default(),
-        r"C:\Python315\python.exe".into(),
-    ]
-    .into_iter()
-    .find(|p| !p.is_empty() && Path::new(p).is_file())
-}
-
-fn src() -> String {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../src")
-        .canonicalize()
-        .unwrap()
-        .display()
-        .to_string()
-        .trim_start_matches(r"\\?\")
-        .to_string()
-}
-
-fn run_py(py: &str, code: &str, args: &[&str]) -> String {
-    let out = Command::new(py)
-        .args(["-c", code])
-        .args(args)
-        .env("PYTHONPATH", src())
-        .env("PYTHONIOENCODING", "utf-8")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "python failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
-fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for e in std::fs::read_dir(from).unwrap() {
-        let e = e.unwrap();
-        let dest = to.join(e.file_name());
-        if e.file_type().unwrap().is_dir() {
-            copy_dir(&e.path(), &dest);
-        } else {
-            std::fs::copy(e.path(), dest).unwrap();
-        }
-    }
-}
-
-fn normalise(v: &mut Value, roots: &[&str]) {
-    match v {
-        Value::Object(m) => {
-            for (k, x) in m.iter_mut() {
-                if k == "at" && x.is_number() {
-                    *x = json!(0);
-                } else {
-                    normalise(x, roots);
-                }
-            }
-        }
-        Value::Array(a) => a.iter_mut().for_each(|x| normalise(x, roots)),
-        Value::String(s) => {
-            for r in roots {
-                *s = s.replace(r, "<ROOT>");
-            }
-            if s.starts_with("rusticre:") {
-                *s = "rusticre:PID".into();
-            }
-        }
-        _ => {}
-    }
-}
-
-const L: &str = "L-0000abcd";
-
-fn target() -> Target {
-    json!({"key": "k1", "sha256": "ab".repeat(32), "name": "prog", "gpr": "x.gpr", "program": "prog", "lineage": {"id": L, "generation": 3, "origin_key": "k1"}})
-        .as_object()
-        .unwrap()
-        .clone()
-}
-
-fn id(n: usize) -> String {
-    format!("{n:032x}")
-}
-
-fn rec(n: usize) -> Value {
-    json!({"id": id(n), "address": format!("0x{:x}", 0x401000 + n * 16), "options": {"kind": "rename", "source": "t", "name": format!("n{n}")}, "seq": n, "by": {"client": "c"}, "at": 1.5,
-           "effects": [{"subject": format!("address:0x{:x}", 0x401000 + n * 16), "field": "name", "before": "a", "after": format!("n{n}")}]})
-}
+mod common;
+use common::{L, copy_dir, id, load, normalise, python, rec, run_py, target};
 
 /// A lineage with generations 0..=3 (3 publishes records 2 and 3) and a view on generation 1 holding record 1 (committed),
 /// 2 and 3 (now in the master) and 4 (pending, address 0x401040).
@@ -241,23 +151,6 @@ except Exception as e:
 print(json.dumps(out))
 "#;
 
-fn load(root: &Path, base: &Path) -> Value {
-    let s: Settings = json!({"root": root.to_str().unwrap()})
-        .as_object()
-        .unwrap()
-        .clone();
-    let mut v = Value::Object(store::load_store(&s, &target()).unwrap());
-    normalise(
-        &mut v,
-        &[
-            root.to_str().unwrap(),
-            &root.to_str().unwrap().replace('\\', "\\\\"),
-            base.to_str().unwrap(),
-        ],
-    );
-    v
-}
-
 #[test]
 fn rebase_matches_python_across_conflict_outcomes() {
     let Some(py) = python() else { return };
@@ -340,8 +233,8 @@ fn rebase_matches_python_across_conflict_outcomes() {
             e => assert_eq!(got, e, "{name}"),
         }
         assert_eq!(
-            load(&root_a, dir.path()),
-            load(&root_b, dir.path()),
+            load(&root_a, dir.path(), &target()),
+            load(&root_b, dir.path(), &target()),
             "store of case {name}"
         );
     }
