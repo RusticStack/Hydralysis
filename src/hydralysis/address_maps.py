@@ -36,6 +36,18 @@ def import_map(settings: dict, digest: str, path: str) -> dict:
         raise ValueError("address map path must be absolute")
     with source_path.open("rb") as stream:
         raw = stream.read(MAX_BYTES + 1)
+    content_hash, count, make_record = _normalize(raw, digest, source_path)
+    with locked(directory / ".lock", what="address map import"):
+        output = directory / (content_hash + ".json")
+        if not output.exists():
+            if len(list(directory.glob("*.json"))) >= MAX_MAPS:
+                raise ValueError("address map limit reached for this build")
+            write_json(output, make_record())
+    return {"sha256": digest, "map_sha256": content_hash, "entries": count, "path": str(output)}
+
+
+def _normalize(raw: bytes, digest: str, source_path: Path):
+    """Validate the map file's bytes: `(content hash, row count, a function that makes the record that is stored)`."""
     if len(raw) > MAX_BYTES:
         raise ValueError("address map exceeds 16 MiB")
     try:
@@ -76,13 +88,7 @@ def import_map(settings: dict, digest: str, path: str) -> dict:
     record["record_sha256"] = _record_hash(record)
     if len(json.dumps(record, ensure_ascii=True, indent=2).encode("utf-8")) > 32 * 1024 * 1024:
         raise ValueError("normalized address map exceeds 32 MiB")
-    with locked(directory / ".lock", what="address map import"):
-        output = directory / (content_hash + ".json")
-        if not output.exists():
-            if len(list(directory.glob("*.json"))) >= MAX_MAPS:
-                raise ValueError("address map limit reached for this build")
-            write_json(output, record)
-    return {"sha256": digest, "map_sha256": content_hash, "entries": len(cleaned), "path": str(output)}
+    return content_hash, len(cleaned), lambda: record
 
 
 def resolve(settings: dict, digest: str, selector: str) -> dict:
@@ -109,3 +115,10 @@ def resolve(settings: dict, digest: str, selector: str) -> dict:
     if len({row["rva"] for row in matches}) != 1:
         raise ValueError("ambiguous address map entry for %s; conflicting cited RVAs" % selector)
     return {"selector": selector, "sha256": digest, "rva": matches[0]["rva"], "evidence": matches}
+
+# --- HYDRALYSIS_IMPL=rust ----------------------------------------------------------------------------------------
+# The Rust twin (rust/crates/hy-engine, bound in native/src/hyapi.rs) answers what it models exactly; see _rust_engine.py.
+import os as _os  # noqa: E402
+if _os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() == "rust":
+    from hydralysis import _rust_engine
+    _rust_engine.install()

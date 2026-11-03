@@ -33,7 +33,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from hydralysis import evidence, proc, trace_canon, trace_schema
+from hydralysis import evidence, proc, trace_canon, trace_native, trace_schema
 
 ACTIONS = ("start", "stop", "status", "query", "diff", "explain", "mark", "export", "check", "import", "resymbolize",
            "reprocess", "relations", "evict", "bundle")
@@ -149,6 +149,20 @@ def _size(value) -> int:
 
 
 def shape(reply, *, session: str | None, command: str, limit: int, requested_revision=None) -> dict:
+    """Bound REPLY and add the fields every trace answer carries (see `_shape_py`).
+
+    With ``HYDRALYSIS_IMPL=rust`` a reply of plain JSON values is shaped in Rust (crate hy-trace); anything else, and any
+    argument the port does not model, is shaped by the Python below, which stays the specification."""
+    routine = trace_native.function("trace_shape")
+    if routine is not None and type(limit) is int and limit >= 0 and type(command) is str and (session is None or type(session) is str):
+        try:
+            return routine(reply, session, command, limit, requested_revision)
+        except (trace_native.native().TraceFallback, OverflowError):
+            pass
+    return _shape_py(reply, session=session, command=command, limit=limit, requested_revision=requested_revision)
+
+
+def _shape_py(reply, *, session: str | None, command: str, limit: int, requested_revision=None) -> dict:
     """Bound REPLY and add the fields every trace answer carries: revision, coverage, citations and what was cut.
 
     The engine's reply is data and is never trusted for size: every list is cut at LIMIT, and if the whole is still over
@@ -311,6 +325,41 @@ def read_jsonl(path: Path, *, max_events: int = MAX_IMPORT_EVENTS) -> dict:
     data = path.read_bytes()
     if not data.strip():
         return {"outcome": "empty", "events": [], "lines": 0}
+    clean = _read_clean_native(data, max_events)
+    if clean is not None:
+        events, line_count = clean
+        damage = None
+    else:
+        events, damage, line_count = _scan_lines(data, max_events)
+    lost, last_seq, gap_next = 0, {}, {}
+    for event in events:
+        key = (event["source_id"], event["producer_gen"])
+        if event["kind"] == "core.capture.gap":
+            payload = event.get("payload") or {}
+            if isinstance(payload.get("last_missing_source_seq"), int):
+                gap_next[key] = payload["last_missing_source_seq"] + 1
+        if key in last_seq and event["source_seq"] != last_seq[key] + 1 and gap_next.get(key) != event["source_seq"]:
+            lost += 1
+        last_seq[key] = event["source_seq"]
+    outcome = damage["kind"] if damage else "clean"
+    return {"outcome": outcome, "events": events, "lines": line_count, "damage": damage, "lost_producers": lost}
+
+
+def _read_clean_native(data: bytes, max_events: int):
+    """``(events, line count)`` of a clean file read in Rust, or None: routing off, or any damage (the Python then words it)."""
+    module = trace_native.native()
+    compiled = trace_schema.native_event_schema()
+    if module is None or compiled is None or not hasattr(module, "trace_read_jsonl"):
+        return None
+    try:
+        found = module.trace_read_jsonl(data, max_events, compiled)
+    except (module.TraceFallback, OverflowError):
+        return None
+    return None if found is None else (found[0], found[1])
+
+
+def _scan_lines(data: bytes, max_events: int):
+    """The line-by-line scan of `read_jsonl`: ``(valid prefix of events, damage or None, number of lines)``."""
     events, damage = [], None
     lines = data.split(b"\n")
     ends_clean = data.endswith(b"\n")
@@ -341,18 +390,7 @@ def read_jsonl(path: Path, *, max_events: int = MAX_IMPORT_EVENTS) -> dict:
             damage = {"kind": "over_bound", "line": number, "reason": "more than %d events" % max_events}
             break
         events.append(event)
-    lost, last_seq, gap_next = 0, {}, {}
-    for event in events:
-        key = (event["source_id"], event["producer_gen"])
-        if event["kind"] == "core.capture.gap":
-            payload = event.get("payload") or {}
-            if isinstance(payload.get("last_missing_source_seq"), int):
-                gap_next[key] = payload["last_missing_source_seq"] + 1
-        if key in last_seq and event["source_seq"] != last_seq[key] + 1 and gap_next.get(key) != event["source_seq"]:
-            lost += 1
-        last_seq[key] = event["source_seq"]
-    outcome = damage["kind"] if damage else "clean"
-    return {"outcome": outcome, "events": events, "lines": len(lines), "damage": damage, "lost_producers": lost}
+    return events, damage, len(lines)
 
 
 def segment_from_events(events: list[dict], segment_id: str) -> bytes:

@@ -102,3 +102,10 @@ def read_bytes(path, *, max_bytes: int = DEFAULT_MAX_BYTES) -> bytes:
 
 def read_text(path, *, encoding: str = "utf-8", max_bytes: int = DEFAULT_MAX_BYTES) -> str:
     return read_bytes(path, max_bytes=max_bytes).decode(encoding, errors="strict")
+
+# --- HYDRALYSIS_IMPL=rust ----------------------------------------------------------------------------------------
+# The Rust twin (rust/crates/hy-engine, bound in native/src/hyapi.rs) answers what it models exactly; see _rust_engine.py.
+import os as _os  # noqa: E402
+if _os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() == "rust":
+    from hydralysis import _rust_engine
+    _rust_engine.install()

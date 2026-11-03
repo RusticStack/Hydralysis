@@ -91,3 +91,10 @@ def lookup_rvas(path: Path, rvas: set[int], chunk_size: int = 4 * 1024 * 1024) -
         if segment == "0001" and (offset + cco) in rvas:
             found.append(format_hit(hash_value, symbol, segment, offset, cco))
     return found
+
+# --- HYDRALYSIS_IMPL=rust ----------------------------------------------------------------------------------------
+# The Rust twin (rust/crates/hy-engine, bound in native/src/hyapi.rs) answers what it models exactly; see _rust_engine.py.
+import os as _os  # noqa: E402
+if _os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() == "rust":
+    from hydralysis import _rust_engine
+    _rust_engine.install()

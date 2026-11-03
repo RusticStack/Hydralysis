@@ -49,3 +49,10 @@ def public(record: dict) -> dict:
     if isinstance(owner, dict) and "token_sha256" in owner:
         record = {**record, "owner": {key: value for key, value in owner.items() if key != "token_sha256"}}
     return record
+
+# --- HYDRALYSIS_IMPL=rust ----------------------------------------------------------------------------------------
+# The Rust twin (rust/crates/hy-engine, bound in native/src/hyapi.rs) answers what it models exactly; see _rust_engine.py.
+import os as _os  # noqa: E402
+if _os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() == "rust":
+    from hydralysis import _rust_engine
+    _rust_engine.install()
