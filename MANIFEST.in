@@ -1,0 +1,12 @@
+# The sdist carries the package and its metadata, not the repository's tests or working files:
+# tests/ (about 2 MB of the sdist), the rust/ and native/ sources, benchmarks, tools and test work directories
+# are built and tested from a checkout. The wheel never held any of them (packages.find where = ["src"]).
+prune tests
+prune test-work
+prune benchmarks
+prune tools
+prune native
+prune rust
+prune docs
+prune skills
+global-exclude *.py[cod] __pycache__ *.log
