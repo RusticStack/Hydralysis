@@ -26,9 +26,22 @@ pub fn map_error(error: hy_trace::Error) -> PyErr {
     match error {
         hy_trace::Error::Hash { code, message } => TraceHashError::new_err((code, message)),
         hy_trace::Error::Unsupported(message) => fallback(message),
-        hy_trace::Error::Encode { encoding, text, position } => Python::attach(|py| {
-            let args = (encoding, text, position, position + 1, "character not representable");
-            match py.get_type::<pyo3::exceptions::PyUnicodeEncodeError>().call1(args) {
+        hy_trace::Error::Encode {
+            encoding,
+            text,
+            position,
+        } => Python::attach(|py| {
+            let args = (
+                encoding,
+                text,
+                position,
+                position + 1,
+                "character not representable",
+            );
+            match py
+                .get_type::<pyo3::exceptions::PyUnicodeEncodeError>()
+                .call1(args)
+            {
                 Ok(value) => PyErr::from_value(value),
                 Err(error) => error,
             }
@@ -41,8 +54,18 @@ pub fn or_fallback<T>(result: PyResult<T>) -> PyResult<T> {
     result.map_err(|error| fallback(format!("not modelled: {error}")))
 }
 
-/// A Python object as a JSON value; `None` for shapes that are not plain JSON.
+/// A Python object as a JSON value; anything that is not plain JSON is a `TraceFallback`. A tuple becomes an array.
 pub fn to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
+    convert(obj, true)
+}
+
+/// As [`to_value`], but a tuple is a `TraceFallback` too: for answers that hand the input's own values back, where a list
+/// in place of a tuple would be a visible change.
+pub fn to_value_exact(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
+    convert(obj, false)
+}
+
+fn convert(obj: &Bound<'_, PyAny>, tuples: bool) -> PyResult<Value> {
     if obj.is_none() {
         return Ok(Value::Null);
     }
@@ -60,27 +83,50 @@ pub fn to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     }
     if obj.is_instance_of::<PyFloat>() {
         let v: f64 = obj.extract()?;
-        return Number::from_f64(v).map(Value::Number).ok_or_else(|| fallback("non-finite float"));
+        return Number::from_f64(v)
+            .map(Value::Number)
+            .ok_or_else(|| fallback("non-finite float"));
     }
     if let Ok(text) = obj.cast::<PyString>() {
-        return Ok(Value::String(or_fallback(text.to_str().map(str::to_owned))?));
+        return Ok(Value::String(or_fallback(
+            text.to_str().map(str::to_owned),
+        )?));
     }
     if let Ok(list) = obj.cast::<PyList>() {
-        return list.iter().map(|item| to_value(&item)).collect::<PyResult<Vec<_>>>().map(Value::Array);
+        return list
+            .iter()
+            .map(|item| convert(&item, tuples))
+            .collect::<PyResult<Vec<_>>>()
+            .map(Value::Array);
     }
     if let Ok(tuple) = obj.cast::<PyTuple>() {
+        if !tuples {
+            return Err(fallback("a tuple"));
+        }
         // A tuple is kept as an array; the reports only ever compare it with another such value.
-        return tuple.iter().map(|item| to_value(&item)).collect::<PyResult<Vec<_>>>().map(Value::Array);
+        return tuple
+            .iter()
+            .map(|item| convert(&item, tuples))
+            .collect::<PyResult<Vec<_>>>()
+            .map(Value::Array);
     }
     if let Ok(dict) = obj.cast::<PyDict>() {
         let mut map = Map::with_capacity(dict.len());
         for (key, value) in dict.iter() {
-            let key = key.cast::<PyString>().map_err(|_| fallback("a key that is not text"))?;
-            map.insert(or_fallback(key.to_str().map(str::to_owned))?, to_value(&value)?);
+            let key = key
+                .cast::<PyString>()
+                .map_err(|_| fallback("a key that is not text"))?;
+            map.insert(
+                or_fallback(key.to_str().map(str::to_owned))?,
+                convert(&value, tuples)?,
+            );
         }
         return Ok(Value::Object(map));
     }
-    Err(fallback(format!("not plain JSON: {}", obj.get_type().name()?)))
+    Err(fallback(format!(
+        "not plain JSON: {}",
+        obj.get_type().name()?
+    )))
 }
 
 /// A JSON value as Python objects (dicts keep their order).
@@ -94,7 +140,11 @@ pub fn from_value<'py>(py: Python<'py>, value: &Value) -> PyResult<Bound<'py, Py
             } else if let Some(v) = number.as_u64() {
                 v.into_pyobject(py)?.into_any()
             } else {
-                number.as_f64().unwrap_or(f64::NAN).into_pyobject(py)?.into_any()
+                number
+                    .as_f64()
+                    .unwrap_or(f64::NAN)
+                    .into_pyobject(py)?
+                    .into_any()
             }
         }
         Value::String(text) => PyString::new(py, text).into_any(),

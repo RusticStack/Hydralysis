@@ -6,7 +6,7 @@
 //! is a `TraceFallback`: the Python implementation then answers, or raises, as it always did.
 
 use super::port::{fallback, from_value, map_error, or_fallback, to_value};
-use hy_trace::pyfmt::{IntParse, parse_int_base0, parse_int_radix};
+use hy_trace::pyfmt::{parse_int_base0, parse_int_radix, IntParse};
 use hy_trace::reports::{
     self, DispatchSite, Event, FieldSpan, Gap, Key, StaticSite, WriterOptions,
 };
@@ -17,7 +17,9 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 
 fn as_dict<'py>(obj: &Bound<'py, PyAny>, what: &str) -> PyResult<Bound<'py, PyDict>> {
-    obj.clone().cast_into::<PyDict>().map_err(|_| fallback(format!("{what} is not a dict")))
+    obj.clone()
+        .cast_into::<PyDict>()
+        .map_err(|_| fallback(format!("{what} is not a dict")))
 }
 
 fn key_of(obj: &Bound<'_, PyAny>) -> PyResult<Key> {
@@ -34,16 +36,24 @@ fn key_of(obj: &Bound<'_, PyAny>) -> PyResult<Key> {
         return Ok(Key::Str(or_fallback(text.to_str().map(str::to_owned))?));
     }
     if let Ok(tuple) = obj.cast::<PyTuple>() {
-        return tuple.iter().map(|item| key_of(&item)).collect::<PyResult<Vec<_>>>().map(Key::Tuple);
+        return tuple
+            .iter()
+            .map(|item| key_of(&item))
+            .collect::<PyResult<Vec<_>>>()
+            .map(Key::Tuple);
     }
-    Err(fallback("a key that is not None, an integer, text or a tuple of them"))
+    Err(fallback(
+        "a key that is not None, an integer, text or a tuple of them",
+    ))
 }
 
 fn opt_text(obj: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
     if obj.is_none() {
         return Ok(None);
     }
-    let text = obj.cast::<PyString>().map_err(|_| fallback("text expected"))?;
+    let text = obj
+        .cast::<PyString>()
+        .map_err(|_| fallback("text expected"))?;
     or_fallback(text.to_str().map(str::to_owned)).map(Some)
 }
 
@@ -97,18 +107,26 @@ impl<'py> Names<'py> {
             ours: intern!(py, "ours").clone(),
             payload: intern!(py, "payload").clone(),
             static_: intern!(py, "static").clone(),
-            wanted: payload_keys.iter().map(|k| ((*k).to_owned(), PyString::new(py, k))).collect(),
+            wanted: payload_keys
+                .iter()
+                .map(|k| ((*k).to_owned(), PyString::new(py, k)))
+                .collect(),
         }
     }
 }
 
-fn present<'py>(dict: &Bound<'py, PyDict>, key: &Bound<'py, PyString>) -> PyResult<Option<Bound<'py, PyAny>>> {
+fn present<'py>(
+    dict: &Bound<'py, PyDict>,
+    key: &Bound<'py, PyString>,
+) -> PyResult<Option<Bound<'py, PyAny>>> {
     dict.get_item(key)
 }
 
 /// `normalize_event(row)`, reading only PAYLOAD_KEYS of the payload.
 fn extract_event<'py>(row: &Bound<'py, PyAny>, names: &Names<'py>) -> PyResult<Event> {
-    let row = row.cast::<PyDict>().map_err(|_| fallback("an event row that is not a dict"))?;
+    let row = row
+        .cast::<PyDict>()
+        .map_err(|_| fallback("an event row that is not a dict"))?;
     let static_dict = match present(row, &names.static_)? {
         Some(s) if s.is_truthy()? => Some(as_dict(&s, "static")?),
         _ => None,
@@ -155,19 +173,25 @@ fn extract_event<'py>(row: &Bound<'py, PyAny>, names: &Names<'py>) -> PyResult<E
     };
     let none = |obj: Option<Bound<'py, PyAny>>| obj.filter(|o| !o.is_none());
     let seq = match none(present(row, &names.seq)?) {
-        Some(s) if s.is_instance_of::<PyInt>() && !s.is_instance_of::<PyBool>() => Some(or_fallback(s.extract::<i64>())?),
+        Some(s) if s.is_instance_of::<PyInt>() && !s.is_instance_of::<PyBool>() => {
+            Some(or_fallback(s.extract::<i64>())?)
+        }
         Some(_) => return Err(fallback("a sequence number that is not an integer")),
         None => None,
     };
     let va = match none(present(row, &names.va)?) {
-        Some(v) if v.is_instance_of::<PyInt>() && !v.is_instance_of::<PyBool>() => Some(or_fallback(v.extract::<u64>())?),
+        Some(v) if v.is_instance_of::<PyInt>() && !v.is_instance_of::<PyBool>() => {
+            Some(or_fallback(v.extract::<u64>())?)
+        }
         Some(_) => return Err(fallback("an address that is not an unsigned integer")),
         None => None,
     };
     let ours = match present(row, &names.ours)? {
         Some(o) => o.is_truthy()?,
         None => match &payload {
-            Some(p) => p.get_item(&names.ours)?.is_some_and(|o| o.is_truthy().unwrap_or(false)),
+            Some(p) => p
+                .get_item(&names.ours)?
+                .is_some_and(|o| o.is_truthy().unwrap_or(false)),
             None => false,
         },
     };
@@ -206,9 +230,15 @@ fn extract_event<'py>(row: &Bound<'py, PyAny>, names: &Names<'py>) -> PyResult<E
     })
 }
 
-fn extract_events<'py>(py: Python<'py>, events: &Bound<'py, PyAny>, payload_keys: &[&str]) -> PyResult<Vec<Event>> {
+fn extract_events<'py>(
+    py: Python<'py>,
+    events: &Bound<'py, PyAny>,
+    payload_keys: &[&str],
+) -> PyResult<Vec<Event>> {
     let names = Names::new(py, payload_keys);
-    let list = events.cast::<PyList>().map_err(|_| fallback("events is not a list"))?;
+    let list = events
+        .cast::<PyList>()
+        .map_err(|_| fallback("events is not a list"))?;
     list.iter().map(|row| extract_event(&row, &names)).collect()
 }
 
@@ -245,7 +275,11 @@ pub fn reports_write_survival<'py>(
     };
     let mut parsed = Vec::new();
     if let Some(gaps) = gaps.filter(|g| !g.is_none()) {
-        for gap in gaps.cast::<PyList>().map_err(|_| fallback("gaps is not a list"))?.iter() {
+        for gap in gaps
+            .cast::<PyList>()
+            .map_err(|_| fallback("gaps is not a list"))?
+            .iter()
+        {
             let gap = as_dict(&gap, "a gap")?;
             if let Some(frame) = gap.get_item("frame")? {
                 let key = key_of(&frame)?;
@@ -267,7 +301,15 @@ pub fn reports_write_survival<'py>(
         }
     }
     let events = extract_events(py, events, &["state_key", "key", "value"])?;
-    let report = reports::write_survival(&events, field, consumer, &phases, &parsed, nonneg(representatives)?).map_err(map_error)?;
+    let report = reports::write_survival(
+        &events,
+        field,
+        consumer,
+        &phases,
+        &parsed,
+        nonneg(representatives)?,
+    )
+    .map_err(map_error)?;
     from_value(py, &report)
 }
 
@@ -281,7 +323,8 @@ pub fn reports_observed_edges<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let candidates = json_object(static_candidates)?;
     let events = extract_events(py, events, &["site", "target", "receiver_class", "slot"])?;
-    let report = reports::observed_edges(&events, candidates.as_ref(), nonneg(frames_per_edge)?).map_err(map_error)?;
+    let report = reports::observed_edges(&events, candidates.as_ref(), nonneg(frames_per_edge)?)
+        .map_err(map_error)?;
     from_value(py, &report)
 }
 
@@ -308,7 +351,15 @@ pub fn reports_hook_bypass<'py>(
         None => Vec::new(),
     };
     let events = extract_events(py, events, &["state_key", "key"])?;
-    let report = reports::hook_bypass(&events, hook, field, &siblings, &observed, nonneg(per_class)?).map_err(map_error)?;
+    let report = reports::hook_bypass(
+        &events,
+        hook,
+        field,
+        &siblings,
+        &observed,
+        nonneg(per_class)?,
+    )
+    .map_err(map_error)?;
     from_value(py, &report)
 }
 
@@ -327,8 +378,12 @@ pub fn reports_discovery<'py>(
     candidates: &Bound<'py, PyAny>,
     observation_gaps: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let report = reports::discovery_report(&value_list(exercised)?, &value_list(candidates)?, &value_list(observation_gaps)?)
-        .map_err(map_error)?;
+    let report = reports::discovery_report(
+        &value_list(exercised)?,
+        &value_list(candidates)?,
+        &value_list(observation_gaps)?,
+    )
+    .map_err(map_error)?;
     from_value(py, &report)
 }
 
@@ -369,7 +424,11 @@ pub fn reports_field_writers<'py>(
     per_site: i64,
 ) -> PyResult<Bound<'py, PyAny>> {
     let mut sites = Vec::new();
-    for row in static_sites.cast::<PyList>().map_err(|_| fallback("static sites is not a list"))?.iter() {
+    for row in static_sites
+        .cast::<PyList>()
+        .map_err(|_| fallback("static sites is not a list"))?
+        .iter()
+    {
         let row = as_dict(&row, "a static site")?;
         let get = |key: &str| -> PyResult<Value> {
             match row.get_item(key)? {
@@ -392,14 +451,31 @@ pub fn reports_field_writers<'py>(
     let mut table: HashMap<Option<i128>, String> = HashMap::new();
     if let Some(names) = names.filter(|n| !n.is_none() && n.is_truthy().unwrap_or(false)) {
         for (address, name) in as_dict(names, "names")?.iter() {
-            table.insert(entry_of(&address)?, opt_text(&name)?.ok_or_else(|| fallback("a name that is None"))?);
+            table.insert(
+                entry_of(&address)?,
+                opt_text(&name)?.ok_or_else(|| fallback("a name that is None"))?,
+            );
         }
     }
     let write_kinds = text_list(write_kinds)?;
     let events = extract_events(py, events, &["object", "offset", "size", "site", "callee"])?;
-    let options = WriterOptions { escape_kind, write_kinds: &write_kinds, per_site: nonneg(per_site)? };
-    let report = reports::field_writers(&sites, &events, FieldSpan { object: object_addr, offset, size }, &table, &options)
-        .map_err(map_error)?;
+    let options = WriterOptions {
+        escape_kind,
+        write_kinds: &write_kinds,
+        per_site: nonneg(per_site)?,
+    };
+    let report = reports::field_writers(
+        &sites,
+        &events,
+        FieldSpan {
+            object: object_addr,
+            offset,
+            size,
+        },
+        &table,
+        &options,
+    )
+    .map_err(map_error)?;
     from_value(py, &report)
 }
 
@@ -417,21 +493,30 @@ pub fn reports_edges_from_dispatch<'py>(
     for (site, info) in as_dict(dispatch_sites, "dispatch sites")?.iter() {
         let site = opt_text(&site)?.ok_or_else(|| fallback("a dispatch site that is None"))?;
         let slot = as_dict(&info, "a dispatch site entry")?.get_item("slot")?;
-        sites.insert(site, DispatchSite { slot: slot.map_or(Ok(Value::Null), |s| to_value(&s))? });
+        sites.insert(
+            site,
+            DispatchSite {
+                slot: slot.map_or(Ok(Value::Null), |s| to_value(&s))?,
+            },
+        );
     }
     let ignore = text_list(ignore)?;
     let candidates = json_object(candidates)?;
     let events = extract_events(py, events, &["receiver"])?;
     let callback = receiver_class.filter(|c| !c.is_none()).cloned();
     let mut class = |receiver: &Value| -> hy_trace::Result<Value> {
-        let Some(callback) = &callback else { return Ok(Value::Null) };
+        let Some(callback) = &callback else {
+            return Ok(Value::Null);
+        };
         let answer = from_value(py, receiver)
             .and_then(|arg| callback.call1((arg,)))
             .and_then(|answer| to_value(&answer))
             .map_err(|error| hy_trace::Error::unsupported(format!("receiver_class: {error}")))?;
         Ok(answer)
     };
-    let out = reports::edges_from_dispatch(&events, &sites, &ignore, candidates.as_ref(), &mut class).map_err(map_error)?;
+    let out =
+        reports::edges_from_dispatch(&events, &sites, &ignore, candidates.as_ref(), &mut class)
+            .map_err(map_error)?;
     let list = PyList::empty(py);
     for event in &out {
         list.append(from_value(py, event)?)?;
@@ -490,9 +575,13 @@ pub fn reports_from_engine_rows<'py>(
         None => None,
     };
     let rename = |name: Bound<'py, PyAny>| -> PyResult<Bound<'py, PyAny>> {
-        let Ok(text) = name.cast::<PyString>() else { return Ok(name) };
+        let Ok(text) = name.cast::<PyString>() else {
+            return Ok(name);
+        };
         let text = or_fallback(text.to_str().map(str::to_owned))?;
-        let Some(tail) = text.strip_prefix("FUN_") else { return Ok(name) };
+        let Some(tail) = text.strip_prefix("FUN_") else {
+            return Ok(name);
+        };
         match parse_int_radix(tail, 16) {
             IntParse::Value(v) => Ok(table.get(&v).cloned().unwrap_or(name)),
             IntParse::Invalid => Ok(name),
@@ -501,13 +590,24 @@ pub fn reports_from_engine_rows<'py>(
     };
     let none = py.None().into_bound(py);
     let out = PyList::empty(py);
-    for row in rows.cast::<PyList>().map_err(|_| fallback("rows is not a list"))?.iter() {
+    for row in rows
+        .cast::<PyList>()
+        .map_err(|_| fallback("rows is not a list"))?
+        .iter()
+    {
         let row = as_dict(&row, "an engine row")?;
-        let get = |key: &str| -> PyResult<Bound<'py, PyAny>> { Ok(row.get_item(key)?.unwrap_or_else(|| none.clone())) };
+        let get = |key: &str| -> PyResult<Bound<'py, PyAny>> {
+            Ok(row.get_item(key)?.unwrap_or_else(|| none.clone()))
+        };
         let payload = match row.get_item("payload")? {
             Some(p) if p.is_instance_of::<PyString>() => {
-                let text = or_fallback(p.cast::<PyString>().map_err(|_| fallback("payload"))?.to_str())?;
-                let parsed: Value = serde_json::from_str(text).map_err(|e| fallback(format!("payload JSON: {e}")))?;
+                let text = or_fallback(
+                    p.cast::<PyString>()
+                        .map_err(|_| fallback("payload"))?
+                        .to_str(),
+                )?;
+                let parsed: Value = serde_json::from_str(text)
+                    .map_err(|e| fallback(format!("payload JSON: {e}")))?;
                 if !parsed.is_object() {
                     return Err(fallback("a payload that is not an object"));
                 }
@@ -539,7 +639,11 @@ pub fn reports_from_engine_rows<'py>(
             Some(f) => rename(f)?,
             None => none.clone(),
         };
-        let function = if function.is_truthy()? { function } else { payload.get_item("site")?.unwrap_or_else(|| none.clone()) };
+        let function = if function.is_truthy()? {
+            function
+        } else {
+            payload.get_item("site")?.unwrap_or_else(|| none.clone())
+        };
         let stack = PyList::empty(py);
         if let Some(entries) = known_get("stack")?.filter(|s| s.is_truthy().unwrap_or(false)) {
             for entry in entries.try_iter()? {
@@ -550,14 +654,19 @@ pub fn reports_from_engine_rows<'py>(
             }
         }
         let thread = get("thread_gen")?;
-        let thread_gen: Bound<'py, PyAny> =
-            if thread.is_none() { none.clone() } else { PyTuple::new(py, [get("process_gen")?, thread])?.into_any() };
+        let thread_gen: Bound<'py, PyAny> = if thread.is_none() {
+            none.clone()
+        } else {
+            PyTuple::new(py, [get("process_gen")?, thread])?.into_any()
+        };
         let rva: Bound<'py, PyAny> = match payload.get_item("rva")?.filter(|r| !r.is_none()) {
             None => none.clone(),
             Some(r) if r.is_instance_of::<PyBool>() => return Err(fallback("a boolean rva")),
             Some(r) if r.is_instance_of::<PyInt>() => r,
             Some(r) => {
-                let text = r.cast::<PyString>().map_err(|_| fallback("an rva of an unexpected type"))?;
+                let text = r
+                    .cast::<PyString>()
+                    .map_err(|_| fallback("an rva of an unexpected type"))?;
                 match parse_int_base0(or_fallback(text.to_str())?) {
                     IntParse::Value(v) => i64::try_from(v)
                         .map_err(|_| fallback("an rva beyond i64"))?
@@ -571,14 +680,25 @@ pub fn reports_from_engine_rows<'py>(
         event.set_item("event_id", get("event_id")?)?;
         event.set_item("kind", get("kind")?)?;
         event.set_item("seq", seq)?;
-        event.set_item("frame", payload.get_item("frame")?.unwrap_or_else(|| none.clone()))?;
-        event.set_item("phase", payload.get_item("phase")?.unwrap_or_else(|| none.clone()))?;
-        event.set_item("role", payload.get_item("role")?.unwrap_or_else(|| none.clone()))?;
+        event.set_item(
+            "frame",
+            payload.get_item("frame")?.unwrap_or_else(|| none.clone()),
+        )?;
+        event.set_item(
+            "phase",
+            payload.get_item("phase")?.unwrap_or_else(|| none.clone()),
+        )?;
+        event.set_item(
+            "role",
+            payload.get_item("role")?.unwrap_or_else(|| none.clone()),
+        )?;
         event.set_item("thread_gen", thread_gen)?;
         event.set_item("function", function)?;
         event.set_item("stack", stack)?;
         event.set_item("va", get("va")?)?;
-        let ours = payload.get_item("ours")?.map_or(Ok(false), |o| o.is_truthy())?;
+        let ours = payload
+            .get_item("ours")?
+            .map_or(Ok(false), |o| o.is_truthy())?;
         event.set_item("ours", ours)?;
         event.set_item("payload", &payload)?;
         event.set_item("rva", rva)?;

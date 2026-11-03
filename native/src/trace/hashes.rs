@@ -3,9 +3,10 @@
 
 use super::port::{fallback, map_error, or_fallback};
 use hy_trace::hashes::{
-    self, Algorithm, Codec, CrcParams, Dictionary, Encoding, Fold, FnvVariant, SectionBytes, annotate_constants,
+    self, annotate_constants, Algorithm, Codec, CrcParams, Dictionary, Encoding, FnvVariant, Fold,
+    SectionBytes,
 };
-use hy_trace::pyfmt::{IntParse, parse_int_base0};
+use hy_trace::pyfmt::{parse_int_base0, IntParse};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyBytes, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use std::collections::BTreeSet;
@@ -15,19 +16,27 @@ fn get<'py>(spec: &Bound<'py, PyDict>, key: &str) -> PyResult<Option<Bound<'py, 
 }
 
 fn get_u64(spec: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<u64>> {
-    get(spec, key)?.map(|v| or_fallback(v.extract::<u64>())).transpose()
+    get(spec, key)?
+        .map(|v| or_fallback(v.extract::<u64>()))
+        .transpose()
 }
 
 fn get_i64(spec: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<i64>> {
-    get(spec, key)?.map(|v| or_fallback(v.extract::<i64>())).transpose()
+    get(spec, key)?
+        .map(|v| or_fallback(v.extract::<i64>()))
+        .transpose()
 }
 
 fn get_bool(spec: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<bool>> {
-    get(spec, key)?.map(|v| or_fallback(v.extract::<bool>())).transpose()
+    get(spec, key)?
+        .map(|v| or_fallback(v.extract::<bool>()))
+        .transpose()
 }
 
 fn get_str(spec: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<String>> {
-    get(spec, key)?.map(|v| or_fallback(v.extract::<String>())).transpose()
+    get(spec, key)?
+        .map(|v| or_fallback(v.extract::<String>()))
+        .transpose()
 }
 
 /// An `Algorithm.spec` dict of the Python side:
@@ -35,8 +44,14 @@ fn get_str(spec: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<String>> {
 fn algorithm_of(spec: &Bound<'_, PyDict>) -> PyResult<Algorithm> {
     let name = get_str(spec, "name")?.ok_or_else(|| fallback("an algorithm without a name"))?;
     let bits = get_i64(spec, "bits")?.ok_or_else(|| fallback("an algorithm without a width"))?;
-    let fold = get_str(spec, "fold")?.as_deref().and_then(Fold::parse).ok_or_else(|| fallback("fold"))?;
-    let encoding = get_str(spec, "encoding")?.as_deref().and_then(Encoding::parse).ok_or_else(|| fallback("encoding"))?;
+    let fold = get_str(spec, "fold")?
+        .as_deref()
+        .and_then(Fold::parse)
+        .ok_or_else(|| fallback("fold"))?;
+    let encoding = get_str(spec, "encoding")?
+        .as_deref()
+        .and_then(Encoding::parse)
+        .ok_or_else(|| fallback("encoding"))?;
     let codec = match get_str(spec, "codec")?.as_deref() {
         Some("fnv") => {
             let variant = match get_str(spec, "variant")?.as_deref() {
@@ -45,7 +60,12 @@ fn algorithm_of(spec: &Bound<'_, PyDict>) -> PyResult<Algorithm> {
                 _ => return Err(fallback("FNV variant")),
             };
             let width = get_i64(spec, "width")?.unwrap_or(bits);
-            Codec::Fnv { variant, bits: width, basis: get_u64(spec, "basis")?, prime: get_u64(spec, "prime")? }
+            Codec::Fnv {
+                variant,
+                bits: width,
+                basis: get_u64(spec, "basis")?,
+                prime: get_u64(spec, "prime")?,
+            }
         }
         Some("crc32") => Codec::Crc32,
         Some("crc") => {
@@ -67,10 +87,18 @@ fn algorithm_of(spec: &Bound<'_, PyDict>) -> PyResult<Algorithm> {
             }
             Codec::Crc(params)
         }
-        Some("murmur3") => Codec::Murmur3 { seed: get_u64(spec, "seed")?.unwrap_or(0) },
+        Some("murmur3") => Codec::Murmur3 {
+            seed: get_u64(spec, "seed")?.unwrap_or(0),
+        },
         _ => return Err(fallback("codec")),
     };
-    Ok(Algorithm { name, bits, codec, fold, encoding })
+    Ok(Algorithm {
+        name,
+        bits,
+        codec,
+        fold,
+        encoding,
+    })
 }
 
 /// One hash function, built once from its spec: the fast path of `Algorithm.__call__`.
@@ -83,7 +111,9 @@ pub struct HashFn {
 impl HashFn {
     #[new]
     fn new(spec: &Bound<'_, PyDict>) -> PyResult<Self> {
-        Ok(Self { algorithm: algorithm_of(spec)? })
+        Ok(Self {
+            algorithm: algorithm_of(spec)?,
+        })
     }
 
     /// The hash of already-encoded bytes.
@@ -110,9 +140,16 @@ impl NativeDictionary {
     fn new(algorithms: &Bound<'_, PyList>, listed: Vec<String>) -> PyResult<Self> {
         let algorithms = algorithms
             .iter()
-            .map(|item| algorithm_of(item.cast::<PyDict>().map_err(|_| fallback("algorithm spec"))?))
+            .map(|item| {
+                algorithm_of(
+                    item.cast::<PyDict>()
+                        .map_err(|_| fallback("algorithm spec"))?,
+                )
+            })
             .collect::<PyResult<Vec<_>>>()?;
-        Ok(Self { inner: Dictionary::new(algorithms, listed) })
+        Ok(Self {
+            inner: Dictionary::new(algorithms, listed),
+        })
     }
 
     fn __len__(&self) -> usize {
@@ -126,17 +163,28 @@ impl NativeDictionary {
     }
 
     /// Add every name of NAMES (a list of text) under SOURCE; returns how many were added.
-    fn add_many(&mut self, py: Python<'_>, names: &Bound<'_, PyAny>, source: &Bound<'_, PyAny>) -> PyResult<usize> {
+    fn add_many(
+        &mut self,
+        py: Python<'_>,
+        names: &Bound<'_, PyAny>,
+        source: &Bound<'_, PyAny>,
+    ) -> PyResult<usize> {
         let source = text_arg(source)?;
         let names = names
             .try_iter()?
             .map(|item| text_arg(&item?))
             .collect::<PyResult<Vec<String>>>()?;
         let inner = &mut self.inner;
-        py.detach(|| inner.add_many(names.iter().map(String::as_str), &source)).map_err(map_error)
+        py.detach(|| inner.add_many(names.iter().map(String::as_str), &source))
+            .map_err(map_error)
     }
 
-    fn resolve<'py>(&self, py: Python<'py>, algorithm: &str, hash: u64) -> PyResult<Bound<'py, PyAny>> {
+    fn resolve<'py>(
+        &self,
+        py: Python<'py>,
+        algorithm: &str,
+        hash: u64,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let answer = self.inner.resolve(algorithm, hash).map_err(map_error)?;
         super::port::from_value(py, &answer.to_value())
     }
@@ -159,7 +207,12 @@ impl NativeDictionary {
     }
 
     /// `annotate_constants`: for each number, `(status, [answer dicts])`.
-    fn annotate<'py>(&self, py: Python<'py>, numbers: Vec<u64>, algorithms: Vec<(String, i64)>) -> PyResult<Bound<'py, PyAny>> {
+    fn annotate<'py>(
+        &self,
+        py: Python<'py>,
+        numbers: Vec<u64>,
+        algorithms: Vec<(String, i64)>,
+    ) -> PyResult<Bound<'py, PyAny>> {
         let notes = annotate_constants(&self.inner, &numbers, &algorithms).map_err(map_error)?;
         let out = PyList::empty(py);
         for note in notes {
@@ -180,8 +233,11 @@ impl NativeDictionary {
         values: Vec<u64>,
         parent: Option<String>,
     ) -> PyResult<(Bound<'py, PyAny>, Bound<'py, PyAny>)> {
-        let revision = self.inner.interpretation(algorithm, &values, parent.as_deref()).map_err(map_error)?;
-        Ok(self.shape(py, &revision)?)
+        let revision = self
+            .inner
+            .interpretation(algorithm, &values, parent.as_deref())
+            .map_err(map_error)?;
+        self.shape(py, &revision)
     }
 
     /// `interpret_events`: resolve the hashed payload FIELDS of EVENTS; `(header dict, annotations list)`.
@@ -195,14 +251,22 @@ impl NativeDictionary {
         let mut wanted = BTreeSet::new();
         let mut notes: Vec<(Bound<'py, PyAny>, &str, u64)> = Vec::new();
         for event in events.iter() {
-            let event = event.cast_into::<PyDict>().map_err(|_| fallback("an event that is not a dict"))?;
+            let event = event
+                .cast_into::<PyDict>()
+                .map_err(|_| fallback("an event that is not a dict"))?;
             let payload = match event.get_item("payload")? {
-                Some(p) if p.is_truthy()? => p.cast_into::<PyDict>().map_err(|_| fallback("a payload that is not a dict"))?,
+                Some(p) if p.is_truthy()? => p
+                    .cast_into::<PyDict>()
+                    .map_err(|_| fallback("a payload that is not a dict"))?,
                 _ => continue,
             };
-            let event_id = event.get_item("event_id")?.unwrap_or_else(|| py.None().into_bound(py));
+            let event_id = event
+                .get_item("event_id")?
+                .unwrap_or_else(|| py.None().into_bound(py));
             for field in &fields {
-                let Some(value) = payload.get_item(field)? else { continue };
+                let Some(value) = payload.get_item(field)? else {
+                    continue;
+                };
                 if value.is_instance_of::<PyDict>() || value.is_instance_of::<PyList>() {
                     continue;
                 }
@@ -213,8 +277,12 @@ impl NativeDictionary {
             }
         }
         let values: Vec<u64> = wanted.into_iter().collect();
-        let revision = self.inner.interpretation(algorithm, &values, None).map_err(map_error)?;
-        let by_hash: std::collections::HashMap<u64, &hashes::Resolution> = revision.rows.iter().map(|r| (r.hash, r)).collect();
+        let revision = self
+            .inner
+            .interpretation(algorithm, &values, None)
+            .map_err(map_error)?;
+        let by_hash: std::collections::HashMap<u64, &hashes::Resolution> =
+            revision.rows.iter().map(|r| (r.hash, r)).collect();
         let annotations = PyList::empty(py);
         for (event_id, field, number) in notes {
             let row = by_hash[&number];
@@ -251,7 +319,9 @@ impl NativeDictionary {
 }
 
 fn text_arg(obj: &Bound<'_, PyAny>) -> PyResult<String> {
-    let text = obj.cast::<PyString>().map_err(|_| fallback("a name or source that is not text"))?;
+    let text = obj
+        .cast::<PyString>()
+        .map_err(|_| fallback("a name or source that is not text"))?;
     or_fallback(text.to_str().map(str::to_owned))
 }
 
@@ -273,10 +343,16 @@ fn hash_of(value: &Bound<'_, PyAny>) -> PyResult<Option<u64>> {
         };
     }
     // float, None, tuple, bytes: their `str()` is never an integer literal
-    if value.is_none() || value.is_instance_of::<PyFloat>() || value.is_instance_of::<PyTuple>() || value.is_instance_of::<PyBytes>() {
+    if value.is_none()
+        || value.is_instance_of::<PyFloat>()
+        || value.is_instance_of::<PyTuple>()
+        || value.is_instance_of::<PyBytes>()
+    {
         return Ok(None);
     }
-    Err(fallback("a payload value of a type the hash parse does not model"))
+    Err(fallback(
+        "a payload value of a type the hash parse does not model",
+    ))
 }
 
 /// `scan_constants` over an image's bytes. SECTIONS: `(name bytes, virtual address, raw pointer, raw size,
@@ -299,7 +375,10 @@ pub fn scan_constants<'py>(
         .map(|(name, virtual_address, pointer, size, characteristics)| {
             let start = pointer.min(bytes.len());
             let end = pointer.saturating_add(size).min(bytes.len());
-            let trimmed = name.iter().rposition(|&b| b != 0).map_or(&name[..0], |last| &name[..=last]);
+            let trimmed = name
+                .iter()
+                .rposition(|&b| b != 0)
+                .map_or(&name[..0], |last| &name[..=last]);
             SectionBytes {
                 name: String::from_utf8_lossy(trimmed).into_owned(),
                 virtual_address,
@@ -318,7 +397,8 @@ pub fn scan_constants<'py>(
         answer.extract::<(u64, u64)>().ok()
     };
     let (hits, truncated) =
-        hashes::scan_constants(&views, &hashes, limit, functions.as_deref(), &mut callback).map_err(map_error)?;
+        hashes::scan_constants(&views, &hashes, limit, functions.as_deref(), &mut callback)
+            .map_err(map_error)?;
     let list = PyList::empty(py);
     for hit in &hits {
         list.append(super::port::from_value(py, &hit.to_value())?)?;
@@ -337,14 +417,23 @@ fn opt_u64(value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<u64>> {
 /// `trace_hashes.fnv(data, bits, variant=, basis=, prime=)`.
 #[pyfunction]
 #[pyo3(signature = (data, bits, variant="1a", basis=None, prime=None))]
-fn fnv(data: &[u8], bits: i64, variant: &str, basis: Option<&Bound<'_, PyAny>>, prime: Option<&Bound<'_, PyAny>>) -> PyResult<u64> {
+fn fnv(
+    data: &[u8],
+    bits: i64,
+    variant: &str,
+    basis: Option<&Bound<'_, PyAny>>,
+    prime: Option<&Bound<'_, PyAny>>,
+) -> PyResult<u64> {
     let variant = match variant {
         "1a" => FnvVariant::V1a,
         "1" => FnvVariant::V1,
         _ => {
             // the width is checked first, then the variant
             hashes::fnv(data, bits, FnvVariant::V1a, None, None).map_err(map_error)?;
-            return Err(map_error(hy_trace::Error::hash("bad_variant", "FNV variant is 1 or 1a")));
+            return Err(map_error(hy_trace::Error::hash(
+                "bad_variant",
+                "FNV variant is 1 or 1a",
+            )));
         }
     };
     hashes::fnv(data, bits, variant, opt_u64(basis)?, opt_u64(prime)?).map_err(map_error)
