@@ -344,6 +344,29 @@ fn log_clear_verified() {
     appendlog::clear_verified();
 }
 
+/// The "verified up to" memo of a log key (`durable._VERIFIED[key]`), or `None`.
+#[pyfunction]
+fn log_verified_get(key: &str) -> Option<u64> {
+    appendlog::verified_get(key)
+}
+
+#[pyfunction]
+fn log_verified_set(key: &str, valid_end: u64) {
+    appendlog::verified_set(key, valid_end);
+}
+
+#[pyfunction]
+fn log_verified_pop(key: &str) -> Option<u64> {
+    appendlog::verified_pop(key)
+}
+
+/// `(kind, value_json, reason)` of raw file bytes: `durable._classify` (the differential tests compare it with Python's).
+#[pyfunction]
+fn classify_bytes(raw: Option<&[u8]>) -> (String, Option<String>, String) {
+    let (kind, value, reason) = sealed::classify(raw);
+    (kind.as_str().to_string(), value.as_ref().map(text), reason)
+}
+
 #[pyfunction]
 fn storelog_clear_cache() {
     hy_store::storelog::clear_cache();
@@ -376,6 +399,10 @@ fn hydralysis_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(storelog_configure, module)?)?;
     module.add_function(wrap_pyfunction!(storelog_cache_len, module)?)?;
     module.add_function(wrap_pyfunction!(log_clear_verified, module)?)?;
+    module.add_function(wrap_pyfunction!(log_verified_get, module)?)?;
+    module.add_function(wrap_pyfunction!(log_verified_set, module)?)?;
+    module.add_function(wrap_pyfunction!(log_verified_pop, module)?)?;
+    module.add_function(wrap_pyfunction!(classify_bytes, module)?)?;
     module.add_class::<FileLock>()?;
     evidence::register(module)?;
     lineage::register(module)?;

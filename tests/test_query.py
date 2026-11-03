@@ -620,6 +620,7 @@ class SharedBase(EngineCase):
     def test_a_waiter_takes_the_base_the_builder_finishes(self):
         import threading
         import time
+        from hydralysis import durable
         from hydralysis.locks import LaneLock
         self.edit(kind="rename", name="One", view="a")
         folder = self.folder()
@@ -633,7 +634,9 @@ class SharedBase(EngineCase):
 
         def finish():
             time.sleep(0.3)
-            marker.write_bytes(saved)
+            # The real builder publishes the marker with write_sealed (temp file + atomic replace). A plain write_bytes
+            # truncates first, so the waiter polling the marker could read it empty and rightly report a corrupt record.
+            durable.atomic_write(marker, saved)
             holder.release()
         thread = threading.Thread(target=finish)
         thread.start()

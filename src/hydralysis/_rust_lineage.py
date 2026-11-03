@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 
 from hydralysis import _rust_store  # noqa: F401  (puts HYDRALYSIS_RS_DIR on sys.path)
+from hydralysis._seams import Seam, any_active, guarded
 
 import hydralysis_rs as rs
 
@@ -34,6 +35,7 @@ def _path(value) -> str:
 def install_lineage(lineage) -> None:
     original_register = lineage.register
     original_canonical = lineage.canonical
+    python = {name: getattr(lineage, name) for name in ("append_current", "verify_head", "tampered", "status")}
 
     def canonical(value) -> bytes:
         try:
@@ -104,10 +106,20 @@ def install_lineage(lineage) -> None:
     def status(settings, target):
         return json.loads(rs.lin_status(_dump(settings), _dump(target)))
 
-    for function in (canonical, fileset_sha256, self_hash, find, load, ensure, append_current, head, history, resolve, tree_files,
+    for function in (canonical, fileset_sha256, self_hash, find, load, ensure, head, history, resolve, tree_files,
                      tree_hash, write_manifest, read_manifest, manifest_file_sha256, verify_manifest, reserved_generations,
-                     next_generation, verify_head, tampered, status):
+                     next_generation):
         setattr(lineage, function.__name__, function)
+    # The Python objects a white-box test patches (see _seams.py; hy-store/TESTMAP.md lists them). The append goes through
+    # durable.AppendLog in Python, so it answers to the same seams as the log itself; the tamper checks answer to the
+    # manifest functions they call.
+    appending = Seam((lineage, "current_log"))
+    manifests = Seam((lineage, "verify_manifest"), (lineage, "read_manifest"), (lineage, "manifest_file_sha256"),
+                     (lineage, "tree_hash"), (lineage, "tree_files"), (lineage, "_tree_signature"), (lineage, "_verified_problems"))
+    lineage.append_current = guarded(append_current, python["append_current"], appending, *_rust_store.LOG_SEAMS)
+    lineage.verify_head = guarded(verify_head, python["verify_head"], manifests)
+    lineage.tampered = guarded(tampered, python["tampered"], manifests)
+    lineage.status = guarded(status, python["status"], manifests)
     lineage.IMPL = "rust"
 
 
@@ -181,9 +193,13 @@ def install_events(events) -> None:
     def verify_log(directory, session, upto=None, expect=None):
         return json.loads(rs.ev_verify_log(_path(directory), session, upto, dict(expect) if expect else None))
 
+    # `os.write` is what the Python log writes a record with; a test that patches it (a full disk) expects the write to fail.
+    write_seam = Seam((os, "write"))
+
     class EventLog:
         """The ring, the counters and the durable chain of one session (Rust). The attributes callers have always used
-        are properties over the Rust object."""
+        are properties over the Rust object. While `os.write` is patched, the records are written through
+        Python's `os.write` (`_write`), so the patched function decides whether the write fails, as in the Python class."""
 
         def __init__(self, directory, session, *, ring_events=events.RING_EVENTS, ring_bytes=events.RING_BYTES,
                      log_max_bytes=events.LOG_MAX_BYTES, durable_log=True):
@@ -193,6 +209,22 @@ def install_events(events) -> None:
             self.durable_log = durable_log
             self.path = self.directory / events.LOG_NAME
             self._rust = rs.EventLog(_path(self.directory), session, ring_events, ring_bytes, log_max_bytes, durable_log)
+            self._substituted = False
+            self._fd = None
+
+        def _route(self):
+            active = write_seam.active()
+            if active != self._substituted:
+                self._rust.set_writer(self._write if active else None)
+                self._substituted = active
+
+        def _write(self, data):
+            if self._fd is None:
+                self.directory.mkdir(parents=True, exist_ok=True)
+                self._fd = os.open(_path(self.path), os.O_WRONLY | os.O_APPEND | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o666)
+            view = memoryview(data)
+            while view:
+                view = view[os.write(self._fd, view):]
 
         @property
         def ring(self):
@@ -242,9 +274,11 @@ def install_events(events) -> None:
             self._rust.count_message(script, _dump(message), clipped)
 
         def record(self, script, message):
+            self._route()
             return json.loads(self._rust.record(script, _dump(message)))
 
         def marker(self, kind, body):
+            self._route()
             return json.loads(self._rust.marker(kind, _dump(body)))
 
         def sync(self):
@@ -252,6 +286,12 @@ def install_events(events) -> None:
 
         def close(self):
             self._rust.close()
+            if self._fd is not None:
+                try:
+                    os.close(self._fd)
+                except OSError:
+                    pass
+                self._fd = None
 
         def head_info(self):
             return json.loads(self._rust.head_info())

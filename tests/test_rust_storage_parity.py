@@ -7,7 +7,6 @@ from __future__ import annotations
 import json
 import os
 import random
-import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -213,7 +212,7 @@ class SealedRecords(unittest.TestCase):
                     outcomes.append(("ok", reader(path)))
                 except ValueError as exc:
                     text = str(exc).replace(str(path.parent), "<dir>").replace(path.name, "<name>")
-                    outcomes.append(("err", getattr(exc, "code", None), re.sub(r"unparseable \(.*?\)(?=; |\. Nothing)", "unparseable", text)))
+                    outcomes.append(("err", getattr(exc, "code", None), text))
             self.assertEqual(outcomes[0], outcomes[1], case)
 
     def test_inspect_file_kinds(self):
@@ -226,9 +225,7 @@ class SealedRecords(unittest.TestCase):
             for require in (False, True):
                 kind, value, reason = durable.inspect_file(path, None, require)
                 rkind, rvalue, rreason = rs.inspect_file(str(path), None, require)
-                self.assertEqual((kind, value), (rkind, _load(rvalue)))
-                if not reason.startswith("unparseable"):  # the JSON parser's own message differs (documented)
-                    self.assertEqual(reason, rreason)
+                self.assertEqual((kind, value, reason), (rkind, _load(rvalue), rreason))
 
 
 def bare(record):

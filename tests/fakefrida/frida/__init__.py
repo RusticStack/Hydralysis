@@ -18,6 +18,9 @@ from types import SimpleNamespace
 
 __version__ = "17.24.3"
 
+# Declares this package a stand-in: hydralysis.runtime_device keeps the Frida-shaped device for it even under HYDRALYSIS_IMPL=rust.
+HYDRALYSIS_STAND_IN = True
+
 BASE = 0x140000000
 _spawned: dict[int, subprocess.Popen] = {}
 

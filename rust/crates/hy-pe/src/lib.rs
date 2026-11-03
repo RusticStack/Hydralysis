@@ -419,3 +419,65 @@ impl Image {
         !(rva == 0 || size < 12)
     }
 }
+
+#[cfg(test)]
+mod reloc_tests {
+    use super::Image;
+
+    fn put(d: &mut [u8], at: usize, bytes: &[u8]) {
+        d[at..at + bytes.len()].copy_from_slice(bytes);
+    }
+
+    /// The test_pe fixture (a 32-bit image at 0x400000) with a `.reloc` section at 0x3000 holding one HIGHLOW fixup at
+    /// 0x1001; the raw offsets are file-aligned, as pefile (and this crate) read directory data at the aligned offset.
+    fn image_with_a_relocation_table() -> Image {
+        let mut d = vec![0u8; 0x420];
+        put(&mut d, 0, b"MZ");
+        put(&mut d, 0x3C, &0x80u32.to_le_bytes());
+        put(&mut d, 0x80, b"PE\0\0");
+        put(&mut d, 0x84, &0x14Cu16.to_le_bytes());
+        put(&mut d, 0x86, &3u16.to_le_bytes());
+        put(&mut d, 0x84 + 16, &224u16.to_le_bytes());
+        let opt = 0x98;
+        put(&mut d, opt, &0x10Bu16.to_le_bytes());
+        put(&mut d, opt + 16, &0x1000u32.to_le_bytes());
+        put(&mut d, opt + 28, &0x400000u32.to_le_bytes());
+        put(&mut d, opt + 56, &0x4000u32.to_le_bytes());
+        put(&mut d, opt + 60, &0x200u32.to_le_bytes());
+        put(&mut d, opt + 92, &16u32.to_le_bytes());
+        put(&mut d, opt + 96 + 5 * 8, &0x3000u32.to_le_bytes());
+        put(&mut d, opt + 96 + 5 * 8 + 4, &12u32.to_le_bytes());
+        for (i, (name, vsize, rva, raw, offset)) in [
+            (&b".text"[..], 0x100u32, 0x1000u32, 0x20u32, 0x200u32),
+            (b".data", 0x20, 0x2000, 0x20, 0x220),
+            (b".reloc", 0x20, 0x3000, 0x20, 0x400),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let at = opt + 224 + i * 40;
+            put(&mut d, at, name);
+            for (field, value) in [(8, vsize), (12, rva), (16, raw), (20, offset)] {
+                put(&mut d, at + field, &value.to_le_bytes());
+            }
+        }
+        put(&mut d, 0x200, &[0x68, 0x00, 0x60, 0x41, 0x00, 0xe8, 0x30, 0xfe]);
+        put(&mut d, 0x400, &0x1000u32.to_le_bytes());
+        put(&mut d, 0x404, &12u32.to_le_bytes());
+        put(&mut d, 0x408, &((3u16 << 12) | 1).to_le_bytes());
+        Image::from_vec("fixture.exe", d).expect("a valid fixture")
+    }
+
+    /// The PE of the Python test `test_writers.LoadedBytes` with a real table: 0x41 + 0x50 = 0x91 at the relocated byte.
+    #[test]
+    fn base_relocations_from_the_file_are_applied_for_the_load_delta() {
+        let image = image_with_a_relocation_table();
+        let at_base = image.loaded_bytes(0x1000, 8, image.base).unwrap();
+        assert_eq!(at_base, image.read_rva(0x1000, 8).unwrap());
+        let moved = image.loaded_bytes(0x1000, 8, image.base + 0x50_0000).unwrap();
+        assert_eq!(&moved[..5], &[0x68, 0x00, 0x60, 0x91, 0x00]);
+        assert_eq!(&moved[5..], &at_base[5..]);
+        // A window that starts inside the relocated word gets its upper bytes fixed too.
+        assert_eq!(image.loaded_bytes(0x1003, 2, image.base + 0x50_0000).unwrap(), &moved[3..5]);
+    }
+}

@@ -163,3 +163,18 @@ and `export_worker.run`.
 | new: tests/test_static_plane.py (7) | PAR | xrefs of 61 addresses equal the Java oracle through `QueryRunner` with no engine call; paging; engine fallback for function/functions/decompile, a program not in the index, overlays, no switch |
 | new: rust/crates/hy-static/tests/oracle_diff.rs (12) | PAR | Java oracle: references to/from, functions, symbols; PE image for bytes; JSON entry point |
 | benchmarks/static_plane.py | PAR | real engine: 200 xrefs queries, rows equal |
+
+## PE image seams (branch r/hy-parityfix)
+
+`pe.py` routes the `Image` methods to the Rust image. Two white-box tests replace what the Python method reads, which the Rust
+image (it parses the file's bytes itself) cannot see, so those two methods run the Python method while the replacement is in
+place (`pe._SEAMS`: one identity check or one dict lookup per call):
+
+| Method | Python runs while | Test |
+|---|---|---|
+| `loaded_bytes` | `type(image)._relocations` is replaced (a fabricated relocation table) | test_writers::LoadedBytes::test_base_relocations_are_applied_for_the_load_delta |
+| `imports_text` | `parse_data_directories` is set on the image's pefile object (the test fills `DIRECTORY_ENTRY_IMPORT` by hand) | test_client::ImportSlots::test_each_import_names_its_iat_slot_and_a_pattern_filters |
+
+The Rust `loaded_bytes` is not wrong: with a real `.reloc` directory in the file it applies the fixup (0x41 -> 0x91) exactly as
+Python does. That is pinned by `hy-pe` `reloc_tests::base_relocations_from_the_file_are_applied_for_the_load_delta` and by
+tests/test_pe_relocations.py, which runs under both implementations.

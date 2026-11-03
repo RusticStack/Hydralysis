@@ -74,10 +74,13 @@ pub fn classify(raw: Option<&[u8]>) -> (Kind, Option<Value>, String) {
             let text = error.to_string();
             // Python parses a lone surrogate escape and then fails to canonicalise a sealed body; serde refuses it at parse
             // time. A sealed-looking file with that escape reports Python's reason.
-            if (text.contains("surrogate") || text.contains("hex escape")) && raw.windows(6).any(|w| w == b"\"seal\"") {
+            // Python's words for the refusal (`str(exc)[:80]` of the UnicodeDecodeError or JSONDecodeError), not serde's.
+            let python = crate::pyjson::utf8_error(raw).or_else(|| std::str::from_utf8(raw).ok().and_then(crate::pyjson::decode_error));
+            if python.is_none() && (text.contains("surrogate") || text.contains("hex escape")) && raw.windows(6).any(|w| w == b"\"seal\"") {
                 return (Kind::Invalid, None, "body cannot be canonicalised".into());
             }
-            return (Kind::Invalid, None, format!("unparseable ({})", text.chars().take(80).collect::<String>()));
+            let reason = python.unwrap_or(text);
+            return (Kind::Invalid, None, format!("unparseable ({})", reason.chars().take(80).collect::<String>()));
         }
     };
     let Value::Object(mut map) = value else {

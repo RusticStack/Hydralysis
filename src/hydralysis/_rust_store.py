@@ -13,6 +13,8 @@ import json
 import os
 import sys
 
+from hydralysis._seams import Seam, any_active, guarded
+
 # Child processes that import hydralysis with their own sys.path find the extension through HYDRALYSIS_RS_DIR
 # (os.pathsep separated directories that hold hydralysis_rs.pyd).
 for _directory in filter(None, os.environ.get("HYDRALYSIS_RS_DIR", "").split(os.pathsep)):
@@ -25,6 +27,15 @@ except ImportError as exc:  # pragma: no cover - only with HYDRALYSIS_IMPL=rust
     raise ImportError("HYDRALYSIS_IMPL=rust needs the hydralysis_rs extension (rust/crates/hy-py): %s" % exc) from exc
 
 _MISSING = object()
+
+# The Python objects a white-box test patches (see _seams.py; hy-store/TESTMAP.md lists them). install_durable fills them in
+# once the wrappers are installed, so a patch of a wrapper itself (durable.replace_file, durable.scan_file) counts too; the
+# lineage, storelog and events routing reuse them for the same primitives.
+FILE_SEAM = Seam()    # replace / fsync / sleep / native move / process exit: atomic_write, replace_file, anything above them
+WRITE_SEAM = Seam()   # the steps write_sealed takes in Python: atomic_write, _keep_previous
+READ_SEAM = Seam()    # the byte reads under read_sealed_info / inspect_file
+LOG_SEAM = Seam()     # the steps an AppendLog append takes in Python
+LOG_SEAMS = (FILE_SEAM, LOG_SEAM)
 
 
 def _dump(value) -> str:
@@ -52,9 +63,45 @@ def _refuse_surrogate(value, exc):
     raise exc
 
 
+class Verified:
+    """Stands in for the Python module's `_VERIFIED` memo (log key -> end of the last line known valid). The memo lives in
+    Rust; this is its mapping surface, so the tests and the Python fallback of `AppendLog` read and write the one memo."""
+
+    def get(self, key, default=None):
+        found = rs.log_verified_get(key)
+        return default if found is None else found
+
+    def __getitem__(self, key):
+        found = rs.log_verified_get(key)
+        if found is None:
+            raise KeyError(key)
+        return found
+
+    def __setitem__(self, key, value):
+        rs.log_verified_set(key, value)
+
+    def __contains__(self, key):
+        return rs.log_verified_get(key) is not None
+
+    def pop(self, key, *default):
+        found = rs.log_verified_pop(key)
+        if found is not None:
+            return found
+        if default:
+            return default[0]
+        raise KeyError(key)
+
+    def clear(self):
+        rs.log_clear_verified()
+
+
 def install_durable(durable) -> None:
+    from hydralysis import localio
+
     original_log = durable.AppendLog
     original_scan = durable.Scan
+    python = {name: getattr(durable, name) for name in (
+        "atomic_write", "replace_file", "write_sealed", "inspect_file", "read_sealed_info")}
 
     def canonical(value) -> bytes:
         try:
@@ -83,7 +130,7 @@ def install_durable(durable) -> None:
         return json.loads(record), source
 
     def read_sealed(path, **options):
-        return read_sealed_info(path, **options)[0]
+        return durable.read_sealed_info(path, **options)[0]
 
     def write_sealed(path, value, *, indent=2, max_bytes=None, too_large=None):
         if not isinstance(value, dict):
@@ -124,7 +171,7 @@ def install_durable(durable) -> None:
             return os.fspath(self.lock_path)
 
         def scan(self):
-            return scan_file(self.path)
+            return durable.scan_file(self.path)
 
         def last(self, *, strict=False):
             return _load(rs.log_last(os.fspath(self.path), strict))
@@ -133,36 +180,51 @@ def install_durable(durable) -> None:
             return json.loads(rs.log_repairs(os.fspath(self.path)))
 
         def append(self, record, *, lock_held=False):
+            if any_active(LOG_SEAMS):
+                return original_log.append(self, record, lock_held=lock_held)
             return rs.log_append(os.fspath(self.path), _dump(record), self._lock(), self.by, self.lock_timeout_s, lock_held)
 
         def repair(self, *, lock_held=False):
+            if any_active(LOG_SEAMS):
+                return original_log.repair(self, lock_held=lock_held)
             return _load(rs.log_repair(os.fspath(self.path), self._lock(), self.by, self.lock_timeout_s, lock_held))
 
-    for function in (canonical, dumps_sealed, frame, inspect_file, read_sealed_info, read_sealed, write_sealed,
-                     atomic_write, replace_file, scan_file, scan_bytes, file_lock):
+    for function in (canonical, dumps_sealed, frame, scan_file, scan_bytes, file_lock):
         setattr(durable, function.__name__, function)
-    class Verified:
-        """Stands in for the Python module's `_VERIFIED` memo: the tests only clear it."""
-
-        def clear(self):
-            rs.log_clear_verified()
-
+    durable.inspect_file = guarded(inspect_file, python["inspect_file"], READ_SEAM)
+    durable.read_sealed_info = guarded(read_sealed_info, python["read_sealed_info"], READ_SEAM)
+    durable.read_sealed = read_sealed
+    durable.write_sealed = guarded(write_sealed, python["write_sealed"], FILE_SEAM, WRITE_SEAM)
+    durable.atomic_write = guarded(atomic_write, python["atomic_write"], FILE_SEAM)
+    durable.replace_file = guarded(replace_file, python["replace_file"], FILE_SEAM)
     durable.AppendLog = AppendLog
     durable._VERIFIED = Verified()
     durable.IMPL = "rust"
+
+    FILE_SEAM.add((os, "fsync"), (os, "replace"), (durable, "_replace_once"), (durable, "_move_file_ex"), (durable, "_sleep"),
+                  (durable, "NATIVE_MOVE"), (durable, "_write_file"), (durable, "_fsync_directory"), (durable, "_die"),
+                  (durable, "replace_file"))
+    WRITE_SEAM.add((durable, "atomic_write"), (durable, "_keep_previous"))
+    READ_SEAM.add((durable, "read_bytes"), (localio, "read_bytes"), (localio, "_kernel"))
+    LOG_SEAM.add((os, "write"), (AppendLog, "_raw_append"), (AppendLog, "_check_tail"), (AppendLog, "_repair_tail"),
+                 (AppendLog, "_append_locked"), (durable, "scan_file"), (durable, "file_lock"), (durable, "atomic_write"))
 
 
 def install_storelog(storelog) -> None:
     from hydralysis import durable
 
-    class Cache:
-        """Stands in for the Python module's `_CACHE` (cleared by tests, measured by `len`)."""
+    python = {name: getattr(storelog, name) for name in ("save", "read", "known_edits")}
+
+    class Cache(dict):
+        """The Python module's `_CACHE` (the Python fallback below fills it), plus the Rust cache: cleared together by the
+        tests and measured together by `len`."""
 
         def clear(self):
+            super().clear()
             rs.storelog_clear_cache()
 
         def __len__(self):
-            return rs.storelog_cache_len()
+            return super().__len__() + rs.storelog_cache_len()
 
     def configure():  # the patchable constants of the Python module are honoured at call time
         rs.storelog_configure(storelog.SNAPSHOT_EVERY, storelog.SNAPSHOT_LOG_BYTES, storelog.CACHE_ENTRIES)
@@ -192,8 +254,16 @@ def install_storelog(storelog) -> None:
         record.update(updated)
         return record, {"anchor": anchor, "n": n, "start": start}
 
-    for function in (save, read, known_edits, diff, chain):
+    for function in (diff, chain):
         setattr(storelog, function.__name__, function)
+    # The Python objects a white-box test patches (see _seams.py; hy-store/TESTMAP.md lists them): the writer's and the
+    # reader's helpers, and the durable primitives under them.
+    writing = Seam((durable, "write_sealed"), (storelog, "_snapshot"), (storelog, "_trim"), (storelog, "_current"),
+                   (storelog, "_fits"))
+    reading = Seam((durable, "scan_file"), (storelog, "_identity"), (storelog, "_rows"))
+    storelog.save = guarded(save, python["save"], writing, WRITE_SEAM, *LOG_SEAMS)
+    storelog.read = guarded(read, python["read"], reading)
+    storelog.known_edits = guarded(known_edits, python["known_edits"], writing)
     storelog._CACHE = Cache()
     storelog.IMPL = "rust"
     assert durable  # the durable module is installed first when HYDRALYSIS_IMPL=rust

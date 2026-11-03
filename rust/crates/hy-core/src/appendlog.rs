@@ -31,6 +31,23 @@ pub fn scan_count() -> u64 {
     SCANS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// The memo for KEY (`os.path.normcase(os.path.abspath(log))`), the mapping surface of `durable._VERIFIED`.
+pub fn verified_get(key: &str) -> Option<u64> {
+    VERIFIED.lock().ok()?.get(key).copied()
+}
+
+/// Set the memo for KEY.
+pub fn verified_set(key: &str, valid_end: u64) {
+    if let Ok(mut map) = VERIFIED.lock() {
+        map.insert(key.to_string(), valid_end);
+    }
+}
+
+/// Remove and return the memo for KEY.
+pub fn verified_pop(key: &str) -> Option<u64> {
+    VERIFIED.lock().ok()?.remove(key)
+}
+
 /// Forget every "verified up to" memo (tests that rewrite logs behind this process; `durable._VERIFIED.clear()`).
 pub fn clear_verified() {
     if let Ok(mut map) = VERIFIED.lock() {

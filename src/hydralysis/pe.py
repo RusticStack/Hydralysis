@@ -603,11 +603,32 @@ def _native_image(image: "Image"):
     return handle
 
 
+_RELOCATIONS = Image._relocations
+
+
+def _relocations_patched(image: "Image") -> bool:
+    """True while a test has replaced `Image._relocations` (a fabricated relocation table): the Rust image reads the
+    table from the file's bytes, so `loaded_bytes` then runs the Python method, which asks the replacement."""
+    return type(image)._relocations is not _RELOCATIONS
+
+
+def _pefile_patched(image: "Image") -> bool:
+    """True while a test has replaced `parse_data_directories` on this image's pefile object (it then sets the import
+    directory by hand): `imports_text` runs the Python method, which reads the pefile object the test prepared."""
+    parsed = getattr(image, "pe", None)
+    return "parse_data_directories" in getattr(parsed, "__dict__", ())
+
+
+# Methods whose Rust answer cannot see a Python-side replacement of what the Python method reads (hy-pe/TESTMAP.md).
+_SEAMS = {"loaded_bytes": _relocations_patched, "imports_text": _pefile_patched}
+
+
 def _delegating(name: str, python_impl):
     native_name = {"_available": "available"}.get(name, name)
+    seam = _SEAMS.get(name)
 
     def method(self, *args, **kwargs):
-        if not rust_impl_enabled():
+        if not rust_impl_enabled() or (seam is not None and seam(self)):
             return python_impl(self, *args, **kwargs)
         return getattr(_native_image(self), native_name)(*args, **kwargs)
 
