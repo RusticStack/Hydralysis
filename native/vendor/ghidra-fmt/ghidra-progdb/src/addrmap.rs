@@ -81,7 +81,7 @@ impl AddressSpaces {
 }
 
 /// A decoded address.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Address {
     /// An offset in a space.
     Space {

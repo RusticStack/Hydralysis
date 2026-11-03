@@ -4,7 +4,7 @@ Not a port of one Python module: a second way to answer some `ghidra_query` ques
 `RusticQuery.java` in the Hydra Engine daemon. With `HYDRALYSIS_IMPL=rust` and `hydralysis_native` built,
 `QueryRunner._ask` first asks `hydralysis.staticplane`, which calls `hy_static` (through `native/src/static_plane.rs`).
 `hy_static` opens the program's `db.N.gbf` read-only through the vendored `ghidra-progdb`
-(`native/vendor/ghidra-fmt`, engine commit 75f489388b, see its `VENDORED.md`). A refusal is `None` in Python and the
+(`native/vendor/ghidra-fmt`, engine commit 13e7458cc3, see its `VENDORED.md`). A refusal is `None` in Python and the
 engine path runs unchanged. Python default is unchanged.
 
 ## What is answered natively, what falls back

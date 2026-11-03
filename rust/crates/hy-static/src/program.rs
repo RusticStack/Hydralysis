@@ -6,6 +6,7 @@ use std::sync::{Arc, OnceLock};
 
 use ghidra_fmt_chain::{ByteSource, ChainedBuffer};
 use ghidra_fmt_gbf::BufferFile;
+use ghidra_progdb::query::Program;
 use ghidra_progdb::{Address, AddressSpaces, MemoryBlock, ProgramDb, RefKind, SourceType, SpaceDef, SubBlockKind};
 
 use crate::error::{Error, Result};
@@ -148,7 +149,7 @@ struct SymbolIndex {
 
 /// An analysed program opened read-only from a project folder.
 pub struct StaticProgram {
-    db: ProgramDb<BufferFile>,
+    prog: Program<BufferFile>,
     located: Located,
     info: ProgramInfo,
     blocks: Vec<MemoryBlock>,
@@ -166,8 +167,9 @@ impl StaticProgram {
     /// outside what this plane reads exactly; `Failed` when the files cannot be read.
     pub fn open(project: &Path, program: &str) -> Result<Self> {
         let located = layout::locate(project, program)?;
-        let store = BufferFile::open(&located.gbf, true)?;
-        let db = ProgramDb::open(store, x86_64_spaces())?;
+        // Lazy: no index is built until a question needs it, and the file is closed with the program.
+        let prog = Program::open_file_lazy(&located.gbf, x86_64_spaces())?;
+        let db = prog.db();
         let language = db.language_id().unwrap_or_default().to_owned();
         if language != LANGUAGE {
             return Err(Error::unsupported(format!("language {language:?} (only {LANGUAGE} is read)")));
@@ -201,7 +203,17 @@ impl StaticProgram {
             }
         }
         let file_bytes = read_file_bytes(&db)?;
-        Ok(Self { db, located, info, blocks, file_bytes, symbols: OnceLock::new(), functions: OnceLock::new() })
+        Ok(Self { prog, located, info, blocks, file_bytes, symbols: OnceLock::new(), functions: OnceLock::new() })
+    }
+
+    /// The underlying reader.
+    pub fn db(&self) -> &ProgramDb<BufferFile> {
+        self.prog.db()
+    }
+
+    /// The query facade (lazy indexes) of the same file.
+    pub fn facade(&self) -> &Program<BufferFile> {
+        &self.prog
     }
 
     /// The program identity.
@@ -220,12 +232,12 @@ impl StaticProgram {
     }
 
     fn space_address(&self, offset: u64) -> Address {
-        Address::Space { space: self.db.address_map().spaces().default_space.clone(), offset }
+        Address::Space { space: self.db().address_map().spaces().default_space.clone(), offset }
     }
 
     fn default_offset(&self, address: &Address) -> Option<u64> {
         match address {
-            Address::Space { space, offset } if *space == self.db.address_map().spaces().default_space => Some(*offset),
+            Address::Space { space, offset } if *space == self.db().address_map().spaces().default_space => Some(*offset),
             _ => None,
         }
     }
@@ -254,13 +266,13 @@ impl StaticProgram {
 
     /// `ReferenceManager.getReferencesTo(address)` in stored order.
     pub fn xrefs_to(&self, address: u64) -> Result<Vec<Xref>> {
-        let refs = self.db.references_to_at(&self.space_address(address))?;
+        let refs = self.db().references_to_at(&self.space_address(address))?;
         refs.iter().map(|r| self.xref_of(r)).collect()
     }
 
     /// `ReferenceManager.getReferencesFrom(address)` in stored order.
     pub fn xrefs_from(&self, address: u64) -> Result<Vec<Xref>> {
-        let refs = self.db.references_from_at(&self.space_address(address))?;
+        let refs = self.db().references_from_at(&self.space_address(address))?;
         refs.iter().map(|r| self.xref_of(r)).collect()
     }
 
@@ -269,7 +281,7 @@ impl StaticProgram {
             .get_or_init(|| {
                 let mut rows = Vec::new();
                 let mut by_name: HashMap<String, Vec<usize>> = HashMap::new();
-                for s in self.db.symbols()? {
+                for s in self.db().symbols()? {
                     let address = self.default_offset(&s.address);
                     let space = match &s.address {
                         Address::Space { space, .. } => space.clone(),
@@ -318,7 +330,7 @@ impl StaticProgram {
         let symbols = self.symbol_index()?;
         let by_id: HashMap<i64, &SymbolInfo> = symbols.rows.iter().map(|s| (s.id, s)).collect();
         let mut out = Vec::new();
-        for f in self.db.functions()? {
+        for f in self.db().functions()? {
             let Some(sym) = by_id.get(&f.id) else {
                 return Err(Error::failed("function without a symbol"));
             };
@@ -367,7 +379,7 @@ impl StaticProgram {
         if len > MAX_READ {
             return Err(Error::unsupported("read larger than the plane answers"));
         }
-        let store = self.db.database().store();
+        let store = self.db().database().store();
         let mut out = vec![0u8; len];
         let mut done = 0usize;
         while done < len {
