@@ -138,6 +138,28 @@ class StaticPlane(unittest.TestCase):
             cursor = page["next_cursor"]
         self.assertGreaterEqual(seen, 1)
 
+    def test_the_cache_serves_repeats_and_drops_a_changed_file(self):
+        import time
+        staticplane.cache_clear()
+        zero = staticplane.cache_stats()   # counters are per process; compare differences
+
+        def since(key):
+            return staticplane.cache_stats()[key] - zero[key]
+
+        first = self.ask("function", "0x140001030")
+        again = self.ask("function", "0x140001030")
+        self.assertEqual(first["function"], again["function"])
+        stats = staticplane.cache_stats()
+        self.assertEqual((stats["entries"], since("misses"), since("hits"), since("builds")), (1, 1, 1, 1))
+        self.assertLessEqual(stats["bytes"], stats["budget"])
+        gbf = next(self.project.rglob("db.*.gbf"))
+        later = time.time() + 30
+        os.utime(gbf, (later, later))   # what a save of identical content looks like
+        third = self.ask("function", "0x140001030")
+        self.assertEqual(third["function"], first["function"])
+        self.assertEqual((since("invalidations"), since("misses"), since("builds")), (1, 2, 2))
+        self.assertEqual(self.engine.calls, [])
+
     def test_paging_matches_one_big_page(self):
         groups = oracle_refs()
         address = max(groups, key=lambda key: len(groups[key]))

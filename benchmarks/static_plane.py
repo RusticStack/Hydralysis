@@ -65,34 +65,45 @@ result = {"mode": mode}
 before = peak_working_set()
 # the requests; in rust mode keep only what the plane answers, and report that list so the engine runs the same ones
 requests = {}
+first_seen = {}
 for name, items in plan.items():
     keep = []
     for item in items:
-        if mode == "rust" and staticplane.answer(gpr, program, request(item["action"], **item["args"])) is None:
-            continue
+        if mode == "rust":
+            started = time.perf_counter()
+            answered = staticplane.answer(gpr, program, request(item["action"], **item["args"]))
+            first_seen.setdefault(name, time.perf_counter() - started)   # the first question of an action: the cache fills
+            if answered is None:
+                continue
         keep.append(item)
     requests[name] = keep
 if mode != "rust":
     requests = plan   # the main process passes the filtered plan
 result["plan"] = requests
+result["first_seen_s"] = first_seen
 result["declined"] = {name: len(plan[name]) - len(requests[name]) for name in plan}
 
 first = None
+passes = int(os.environ.get("BENCH_PASSES", "1"))
 for name, items in requests.items():
-    times, rows = [], []
-    for item in items:
-        started = time.perf_counter()
-        reply = ask(item["action"], **item["args"])
-        elapsed = time.perf_counter() - started
-        if first is None:
-            first = elapsed   # the very first query of the process: with the engine, the daemon start
-        times.append(elapsed)
-        for key in ("engine", "id", "query_s", "agent", "base", "target", "view"):
-            reply.pop(key, None)
-        rows.append(reply)
-        result.setdefault("modes", set()).add(item["action"])
-    result[name] = {"times": times, "answers": rows}
+    times, rows, first_call = [], [], None
+    for number in range(passes):
+        for item in items:
+            started = time.perf_counter()
+            reply = ask(item["action"], **item["args"])
+            elapsed = time.perf_counter() - started
+            if first is None:
+                first = elapsed   # the very first query of the process: with the engine, the daemon start
+            if first_call is None:
+                first_call = elapsed   # the first query of this action: with the Rust plane, it builds the cache entry
+            times.append(elapsed)
+            if number == 0:
+                for key in ("engine", "id", "query_s", "agent", "base", "target", "view"):
+                    reply.pop(key, None)
+                rows.append(reply)
+    result[name] = {"times": times, "answers": rows, "first_call_s": first_call}
 result["first_query_s"] = first
+result["cache"] = staticplane.cache_stats() if mode == "rust" else None
 result["peak_working_set_delta_mb"] = (peak_working_set() - before) / 1e6
 result["peak_working_set_mb"] = peak_working_set() / 1e6
 result["modes"] = sorted(result.get("modes", []))
@@ -121,8 +132,9 @@ def plan_for(count: int):
     }
 
 
-def child(mode: str, settings: dict, plan: dict, root: Path) -> dict:
+def child(mode: str, settings: dict, plan: dict, root: Path, passes: int = 1) -> dict:
     env = dict(os.environ)
+    env["BENCH_PASSES"] = str(passes)
     env.update(HYDRALYSIS_ROOT=str(root / "data"), HYDRALYSIS_SRC=str(REPOSITORY / "src"),
                HYDRALYSIS_SETTINGS=json.dumps(settings), HYDRALYSIS_PLAN=json.dumps(plan), BENCH_MODE=mode)
     if mode == "rust":
@@ -173,10 +185,15 @@ def stats(times):
             "p95_ms": round(ordered[max(0, int(len(ordered) * 0.95) - 1)] * 1000, 3), "total_s": round(sum(times), 4)}
 
 
+def first_ms(run, name):
+    return round(run[name]["first_call_s"] * 1000, 3)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", required=True)
     parser.add_argument("--queries", type=int, default=200)
+    parser.add_argument("--passes", type=int, default=3, help="times each request list is repeated (answers kept from the first)")
     parser.add_argument("--out", default="")
     args = parser.parse_args()
     root = Path(args.root)
@@ -194,23 +211,25 @@ def main():
     plan = plan_for(args.queries)
     runs = {}
     try:
-        runs["rust"] = child("rust", settings, plan, root)
+        runs["rust"] = child("rust", settings, plan, root, args.passes)
         kept = runs["rust"]["plan"]
-        runs["engine_cold"] = child("engine", settings, kept, root)
+        runs["engine_cold"] = child("engine", settings, kept, root, args.passes)
         runs["engine_memory_mb"] = engine_memory_mb(settings)
-        runs["engine_warm"] = child("engine", settings, kept, root)
+        runs["engine_warm"] = child("engine", settings, kept, root, args.passes)
     finally:
         stop_daemon(settings)
     summary = {"declined_by_the_plane": runs["rust"]["declined"], "engine_daemon_memory": runs["engine_memory_mb"],
                "python_peak_working_set_mb": {k: round(runs[k]["peak_working_set_mb"], 1) for k in ("rust", "engine_cold", "engine_warm")},
                "python_working_set_growth_mb": {k: round(runs[k]["peak_working_set_delta_mb"], 1) for k in ("rust", "engine_cold", "engine_warm")},
                "first_query_s": {k: round(runs[k]["first_query_s"], 4) for k in ("rust", "engine_cold", "engine_warm")},
-               "equal_to_engine": {}, "actions": {}}
+               "rust_cache": runs["rust"]["cache"], "equal_to_engine": {}, "actions": {}}
     for name in kept:
         a, b = runs["rust"][name]["answers"], runs["engine_warm"][name]["answers"]
         mismatches = [i for i, (x, y) in enumerate(zip(a, b)) if _strip(x) != _strip(y)]
         summary["equal_to_engine"][name] = {"compared": len(a), "mismatches": len(mismatches)}
         summary["actions"][name] = {k: stats(runs[k][name]["times"]) for k in ("rust", "engine_cold", "engine_warm")}
+        summary["actions"][name]["first_call_ms"] = {k: first_ms(runs[k], name) for k in ("engine_cold", "engine_warm")}
+        summary["actions"][name]["first_call_ms"]["rust"] = round(runs["rust"]["first_seen_s"][name] * 1000, 3)
     print(json.dumps(summary, indent=2))
     if args.out:
         Path(args.out).write_text(json.dumps(summary, indent=2))

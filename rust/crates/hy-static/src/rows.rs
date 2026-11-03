@@ -26,11 +26,6 @@ fn clip(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
-fn range_text(space_default: &str, min: u64, max: u64) -> Result<String> {
-    let _ = space_default;
-    Ok(format!("[{}, {}]", address_text(min), address_text(max)))
-}
-
 /// The function rows are for the default space only.
 pub fn is_internal(f: &FunctionInfo, default_space: &str) -> bool {
     matches!(&f.entry, Address::Space { space, .. } if space == default_space)
@@ -106,8 +101,39 @@ pub fn signature(prog: &Program<BufferFile>, f: &FunctionInfo, name: &str, defau
     Ok(format!("{returns} {name}({list})"))
 }
 
-/// The row of one function.
-pub fn function_row(prog: &Program<BufferFile>, f: &FunctionInfo, default_space: &str) -> Result<Value> {
+/// The parts of one `function` row, ready to print. Nothing in it refers to the database file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowData {
+    entry: u64,
+    name: String,
+    signature: String,
+    /// At most [`BODY_MAX`] ranges.
+    body: Vec<(u64, u64)>,
+    body_truncated: bool,
+}
+
+impl RowData {
+    /// The JSON row of `RusticQuery.function(Function)`.
+    pub fn to_value(&self) -> Value {
+        let body: Vec<Value> =
+            self.body.iter().map(|&(min, max)| Value::String(format!("[{}, {}]", address_text(min), address_text(max)))).collect();
+        json!({
+            "address": format!("0x{}", address_text(self.entry)),
+            "name": self.name,
+            "signature": self.signature,
+            "body": body,
+            "body_truncated": self.body_truncated,
+        })
+    }
+
+    /// An estimate of the bytes this row holds.
+    pub fn size(&self) -> usize {
+        std::mem::size_of::<Self>() + self.name.len() + self.signature.len() + self.body.len() * 16
+    }
+}
+
+/// The row of one function, as data.
+pub fn build_row(prog: &Program<BufferFile>, f: &FunctionInfo, default_space: &str) -> Result<RowData> {
     let name = f.name.clone().ok_or_else(|| Error::unsupported("function without a computable name"))?;
     let entry = match &f.entry {
         Address::Space { offset, .. } => *offset,
@@ -122,13 +148,13 @@ pub fn function_row(prog: &Program<BufferFile>, f: &FunctionInfo, default_space:
         if r.space != default_space {
             return Err(Error::unsupported("function body outside the default space"));
         }
-        body.push(Value::String(range_text(default_space, r.min, r.max)?));
+        body.push((r.min, r.max));
     }
-    Ok(json!({
-        "address": format!("0x{}", address_text(entry)),
-        "name": clip(&name, NAME_MAX),
-        "signature": clip(&signature, SIGNATURE_MAX),
-        "body": body,
-        "body_truncated": f.body.len() > BODY_MAX,
-    }))
+    Ok(RowData {
+        entry,
+        name: clip(&name, NAME_MAX),
+        signature: clip(&signature, SIGNATURE_MAX),
+        body,
+        body_truncated: f.body.len() > BODY_MAX,
+    })
 }

@@ -10,7 +10,7 @@ use ghidra_progdb::query::Program;
 use ghidra_progdb::{Address, AddressSpaces, MemoryBlock, ProgramDb, RefKind, SourceType, SpaceDef, SubBlockKind};
 
 use crate::error::{Error, Result};
-use crate::layout::{self, Located};
+use crate::layout::{self, Located, Mark};
 
 /// The only language this plane answers for: the Windows x64 programs Hydralysis analyses.
 pub const LANGUAGE: &str = "x86:LE:64:default";
@@ -147,13 +147,45 @@ struct SymbolIndex {
     by_name: HashMap<String, Vec<usize>>,
 }
 
-/// An analysed program opened read-only from a project folder.
-pub struct StaticProgram {
-    prog: Program<BufferFile>,
+/// What opening a program established, and nothing that holds the file: where it is, what it says about itself, its
+/// memory blocks and file-bytes buffer ids, and the [`Mark`]s of the files that decide it. It is what the cache keeps
+/// between calls; [`Meta::unchanged`] is the `stat`-only check that it still describes the files.
+pub struct Meta {
     located: Located,
     info: ProgramInfo,
     blocks: Vec<MemoryBlock>,
     file_bytes: BTreeMap<i64, FileBytesEntry>,
+    marks: Vec<Mark>,
+}
+
+impl Meta {
+    /// The program identity.
+    pub fn info(&self) -> &ProgramInfo {
+        &self.info
+    }
+
+    /// Where the database file is, and its stamp when it was found.
+    pub fn located(&self) -> &Located {
+        &self.located
+    }
+
+    /// True while every watched file and folder has the size and write time it had when this was read.
+    pub fn unchanged(&self) -> bool {
+        self.located.watch.iter().zip(&self.marks).all(|(path, mark)| layout::mark_of(path) == *mark)
+    }
+
+    /// An estimate of the bytes held.
+    pub fn size(&self) -> usize {
+        let blocks: usize = self.blocks.iter().map(|b| 256 + b.name.len() + b.sub_blocks.len() * 64).sum();
+        let ids: usize = self.file_bytes.values().map(|f| 64 + (f.original.len() + f.layered.len()) * 4).sum();
+        1024 + self.located.watch.len() * 200 + self.info.name.len() + self.info.program_path.len() + blocks + ids
+    }
+}
+
+/// An analysed program opened read-only from a project folder.
+pub struct StaticProgram {
+    prog: Program<BufferFile>,
+    meta: Arc<Meta>,
     symbols: OnceLock<std::result::Result<SymbolIndex, Error>>,
     functions: OnceLock<std::result::Result<Vec<FunctionInfo>, Error>>,
 }
@@ -167,6 +199,8 @@ impl StaticProgram {
     /// outside what this plane reads exactly; `Failed` when the files cannot be read.
     pub fn open(project: &Path, program: &str) -> Result<Self> {
         let located = layout::locate(project, program)?;
+        // Marked before anything is read: a change during the read shows as a difference afterwards.
+        let marks = layout::marks_of(&located.watch);
         // Lazy: no index is built until a question needs it, and the file is closed with the program.
         let prog = Program::open_file_lazy(&located.gbf, x86_64_spaces())?;
         let db = prog.db();
@@ -203,7 +237,27 @@ impl StaticProgram {
             }
         }
         let file_bytes = read_file_bytes(db)?;
-        Ok(Self { prog, located, info, blocks, file_bytes, symbols: OnceLock::new(), functions: OnceLock::new() })
+        let meta = Arc::new(Meta { located, info, blocks, file_bytes, marks });
+        if !meta.unchanged() {
+            return Err(Error::failed("the project files changed while the program was opened"));
+        }
+        Ok(Self { prog, meta, symbols: OnceLock::new(), functions: OnceLock::new() })
+    }
+
+    /// Open the file again for a program whose [`Meta`] is already known (and still [`Meta::unchanged`]): only the
+    /// lazy reader is created, no table is read.
+    ///
+    /// # Errors
+    ///
+    /// `Failed` when the file cannot be opened.
+    pub fn open_with(meta: Arc<Meta>) -> Result<Self> {
+        let prog = Program::open_file_lazy(&meta.located.gbf, x86_64_spaces())?;
+        Ok(Self { prog, meta, symbols: OnceLock::new(), functions: OnceLock::new() })
+    }
+
+    /// What opening established, for keeping.
+    pub fn meta(&self) -> &Arc<Meta> {
+        &self.meta
     }
 
     /// The underlying reader.
@@ -218,17 +272,17 @@ impl StaticProgram {
 
     /// The program identity.
     pub fn info(&self) -> &ProgramInfo {
-        &self.info
+        &self.meta.info
     }
 
     /// Where the database file is, and its stamp when it was found.
     pub fn located(&self) -> &Located {
-        &self.located
+        &self.meta.located
     }
 
     /// The memory blocks, by start address.
     pub fn blocks(&self) -> &[MemoryBlock] {
-        &self.blocks
+        &self.meta.blocks
     }
 
     /// The default space name (`ram`).
@@ -406,10 +460,11 @@ impl StaticProgram {
             match sub.kind {
                 SubBlockKind::FileBytes => {
                     let fb = self
+                        .meta
                         .file_bytes
                         .get(&i64::from(sub.source_id))
                         .ok_or_else(|| Error::failed("memory part names a missing file bytes id"))?;
-                    read_layered(&self.located.gbf, fb, sub.source_offset + in_sub, dest)?;
+                    read_layered(&self.meta.located.gbf, fb, sub.source_offset + in_sub, dest)?;
                 }
                 SubBlockKind::Buffer => {
                     let buffer = ChainedBuffer::open(store, sub.source_id)?;
@@ -429,7 +484,7 @@ impl StaticProgram {
     }
 
     fn block_containing(&self, address: u64) -> Option<&MemoryBlock> {
-        self.blocks.iter().find(|b| match &b.start {
+        self.meta.blocks.iter().find(|b| match &b.start {
             Address::Space { offset, .. } => address >= *offset && address - offset < b.length as u64,
             _ => false,
         })

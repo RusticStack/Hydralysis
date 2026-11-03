@@ -28,40 +28,67 @@ Extra declines for `function`/`functions` (the prototype is Ghidra's, not just t
 of an internal function takes that function's return type and parameters), custom variable storage, inline, variadic,
 calling conventions other than `__fastcall`/`__stdcall`/`__cdecl`/`unknown`/`default` (`__thiscall` adds `this`: automatic
 parameters are not ported), return types that are structures, unions, arrays or unresolved (hidden `__return_storage_ptr__`),
-non-ASCII names (Java clips UTF-16 units), and database files over 48 MiB (no cache is kept, so the function index is rebuilt
-on every call; above that size the engine's warm daemon is faster).
+non-ASCII names (Java clips UTF-16 units), database files over 48 MiB when the rows must be
+built (building reads the whole symbol and function tables; rows already cached are served at any size), and programs whose
+rows alone exceed the cache budget.
 
-## Handles
+## Cache and handles
 
-The program is opened lazily on every call (`open_file_lazy`: no table is read until asked) and dropped when the call ends.
-Nothing is cached between calls, so no file stays open: Windows can rename or replace the project files at any time. The
-`db.N.gbf` size and mtime are checked before and after the read.
+A process-local cache (`cache.rs`) keeps, per program, what was parsed: the identity, memory blocks and file-bytes ids
+(`Meta`) and, after the first function question, every internal function's finished row with its body ranges
+(`FunctionData`). Both are plain memory. **No file handle is kept**: the program is opened lazily (`open_file_lazy`) only
+when a question must read the file (references, bytes, symbols, or a cache fill), and closed when the call ends; a hit on
+`function`/`functions` opens nothing. Windows can rename, replace or delete the project at any time (tested).
+
+* Key: canonical project path plus program path.
+* Validation before every use, `stat` only: size and write time of `db.N.gbf`, `~index.dat`, the `.prp` file, and the
+  *absence* of `~index.jrn`; write time of the `~<id>.db` folder and of `idata` (they move when a new version, a save file or
+  a journal appears). Any difference drops the entry and the files are read again; a project with a save in progress (an
+  unknown file beside the database, a journal) is then declined exactly as on a first read. The marks are taken before the
+  read and compared after it, so a change during the read is a `Failed`, never an answer.
+* Budget: entries are charged by an estimate of their bytes (fixture: about 140 KB for 405 functions) and evicted least
+  recently used first. Default 64 MiB; `HYDRALYSIS_STATIC_CACHE_MB` sets it (the global cache reads it once). Function rows that
+  alone exceed the budget are not kept, and the plane declines `function`/`functions` for that program version (remembered,
+  so the build is not repeated) and the engine answers; budget 0 means the same for function questions, while `xrefs` is still
+  answered. `staticplane.cache_stats()` / `cache_clear()` expose counters (entries, bytes, budget, hits, misses, evictions,
+  invalidations, builds).
+
+## Routing policy
+
+All three actions are routed to the Rust plane whenever it answers, with no daemon-liveness check: with the cache each is
+faster than the warm engine at p50 (table below), and with no daemon running it also saves the engine start. The engine
+answers only what the plane declines. The costs that remain are the first `function`/`functions` question per program
+version (it builds the rows: 4-5 ms on the fixture, more on big programs, hence the 48 MiB gate) and one cache entry per
+program in memory.
 
 ## Layout resolved
 
 `<name>.gpr` (or its folder, or `<name>.rep`) -> `idata/~index.dat` (folders and items) -> `idata/<bucket>/<id>.prp`
 (`CONTENT_TYPE` must be `Program`) -> `idata/<bucket>/~<id>.db/db.<N>.gbf`, highest `N`. Packed `.pdb` files are not read.
 
-## Measured (fixture legacy-12.1.4-analysed, 405 functions; `benchmarks/static_plane.py`, machine shared with other jobs)
+## Measured (fixture legacy-12.1.4-analysed, 405 functions; `benchmarks/static_plane.py --passes 5`)
 
-Median ms per query through `QueryRunner`, two runs (the second with other agents busy). Answers equal the engine's in every
+Median / p95 ms per query through `QueryRunner` (1000 xrefs, 1985 function, 5 and 15 functions requests per column; the
+machine is shared with other jobs, so absolute values move by 20-40% between runs). Answers equal the engine's in every
 compared request (200 xrefs, 397 function rows, 4 functions pages; 0 differences).
 
-| action | rust (no JVM) | engine cold daemon | engine warm daemon |
-| --- | --- | --- | --- |
-| xrefs | 0.92 / 1.21 | 2.4 / 3.1 | 1.6 / 2.4 |
-| function | 4.8 / 6.9 | 2.0 / 3.1 | 1.7 / 2.7 |
-| functions (limit 200, 1 page answered) | 8.2 / 8.0 | 4.0 / 4.2 | 1.8 / 3.8 |
-| functions (filtered, limit 20) | 5.6 / 6.6 | 2.7 / 2.5 | 2.1 / 3.5 |
+| action | rust (cached) | engine warm daemon | engine cold daemon | rust vs warm |
+| --- | --- | --- | --- | --- |
+| xrefs | 0.69 / 0.88 | 1.38 / 1.79 | 1.70 / 2.64 | 2.0x faster |
+| function | 0.51 / 0.66 | 1.41 / 1.74 | 1.51 / 2.02 | 2.8x faster |
+| functions, limit 200 (1 page answered) | 0.56 / 0.56 | 1.64 / 1.73 | 1.60 / 1.65 | 2.9x faster |
+| functions, filtered, limit 20 | 0.68 / 0.71 | 1.65 / 1.78 | 1.71 / 1.96 | 2.4x faster |
 
-First query of a fresh process: rust 2.5 / 4.7 ms; engine with no daemon 18.4 / 10.4 s (round 1: 126 s); engine with a warm
-daemon 0.03-1.1 s. So xrefs is faster than the warm engine, `function`/`functions` are about 2.5-4x slower per call (the
-function index is rebuilt on every call because nothing is cached) but need no JVM and no daemon start. Memory: the Rust
-plane grew the Python process by 6 MB (peak 32 MB total); the daemon JVM was at 309 MB (peak 361 MB) for the same fixture.
+First question of an action in a fresh process: `function` rust 4.4 ms (builds the rows) against 1.4 ms warm engine;
+`xrefs` rust 8 ms (loads the extension, opens the project) against 320 ms warm engine in a fresh client and 4.0 s with a
+cold daemon (first query of the process: rust 1.7 ms, engine cold daemon 4.0 s; earlier runs 10-18 s and 126 s). Memory: the
+cache held 140 KB; the Rust plane grew the Python process by 4 MB (peak 30 MB); the daemon JVM was at 342 MB (peak 391 MB).
+Before the cache (per-call index): `function` 4.8-6.9 ms, `functions` 5.6-8.2 ms, 2.5-4x slower than the warm engine.
 
 ## Tests
 
 * `tests/oracle_diff.rs`: against `tests/fixtures/oracle/oracleprog-*.txt` (Java) and `flow_fixture.exe`.
+* `tests/cache.rs`: cached answers equal the engine's recorded ones (and the first answer); a changed write time or size invalidates; a save file or journal drops the entry and is declined; the byte budget evicts least recently used, rows over the budget are declined once; no handle (the folder is renamed and deleted while entries are held).
 * `tests/engine_truth.rs`: against answers recorded from the real engine (`tests/fixtures/engine/*.json`, written by a dumper that asks the live daemon): `function` per function entry, `functions` pages.
 * `tests/test_static_plane.py` (Python): routing through `QueryRunner` with an engine stand-in that fails when touched.
 * `benchmarks/static_plane.py`: equality with, and time against, the real engine per action (xrefs, function, functions), cold and warm, with memory.

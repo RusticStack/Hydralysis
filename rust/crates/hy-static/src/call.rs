@@ -8,8 +8,9 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 use crate::answer::{ACTIONS, answer_in_project};
+use crate::cache;
 use crate::error::{Error, Result};
-use crate::program::{FunctionInfo, StaticProgram, SymbolInfo, Xref, address_text};
+use crate::program::{FunctionInfo, SymbolInfo, Xref, address_text};
 
 fn arg_str(args: &[Value], at: usize) -> Result<&str> {
     args.get(at).and_then(Value::as_str).ok_or_else(|| Error::unsupported(format!("argument {at} is not a string")))
@@ -56,6 +57,7 @@ fn hex(bytes: &[u8]) -> String {
 /// | name | further arguments | answer |
 /// | --- | --- | --- |
 /// | `supports` | `action` | `true` when [`answer_in_project`] answers that action |
+/// | `cache_stats`, `cache_clear` | | the process-wide cache's counters; drop its entries |
 /// | `answer` | request object | the engine-shaped reply of `RusticQuery` |
 /// | `info` | | name, path, language, compiler, image base, hash, database version |
 /// | `xrefs_to`, `xrefs_from` | address | the references, in stored order |
@@ -68,15 +70,27 @@ fn hex(bytes: &[u8]) -> String {
 ///
 /// [`Error::Unsupported`] or [`Error::Failed`]; the caller asks the engine.
 pub fn call(name: &str, args: &[Value]) -> Result<Value> {
-    if name == "supports" {
-        return Ok(json!(ACTIONS.contains(&arg_str(args, 0)?)));
+    match name {
+        "supports" => return Ok(json!(ACTIONS.contains(&arg_str(args, 0)?))),
+        "cache_stats" => {
+            let s = cache::global().stats();
+            return Ok(json!({
+                "entries": s.entries, "bytes": s.bytes, "budget": s.budget, "hits": s.hits, "misses": s.misses,
+                "evictions": s.evictions, "invalidations": s.invalidations, "builds": s.builds,
+            }));
+        }
+        "cache_clear" => {
+            cache::global().clear();
+            return Ok(json!(true));
+        }
+        _ => {}
     }
     let project = Path::new(arg_str(args, 0)?);
     let program = arg_str(args, 1)?;
     if name == "answer" {
         return answer_in_project(project, program, args.get(2).ok_or_else(|| Error::unsupported("no request"))?);
     }
-    let opened = StaticProgram::open(project, program)?;
+    let opened = cache::global().open(project, program)?;
     let value = match name {
         "info" => {
             let i = opened.info();
@@ -96,7 +110,7 @@ pub fn call(name: &str, args: &[Value]) -> Result<Value> {
         }
         other => return Err(Error::unsupported(format!("no call named {other:?}"))),
     };
-    if opened.located().stamp_now()? != opened.located().stamp {
+    if !opened.meta().unchanged() {
         return Err(Error::failed("the database file changed while it was read"));
     }
     Ok(value)
