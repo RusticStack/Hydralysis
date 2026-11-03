@@ -54,6 +54,30 @@ the Rust device is chosen only when none is configured (the real binding is not 
 9. **Limits**: 16 observe/break probes at once (sites 48..63); a trace release (`detach_sites`) retires every site, probes
    included; trace `attempted` counts all sites, observe probes included, when both run together.
 
+## Pure leaves of the Python runtime layer (`r/hy-rt2`)
+
+| Python | Rust | Routing |
+| --- | --- | --- |
+| `runtime_decode.normalize/decode/decode_event/layout_values` | `decode.rs`, `hy-rt-py` `decode_*` | `HYDRALYSIS_IMPL=rust` and `HYDRALYSIS_RUNTIME_HELD=1` (0.37x to 0.63x; see PORT-STATUS.md) |
+| `runtime_snapshot.compare/stable_sha256` | `snapshot.rs`, `hy-rt-py` `snapshot_compare/snapshot_stable_sha256` | `HYDRALYSIS_IMPL=rust` (2x to 10x faster) |
+
+Both give the Python's bytes for the shapes a session produces. An input they do not model (a float where Python calls `int()`, a
+struct field at a negative offset, an integer beyond 64 bits, a non-finite float, a mask with a `[` class, nesting deeper than 200,
+a lone surrogate, a container where Python would call `str()`) raises `hydralysis_rt.Unmodelled` and the Python function answers, so a
+`ValueError` text or a quirk is never reimplemented twice. The Python wrappers are `guarded` by a `Seam` over the helpers a white-box
+test patches (`scalar`, `_unpack`, `canonical`, `_masked`, ...). Quirks kept on purpose: `normalize` returns the caller's `deref`
+list object in Python and a copy in Rust; `normalize` accepts negative struct offsets in Python (the decode of one reads from the end
+of the buffer) and the Rust declines to decode them; the `struct.error` text of a short buffer is reproduced
+(`unpack_from requires a buffer of at least N bytes ...`). Not routed: `runtime_snapshot.flatten` (only used by the two routed
+functions) and `snapshot_id` (0.3x).
+
+`runtime_exports`, `runtime_authorize`, `runtime_ipc`, `runtime_events` (already routed) and the session classes
+(`runtime_agents`, `runtime_worker`, `runtime_actions`, `runtime_capture`, `runtime_memory`, `runtime_trace`, `runtime`) were looked at and
+not ported: each is a once-per-action check, a socket loop, or Frida RPC orchestration whose time is the target's or the RPC's. The
+Rust agent already replaces the four JS templates that the Rust device recognises; the JS that remains (`runtime_agents.py`'s
+CModule trace recorder when Frida is the device, the CONTROL helpers for Frida) is the Frida implementation itself and has no Rust
+counterpart to be tested against, so it stays.
+
 ## What runs where
 
 `cargo test`, `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` cover the Rust side (live tests spawn

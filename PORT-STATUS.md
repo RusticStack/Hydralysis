@@ -28,6 +28,13 @@ viewpool; its own benchmark says the hosted edit path is slower and stays opt-in
 |---|---|---|---|
 | `trace_pairing.pair_report` | `hy-trace::pairing`, `native/src/trace/pairing.rs` | on with `HYDRALYSIS_IMPL=rust` | 5x to 36x faster, byte-identical |
 | `trace_bindings.link_events` | `hy-trace::bindings`, `native/src/trace/bindings.rs` | held back (`HYDRALYSIS_TRACE_HELD=1`) | 0.6x at 5k events, 1.5x at 300k, 2x memory: opt-in only |
+| `runtime_snapshot.compare`, `.stable_sha256` | `hy-runtime::snapshot`, `hy-rt-py` (`snapshot_compare`, `snapshot_stable_sha256`) | on with `HYDRALYSIS_IMPL=rust` | 2.5x to 3.4x (compare), 2.2x to 10x (stable hash; two runs: 2.1x-5.3x / 3.5x-4.6x, the machine was shared); +4 MB at 200 regions, +50 to +100 MB at 5000 regions |
+| `runtime_decode.normalize`, `.decode`, `.decode_event`, `.layout_values` | `hy-runtime::decode`, `hy-rt-py` (`decode_*`) | held back (`HYDRALYSIS_RUNTIME_HELD=1` as well as `HYDRALYSIS_IMPL=rust`) | 0.37x to 0.63x (first run 0.33x-0.57x): a few microseconds of work per call, the argument and answer conversion costs more; opt-in only |
+
+Measurements for the two `runtime_*` rows: `benchmarks/bench_runtime_decode.py` (same method as `bench_trace_ports.py`: fresh child process
+per row, median of 5, peak working set, input built before the timer, answers compared by digest); logs
+`E:\Projects\Hydra\_logs\h7\rt2\bench-decode.log` and `bench-snapshot.log`, `bench-final.log`. Unrouted in `runtime_snapshot`: `flatten` (only called by the two routed
+functions) and `snapshot_id` (0.3x: `json`'s C encoder beats the conversion).
 
 Measurements (`benchmarks/bench_trace_ports.py`, release build, median of 5, fresh child process per row, peak working set
 from `GetProcessMemoryInfo`; the input is built before the timer and is the same in both children; log
@@ -47,8 +54,10 @@ owner events (same answer). `link_events` is linear in both; the Rust spends its
 
 ## Remaining, ranked by hot-path relevance (not ported)
 
-1. `runtime_agents.py` (62k), `runtime.py` (48k), `runtime_memory.py` (32k), `runtime_capture.py` (31k), `runtime_worker.py` (28k),
-   `runtime_trace.py` (26k), `runtime_actions.py` (20k): the live Frida session code. Event-handling hot path of a runtime
+1. (after `r/hy-rt2`: `runtime_decode` and the pure part of `runtime_snapshot` are ported, see above; the Rust runtime device now has
+   live tests for detours/`accept_patch`, decoded captures and samples, cwd/env and the second-harness rule:
+   `tests/test_rust_runtime_live.py`.) `runtime_agents.py` (62k), `runtime.py` (48k), `runtime_memory.py` (32k), `runtime_capture.py` (31k),
+   `runtime_worker.py` (28k), `runtime_trace.py` (26k), `runtime_actions.py` (20k): the live Frida session code. Event-handling hot path of a runtime
    session, but it is dominated by Frida RPC and the JS agent; hy-runtime/hy-rt-py already cover the event decode and the device.
    The Frida JS agent (`runtime_agents`) is allowed to be converted; that is a separate, larger lane.
 2. `workcopy.py` (91k), `userscripts.py` (17k), `viewpool.py` (19k): on `r/hy-workcopy`. `userscripts.run`, `workcopy._sync/_apply`

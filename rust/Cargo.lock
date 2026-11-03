@@ -507,6 +507,7 @@ version = "0.1.0"
 dependencies = [
  "hy-agent-proto",
  "serde_json",
+ "sha2",
  "windows-sys",
 ]
 

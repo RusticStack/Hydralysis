@@ -148,3 +148,53 @@ def layout_values(fields: list[dict], data: bytes) -> list[dict]:
             row["bytes"] = chunk.hex(" ").upper()
         rows.append(row)
     return rows
+
+
+# ---- optional Rust implementation (HYDRALYSIS_IMPL=rust) ------------------------------------------------------------------
+# crates/hy-runtime `decode`, bound in crates/hy-rt-py (`hydralysis_rt`). The functions above stay the specification: the Rust
+# ones give the same value for the shapes the worker and the MCP layer produce and raise `Unmodelled` for any other (a float
+# where Python calls int(), a negative struct offset, ...), which runs the Python. A ValueError is Python's own, same text.
+# HELD BACK: measured 0.33x to 0.63x of the Python (benchmarks/bench_runtime_decode.py: the work per call is a few
+# microseconds, the conversion of the arguments and of the answer costs more), so it is routed only when
+# HYDRALYSIS_RUNTIME_HELD=1 is set as well as HYDRALYSIS_IMPL=rust.
+
+_normalize_py, _decode_py, _decode_event_py, _layout_values_py = normalize, decode, decode_event, layout_values
+
+
+def _install_rust() -> None:
+    import os
+    import sys
+    if os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() != "rust" or os.environ.get("HYDRALYSIS_RUNTIME_HELD") != "1":
+        return
+    try:
+        from hydralysis import rust_frida
+        rt = rust_frida._load_rt()
+        routines = (rt.decode_normalize, rt.decode_value, rt.decode_event, rt.decode_layout_values, rt.Unmodelled)
+    except Exception:  # noqa: BLE001 - no Rust runtime built: the Python stays
+        return
+    from hydralysis._seams import Seam, guarded
+    module = sys.modules[__name__]
+    seam = Seam((module, "scalar"), (module, "_unpack"), (module, "SCALARS"), (struct, "unpack_from"))
+    unmodelled = rt.Unmodelled
+
+    def routed(rust_function, python_function):
+        def call(*args):
+            try:
+                return rust_function(*args)
+            except unmodelled:
+                return python_function(*args)
+        return guarded(call, python_function, seam)
+
+    def decode_bytes(spec, data):
+        return rt.decode_value(spec, bytes(data))
+
+    def layout_bytes(fields, data):
+        return rt.decode_layout_values(fields, bytes(data))
+
+    module.normalize = routed(rt.decode_normalize, _normalize_py)
+    module.decode = routed(decode_bytes, _decode_py)
+    module.decode_event = routed(rt.decode_event, _decode_event_py)
+    module.layout_values = routed(layout_bytes, _layout_values_py)
+
+
+_install_rust()

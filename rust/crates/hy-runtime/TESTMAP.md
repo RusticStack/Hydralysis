@@ -49,6 +49,23 @@ removed. Counts are `def test_` per file.
 | tools/watch_conformance.py | drives the Python worker | port with the client |
 | sealed mailbox / HMAC IPC, event-log hash chain, TRACE-1 canonical JSON | storage/IPC lanes (hy-store) | hy-store crates |
 
+## Live scenarios on the Rust device (`tests/test_rust_runtime_live.py`, `r/hy-rt2`)
+
+The claims below were only tested on the Frida stand-in (it wins the device selection in the MCP suites). They now run against
+`hy-fixture.exe` (new modes `patched FILE` and `env FILE`; `info` also prints `SPARE`/`SPAREBYTES`).
+
+| Claim | Frida stand-in test | Rust-device test |
+| --- | --- | --- |
+| a live detour is reported with file bytes and patcher | `test_mcp_runtime.PatchedFunctionOverMCP.test_live_patch_is_reported...` | `Agent.test_a_live_detour_is_reported...`, `MCP.test_live_patch_is_reported_over_mcp` |
+| probe past a detour only with `accept_patch` and the original prologue | `PatchedFunctionOverMCP.test_probe_past_a_detour...` | `Agent.test_a_probe_past_a_detour_needs...`, `Agent.test_the_probe_past_a_detour_fires_through_it`, `MCP.test_probe_past_a_detour_only_with_accept_patch_over_mcp` |
+| cwd and env of a spawned session, worker-only variables restored | `RuntimeOverMCP.test_spawn_session_lifecycle_honours_cwd_and_env` | `Agent.test_spawn_honours_cwd_and_env...`, `Agent.test_spawn_without_cwd...`, `MCP.test_spawn_honours_cwd_and_env` |
+| the second harness reads, cannot drive, detach or attach | `TwoHarnessesOneGame.test_the_second_harness_reads...` | `MCP.test_the_second_harness_reads_but_cannot_drive_or_attach` |
+| captured arguments decoded (values, names, registers, unreadable pointers) | `test_runtime_decode` (decoder only) | `Agent.test_captured_arguments_are_decoded_in_the_worker`, `Agent.test_an_unreadable_pointer...` |
+| sample window of a numeric capture | (none) | `Agent.test_a_numeric_capture_is_sampled_over_a_window`, `Agent.test_the_sample_option_is_validated` |
+
+The `MCP` class starts the real stdio server with `HYDRALYSIS_IMPL=rust` and a `frida` directory that is not a stand-in, so the worker
+takes the Rust device. Differential tests of the two ported leaves: `tests/test_rust_parity_runtime.py`.
+
 ## Stage 4: the PyO3 surface (`HYDRALYSIS_IMPL=rust`)
 
 `hy-py` builds `hydralysis_rt` (a PyO3 module over `Session`); `src/hydralysis/rust_frida.py` answers the Frida-shaped calls the
