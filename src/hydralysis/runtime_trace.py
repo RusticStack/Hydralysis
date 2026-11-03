@@ -75,6 +75,24 @@ def _hooking(value) -> str:
     return value
 
 
+def prologue_detour(patterns: list[list[int]], actual: list[int]) -> int | None:
+    """The offset where an existing `jmp rel32` detour left a declared prologue tail intact, or None.
+
+    Another instrumenter (Frida, a mod loader) overwrites whole instructions with a 5-byte jmp and pads the rest;
+    the instructions after the overwritten span stay at their original offsets. A pattern tail of at least six
+    bytes, wildcards allowed, proves the site is still the verified function. Returns the offset, used only to say
+    that the probe must be armed through Interceptor instead of patching over the other instrumenter's jump.
+    """
+    if not actual or actual[0] != 0xE9:
+        return None
+    for pattern in patterns:
+        for offset in range(5, min(12, len(pattern) - 6) + 1):
+            tail = pattern[offset:]
+            if len(tail) >= 6 and all(byte < 0 or byte == actual[offset + i] for i, byte in enumerate(tail)):
+                return offset
+    return None
+
+
 class TraceMixin:
     def init_trace(self) -> None:
         self.trace: TraceSource | None = None
@@ -135,17 +153,37 @@ class TraceMixin:
             raise TraceRefused("%s: no site (an export or a module RVA inside the module)" % name)
         address = hex(int(module["base"], 16) + rva)
         size = int(spec.get("expect_len", 8))
-        if spec.get("expect"):
-            from hydralysis.runtime_agents import _expect
-            expected = _expect(str(spec["expect"]))
+        from hydralysis.runtime_agents import _expect, _expect_pattern
+        if spec.get("expects"):
+            patterns = [_expect_pattern(str(text)) for text in spec["expects"]]
+        elif spec.get("expect"):
+            patterns = [_expect(str(spec["expect"]))]
         else:
-            expected = list(self._w().file_bytes(module["path"], rva, size, int(module["base"], 16)))
-        actual = list(self.control.exports_sync.read(address, len(expected)))
-        if actual != expected:
+            patterns = [list(self._w().file_bytes(module["path"], rva, size, int(module["base"], 16)))]
+        size = max(len(pattern) for pattern in patterns)
+        expected = patterns[0]
+        actual = list(self.control.exports_sync.read(address, size))
+
+        def _prologue_matches(pattern):
+            return len(pattern) <= len(actual) and all(byte < 0 or byte == actual[i] for i, byte in enumerate(pattern))
+
+        matched = next((pattern for pattern in patterns if _prologue_matches(pattern)), None)
+        detour = None
+        if matched is None:
+            # Another instrumenter may already have detoured the function with a 5-byte jmp. Frida relocates
+            # whole instructions and pads the rest, so the untouched tail of the prologue stays at its original
+            # offset. Accept that (the image hash already proved the build) and arm through Interceptor, never by
+            # patching over the other instrumenter's jump.
+            detour = prologue_detour(patterns, actual)
+            if detour is not None:
+                matched = patterns[0]
+        if matched is None:
             patch = self._patcher(int(address, 16))
             raise TraceRefused("%s: PROLOGUE MISMATCH; hook refused: got %s%s" % (
                 name, " ".join("%02X" % b for b in actual),
                 "; live detour %s by %s" % (patch["jump"], patch["patcher_module"] or "no module") if patch else ""))
+        if detour is not None:
+            expected = list(actual)       # the recorder re-checks the bytes the detour left in place
         call = self._w()._call_in_span(module["path"], rva)
         if call:
             raise TraceRefused("%s: the bytes the hook overwrites hold a call (%s)" % (name, call))
@@ -166,10 +204,13 @@ class TraceMixin:
         if spec.get("event") and kind not in ("open", "ioctl", "devquery", "close"):
             kind = "event"
         return {"id": site_id, "name": name, "kind": kind, "module": module["path"],
-                "module_name": module["name"], "base": module["base"], "rva": rva, "expect": expected, "nargs": nargs,
+                "module_name": module["name"], "base": module["base"], "rva": rva, "expect": expected,
+                "expects": [expected] if detour is not None else patterns,
+                "nargs": nargs,
                 "with_leave": bool(spec.get("with_leave")) or any(f["source"] == "ret" for f in fields), "buf": buf,
                 "va": int(address, 16), "module_sha256": module["file_sha256"], "payload": bool(spec.get("payload")),
                 "stack": stack, "event": spec.get("event"), "hook": spec.get("hook"), "fields": fields, "const": dict(spec.get("const") or {}),
+                "detour": detour, "force_interceptor": detour is not None,
                 "buf_arg": buf["ptr_arg"] if buf else None}
 
     def _loaded_name(self, name: str) -> str:
@@ -286,7 +327,7 @@ class TraceMixin:
                                  max_payload=max(1, max_payload or 256), **self._shared_scope(args))
         self.trace_info = {"script_id": script_id, "refusals": refusals, "probes": [{k: p[k] for k in ("id", "name", "kind", "module_name", "rva", "module_sha256")} for p in probes]}
         self._trace_ready.clear()
-        parameters = {"probes": [{k: p[k] for k in ("id", "name", "kind", "module", "base", "rva", "expect", "nargs", "with_leave", "buf", "stack")} for p in probes],
+        parameters = {"probes": [{k: p[k] for k in ("id", "name", "kind", "module", "base", "rva", "expect", "expects", "nargs", "with_leave", "buf", "stack", "force_interceptor")} for p in probes],
                       "rings": rings, "ring_bytes": ring_bytes, "batch_ms": int(args.get("batch_ms", BATCH_MS)),
                       "counter_ms": int(args.get("counter_ms", 250)), "batch_bytes": int(args.get("batch_bytes", 1 << 20)),
                       "bp_us": int(float(args.get("bp_ms", BACKPRESSURE_MS)) * 1000), "window": int(args.get("window", ACK_WINDOW)),
@@ -302,10 +343,14 @@ class TraceMixin:
             raise
         for item in refusals:
             self.trace.refuse("probe:" + str(item["probe"]), item["reason"], item["limitation"])
+        detoured = [p["name"] for p in probes if p.get("detour") is not None]
+        if detoured:
+            self.trace.refuse("prologue-detour", "another instrumenter detoured %s; those probes are armed through Interceptor, "
+                               "not by patching over its jump" % ", ".join(detoured), "detour:prologue")
         try:
             self._record_lifetimes()
         except Exception as exc:     # the facts are a convenience for the ingester; the capture itself does not depend on them
-            self.trace.errors.append("lifetimes: %r" % exc)
+            self.trace.refuse("lifetimes", str(exc), "lifetimes-unavailable")
         self.trace_info["etw"] = None
         if args.get("etw"):
             self._start_etw(args["etw"])
@@ -316,6 +361,7 @@ class TraceMixin:
         ready = self.trace_info.get("ready") or {}
         return {"started": True, "script_id": script_id, "probes": ready.get("installed"), "refusals": refusals,
                 "fault_context": ready.get("context"), "fault_policy": policy, "segment": str(self.trace.path),
+                "segment_id": self.trace.segment_id,
                 "scope": {"name": self.trace.scope, "key_id": self.trace.key_id}, "producer_gen": gen,
                 "overhead_note": "install pauses per probe are in `probes[].install_ms`"}
 
@@ -385,7 +431,9 @@ class TraceMixin:
             try:
                 self._record_lifetimes(late=True)
             except Exception as exc:
-                trace.errors.append("lifetimes at stop: %r" % exc)
+                # The target may have exited before this convenience query (the script is gone). That is a
+                # coverage limitation, not a probe fault, so `fault_free` stays about the probes.
+                trace.refuse("lifetimes-at-stop", str(exc), "lifetimes-unavailable")
         entry = self.scripts.get(script_id)
         detach = {"quiescent": True, "note": "the recorder was already gone"}
         if entry is not None:

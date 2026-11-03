@@ -35,6 +35,7 @@ def probe_specs(profile, verification: dict) -> list[dict]:
         spec = {"name": hook["id"], "hook": hook["id"], "event": hook["event"], "module": hook["module"],
                 "rva": hex(site), "sha256": row["image_sha256"], "expect_len": max(8, min(64, longest)),
                 "nargs": hook["nargs"], "with_leave": hook["with_leave"], "stack": hook["stack"], "required": hook["required"],
+                "expects": [str(text) for text in hook["prologue"]],
                 "fields": [dict(field) for field in hook["fields"]], "const": dict(hook.get("const") or {})}
         if hook["buf"]:
             buf = hook["buf"]

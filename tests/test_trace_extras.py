@@ -61,7 +61,10 @@ class Watchdog(unittest.TestCase):
     def test_captures_every_thread_without_stopping_the_target(self):
         from hydralysis import trace_watchdog as wd
         code = "import threading,time\nfor _ in range(3): threading.Thread(target=time.sleep,args=(30,),daemon=True).start()\ntime.sleep(30)"
-        p = subprocess.Popen([sys.executable, "-c", code])
+        # A venv's Scripts/python.exe may be a launcher that runs the real interpreter as a child; the
+        # launcher has two threads, so watch the base interpreter (same PID as the target) instead.
+        python = getattr(sys, "_base_executable", sys.executable)
+        p = subprocess.Popen([python, "-c", code])
         try:
             time.sleep(1.0)
             r = wd.capture_stacks(p.pid)

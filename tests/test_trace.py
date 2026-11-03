@@ -276,20 +276,26 @@ prologue = "{prologue}"
 
             def call(self, action, args=None):
                 calls.append((action, dict(args or {})))
-                return {"session": "r" * 32} if action in ("spawn", "attach") else {"ok": True, "action": action}
+                if action in ("spawn", "attach"):
+                    return {"session": "r" * 32, "owner": "runtime-token"}
+                return {"ok": True, "action": action}
 
         engine = FakeEngine({"trace_open": {"session": "s1", "lease": {"cap": "tok"}}, "trace_close": {"closed": True, "revision": 77}})
         with patch("hydralysis.runtime.RuntimeRunner", Runner):
             started, _ = run("start", "s1", {"launch": {"action": "spawn", "path": "C:/x/app.exe"}}, engine=engine)
             self.assertEqual(started["runtime"]["session"], "r" * 32)
-            self.assertEqual([c[0] for c in calls], ["spawn", "capture"])
+            self.assertEqual([c[0] for c in calls], ["spawn", "capture", "resume"])
             self.assertEqual(calls[0][1], {"path": "C:/x/app.exe"})
             self.assertEqual(calls[1][1]["op"], "start")
             self.assertEqual(calls[1][1]["trace"]["session"], "s1")
-            self.assertEqual(calls[1][1]["trace"]["owner"], "tok")
+            # the capture's owner is the runtime session's token (what capture stop|scope checks), not the trace cap
+            self.assertEqual(calls[1][1]["trace"]["owner"], "runtime-token")
+            self.assertEqual(calls[2][1], {"session": "r" * 32, "owner": "runtime-token"})
             stopped, _ = run("stop", "s1", {}, engine=engine)
-        self.assertEqual([c[0] for c in calls], ["spawn", "capture", "capture", "detach"])
-        self.assertEqual(calls[2][1], {"op": "stop", "session": "r" * 32, "owner": "tok"})
+        self.assertEqual([c[0] for c in calls], ["spawn", "capture", "resume", "capture", "detach"])
+        stop_call = next(c[1] for c in calls if c[0] == "capture" and c[1].get("op") == "stop")
+        self.assertEqual(stop_call, {"op": "stop", "session": "r" * 32, "owner": "runtime-token", "timeout_s": 60})
+        self.assertEqual(calls[4][1], {"session": "r" * 32, "owner": "runtime-token"})
         self.assertEqual(engine.commands(), ["trace_open", "trace_close"])
         self.assertEqual(engine.calls[1][1]["cap"], "tok")
         self.assertEqual(stopped["closed"]["revision"], 77)

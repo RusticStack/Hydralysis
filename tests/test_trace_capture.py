@@ -66,6 +66,28 @@ class Policy(unittest.TestCase):
         self.assertIn("not one of", tc.check_probe_policy("whatever", {}))
 
 
+class PrologueAlternatives(unittest.TestCase):
+    def test_wildcards_are_parsed_only_for_profile_alternatives(self):
+        from hydralysis.runtime_agents import _expect, _expect_pattern
+        self.assertEqual(_expect_pattern("E9 ?? ?? 0F 1F 00"), [0xE9, -1, -1, 0x0F, 0x1F, 0])
+        for bad in ("E9 ??", "E9 ZZ", "E9", "E9 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"):
+            with self.assertRaises(ValueError):
+                _expect_pattern(bad)
+        with self.assertRaises(ValueError):
+            _expect("E9 ??")
+
+    def test_a_live_detour_is_accepted_only_with_an_intact_tail(self):
+        from hydralysis.runtime_trace import prologue_detour
+        image = [int(x, 16) for x in "8B 54 24 04 81 FA 04 03 00 00 7D 17 8B 41 0C 8B".split()]
+        live = [int(x, 16) for x in "E9 2F 71 0C 01 0F 1F 44 00 00 7D 17 8B 41 0C 8B".split()]
+        self.assertEqual(prologue_detour([image], live), 8)
+        self.assertIsNone(prologue_detour([image], [0x90] + live[1:]))       # not a jmp detour
+        wrong = list(live)
+        wrong[-1] = 0x00                                                    # the tail is not the verified prologue
+        self.assertIsNone(prologue_detour([image], wrong))
+        self.assertIsNone(prologue_detour([image], image))                  # the image form is the caller's match
+
+
 class Sampling(unittest.TestCase):
     """The declared sampling policy: validated, and every hit it skips is cited exactly once, never silently."""
 
@@ -318,7 +340,10 @@ class Recorder(unittest.TestCase):
                     pass
 
     def target(self, mode="loop", n=100):
-        p = subprocess.Popen([sys.executable, str(self.script), mode, str(n)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        # A venv's Scripts/python.exe may be a launcher that runs the real interpreter as a child;
+        # the launcher has none of the target's work, so attach to the base interpreter instead.
+        python = getattr(sys, "_base_executable", sys.executable)
+        p = subprocess.Popen([python, str(self.script), mode, str(n)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         self.procs.append(p)
         self.assertEqual(p.stdout.readline().strip(), "ready")
         return p

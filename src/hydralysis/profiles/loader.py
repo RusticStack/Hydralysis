@@ -36,7 +36,7 @@ BASELINE = Path(__file__).with_name("baseline_fixtures.toml")
 
 _ID = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _PROFILE_ID = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}/[0-9]{1,6}$")
-_KIND = re.compile(r"^(?!core\.)[a-z][a-z0-9_]{0,31}\.[a-z][a-z0-9_]{0,63}(?:\.[a-z][a-z0-9_]{0,63}){0,3}$")
+_KIND = re.compile(r"^(?!core\.)[a-z][a-z0-9_]{0,31}\.[a-z][a-z0-9_]{0,63}$")   # the wire spec: <profile>.<name>, exactly two parts
 _SHA = re.compile(r"^[0-9a-f]{64}$")
 _MODULE = re.compile(r"^[A-Za-z0-9_.+ -]{1,128}$")
 _FIELD = re.compile(r"^[a-z][a-z0-9_]{0,63}$")

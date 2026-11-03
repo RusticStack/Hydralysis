@@ -157,6 +157,24 @@ prologue = "55"
             profiles.load_text("[[[")
         self.assertEqual(caught.exception.code, "profile_unreadable")
 
+    def test_a_profile_kind_is_exactly_namespace_dot_name(self):
+        # The wire spec accepts `<profile>.<name>` and nothing deeper; the engine refuses a three-part kind at
+        # ingest, so the loader must refuse it before a capture is ever armed.
+        text = """
+[profile]
+id = "x/1"
+[target]
+bitness = 64
+modules = ["a.exe"]
+fixtures_only = true
+[[event_kinds]]
+name = "game.script.action"
+extends = "core.marker"
+"""
+        with self.assertRaises(ProfileError) as caught:
+            profiles.load_text(text)
+        self.assertTrue(any("event_kinds[0].name" in error for error in caught.exception.errors), caught.exception.errors)
+
 
 class Codecs(unittest.TestCase):
     def codec(self, vectors):

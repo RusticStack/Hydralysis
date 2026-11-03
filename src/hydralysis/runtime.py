@@ -274,6 +274,10 @@ class RuntimeRunner:
             raise PermissionError("runtime session %s is owned by %s (%s) since %s; other clients may use status, modules, "
                                   "threads, read and patches; driving it needs options.owner, the token its spawn/attach returned"
                                   % (session_id, owner.get("client"), owner.get("harness"), owner.get("since")))
+        # The worker checks the same token again for capture stop/scope; the runtime gate consumed it, so put it back
+        # (it is never written to a capture record or log).
+        if action == "capture" and str(args.get("op") or "") in CAPTURE_OWNER_OPS and token:
+            args["owner"] = token
         if action == "read" and "type" in args:
             args.update(self._layout(args))
         if action == "writers":

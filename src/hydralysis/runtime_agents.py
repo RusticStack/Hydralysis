@@ -60,6 +60,21 @@ def _expect(text: str) -> list[int]:
         raise ValueError("runtime probe requires 5..64 exact expected bytes; wildcards cannot validate a live hook")
     return [int(word, 16) for word in words]
 
+def _expect_pattern(text: str) -> list[int]:
+    """A profile prologue alternative: exact hex bytes, or ?? for a wildcard (-1)."""
+    words = str(text).split()
+    if not 5 <= len(words) <= 64:
+        raise ValueError("a prologue alternative needs 5..64 bytes")
+    out = []
+    for word in words:
+        if word in ("??", "?"):
+            out.append(-1)
+        elif re.fullmatch("[0-9A-Fa-f]{2}", word):
+            out.append(int(word, 16))
+        else:
+            raise ValueError("prologue byte %r is not hex or ??" % (word,))
+    return out
+
 
 def _probe_source(module: dict, rva: int, expected: list[int], hook_id: str, limit: int, pause: bool,
                   captures: list | None = None, sample: dict | None = None, convention: str = "native",
@@ -77,8 +92,9 @@ const site=all[0].base.add(p.rva);
 // A hook named by export: the module's own export table must agree with the file's (checked before this).
 if(p.export!==null){let found=null;try{found=all[0].getExportByName(p.export);}catch(e){}
  if(found===null||!found.equals(site))throw new Error('EXPORT MISMATCH; probe refused');}
-const got=readExact(site,p.expect.length);
-if(got.some((b,i)=>b!==p.expect[i]))throw new Error('PROLOGUE MISMATCH; probe refused');
+const pats=p.expects||[p.expect];
+const got=readExact(site,Math.max(...pats.map(a=>a.length)));
+if(!pats.some(pat=>pat.length<=got.length&&pat.every((b,i)=>b<0||b===got[i])))throw new Error('PROLOGUE MISMATCH; probe refused');
 let hits=0,seen=0;
 // Bounded copies of what arguments point to; every read is checked against a readable range.
 function readable(q,n){const r=Process.findRangeByAddress(q);return r!==null&&r.protection.indexOf('r')>=0&&q.add(n).compare(r.base.add(r.size))<=0;}
@@ -156,16 +172,23 @@ TRACE_C = r"""
 #include <gum/guminterceptor.h>
 #include <string.h>
 
-extern int QueryPerformanceCounter(gint64 *);
-extern int ReadProcessMemory(void *, const void *, void *, gsize, gsize *);
-extern void *FlsGetValue(guint);
-extern int FlsSetValue(guint, void *);
-extern int TlsSetValue(guint, void *);
-extern guint GetLastError(void);
-extern guint GetCurrentThreadId(void);
-extern int SwitchToThread(void);
+#if defined(__i386__) || defined(_M_IX86)
+#define HYDRA_STDCALL __attribute__((stdcall))
+#else
+#define HYDRA_STDCALL
+#endif
+extern int HYDRA_STDCALL QueryPerformanceCounter(gint64 *);
+extern int HYDRA_STDCALL ReadProcessMemory(void *, const void *, void *, gsize, gsize *);
+extern void * HYDRA_STDCALL FlsGetValue(guint);
+extern int HYDRA_STDCALL FlsSetValue(guint, void *);
+extern int HYDRA_STDCALL TlsSetValue(guint, void *);
+extern guint HYDRA_STDCALL GetLastError(void);
+extern guint HYDRA_STDCALL GetCurrentThreadId(void);
+extern int HYDRA_STDCALL SwitchToThread(void);
+#if defined(__x86_64__) || defined(_M_X64)
 extern void *RtlLookupFunctionEntry(guint64, guint64 *, void *);
 extern void *RtlVirtualUnwind(guint, guint64, guint64, void *, void *, void **, guint64 *, void *);
+#endif
 
 #define MAX_RINGS 128
 #define BUFMAX 256
@@ -234,8 +257,13 @@ guint site_size(void) { return sizeof(Site); }
 guint ring_size(void) { return sizeof(Ring); }
 
 static inline guint64 rdtsc_(void) { guint32 lo, hi; __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi)); return ((guint64)hi << 32) | lo; }
-/* gs:[0x1480 + 8 * i] is TEB.TlsSlots[i]: the thread's own pointer without a call (valid for the first 64 TLS indexes). */
+/* gs:[0x1480 + 8 * i] is TEB.TlsSlots[i]: the thread's own pointer without a call (valid for the first 64 TLS indexes).
+   32-bit targets have fs: and 4-byte slots; they take the FlsGetValue fallback instead. */
+#if defined(__x86_64__) || defined(_M_X64)
 static inline void *tls_slot_(guint i) { guint64 v; __asm__ __volatile__("movq %%gs:0x1480(,%1,8), %0" : "=r"(v) : "r"((guint64)i)); return (void *)v; }
+#else
+static inline void *tls_slot_(guint i) { (void)i; return 0; }
+#endif
 /* CPUID 0x80000007 EDX bit 8: the TSC ticks at one rate whatever the core does, and is kept in step across cores. */
 static guint invariant_tsc_(void) {
   guint32 a = 0x80000000u, b, c = 0, d;
@@ -255,7 +283,7 @@ static void recalibrate(Shared *sh) {
   if (t - sh->tsc0 > 3000000u && (guint64)q > sh->qpc0) sh->ratio = (double)(gint64)((guint64)q - sh->qpc0) / (double)(gint64)(t - sh->tsc0);
 }
 
-void trace_init(Shared *sh, guint8 *mem, guint count, guint bytes, guint fls, guint64 bp_ticks, guint8 *walk_mem, gint tls, guint nsites) {
+void trace_init(Shared *sh, guint8 *mem, guint count, guint bytes, guint fls, guint32 bp_ticks, guint8 *walk_mem, gint tls, guint nsites) {
   guint i;
   gint64 q0, q1;
   guint64 t0, t1;
@@ -349,6 +377,14 @@ static void read_buf(Site *s, Inv *inv, Ring *r) {
   inv->buflen = (guint32)got;
 }
 
+#if defined(__i386__) || defined(_M_IX86)
+/* 32-bit targets: the x64 .pdata unwinder does not exist. Return the observed call site; callstack_limitation says so. */
+static guint walk(GumInvocationContext *ic, Shared *sh, Ring *ring, guint64 *out, guint depth) {
+  (void)sh; (void)ring; (void)depth;
+  out[0] = (guint64)(gsize)gum_invocation_context_get_return_address(ic);
+  return 1;
+}
+#else
 /* The caller chain by the OS unwind tables (.pdata), never by guessing and never by touching memory that might not be
    there: the stack above the hooked function is copied with ReadProcessMemory on this process (the kernel refuses an
    unreadable range with an error code, it does not fault), RtlVirtualUnwind runs against the copy, and the registers it
@@ -392,6 +428,8 @@ static guint walk(GumInvocationContext *ic, Shared *sh, Ring *ring, guint64 *out
   }
   return n;
 }
+
+#endif
 
 /* Room for `total` bytes in the ring, or -1. The slow half of a write: a full ring makes the hit wait for the drain for a
    bounded time (bp_ticks; 0 means never wait), then the record is dropped, counted, and the ring sheds until the drain
@@ -538,6 +576,7 @@ void on_enter(GumInvocationContext *ic) {
   c->hits++;
   if (c->next) { c->next--; r->busy--; return; }       /* skipped by the sampling policy: counted, nothing else */
   c->next = s->mask; c->kept++;
+#if defined(__x86_64__) || defined(_M_X64)
   if (s->fast) {
     GumCpuContext *cpu = ic->cpu_context;
     guint64 fr[18];
@@ -546,6 +585,7 @@ void on_enter(GumInvocationContext *ic) {
     emit_fast(r, s, sh, *(guint64 *)(gsize)cpu->rsp, fr);
     r->busy--; return;
   }
+#endif
   inv->buflen = 0; inv->bflags = 0; inv->buf_addr = 0; inv->nstack = 0;
   for (i = 0; i < s->nargs; i++) inv->args[i] = (guint64)(gsize)gum_invocation_context_get_nth_argument(ic, i);
   inv->ret_addr = (guint64)(gsize)gum_invocation_context_get_return_address(ic);
@@ -650,7 +690,8 @@ const P=PARAMETERS;
 const k32=Process.getModuleByName('kernel32.dll'),ntdll=Process.getModuleByName('ntdll.dll');
 const x=(m,n)=>m.getExportByName(n);
 const qpcFn=x(k32,'QueryPerformanceCounter');
-const qpcNative=new NativeFunction(qpcFn,'int',['pointer']);
+const ABI=Process.pointerSize===4?'stdcall':'default';
+const qpcNative=new NativeFunction(qpcFn,'int',['pointer'],ABI);
 const scratch=Memory.alloc(64);
 function qpcNow(){qpcNative(scratch);return scratch.readU64();}
 // ---- non-faulting reads (attach time): a validated readable range, then readVolatile; null on any failure ----------
@@ -664,7 +705,7 @@ function where(a){if(a===null)return null;const m=Process.findModuleByAddress(a)
 // ---- the host's fault policy as it stands at attach (spec 15.1) -----------------------------------------------------
 function faultContext(){
   const ctx={debugger_present:Process.isDebuggerAttached(),veh:[],veh_error:null,uef:null,uef_error:null,frida_handler_index:null};
-  try{const isdbg=new NativeFunction(x(k32,'IsDebuggerPresent'),'int',[]);ctx.is_debugger_present_api=isdbg()!==0;}catch(e){ctx.is_debugger_present_api=null;}
+  try{const isdbg=new NativeFunction(x(k32,'IsDebuggerPresent'),'int',[],ABI);ctx.is_debugger_present_api=isdbg()!==0;}catch(e){ctx.is_debugger_present_api=null;}
   if(Process.pointerSize===8){try{
     const add=new NativeFunction(x(ntdll,'RtlAddVectoredExceptionHandler'),'pointer',['uint','pointer']);
     const rem=new NativeFunction(x(ntdll,'RtlRemoveVectoredExceptionHandler'),'uint',['pointer']);
@@ -686,7 +727,7 @@ function faultContext(){
     const fi=ctx.veh.findIndex(v=>v&&v.module&&/frida/i.test(v.module));
     ctx.frida_handler_index=fi<0?null:fi;
   }catch(e){ctx.veh_error=String(e);}}
-  try{const set=new NativeFunction(x(k32,'SetUnhandledExceptionFilter'),'pointer',['pointer']);
+  try{const set=new NativeFunction(x(k32,'SetUnhandledExceptionFilter'),'pointer',['pointer'],ABI);
     const prev=set(ptr(0));set(prev);ctx.uef=prev.isNull()?null:where(prev);}catch(e){ctx.uef_error=String(e);}
   return ctx;
 }
@@ -699,24 +740,26 @@ for(const pr of P.probes){
   const hit=mods.filter(m=>m.path===pr.module);
   if(hit.length!==1||hit[0].base.toString()!==pr.base)throw new Error('module mapping changed before probe installation: '+pr.name);
   const site=hit[0].base.add(pr.rva);
-  const got=readExact(site,pr.expect.length);
-  if(got.some((b,i)=>b!==pr.expect[i]))throw new Error('PROLOGUE MISMATCH; probe refused: '+pr.name);
+  const pats=pr.expects||[pr.expect];
+  const got=readExact(site,Math.max(...pats.map(a=>a.length)));
+  if(!pats.some(pat=>pat.length<=got.length&&pat.every((b,i)=>b<0||b===got[i])))throw new Error('PROLOGUE MISMATCH; probe refused: '+pr.name);
   verified.push({probe:pr,site});
 }
 // ---- the native recorder ------------------------------------------------------------------------------------------------
-const freqFn=new NativeFunction(x(k32,'QueryPerformanceFrequency'),'int',['pointer']);freqFn(scratch);
+const freqFn=new NativeFunction(x(k32,'QueryPerformanceFrequency'),'int',['pointer'],ABI);freqFn(scratch);
 const qpcFreq=scratch.readU64();
-const cm=new CModule(P.c_source,{QueryPerformanceCounter:qpcFn,ReadProcessMemory:x(k32,'ReadProcessMemory'),
+const imports={QueryPerformanceCounter:qpcFn,ReadProcessMemory:x(k32,'ReadProcessMemory'),
   FlsGetValue:x(k32,'FlsGetValue'),FlsSetValue:x(k32,'FlsSetValue'),TlsSetValue:x(k32,'TlsSetValue'),GetLastError:x(k32,'GetLastError'),
-  GetCurrentThreadId:x(k32,'GetCurrentThreadId'),SwitchToThread:x(k32,'SwitchToThread'),
-  RtlLookupFunctionEntry:x(ntdll,'RtlLookupFunctionEntry'),RtlVirtualUnwind:x(ntdll,'RtlVirtualUnwind')});
-const flsAlloc=new NativeFunction(x(k32,'FlsAlloc'),'uint',['pointer']);
-const flsFree=new NativeFunction(x(k32,'FlsFree'),'int',['uint']);
+  GetCurrentThreadId:x(k32,'GetCurrentThreadId'),SwitchToThread:x(k32,'SwitchToThread')};
+if(Process.pointerSize===8){imports.RtlLookupFunctionEntry=x(ntdll,'RtlLookupFunctionEntry');imports.RtlVirtualUnwind=x(ntdll,'RtlVirtualUnwind');}
+const cm=new CModule(P.c_source,imports);
+const flsAlloc=new NativeFunction(x(k32,'FlsAlloc'),'uint',['pointer'],ABI);
+const flsFree=new NativeFunction(x(k32,'FlsFree'),'int',['uint'],ABI);
 const fls=flsAlloc(cm.exit_cb);
 // The hot path finds its thread's ring through the TEB's TLS slot (no call); that needs an index below 64.
-const tlsAlloc=new NativeFunction(x(k32,'TlsAlloc'),'uint',[]),tlsFree=new NativeFunction(x(k32,'TlsFree'),'int',['uint']);
+const tlsAlloc=new NativeFunction(x(k32,'TlsAlloc'),'uint',[],ABI),tlsFree=new NativeFunction(x(k32,'TlsFree'),'int',['uint'],ABI);
 let tls=tlsAlloc();if(tls>=64){tlsFree(tls);tls=-1;}
-const f={init:new NativeFunction(cm.trace_init,'void',['pointer','pointer','uint','uint','uint','uint64','pointer','int','uint']),
+const f={init:new NativeFunction(cm.trace_init,'void',['pointer','pointer','uint','uint','uint','uint','pointer','int','uint']),
   set_mask:new NativeFunction(cm.set_mask,'void',['pointer','uint']),site_stats:new NativeFunction(cm.site_stats,'void',['pointer','pointer']),
   shared_size:new NativeFunction(cm.shared_size,'uint',[]),site_size:new NativeFunction(cm.site_size,'uint',[]),
   site_init:new NativeFunction(cm.site_init,'void',['pointer','pointer','uint','uint','uint','int','int','uint','uint','uint']),
@@ -822,7 +865,7 @@ const counterTimer=setInterval(()=>counterMessage(false),P.counter_ms);
 // replaced bytes, a prologue shorter than 5 bytes, no room for a stub within +-2 GB, or a refused page. The stubs live in
 // pages that are never freed, and release() points them at a bare `ret` first, so a thread that is inside a stub when the
 // recorder is torn down returns into the target's code, not into freed memory.
-const kVirtualAlloc=new NativeFunction(x(k32,'VirtualAlloc'),'pointer',['pointer','size_t','uint','uint']);
+const kVirtualAlloc=new NativeFunction(x(k32,'VirtualAlloc'),'pointer',['pointer','size_t','uint','uint'],ABI);
 const stubPages=[],inlineSites=[];
 function reach(a,b){return a.compare(b)>0?a.sub(b):b.sub(a);}
 function stubPage(site){
@@ -935,9 +978,10 @@ for(const v of verified){const pr=v.probe,t0=Date.now(),b=pr.buf;
   f.site_init(s,shared,pr.id,pr.nargs,flags,b?b.ptr_arg:-1,b&&b.len_arg!==null&&b.len_arg!==undefined?b.len_arg:-1,b&&b.fixed?b.fixed:0,b?b.max:0,pr.stack||1);
   sites.push({id:pr.id,name:pr.name,ptr:s,exact:strideFor(pr.id,pr.name)===1});
   let how='interceptor',why=null;
-  if(P.hooking!=='interceptor'&&!pr.with_leave&&!b&&(pr.stack||1)<=1){
+  if(!pr.force_interceptor&&P.hooking!=='interceptor'&&!pr.with_leave&&!b&&(pr.stack||1)<=1){
     const r=inlineHook(v.site,s,pr.id);if(r.ok)how='inline';else why=r.why;}
-  else if(P.hooking!=='interceptor')why=pr.with_leave?'return value needed':(b?'buffer read needed':'stack walk needed');
+  else if(!pr.force_interceptor&&P.hooking!=='interceptor')why=pr.with_leave?'return value needed':(b?'buffer read needed':'stack walk needed');
+  else if(pr.force_interceptor)why='another instrumenter detoured the site';
   if(how==='interceptor')listeners.push(Interceptor.attach(v.site,pr.with_leave?{onEnter:cm.on_enter,onLeave:cm.on_leave}:{onEnter:cm.on_enter},s));
   installed.push({id:pr.id,name:pr.name,address:v.site.toString(),install_ms:Date.now()-t0,hook:how,inline_refused:why});}
 // Modules loaded and unloaded while recording: a reload at another base is a new instance (TRACE-1 section 7). The

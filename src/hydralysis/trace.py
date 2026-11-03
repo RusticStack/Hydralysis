@@ -64,6 +64,8 @@ _LIST_KEYS = ("rows", "groups", "nodes", "edges", "boundaries", "results", "sess
 _NESTED = ("diff", "aligned", "symbols", "decoded")   # reply members that hold lists of their own
 _TOKENS: dict[str, str] = {}      # session -> the writer capability (`cap`) this process was given by trace_open
 _LINKS: dict[str, str] = {}       # trace session -> the runtime session capturing into it
+_OWNERS: dict[str, str] = {}      # trace session -> the runtime owner token that spawned/attached the target
+_PUMPS: dict[str, object] = {}    # trace session -> the live Pump tailing the runtime segment into the engine
 
 # TRACE-1 section 15: the wire codes are hyphenated; evidence stores the same code with underscores.
 LIMITATIONS = {code: evidence.LIMITATIONS[code.replace("-", "_")][1] for code in (
@@ -519,14 +521,17 @@ TRACE_CAPTURE_KEYS = ("ring_bytes", "rings", "batch_ms", "batch_bytes", "counter
                       "authorize_preview", "builtin", "watchdog", "etw", "fault_policy", "producer_gen", "scope", "scope_key", "sampling", "hooking")
 
 
-def _trace_option(session: str, profile, verification, capture_options: dict) -> dict:
+def _trace_option(session: str, profile, verification, capture_options: dict, owner: str | None = None) -> dict:
     """The `trace` object of `capture start`: which trace session the capture feeds, the owner's lease, the enabled hook ids
-    and, resolved from the verified profile, the probes to arm. Recorder settings the caller gives are passed through."""
+    and, resolved from the verified profile, the probes to arm. Recorder settings the caller gives are passed through.
+
+    `owner` is the runtime session's own owner token (returned by spawn/attach), which is what `capture stop|scope`
+    checks; it is not the trace writer capability."""
     from hydralysis import profiles
     unknown = set(capture_options) - set(TRACE_CAPTURE_KEYS)
     if unknown:
         raise ValueError("unknown options.capture_options: %s; accepted: %s" % (", ".join(sorted(unknown)), ", ".join(TRACE_CAPTURE_KEYS)))
-    option = {"session": session, "owner": _TOKENS.get(session), "hooks": list((verification or {}).get("enabled", []))}
+    option = {"session": session, "owner": owner or _TOKENS.get(session), "hooks": list((verification or {}).get("enabled", []))}
     if profile is not None and verification is not None:
         option["probes"] = profiles.probe_specs(profile, verification)
         enabled = [h for h in profile.data["hooks"] if h["id"] in option["hooks"]]
@@ -611,9 +616,27 @@ def _start(client: TraceClient, session: str | None, options: dict, settings: di
         try:
             started = runner.call(action, {key: value for key, value in launch.items() if key != "action"})
             runtime_session = str(started.get("session") or "")
+            owner = str(started.get("owner") or "")
+            if owner:
+                _OWNERS[name] = owner
             capture = runner.call("capture", {"op": "start", "session": runtime_session,
                                               "trace": _trace_option(name, profile, verification,
-                                                                     _object(options.get("capture_options"), "options.capture_options"))})
+                                                                     _object(options.get("capture_options"), "options.capture_options"),
+                                                                     owner),
+                                              "timeout_s": 60})
+            # The target is spawned paused so probes can be armed; resume it now that capture is running.
+            resumed = runner.call("resume", {"session": runtime_session, "owner": owner}) if action == "spawn" else None
+            # The capture writes its own chained segment; a pump is the one writer that tails that segment into the
+            # engine session, so `status`/`query` see live events while the target runs.
+            trace_reply = capture.get("trace") or {}
+            segment, segment_id = trace_reply.get("segment"), trace_reply.get("segment_id")
+            if segment and segment_id and _TOKENS.get(name):
+                try:
+                    from hydralysis import trace_pump
+                    pump_client = TraceClient(_engine(settings))
+                    _PUMPS[name] = trace_pump.Pump(pump_client, name, _TOKENS[name], Path(segment), str(segment_id)).start()
+                except Exception as exc:  # noqa: BLE001 - the capture is still valid; offline import can recover it
+                    result["pump_error"] = "%s: %s" % (type(exc).__name__, exc)
         except Exception as exc:  # noqa: BLE001 - the session was opened; close it so no orphan keeps a writer lease
             try:
                 client.close(name, cap=_TOKENS.pop(name, None))
@@ -621,23 +644,52 @@ def _start(client: TraceClient, session: str | None, options: dict, settings: di
                 pass
             raise
         _LINKS[name] = runtime_session
-        result.update(runtime={"session": runtime_session, "started": started, "capture": capture})
+        result.update(runtime={"session": runtime_session, "started": started, "capture": capture, "resumed": resumed})
     return result
 
 
 def _stop(client: TraceClient, session: str, options: dict, settings: dict) -> dict:
     result = {"session": session}
+    errors: list[str] = []
     runtime_session = str(options.get("runtime_session") or _LINKS.get(session) or "")
     if runtime_session:
         from hydralysis.runtime import RuntimeRunner
         runner = RuntimeRunner(settings)
-        result["runtime"] = {"session": runtime_session, "capture": runner.call(
-            "capture", {"op": "stop", "session": runtime_session, "owner": options.get("cap") or _TOKENS.get(session)})}
+        owner = str(options.get("runtime_owner") or _OWNERS.get(session) or "")
+        result["runtime"] = {"session": runtime_session}
+        try:
+            result["runtime"]["capture"] = runner.call(
+                "capture", {"op": "stop", "session": runtime_session, "owner": owner, "timeout_s": 60})
+        except Exception as exc:  # noqa: BLE001 - the target may have already exited; the segment is still ours
+            result["runtime"]["capture"] = {"error": str(exc)}
+            errors.append("capture stop: %s" % exc)
+        finally:
+            # The capture must finish writing before the pump's last drain; if the stop itself failed we still
+            # drain what exists and never leave the pump thread behind.
+            pump = _PUMPS.pop(session, None)
+            if pump is not None:
+                try:
+                    result["pump"] = pump.stop()
+                except Exception as exc:  # noqa: BLE001
+                    result["pump"] = {"error": str(exc)}
+                    errors.append("pump stop: %s" % exc)
         if options.get("detach", True):
-            result["runtime"]["detach"] = runner.call("detach", {"session": runtime_session})
-    result["closed"] = client.close(session, cap=options.get("cap") or _TOKENS.get(session))
-    _TOKENS.pop(session, None)
-    _LINKS.pop(session, None)
+            try:
+                result["runtime"]["detach"] = runner.call("detach", {"session": runtime_session, "owner": owner})
+            except Exception as exc:  # noqa: BLE001 - a target that exited has nothing left to detach
+                result["runtime"]["detach"] = {"error": str(exc)}
+                errors.append("detach: %s" % exc)
+    try:
+        result["closed"] = client.close(session, cap=options.get("cap") or _TOKENS.get(session))
+    except Exception as exc:  # noqa: BLE001 - report, but never leave the lease bookkeeping behind
+        result["closed"] = {"error": str(exc)}
+        errors.append("close: %s" % exc)
+    finally:
+        _TOKENS.pop(session, None)
+        _LINKS.pop(session, None)
+        _OWNERS.pop(session, None)
+    if errors:
+        result["errors"] = errors
     return result
 
 
