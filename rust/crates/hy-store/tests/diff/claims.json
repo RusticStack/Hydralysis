@@ -1,0 +1,14 @@
+[
+  {"game": "cp", "build": "2.31", "kind": "function", "name": "ForceMoveTo", "note": "moves the vehicle", "source": "decompile line 12", "address": "rva:0x1a5f14", "subsystem": "vehicles"},
+  {"game": "cp", "build": "2.5", "kind": "function", "name": "ForceMoveTo", "note": "moves the vehicle", "source": "decompile line 40", "address": "rva:0x2e3270", "subsystem": "vehicles", "supersedes": 1,
+   "coverage": {"status": "partial", "limitations": ["static_only", "indirect_calls_unresolved"]}},
+  {"game": "cp", "build": "2.5", "kind": "probe", "name": "hit count", "note": "three hits in the fixture", "source": "runtime observe", "address": "rva:0x2e3270", "subsystem": "vehicles",
+   "authority": "controlled-replay", "confidence": "observed", "from_capture": "cap_one", "coverage": {"status": "complete"}, "parameters": {"script_sha256": "abababababababababababababababababababababababababababababababab", "z": [3, 1, {"b": null, "a": true}]},
+   "limitations": ["fixture_only"], "provenance": {"view": "v", "sequence": 3, "generation": 2}},
+  {"game": "cp", "build": "2.5", "kind": "field", "name": "unicode é✓ 😀", "note": "line one\nline | two", "source": "s", "address": "a|b", "subsystem": "ui",
+   "subject_sha256": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd", "limitations": ["z9:custom", "single_run"], "coverage": {"status": "partial", "limitations": ["sampled"], "diagnostics": ["d1"]}},
+  {"game": "cp", "build": "2.5", "kind": "trace", "name": "traced", "note": "read from a trace", "source": "trace", "address": "rva:0x10", "subsystem": "trace",
+   "from_trace": {"session": "s1", "events": ["e2", "e1"], "revision": 5, "interpretation": 2}, "coverage": {"status": "unknown", "reason": "no gaps recorded"}},
+  {"game": "cp", "build": "2.5", "kind": "trace", "name": "unpinned", "note": "cites a session with no pin", "source": "trace", "address": "rva:0x20", "subsystem": "trace",
+   "from_trace": {"session": "s2", "events": ["e9"], "revision": 1}}
+]

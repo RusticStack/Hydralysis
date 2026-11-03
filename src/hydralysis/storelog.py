@@ -342,3 +342,11 @@ def save(path, record: dict, *, max_bytes: int | None, too_large: str | None) ->
             _upkeep_failed(path, "compaction", error)
             with _GUARD:
                 _CACHE.pop(current["key"], None)
+
+
+if os.environ.get("HYDRALYSIS_IMPL") == "rust":  # the Rust implementation (rust/crates/hy-store) behind the same surface
+    import sys as _sys
+
+    from hydralysis import _rust_store
+
+    _rust_store.install_storelog(_sys.modules[__name__])

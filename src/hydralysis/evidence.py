@@ -895,3 +895,12 @@ def export(path: Path, out: Path, game: str = "", subsystem: str = "") -> dict:
         for row in rows:
             handle.write(json.dumps(row) + "\n")
     return {"markdown": str(out), "jsonl": str(jsonl), "current": len(current), "superseded": len(old)}
+
+
+import os as _os
+import sys as _sys
+
+if _os.environ.get("HYDRALYSIS_IMPL") == "rust":  # the Rust implementation (rust/crates/hy-store) behind the same surface
+    from hydralysis import _rust_evidence
+
+    _rust_evidence.install_evidence(_sys.modules[__name__])

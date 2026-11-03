@@ -485,3 +485,13 @@ def status(settings: dict, target: dict) -> dict:
     if problems:
         report["tampered"] = problems
     return report
+
+
+import os as _os  # noqa: E402
+
+if _os.environ.get("HYDRALYSIS_IMPL") == "rust":  # the Rust implementation (rust/crates/hy-store) behind the same surface
+    import sys as _sys
+
+    from hydralysis import _rust_lineage
+
+    _rust_lineage.install_lineage(_sys.modules[__name__])
