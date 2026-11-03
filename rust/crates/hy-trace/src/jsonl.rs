@@ -6,7 +6,7 @@
 //! again from the top. A clean file is by far the common case and the one that is large.
 
 use crate::Result;
-use crate::canon::canonical_bytes;
+use crate::canon::check;
 use crate::schema::Schema;
 use serde_json::Value;
 
@@ -22,28 +22,56 @@ fn blank(line: &[u8]) -> bool {
     line.iter().all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c))
 }
 
-/// The events of DATA when the file is clean, else `None`. DATA is not blank (the Python answers `empty` for that first) and
-/// has at most MAX_EVENTS events.
-pub fn read_clean(data: &[u8], max_events: usize, schema: &Schema) -> Result<Option<Clean>> {
-    let mut lines: Vec<&[u8]> = data.split(|&b| b == b'\n').collect();
-    if data.last() == Some(&b'\n') {
-        lines.pop();
-    }
-    let mut events = Vec::new();
-    for raw in &lines {
+/// How [`read_clean_with`] stopped early.
+#[derive(Debug)]
+pub enum Visit<E> {
+    /// The schema check could not be made.
+    Schema(crate::Error),
+    /// The caller's sink refused an event.
+    Sink(E),
+}
+
+/// Offer each event of DATA to SINK while the file is clean; the number of lines (`len(lines)` of the Python) when it was, else
+/// `None` (the caller then discards what the sink took). DATA is not blank (the Python answers `empty` for that first) and
+/// has at most MAX_EVENTS events. Events are handed over one at a time so the caller never holds them all as parsed values.
+pub fn read_clean_with<E>(
+    data: &[u8],
+    max_events: usize,
+    schema: &Schema,
+    mut sink: impl FnMut(Value) -> std::result::Result<(), E>,
+) -> std::result::Result<Option<usize>, Visit<E>> {
+    let body = data.strip_suffix(b"\n").unwrap_or(data);
+    let (mut lines, mut taken) = (0usize, 0usize);
+    for raw in body.split(|&b| b == b'\n') {
+        lines += 1;
         if blank(raw) {
             continue;
         }
         let Ok(event) = serde_json::from_slice::<Value>(raw) else { return Ok(None) };
-        if !event.is_object() || !schema.accepts(&event)? || canonical_bytes(&event).is_err() {
+        if !event.is_object() || !schema.accepts(&event).map_err(Visit::Schema)? || check(&event).is_err() {
             return Ok(None);
         }
-        if events.len() >= max_events {
+        if taken >= max_events {
             return Ok(None);
         }
-        events.push(event);
+        taken += 1;
+        sink(event).map_err(Visit::Sink)?;
     }
-    Ok(Some(Clean { events, lines: lines.len() }))
+    Ok(Some(lines))
+}
+
+/// The events of DATA when the file is clean, else `None`; see [`read_clean_with`].
+pub fn read_clean(data: &[u8], max_events: usize, schema: &Schema) -> Result<Option<Clean>> {
+    let mut events = Vec::new();
+    let lines = read_clean_with(data, max_events, schema, |event| {
+        events.push(event);
+        Ok::<(), std::convert::Infallible>(())
+    });
+    match lines {
+        Ok(lines) => Ok(lines.map(|lines| Clean { events, lines })),
+        Err(Visit::Schema(error)) => Err(error),
+        Err(Visit::Sink(never)) => match never {},
+    }
 }
 
 #[cfg(test)]

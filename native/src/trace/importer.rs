@@ -31,7 +31,8 @@ impl NativeSchema {
 }
 
 /// `(events, lines)` of a clean JSONL file, or None when the Python reader must take it (any damage, any line it would
-/// word a reason for, an over-the-bound file).
+/// word a reason for, an over-the-bound file). Each event becomes Python objects as soon as it is checked, so the parsed
+/// values are never held all at once.
 #[pyfunction]
 fn trace_read_jsonl<'py>(
     py: Python<'py>,
@@ -41,18 +42,19 @@ fn trace_read_jsonl<'py>(
 ) -> PyResult<Option<Bound<'py, PyTuple>>> {
     let bytes = data.as_bytes();
     let schema = &schema.get().inner;
-    let clean = py
-        .detach(|| jsonl::read_clean(bytes, max_events, schema))
-        .map_err(map_error)?;
-    let Some(clean) = clean else { return Ok(None) };
     let events = PyList::empty(py);
-    for event in &clean.events {
-        events.append(from_value(py, event)?)?;
+    let read = jsonl::read_clean_with(bytes, max_events, schema, |event| {
+        events.append(from_value(py, &event)?)
+    });
+    match read {
+        Ok(Some(lines)) => Ok(Some(PyTuple::new(
+            py,
+            [events.into_any(), lines.into_pyobject(py)?.into_any()],
+        )?)),
+        Ok(None) => Ok(None),
+        Err(jsonl::Visit::Schema(error)) => Err(map_error(error)),
+        Err(jsonl::Visit::Sink(error)) => Err(error),
     }
-    Ok(Some(PyTuple::new(
-        py,
-        [events.into_any(), clean.lines.into_pyobject(py)?.into_any()],
-    )?))
 }
 
 /// `trace.shape(reply, session=..., command=..., limit=..., requested_revision=...)` for a reply of plain JSON values.

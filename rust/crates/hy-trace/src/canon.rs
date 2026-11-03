@@ -86,6 +86,16 @@ fn write_value(value: &Value, out: &mut String) -> Result<(), NotCanonical> {
     Ok(())
 }
 
+/// Whether VALUE has a canonical form (`canonical_bytes` would succeed), without writing it.
+pub fn check(value: &Value) -> Result<(), NotCanonical> {
+    match value {
+        Value::Number(number) if !number.is_i64() && !number.is_u64() => Err(NotCanonical::Float),
+        Value::Array(items) => items.iter().try_for_each(check),
+        Value::Object(map) => map.values().try_for_each(check),
+        _ => Ok(()),
+    }
+}
+
 /// The canonical text of VALUE (ASCII).
 pub fn canonical_text(value: &Value) -> Result<String, NotCanonical> {
     let mut out = String::new();
@@ -120,6 +130,13 @@ mod tests {
         assert_eq!(canonical_text(&json!([i64::MIN, u64::MAX, 0])).unwrap(), "[-9223372036854775808,18446744073709551615,0]");
         assert_eq!(canonical_text(&json!(1.5)), Err(NotCanonical::Float));
         assert_eq!(canonical_text(&json!({"a": [1.0]})), Err(NotCanonical::Float));
+    }
+
+    #[test]
+    fn check_agrees_with_the_writer() {
+        for value in [json!(1), json!([1.5]), json!({"a": {"b": [u64::MAX, -1]}}), json!({"a": [{"b": 2.0}]}), json!("x"), json!(null)] {
+            assert_eq!(check(&value).is_ok(), canonical_text(&value).is_ok(), "{value}");
+        }
     }
 
     #[test]

@@ -21,7 +21,17 @@ def native():
     return module if hasattr(module, "TraceFallback") else None
 
 
+# Ported, tested against the Python and exposed by the extension, but not routed unless asked for: measured no faster than the
+# Python (the report builders and `shape` spend their time moving Python objects across, not in the logic; see
+# rust/crates/hy-trace/PORTING.md). HYDRALYSIS_TRACE_HELD=1 routes them anyway; the parity tests do.
+HELD_BACK = ("reports_", "trace_shape")
+
+
 def function(name: str):
-    """The native function NAME, or None (routing off, or this build of the extension lacks it)."""
+    """The native function NAME, or None (routing off, held back, or this build of the extension lacks it)."""
     module = native()
-    return getattr(module, name, None) if module is not None else None
+    if module is None:
+        return None
+    if name.startswith(HELD_BACK) and os.environ.get("HYDRALYSIS_TRACE_HELD") != "1":
+        return None
+    return getattr(module, name, None)

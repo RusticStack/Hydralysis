@@ -156,7 +156,8 @@ class Algorithm:
         self.spec = dict(spec) if spec else None
         self._fast = None
         module = trace_native.native()
-        if module is not None and self.spec is not None:
+        # (The plain CRC-32 stays on `zlib.crc32`, which is C already and beats a call across the extension boundary.)
+        if module is not None and self.spec is not None and self.spec.get("codec") != "crc32":
             try:
                 self._fast = module.HashFn(self.native_spec())
             except (module.TraceFallback, OverflowError):

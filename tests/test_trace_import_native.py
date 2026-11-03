@@ -21,15 +21,18 @@ from hydralysis import trace, trace_native, trace_schema
 
 @contextlib.contextmanager
 def impl(value):
-    saved = os.environ.get("HYDRALYSIS_IMPL")
+    """HYDRALYSIS_IMPL=VALUE, with the held-back functions (reports, shape) routed so that the Rust code is what runs."""
+    saved = {key: os.environ.get(key) for key in ("HYDRALYSIS_IMPL", "HYDRALYSIS_TRACE_HELD")}
     os.environ["HYDRALYSIS_IMPL"] = value
+    os.environ["HYDRALYSIS_TRACE_HELD"] = "1"
     try:
         yield
     finally:
-        if saved is None:
-            os.environ.pop("HYDRALYSIS_IMPL", None)
-        else:
-            os.environ["HYDRALYSIS_IMPL"] = saved
+        for key, was in saved.items():
+            if was is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = was
 
 
 def have_native():
