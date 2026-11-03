@@ -245,6 +245,44 @@ class Surface(unittest.TestCase):
                 tick()
         self.fail("the target did not exit")
 
+    def test_sampling_calls_from_several_threads_never_deadlock_on_the_gil(self):
+        """`sampling_tick` / `sampling_report` / `configure_sampling` take the sampler mutex, then the session mutex. They must
+        do so with the GIL released: a thread that holds the sampler guard while it waits to get the GIL back would deadlock
+        with one that holds the GIL and waits for the guard (the whole interpreter stops; `faulthandler` ends the run)."""
+        import faulthandler
+        import threading
+        s, out = self.start("write")
+        _wait_for(out, "BASE=")
+        s.configure_sampling("adaptive", 1000.0, 1, 5, [])
+        stop = threading.Event()
+        errors = []
+
+        def hammer(call):
+            while not stop.is_set():
+                try:
+                    call()
+                except Exception as exc:            # noqa: BLE001 - reported below
+                    errors.append(repr(exc))
+                    return
+
+        calls = [s.sampling_tick, s.sampling_tick, s.sampling_report, s.counters,
+                 lambda: s.configure_sampling("adaptive", 1000.0, 1, 5, [])]
+        threads = [threading.Thread(target=hammer, args=(c,), daemon=True) for c in calls]
+        faulthandler.dump_traceback_later(40, exit=True)
+        try:
+            for t in threads:
+                t.start()
+            end = time.monotonic() + 3.0
+            while time.monotonic() < end:
+                time.sleep(0.01)
+            stop.set()
+            for t in threads:
+                t.join(10)
+        finally:
+            faulthandler.cancel_dump_traceback_later()
+        self.assertEqual(errors, [])
+        self.assertFalse(any(t.is_alive() for t in threads))
+
     def test_cas_write_and_undo_and_refusals(self):
         s, out = self.start("write")
         text = _wait_for(out, "BASE=")

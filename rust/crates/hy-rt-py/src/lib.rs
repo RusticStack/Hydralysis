@@ -95,6 +95,26 @@ impl RtSession {
         }
     }
 
+    /// The body of `sampling_report`, run with the GIL released (it holds the sampler mutex across the session call).
+    fn sampling_report_locked(&self) -> PyResult<SamplingReport> {
+        let g = self.sampler.lock().map_err(|_| PyRuntimeError::new_err("sampler lock poisoned"))?;
+        let c = self.with_locked(|s| Ok(s.counters()))?;
+        let (changes, effective) = g.as_ref().map_or((0, 0.0), |x| (x.changes, x.effective));
+        let rows = c
+            .sites
+            .iter()
+            .enumerate()
+            .map(|(i, x)| {
+                let (skipped, stride, rate) = match g.as_ref() {
+                    Some(y) if i < usize::from(OBSERVE_BASE) => (y.reported_skipped(i, x.hits, x.kept), y.stride(i), y.rate(i)),
+                    _ => (0, 1, 0.0),
+                };
+                (i, x.hits, x.kept, skipped, stride, rate)
+            })
+            .collect();
+        Ok((changes, effective, rows))
+    }
+
     fn wrap(s: Session) -> RtSession {
         RtSession {
             pid: s.pid,
@@ -368,7 +388,15 @@ impl RtSession {
     /// Choose the sampling policy: `mode` is "adaptive", "exact" or "fixed" (with `stride`); `exact_sites` are site
     /// indexes never thinned.
     #[pyo3(signature = (mode, rate_budget, stride, interval_ms, exact_sites=Vec::new()))]
-    fn configure_sampling(&self, mode: &str, rate_budget: f64, stride: u32, interval_ms: u64, exact_sites: Vec<usize>) -> PyResult<()> {
+    fn configure_sampling(
+        &self,
+        py: Python<'_>,
+        mode: &str,
+        rate_budget: f64,
+        stride: u32,
+        interval_ms: u64,
+        exact_sites: Vec<usize>,
+    ) -> PyResult<()> {
         let mode = match mode {
             "adaptive" => Mode::Adaptive,
             "exact" => Mode::Exact,
@@ -383,43 +411,36 @@ impl RtSession {
             interval: Duration::from_millis(interval_ms.max(1)),
             exact_sites: exact_sites.into_iter().collect::<HashSet<_>>(),
         };
-        *self.sampler.lock().map_err(|_| PyRuntimeError::new_err("sampler lock poisoned"))? =
-            Some(Sampler::new(policy, usize::from(OBSERVE_BASE)));
-        Ok(())
+        // Every std lock is taken with the GIL released (see `locked_sampler`).
+        py.detach(|| {
+            *self.sampler.lock().map_err(|_| PyRuntimeError::new_err("sampler lock poisoned"))? =
+                Some(Sampler::new(policy, usize::from(OBSERVE_BASE)));
+            Ok(())
+        })
     }
 
     /// One step of the sampling policy (a no-op until configured). New strides are applied to the agent's sites.
+    ///
+    /// The sampler mutex is held across the session call, so the whole step runs with the GIL released: a guard held
+    /// while this thread waits to take the GIL back would deadlock against any thread that holds the GIL and waits for
+    /// that mutex (`configure_sampling`, `sampling_report`). Lock order is sampler, then session, everywhere.
     fn sampling_tick(&self, py: Python<'_>) -> PyResult<()> {
-        let mut g = self.sampler.lock().map_err(|_| PyRuntimeError::new_err("sampler lock poisoned"))?;
-        let Some(sampler) = g.as_mut() else {
-            return Ok(());
-        };
-        self.with(py, |s| {
-            s.sampling_tick(sampler);
-            Ok(())
-        })?;
-        Ok(())
+        py.detach(|| {
+            let mut g = self.sampler.lock().map_err(|_| PyRuntimeError::new_err("sampler lock poisoned"))?;
+            let Some(sampler) = g.as_mut() else {
+                return Ok(());
+            };
+            self.with_locked(|s| {
+                s.sampling_tick(sampler);
+                Ok(())
+            })
+        })
     }
 
     /// `(policy_changes, effective_budget, [(site, hits, kept, skipped, stride, rate_per_s)])` for every site slot (the
     /// caller picks the armed ones). Sites from `OBSERVE_BASE` up are not the sampler's: stride 1, rate 0.
     fn sampling_report(&self, py: Python<'_>) -> PyResult<SamplingReport> {
-        let g = self.sampler.lock().map_err(|_| PyRuntimeError::new_err("sampler lock poisoned"))?;
-        let c = self.with(py, |s| Ok(s.counters()))?;
-        let (changes, effective) = g.as_ref().map_or((0, 0.0), |x| (x.changes, x.effective));
-        let rows = c
-            .sites
-            .iter()
-            .enumerate()
-            .map(|(i, x)| {
-                let (skipped, stride, rate) = match g.as_ref() {
-                    Some(y) if i < usize::from(OBSERVE_BASE) => (y.reported_skipped(i, x.hits, x.kept), y.stride(i), y.rate(i)),
-                    _ => (0, 1, 0.0),
-                };
-                (i, x.hits, x.kept, skipped, stride, rate)
-            })
-            .collect();
-        Ok((changes, effective, rows))
+        py.detach(|| self.sampling_report_locked())
     }
 
     /// Cumulative counters, per-site `(hits, kept)` and per-ring rows.
