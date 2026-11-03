@@ -1554,7 +1554,9 @@ impl SegmentEncoder {
     }
 }
 
+mod hashes;
 mod keys;
+mod port;
 mod pump;
 mod segment;
 
@@ -1567,5 +1569,8 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(keyed_id, module)?)?;
     module.add_function(wrap_pyfunction!(decode_batch, module)?)?;
     module.add_class::<SegmentEncoder>()?;
+    module.add("TraceFallback", module.py().get_type::<port::TraceFallback>())?;
+    module.add("TraceHashError", module.py().get_type::<port::TraceHashError>())?;
+    hashes::register(module)?;
     Ok(())
 }

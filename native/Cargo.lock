@@ -342,6 +342,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "hy-trace"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "memchr",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "windows-sys",
+]
+
+[[package]]
 name = "hy-views"
 version = "0.1.0"
 dependencies = [
@@ -369,6 +381,7 @@ dependencies = [
  "crc32fast",
  "hmac",
  "hy-query",
+ "hy-trace",
  "hy-views",
  "hydra-client",
  "itoa",

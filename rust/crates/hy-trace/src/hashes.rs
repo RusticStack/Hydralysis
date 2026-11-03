@@ -506,8 +506,13 @@ impl Dictionary {
 
     /// `interpretation`: a trace interpretation revision naming hashed ids. Raw values are kept; nothing is rewritten.
     pub fn interpretation(&mut self, algorithm: &str, values: &[u64], parent: Option<&str>) -> Result<Interpretation> {
-        let slot = self.algorithm_slot(algorithm)?;
-        let rows: Vec<Resolution> = values.iter().map(|&v| self.resolution(slot, v)).collect();
+        // (an unknown algorithm is only an error once there is a value to resolve, as in Python)
+        let rows: Vec<Resolution> = if values.is_empty() {
+            Vec::new()
+        } else {
+            let slot = self.algorithm_slot(algorithm)?;
+            values.iter().map(|&v| self.resolution(slot, v)).collect()
+        };
         let dictionary_sha256 = self.digest();
         let mut text = String::new();
         text.push_str("{\"algorithm\":");
