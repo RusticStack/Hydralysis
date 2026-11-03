@@ -1560,6 +1560,7 @@ mod port;
 mod pump;
 mod reports;
 mod segment;
+mod watchdog;
 
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<pump::TracePump>()?;
@@ -1574,5 +1575,6 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("TraceHashError", module.py().get_type::<port::TraceHashError>())?;
     hashes::register(module)?;
     reports::register(module)?;
+    watchdog::register(module)?;
     Ok(())
 }

@@ -32,13 +32,13 @@ impl Handle {
     fn open_process(pid: u32) -> Option<Self> {
         // SAFETY: OpenProcess has no preconditions; a null return is the failure case.
         let handle = unsafe { OpenProcess(PROCESS_ACCESS, 0, pid) };
-        (!handle.is_null()).then_some(Self(handle))
+        (!handle.is_null()).then(|| Self(handle))
     }
 
     fn open_thread(tid: u32) -> Option<Self> {
         // SAFETY: as above.
         let handle = unsafe { OpenThread(THREAD_ACCESS, 0, tid) };
-        (!handle.is_null()).then_some(Self(handle))
+        (!handle.is_null()).then(|| Self(handle))
     }
 }
 
