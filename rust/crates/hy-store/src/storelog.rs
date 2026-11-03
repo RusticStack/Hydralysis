@@ -59,7 +59,7 @@ fn rows(path: &Path) -> Result<Vec<Value>> {
     if !target.is_file() {
         return Ok(Vec::new());
     }
-    let scan = appendlog::scan_file(&target, 0, true);
+    let scan = appendlog::scan_file(&target, 0, true)?;
     if let Some(corrupt) = scan.corrupt {
         return Err(Error::store_corrupt(path, &target, vec![(file_name(&target), format!("log corrupt at byte {}", corrupt.offset))]));
     }
@@ -418,7 +418,7 @@ fn trim(path: &Path, keep_from: Option<&str>) -> Result<()> {
     }
     let log = AppendLog::new(&target);
     let _guard = lock::lock(&log.lock_path, log.lock_timeout_s, &format!("log {}", file_name(&target)))?;
-    let scan = appendlog::scan_file(&target, 0, true);
+    let scan = appendlog::scan_file(&target, 0, true)?;
     if scan.corrupt.is_some() {
         return Ok(()); // leave it for review; readers report it
     }

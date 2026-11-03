@@ -98,6 +98,24 @@ fn remove_refuses_generation_zero_the_head_the_revert_target_and_a_live_views_ba
 }
 
 #[test]
+fn an_unreadable_base_marker_blocks_removal_instead_of_unprotecting_its_generation() {
+    let w = World::with_lineage();
+    let folder = lineage::generation_dir(&w.settings, &w.lid, 4).unwrap();
+    fs::create_dir_all(&folder).unwrap();
+    let base = PathBuf::from(w.settings["root"].as_str().unwrap()).join("bases").join("origin").join("key");
+    for damaged in [&b""[..], b"{not json", b"\x00\xff\xfe"] {
+        write(&base.join("COMPLETE.json"), damaged);
+        let error = backups::protected_generations(&w.settings, &w.lid).unwrap_err();
+        assert!(error.to_string().contains("cannot prove"), "{error}");
+        assert!(backups::remove(&w.settings, &w.lid, &json!({"generation": 4, "confirm": true})).is_err());
+        assert!(folder.exists(), "the generation folder must survive an unprovable protection check");
+    }
+    // a base folder with no marker yet (unfinished) protects nothing and does not block
+    fs::remove_file(base.join("COMPLETE.json")).unwrap();
+    assert!(!backups::protected_generations(&w.settings, &w.lid).unwrap().contains_key(&4));
+}
+
+#[test]
 fn the_revert_chain_stays_protected_after_a_revert_and_a_rolled_back_generation_is_removable() {
     let w = World::with_lineage();
     publish_three(&w);

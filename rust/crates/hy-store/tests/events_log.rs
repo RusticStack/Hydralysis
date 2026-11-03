@@ -91,7 +91,7 @@ fn a_clean_log_verifies_and_ends_at_the_loggers_head() {
 fn the_log_is_the_durable_frame_format() {
     let c = case();
     logged(&c, 3);
-    let scanned = scan_file(&c.dir.join(LOG_NAME), 0, true);
+    let scanned = scan_file(&c.dir.join(LOG_NAME), 0, true).unwrap();
     assert_eq!(scanned.records.iter().map(|r| r["n"].as_i64().unwrap()).collect::<Vec<_>>(), [1, 2, 3]);
     assert!(scanned.corrupt.is_none());
 }

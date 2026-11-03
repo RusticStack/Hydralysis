@@ -252,7 +252,7 @@ fn snapshot(root: &Path, base: &Path) -> Value {
     mask(&mut log, &roots);
     let mut intents = Map::new();
     for cid in intent_cids(&s, L).unwrap() {
-        let mut rows = json!(intent_log(&s, L, &cid).unwrap().scan().records);
+        let mut rows = json!(intent_log(&s, L, &cid).unwrap().scan().unwrap().records);
         mask(&mut rows, &roots);
         intents.insert(cid, rows);
     }

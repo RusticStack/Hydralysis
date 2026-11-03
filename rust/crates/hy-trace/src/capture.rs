@@ -1,7 +1,8 @@
 //! Frame-stall capture from a separate process (Windows x64), ported from `hydralysis.trace_watchdog.capture_stacks`.
 //!
-//! Each thread of the target is suspended for the few microseconds it takes to read its registers, its stack is walked with
-//! [`Unwinder`] and it is resumed. Only `OpenProcess`, `OpenThread`, `SuspendThread`, `GetThreadContext` and
+//! Each thread of the target is suspended while its registers are read and its stack is walked with [`Unwinder`] (the
+//! stack must not change under the walk), and it is resumed by a drop guard, so even a panic in the walk cannot leave it
+//! suspended. Only `OpenProcess`, `OpenThread`, `SuspendThread`, `GetThreadContext` and
 //! `ReadProcessMemory` are used: nothing is written into the target and it needs no cooperation, which is the point (a stalled
 //! frame loop cannot run an in-process recorder). All `unsafe` in this crate is in this file and is the FFI to those calls.
 
@@ -46,6 +47,31 @@ impl Drop for Handle {
     fn drop(&mut self) {
         // SAFETY: the handle is owned by this value and closed once.
         unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// A `CONTEXT` that is really 16-byte aligned: `GetThreadContext` fails with `ERROR_NOACCESS` (998) on a misaligned one,
+/// and the plain type's alignment is not guaranteed to be 16 in the bindings (a capture then failed or worked by luck of
+/// the stack layout).
+#[repr(C, align(16))]
+struct AlignedContext(CONTEXT);
+
+/// A thread this code suspended; dropping it resumes the thread (also while unwinding from a panic).
+struct Suspended<'a>(&'a Handle);
+
+impl<'a> Suspended<'a> {
+    /// Suspend `thread`; the previous suspend count (above 0: somebody else had suspended it) or `None` on failure.
+    fn new(thread: &'a Handle) -> Option<(Self, u32)> {
+        // SAFETY: the handle is a thread handle with suspend rights.
+        let before = unsafe { SuspendThread(thread.0) };
+        (before != u32::MAX).then_some((Self(thread), before))
+    }
+}
+
+impl Drop for Suspended<'_> {
+    fn drop(&mut self) {
+        // SAFETY: resumes the thread suspended in `new`.
+        unsafe { ResumeThread(self.0.0) };
     }
 }
 
@@ -148,7 +174,8 @@ pub enum Capture {
     Captured { pid: u32, threads: Vec<ThreadCapture>, modules: usize },
 }
 
-/// All thread stacks of PID. Each thread is suspended only for the register read. PID must not be the calling process (the
+/// All thread stacks of PID. Each thread is suspended while its registers are read and its stack walked, and resumed
+/// before the next one (by a drop guard). PID must not be the calling process (the
 /// calling thread would suspend itself). A malformed unwind table raises
 /// [`Malformed`] (the original's `IndexError`), after the thread in hand has been resumed.
 pub fn capture_stacks(pid: u32, depth: usize, scan_bytes: usize) -> Result<Capture, Malformed> {
@@ -163,17 +190,17 @@ pub fn capture_stacks(pid: u32, depth: usize, scan_bytes: usize) -> Result<Captu
             threads.push(ThreadCapture::Unreadable { tid, reason: format!("OpenThread failed ({})", last_error()) });
             continue;
         };
-        // SAFETY: CONTEXT is plain data (16-byte aligned by its type); the flags select the control and integer registers.
-        let mut context: CONTEXT = unsafe { std::mem::zeroed() };
+        // SAFETY: CONTEXT is plain data (all-zero is valid); the flags select the control and integer registers.
+        let mut aligned: AlignedContext = unsafe { std::mem::zeroed() };
+        let context = &mut aligned.0;
         context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
-        // SAFETY: the handle is a thread handle with suspend rights.
-        let before = unsafe { SuspendThread(thread.0) }; // the previous suspend count: above 0, somebody else suspended it
-        if before == u32::MAX {
+        // `before` is the previous suspend count: above 0, somebody else suspended it.
+        let Some((suspended, before)) = Suspended::new(&thread) else {
             threads.push(ThreadCapture::Unreadable { tid, reason: "SuspendThread failed".to_owned() });
             continue;
-        }
+        };
         // SAFETY: CONTEXT is valid for writes and the thread is suspended.
-        let ok = unsafe { GetThreadContext(thread.0, &mut context) } != 0;
+        let ok = unsafe { GetThreadContext(thread.0, context) } != 0;
         let walked = if ok {
             let regs: Regs = [
                 context.Rax,
@@ -197,8 +224,8 @@ pub fn capture_stacks(pid: u32, depth: usize, scan_bytes: usize) -> Result<Captu
         } else {
             Ok(Vec::new())
         };
-        // SAFETY: resumes the thread suspended above, also when the walk failed.
-        unsafe { ResumeThread(thread.0) };
+        // Resumed here, also when the walk failed (and by the guard if it had panicked).
+        drop(suspended);
         threads.push(ThreadCapture::Read { tid, captured: ok, frames: walked?, suspended_before: before });
     }
     Ok(Capture::Captured { pid, threads, modules: modules.len() })
@@ -219,6 +246,52 @@ mod tests {
         let first = &modules[0];
         assert!(process.read(first.base, 2).is_some_and(|head| head == b"MZ"));
         assert!(process.read(0, 8).is_none(), "the null page is unreadable");
+    }
+
+    #[test]
+    fn the_guard_resumes_a_suspended_thread_on_drop_and_on_panic() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, mpsc};
+        let ticks = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = mpsc::channel();
+        let worker = {
+            let ticks = Arc::clone(&ticks);
+            std::thread::spawn(move || {
+                // SAFETY: no preconditions.
+                tx.send(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }).unwrap();
+                while ticks.load(Ordering::Relaxed) < u64::MAX - 1 {
+                    if ticks.fetch_add(1, Ordering::Relaxed) > 5_000_000_000 {
+                        break;
+                    }
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let tid = rx.recv().unwrap();
+        let handle = Handle::open_thread(tid).expect("opens the worker");
+        let settle = || std::thread::sleep(std::time::Duration::from_millis(150));
+        for panic_while_held in [false, true] {
+            let (guard, before) = Suspended::new(&handle).expect("suspends");
+            assert_eq!(before, 0);
+            settle();
+            let frozen = ticks.load(Ordering::Relaxed);
+            settle();
+            assert_eq!(ticks.load(Ordering::Relaxed), frozen, "a suspended thread makes no progress");
+            if panic_while_held {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                    let _held = guard;
+                    panic!("the walk panicked");
+                }));
+                assert!(result.is_err());
+            } else {
+                drop(guard);
+            }
+            let resumed = ticks.load(Ordering::Relaxed);
+            settle();
+            assert!(ticks.load(Ordering::Relaxed) > resumed, "the guard resumed the thread (panic: {panic_while_held})");
+        }
+        ticks.store(u64::MAX - 1, Ordering::Relaxed);
+        worker.join().unwrap();
     }
 
     /// A target that stays alive for a few seconds. (Never the test process itself: suspending the calling thread cannot be

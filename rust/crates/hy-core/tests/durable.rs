@@ -300,13 +300,13 @@ fn a_cut_at_every_offset_of_the_last_line_is_read_then_repaired_then_clean() {
     for cut in first.len() + 1..whole.len() {
         std::fs::write(&path, &whole[..cut]).unwrap();
         appendlog_forget();
-        let scan = log.scan();
+        let scan = log.scan().unwrap();
         assert_eq!(scan.records.len(), 1, "cut {cut}");
         assert!(scan.torn_tail.is_some() && scan.corrupt.is_none(), "cut {cut}");
         log.append(&json!({"i": 3}), false).unwrap();
         let after = log.read().unwrap();
         assert_eq!(after, vec![json!({"i": 1}), json!({"i": 3})], "cut {cut}");
-        assert!(log.scan().torn_tail.is_none());
+        assert!(log.scan().unwrap().torn_tail.is_none());
         assert!(!log.repairs().is_empty());
     }
 }
@@ -377,7 +377,7 @@ fn a_writer_killed_in_the_middle_of_an_append_is_followed_by_a_normal_successful
     let log = AppendLog::new(&path);
     log.append(&json!({"i": 1}), false).unwrap();
     assert_eq!(child("append", &path, Some("log.torn_append:torn:5"), &[]).code(), Some(137));
-    assert!(log.scan().torn_tail.is_some());
+    assert!(log.scan().unwrap().torn_tail.is_some());
     log.append(&json!({"i": 2}), false).unwrap();
     assert_eq!(log.read().unwrap(), vec![json!({"i": 1}), json!({"i": 2})]);
     assert_eq!(log.repairs().len(), 1);
@@ -462,4 +462,25 @@ fn a_log_larger_than_the_metadata_budget_is_read_scanned_and_appended_to() {
     log.append(&json!({"last": true}), false).unwrap();
     assert_eq!(log.last(false).unwrap().unwrap()["last"], true);
     let _ = atomic_write_point; // keep the import used on all cfgs
+}
+
+#[test]
+fn an_unreadable_log_is_an_error_not_an_empty_or_valid_one() {
+    let dir = tmp();
+    // a missing log is an empty scan (nothing was ever appended)
+    let missing = dir.path().join("never-written.log");
+    let scan = appendlog::scan_file(&missing, 0, true).unwrap();
+    assert!((scan.records.len(), scan.size, scan.valid_end) == (0, 0, 0));
+    assert!(AppendLog::new(&missing).read().unwrap().is_empty());
+    // a path that exists but cannot be read as a log (a directory: access denied on Windows, EISDIR on Unix) must not
+    // pass for an empty log, or the next writer would believe there is no history to protect
+    let unreadable = dir.path().join("a-directory.log");
+    std::fs::create_dir(&unreadable).unwrap();
+    assert!(appendlog::scan_file(&unreadable, 0, true).is_err());
+    let log = AppendLog::new(&unreadable);
+    assert!(log.read().is_err());
+    assert!(log.scan().is_err());
+    assert!(log.status().is_err());
+    assert!(log.last(false).is_err());
+    assert!(log.last(true).is_err());
 }

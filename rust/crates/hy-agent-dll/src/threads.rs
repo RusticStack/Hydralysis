@@ -10,6 +10,9 @@ struct Ctx(CONTEXT);
 
 pub struct Stopped {
     handles: Vec<(HANDLE, u64)>,
+    /// Keeps the thread-id buffer alive until after `Drop::drop` has resumed every thread: freeing it while other
+    /// threads are suspended could block forever on a heap lock one of them holds. Fields drop after `drop` returns.
+    _tids: Vec<u32>,
 }
 
 impl Stopped {
@@ -56,8 +59,8 @@ pub fn suspend_others() -> Result<Stopped, ()> {
             ok = Thread32Next(snap, &mut e);
         }
         CloseHandle(snap);
-        let mut out = Stopped { handles: Vec::with_capacity(tids.len()) };
-        for tid in tids {
+        let mut out = Stopped { handles: Vec::with_capacity(tids.len()), _tids: Vec::new() };
+        for &tid in &tids {
             let h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, 0, tid);
             if h.is_null() {
                 continue;
@@ -72,6 +75,7 @@ pub fn suspend_others() -> Result<Stopped, ()> {
             let rip = if GetThreadContext(h, &mut c.0) != 0 { c.0.Rip } else { u64::MAX };
             out.handles.push((h, rip));
         }
+        out._tids = tids;
         Ok(out)
     }
 }

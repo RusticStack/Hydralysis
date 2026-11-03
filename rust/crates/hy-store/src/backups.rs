@@ -9,7 +9,7 @@ use crate::config::{dumps_indent2, now_iso, py_str, py_truthy, root_path};
 use crate::lineage::{self, BackupError, Error, Result, SEAL_MARKER, backups_log, canonical, fileset_sha256, self_hash, tree_files};
 use hy_core::fsio::atomic_write_point;
 use hy_core::json;
-use hy_core::sealed::sha256_hex;
+use hy_core::sealed::{ReadOptions, Source, sha256_hex};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
 use std::fs;
@@ -166,7 +166,7 @@ fn free_bytes(_path: &Path) -> Option<u64> {
 // ----------------------------------------------------------------------------------------------------- the log
 
 pub fn logged(settings: &Value, lineage_id: &str) -> Result<Vec<Value>> {
-    Ok(backups_log(settings, lineage_id)?.scan().records)
+    Ok(backups_log(settings, lineage_id)?.scan()?.records)
 }
 
 /// Logical bytes of the lineage's verified backups under ROOT, from backups.log.
@@ -741,8 +741,23 @@ pub fn protected_generations(settings: &Value, lineage_id: &str) -> Result<BTree
                 continue;
             }
             for second in lineage::sorted_entries(&first) {
-                let Ok(data) = fs::read(second.join("COMPLETE.json")) else { continue };
-                let Ok(record) = json::loads(&data) else { continue };
+                if !second.is_dir() {
+                    continue;
+                }
+                // Fail closed: a marker that cannot be read (locked, empty, torn, mis-sealed with no backup) might
+                // be the base of a live view, so it must stop the removal, never silently unprotect its generation.
+                // Only "no marker at all" (an unfinished, invisible base) protects nothing.
+                let marker = second.join("COMPLETE.json");
+                let record = match hy_core::sealed::read_sealed_info(&marker, &ReadOptions::default(), Some(Value::Null)) {
+                    Ok((_, Source::Missing)) => continue,
+                    Ok((record, _)) => record,
+                    Err(error) => {
+                        return Err(value_err(format!(
+                            "cannot prove which generation the base marker {} protects: {error}; nothing was removed",
+                            marker.display()
+                        )));
+                    }
+                };
                 if let Some(generation) = record.get("generation").and_then(Value::as_i64)
                     && record.get("lineage").and_then(Value::as_str) == Some(lineage_id)
                 {

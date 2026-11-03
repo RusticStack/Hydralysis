@@ -10,6 +10,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::*;
+use windows_sys::Win32::Security::Cryptography::{BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom};
 use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::*;
 use windows_sys::Win32::System::Memory::*;
@@ -126,6 +127,8 @@ pub struct Session {
     pub process: HANDLE,
     pub thread: HANDLE,
     pub pid: u32,
+    /// Random per-session tag that names every kernel object of the session and is handed to the agent.
+    tag: u64,
     pub identity: ProcessIdentity,
     pub clock: Clock,
     pub(crate) view: *mut u8,
@@ -149,9 +152,125 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
 }
 
-fn named_event(name: &str, manual: bool) -> io::Result<HANDLE> {
+/// Largest single `read_memory` request.
+pub const MAX_READ: usize = 16 << 20;
+
+/// A zeroed buffer of `len` bytes, refusing sizes above [`MAX_READ`] and reporting allocation failure as an error.
+fn zeroed_buffer(len: usize) -> io::Result<Vec<u8>> {
+    if len > MAX_READ {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!("read of {len} bytes exceeds the {MAX_READ} byte limit")));
+    }
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len).map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e.to_string()))?;
+    buf.resize(len, 0);
+    Ok(buf)
+}
+
+/// A kernel handle closed on drop, so every early return in session setup releases what was created so far.
+struct OwnedHandle(HANDLE);
+
+impl OwnedHandle {
+    fn into_raw(self) -> HANDLE {
+        let h = self.0;
+        core::mem::forget(self);
+        h
+    }
+}
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        // SAFETY: the handle is owned and closed exactly once.
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// A mapped view unmapped on drop.
+struct OwnedView(*mut u8);
+
+impl OwnedView {
+    fn into_raw(self) -> *mut u8 {
+        let v = self.0;
+        core::mem::forget(self);
+        v
+    }
+}
+
+impl Drop for OwnedView {
+    fn drop(&mut self) {
+        // SAFETY: the view was returned by MapViewOfFile and is unmapped exactly once.
+        unsafe { UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: self.0.cast() }) };
+    }
+}
+
+/// Create a session event. An event that already exists is refused: the name is squatted or the tag collided.
+fn named_event(name: &str, manual: bool) -> io::Result<OwnedHandle> {
+    // SAFETY: plain Win32 call with a NUL-terminated name.
     let h = unsafe { CreateEventW(core::ptr::null(), manual as i32, 0, wide(name).as_ptr()) };
-    if h.is_null() { Err(io::Error::last_os_error()) } else { Ok(h) }
+    if h.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let h = OwnedHandle(h);
+    // SAFETY: reads the thread's last-error value set by CreateEventW above.
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("kernel object {name} already exists")));
+    }
+    Ok(h)
+}
+
+/// 64 random bits from the system RNG; never zero (the agent treats zero as "no tag").
+fn random_tag() -> io::Result<u64> {
+    loop {
+        let mut bytes = [0u8; 8];
+        // SAFETY: the buffer is 8 writable bytes; a null algorithm handle with the flag selects the system RNG.
+        let status =
+            unsafe { BCryptGenRandom(core::ptr::null_mut(), bytes.as_mut_ptr(), bytes.len() as u32, BCRYPT_USE_SYSTEM_PREFERRED_RNG) };
+        if status != 0 {
+            return Err(io::Error::other(format!("system RNG failed: {status:#x}")));
+        }
+        let tag = u64::from_le_bytes(bytes);
+        if tag != 0 {
+            return Ok(tag);
+        }
+    }
+}
+
+/// Quote one argument by the MSVCRT / `CommandLineToArgvW` rules, so the child sees exactly `arg` as one argv entry.
+fn push_quoted(out: &mut String, arg: &str) {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '\n', '\x0b', '"']) {
+        out.push_str(arg);
+        return;
+    }
+    out.push('"');
+    let mut backslashes = 0usize;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                // Backslashes before a quote are doubled, then the quote itself is escaped.
+                out.extend(core::iter::repeat_n('\\', backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.extend(core::iter::repeat_n('\\', backslashes));
+                out.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    // Trailing backslashes would escape the closing quote.
+    out.extend(core::iter::repeat_n('\\', backslashes * 2));
+    out.push('"');
+}
+
+/// The child's command line: the executable (always quoted) followed by each argument as one argv entry.
+fn command_line(exe: &str, args: &[String]) -> String {
+    let mut cmd = format!("\"{exe}\"");
+    for a in args {
+        cmd.push(' ');
+        push_quoted(&mut cmd, a);
+    }
+    cmd
 }
 
 unsafe fn put_site(view: *mut u8, i: usize, s: &SiteSpec) {
@@ -182,10 +301,13 @@ unsafe fn put_site(view: *mut u8, i: usize, s: &SiteSpec) {
 }
 
 impl Session {
+    /// Create the section and events. On error nothing created here leaks; the caller keeps ownership of
+    /// `process` and `thread` (they are stored in the session only on success).
     fn build(process: HANDLE, thread: HANDLE, pid: u32, sites: &[SiteSpec]) -> io::Result<Session> {
         unsafe {
             let identity = ProcessIdentity::capture(pid).map_err(|e| io::Error::other(e.to_string()))?;
-            let sec_name = wide(&format!("Local\\hy_agent_{pid}"));
+            let tag = random_tag()?;
+            let sec_name = wide(&proto::object_name("agent", pid, tag));
             let section = CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
                 core::ptr::null(),
@@ -197,30 +319,39 @@ impl Session {
             if section.is_null() {
                 return Err(io::Error::last_os_error());
             }
-            let view = MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, proto::SECTION_SIZE).Value as *mut u8;
+            let section_error = GetLastError();
+            let section = OwnedHandle(section);
+            if section_error == ERROR_ALREADY_EXISTS {
+                // Someone else created this name first: its contents are not ours to trust.
+                return Err(io::Error::new(io::ErrorKind::AlreadyExists, "the agent section name already exists"));
+            }
+            let view = MapViewOfFile(section.0, FILE_MAP_ALL_ACCESS, 0, 0, proto::SECTION_SIZE).Value as *mut u8;
             if view.is_null() {
                 return Err(io::Error::last_os_error());
             }
-            (view as *mut u64).write(proto::MAGIC);
-            (view.add(proto::H_NSITES) as *mut u32).write(sites.len().min(proto::MAX_SITES) as u32);
+            let view = OwnedView(view);
+            (view.0 as *mut u64).write(proto::MAGIC);
+            (view.0.add(proto::H_NSITES) as *mut u32).write(sites.len().min(proto::MAX_SITES) as u32);
             for (i, s) in sites.iter().enumerate().take(proto::MAX_SITES) {
-                put_site(view, i, s);
+                put_site(view.0, i, s);
             }
-            let cmd_ev = named_event(&format!("Local\\hy_cmd_{pid}"), false)?;
-            let rsp_ev = named_event(&format!("Local\\hy_rsp_{pid}"), false)?;
-            let bp_ev =
-                (0..proto::MAX_PAUSE).map(|i| named_event(&format!("Local\\hy_bp_{pid}_{i}"), true)).collect::<io::Result<Vec<_>>>()?;
+            let cmd_ev = named_event(&proto::object_name("cmd", pid, tag), false)?;
+            let rsp_ev = named_event(&proto::object_name("rsp", pid, tag), false)?;
+            let bp_ev = (0..proto::MAX_PAUSE)
+                .map(|i| named_event(&proto::object_name(&format!("bp_{i}"), pid, tag), true))
+                .collect::<io::Result<Vec<_>>>()?;
             Ok(Session {
                 process,
                 thread,
                 pid,
+                tag,
                 identity,
                 clock: Clock::new(false, 0, 0, 0),
-                view,
-                section,
-                cmd_ev,
-                rsp_ev,
-                bp_ev,
+                view: view.into_raw(),
+                section: section.into_raw(),
+                cmd_ev: cmd_ev.into_raw(),
+                rsp_ev: rsp_ev.into_raw(),
+                bp_ev: bp_ev.into_iter().map(OwnedHandle::into_raw).collect(),
                 tails: vec![0; proto::MAX_RINGS],
                 counters: Counters { sites: vec![SiteCounters::default(); proto::MAX_SITES], ..Default::default() },
                 next_event: 0,
@@ -246,19 +377,19 @@ impl Session {
     /// Spawn suspended with a working directory and an environment block when given (the environment replaces the
     /// parent's, as Frida's `envp` does).
     pub fn spawn_opts(exe: &Path, args: &[String], sites: &[SiteSpec], opts: &SpawnOpts) -> io::Result<Session> {
+        use windows_sys::Win32::Storage::FileSystem::CreateFileW;
         let stdout = opts.stdout.as_deref();
         unsafe {
-            let mut cmd = format!("\"{}\"", exe.display());
-            for a in args {
-                cmd.push(' ');
-                cmd.push_str(a);
-            }
-            let mut cmdw = wide(&cmd);
-            let mut si: STARTUPINFOW = core::mem::zeroed();
-            si.cb = core::mem::size_of::<STARTUPINFOW>() as u32;
+            // Each argument reaches the child as exactly one argv entry (spaces and quotes are escaped).
+            let mut cmdw = wide(&command_line(&exe.display().to_string(), args));
+            let mut si: STARTUPINFOEXW = core::mem::zeroed();
+            si.StartupInfo.cb = core::mem::size_of::<STARTUPINFOEXW>() as u32;
             let mut pi: PROCESS_INFORMATION = core::mem::zeroed();
             let exew: Vec<u16> = exe.as_os_str().encode_wide().chain(Some(0)).collect();
-            let mut out_handle: HANDLE = core::ptr::null_mut();
+            // Handles the child inherits: exactly these two, through an explicit list, never "every inheritable
+            // handle of the host" (which would pin other sessions' log files in a multi-session host).
+            let mut inherited: Vec<OwnedHandle> = Vec::new();
+            let mut attr_buf: Vec<usize> = Vec::new();
             let mut inherit = 0;
             if let Some(path) = stdout {
                 let sa = windows_sys::Win32::Security::SECURITY_ATTRIBUTES {
@@ -267,18 +398,45 @@ impl Session {
                     bInheritHandle: 1,
                 };
                 let pw: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-                out_handle =
-                    windows_sys::Win32::Storage::FileSystem::CreateFileW(pw.as_ptr(), 0x4000_0000, 3, &sa, 2, 0x80, core::ptr::null_mut());
+                let out_handle = CreateFileW(pw.as_ptr(), 0x4000_0000, 3, &sa, 2, 0x80, core::ptr::null_mut());
                 if out_handle == INVALID_HANDLE_VALUE {
                     return Err(io::Error::last_os_error());
                 }
+                inherited.push(OwnedHandle(out_handle));
                 let nul: Vec<u16> = wide("NUL");
-                let stdin =
-                    windows_sys::Win32::Storage::FileSystem::CreateFileW(nul.as_ptr(), 0x8000_0000, 3, &sa, 3, 0x80, core::ptr::null_mut());
-                si.dwFlags = 0x100; // STARTF_USESTDHANDLES
-                si.hStdOutput = out_handle;
-                si.hStdError = out_handle;
-                si.hStdInput = stdin;
+                let stdin = CreateFileW(nul.as_ptr(), 0x8000_0000, 3, &sa, 3, 0x80, core::ptr::null_mut());
+                if stdin == INVALID_HANDLE_VALUE {
+                    return Err(io::Error::last_os_error());
+                }
+                inherited.push(OwnedHandle(stdin));
+                si.StartupInfo.dwFlags = 0x100; // STARTF_USESTDHANDLES
+                si.StartupInfo.hStdOutput = out_handle;
+                si.StartupInfo.hStdError = out_handle;
+                si.StartupInfo.hStdInput = stdin;
+                let list: [HANDLE; 2] = [out_handle, stdin];
+                let mut bytes = 0usize;
+                // Sizing call: fails with ERROR_INSUFFICIENT_BUFFER by design and reports the size.
+                InitializeProcThreadAttributeList(core::ptr::null_mut(), 1, 0, &mut bytes);
+                attr_buf.resize(bytes.div_ceil(core::mem::size_of::<usize>()).max(1), 0);
+                let attrs: LPPROC_THREAD_ATTRIBUTE_LIST = attr_buf.as_mut_ptr().cast();
+                if InitializeProcThreadAttributeList(attrs, 1, 0, &mut bytes) == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if UpdateProcThreadAttribute(
+                    attrs,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                    list.as_ptr().cast(),
+                    core::mem::size_of_val(&list),
+                    core::ptr::null_mut(),
+                    core::ptr::null(),
+                ) == 0
+                {
+                    let e = io::Error::last_os_error();
+                    DeleteProcThreadAttributeList(attrs);
+                    return Err(e);
+                }
+                si.lpAttributeList = attrs;
                 inherit = 1;
             }
             let env_block: Option<Vec<u16>> = opts.env.as_ref().map(|vars| {
@@ -294,29 +452,35 @@ impl Session {
                 b
             });
             let cwdw: Option<Vec<u16>> = opts.cwd.as_ref().map(|c| c.as_os_str().encode_wide().chain(Some(0)).collect());
+            let flags = CREATE_SUSPENDED
+                | if env_block.is_some() { 0x400 } else { 0 }
+                | if inherit != 0 { EXTENDED_STARTUPINFO_PRESENT } else { 0 };
             let created = CreateProcessW(
                 exew.as_ptr(),
                 cmdw.as_mut_ptr(),
                 core::ptr::null(),
                 core::ptr::null(),
                 inherit,
-                CREATE_SUSPENDED | if env_block.is_some() { 0x400 } else { 0 },
+                flags,
                 env_block.as_ref().map_or(core::ptr::null(), |b| b.as_ptr() as *const _),
                 cwdw.as_ref().map_or(core::ptr::null(), |c| c.as_ptr()),
-                &si,
+                &si.StartupInfo,
                 &mut pi,
             );
-            if !out_handle.is_null() {
-                CloseHandle(out_handle);
-                CloseHandle(si.hStdInput);
+            let create_error = (created == 0).then(io::Error::last_os_error);
+            if inherit != 0 {
+                DeleteProcThreadAttributeList(si.lpAttributeList);
             }
-            if created == 0 {
-                return Err(io::Error::last_os_error());
+            drop(inherited);
+            if let Some(e) = create_error {
+                return Err(e);
             }
             match Session::build(pi.hProcess, pi.hThread, pi.dwProcessId, sites) {
                 Ok(s) => Ok(s),
                 Err(e) => {
                     TerminateProcess(pi.hProcess, 1);
+                    CloseHandle(pi.hThread);
+                    CloseHandle(pi.hProcess);
                     Err(e)
                 }
             }
@@ -338,7 +502,9 @@ impl Session {
             if h.is_null() {
                 return Err(io::Error::last_os_error());
             }
-            Session::build(h, core::ptr::null_mut(), pid, sites)
+            Session::build(h, core::ptr::null_mut(), pid, sites).inspect_err(|_| {
+                CloseHandle(h);
+            })
         }
     }
 
@@ -378,7 +544,7 @@ impl Session {
             };
             tries = 0;
             let code = loop {
-                match inject::run_remote(self.process, base + rva as usize, core::ptr::null(), 20_000) {
+                match inject::run_remote(self.process, base + rva as usize, self.tag as usize as *const core::ffi::c_void, 20_000) {
                     Ok(c) => break c,
                     Err(e) if retry(&e, tries) => {
                         tries += 1;
@@ -767,8 +933,12 @@ impl Session {
     }
 
     /// Kernel-checked read: an unreadable range fails with an error code, no fault is raised in the target.
+    ///
+    /// # Errors
+    /// `InvalidInput` when `len` exceeds [`MAX_READ`] (the length comes from the caller's request and must not be
+    /// able to abort the host on allocation failure); `OutOfMemory` when the buffer cannot be reserved.
     pub fn read_memory(&self, address: u64, len: usize) -> io::Result<Vec<u8>> {
-        let mut buf = vec![0u8; len];
+        let mut buf = zeroed_buffer(len)?;
         let mut got = 0usize;
         let ok = unsafe { ReadProcessMemory(self.process, address as *const _, buf.as_mut_ptr().cast(), len, &mut got) };
         if ok == 0 || got != len {
@@ -824,5 +994,48 @@ impl Drop for Session {
             }
             CloseHandle(self.process);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line(args: &[&str]) -> String {
+        let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        command_line(r"C:\x\a b.exe", &args)
+    }
+
+    #[test]
+    fn plain_arguments_stay_bare_and_the_exe_is_quoted() {
+        assert_eq!(line(&["info", "--n=3"]), r#""C:\x\a b.exe" info --n=3"#);
+    }
+
+    #[test]
+    fn spaces_quotes_and_empty_arguments_are_one_argv_entry() {
+        assert_eq!(line(&["a b"]), r#""C:\x\a b.exe" "a b""#);
+        assert_eq!(line(&[""]), r#""C:\x\a b.exe" """#);
+        assert_eq!(line(&[r#"say "hi""#]), r#""C:\x\a b.exe" "say \"hi\"""#);
+    }
+
+    #[test]
+    fn backslashes_double_only_before_a_quote_or_the_closing_quote() {
+        assert_eq!(line(&[r"C:\dir\"]), r#""C:\x\a b.exe" C:\dir\"#);
+        assert_eq!(line(&[r"C:\my dir\"]), r#""C:\x\a b.exe" "C:\my dir\\""#);
+        assert_eq!(line(&[r#"a\"b"#]), r#""C:\x\a b.exe" "a\\\"b""#);
+    }
+
+    #[test]
+    fn read_size_is_capped_before_allocating() {
+        assert_eq!(zeroed_buffer(MAX_READ + 1).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(zeroed_buffer(usize::MAX).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(zeroed_buffer(16).unwrap(), vec![0u8; 16]);
+    }
+
+    #[test]
+    fn session_tags_are_random_and_nonzero() {
+        let a = random_tag().unwrap();
+        let b = random_tag().unwrap();
+        assert!(a != 0 && b != 0 && a != b);
     }
 }

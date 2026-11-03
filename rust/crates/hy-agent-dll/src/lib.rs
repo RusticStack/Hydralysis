@@ -14,9 +14,10 @@ mod ring;
 mod threads;
 mod watch;
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use hy_agent_proto as p;
-use std::sync::Mutex;
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::{Mutex, MutexGuard};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::System::Diagnostics::Debug::*;
 use windows_sys::Win32::System::LibraryLoader::*;
@@ -30,6 +31,19 @@ pub extern "system" fn DllMain(_h: *mut core::ffi::c_void, _reason: u32, _res: *
 }
 
 static PREPARED: Mutex<Vec<Option<hook::Prepared>>> = Mutex::new(Vec::new());
+/// The host's per-session random tag (the `hy_agent_init` parameter); names every kernel object of the session.
+static TAG: AtomicU64 = AtomicU64::new(0);
+
+/// The prepared-site table. A poisoned lock is recovered: the data is plain `Option<Prepared>` values, and the agent
+/// runs inside someone else's process, so it must never turn one panic into a second one.
+fn lock_prepared() -> MutexGuard<'static, Vec<Option<hook::Prepared>>> {
+    PREPARED.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn session_name(kind: &str) -> String {
+    // SAFETY: GetCurrentProcessId has no preconditions.
+    p::object_name(kind, unsafe { GetCurrentProcessId() }, TAG.load(Ordering::Acquire))
+}
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -105,7 +119,7 @@ unsafe fn arm_site(idx: usize) -> u32 {
         if let Err(c) = hook::commit(&prepared) {
             return fail(c);
         }
-        let mut g = PREPARED.lock().unwrap();
+        let mut g = lock_prepared();
         if g.len() < p::MAX_SITES {
             g.resize_with(p::MAX_SITES, || None);
         }
@@ -122,7 +136,7 @@ unsafe fn retire_site(idx: usize) -> u32 {
             return p::ERR_BAD_SITE;
         }
         let cfg = ring::section().add(p::site_offset(idx));
-        let g = PREPARED.lock().unwrap();
+        let g = lock_prepared();
         let Some(Some(pr)) = g.get(idx) else {
             return p::ERR_BAD_SITE;
         };
@@ -143,58 +157,102 @@ unsafe fn open_event(name: String) -> HANDLE {
     unsafe { OpenEventW(EVENT_ALL_ACCESS, FALSE, wide(&name).as_ptr()) }
 }
 
+/// Poll interval used when the command event cannot be opened: a null handle makes `WaitForSingleObject` return
+/// `WAIT_FAILED` at once, which would spin the control thread at 100% inside the target.
+const POLL_MS: u32 = 10;
+
+fn dispatch(cmd: u32, a0: usize) -> u32 {
+    // SAFETY: the section is mapped before the control thread starts; arm/retire validate every index.
+    unsafe {
+        match cmd {
+            p::CMD_PING => 0,
+            p::CMD_ARM_SITE => arm_site(a0),
+            p::CMD_RETIRE_SITE => retire_site(a0),
+            p::CMD_DETACH => {
+                let mut r = 0;
+                for i in 0..p::MAX_SITES {
+                    let code = retire_site(i);
+                    if code != 0 && code != p::ERR_BAD_SITE {
+                        r = code;
+                    }
+                }
+                r
+            }
+            _ => p::ERR_BAD_SITE,
+        }
+    }
+}
+
 unsafe extern "system" fn control_main(_arg: *mut core::ffi::c_void) -> u32 {
+    // A panic must not unwind out of an `extern "system"` fn: that aborts the target process.
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: only reached after `hy_agent_init` published the section.
+        unsafe { control_loop() }
+    }))
+    .unwrap_or(p::ERR_INTERNAL)
+}
+
+unsafe fn control_loop() -> u32 {
     unsafe {
         let sec = ring::section();
-        let pid = GetCurrentProcessId();
-        let cmd_ev = open_event(format!("Local\\hy_cmd_{pid}"));
-        let rsp_ev = open_event(format!("Local\\hy_rsp_{pid}"));
+        let cmd_ev = open_event(session_name("cmd"));
+        let rsp_ev = open_event(session_name("rsp"));
         (sec.add(p::H_AGENT_TID) as *mut u32).write_volatile(GetCurrentThreadId());
         let mb = sec.add(p::MAILBOX_OFF);
         loop {
             if a32(sec, p::H_SHUTDOWN).load(Ordering::Acquire) != 0 {
                 return 0;
             }
-            WaitForSingleObject(cmd_ev, 200);
+            if cmd_ev.is_null() {
+                Sleep(POLL_MS);
+            } else {
+                WaitForSingleObject(cmd_ev, 200);
+            }
             let seq = a32(mb, p::MB_SEQ).load(Ordering::Acquire);
             if seq == a32(mb, p::MB_RSEQ).load(Ordering::Acquire) {
                 continue;
             }
             let cmd = (mb.add(p::MB_CMD) as *const u32).read_volatile();
             let a0 = (mb.add(p::MB_ARGS) as *const u64).read_volatile() as usize;
-            let result = match cmd {
-                p::CMD_PING => 0,
-                p::CMD_ARM_SITE => arm_site(a0),
-                p::CMD_RETIRE_SITE => retire_site(a0),
-                p::CMD_DETACH => {
-                    let mut r = 0;
-                    for i in 0..p::MAX_SITES {
-                        let code = retire_site(i);
-                        if code != 0 && code != p::ERR_BAD_SITE {
-                            r = code;
-                        }
-                    }
-                    r
-                }
-                _ => p::ERR_BAD_SITE,
-            };
+            // A panic in one command is that command's error; the target and the control thread keep running.
+            let result = catch_unwind(AssertUnwindSafe(|| dispatch(cmd, a0))).unwrap_or(p::ERR_INTERNAL);
             (mb.add(p::MB_RESULT) as *mut u32).write_volatile(result);
             a32(mb, p::MB_RSEQ).store(seq, Ordering::Release);
-            SetEvent(rsp_ev);
+            if !rsp_ev.is_null() {
+                SetEvent(rsp_ev);
+            }
         }
     }
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn hy_agent_init(_param: *mut core::ffi::c_void) -> u32 {
+pub unsafe extern "system" fn hy_agent_init(param: *mut core::ffi::c_void) -> u32 {
+    // `param` is the host's per-session tag; a panic here must not abort the target.
+    catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: runs once, in the remote thread the host created for it.
+        unsafe { agent_init(param as usize as u64) }
+    }))
+    .unwrap_or(p::ERR_INTERNAL)
+}
+
+unsafe fn agent_init(tag: u64) -> u32 {
     unsafe {
-        let pid = GetCurrentProcessId();
-        let h = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, wide(&format!("Local\\hy_agent_{pid}")).as_ptr());
+        if tag == 0 {
+            return p::ERR_SECTION;
+        }
+        TAG.store(tag, Ordering::Release);
+        let h = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, wide(&session_name("agent")).as_ptr());
         if h.is_null() {
             return p::ERR_SECTION;
         }
         let base = MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, p::SECTION_SIZE).Value as *mut u8;
-        if base.is_null() || (base as *const u64).read() != p::MAGIC {
+        // The view keeps the section alive; the handle is no longer needed on any path.
+        CloseHandle(h);
+        if base.is_null() {
+            return p::ERR_SECTION;
+        }
+        if (base as *const u64).read() != p::MAGIC {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS { Value: base.cast() });
             return p::ERR_SECTION;
         }
         ring::SECTION.store(base as usize, Ordering::Release);
@@ -234,7 +292,7 @@ pub unsafe extern "system" fn hy_agent_init(_param: *mut core::ffi::c_void) -> u
             Err(c) => return c,
         }
         for i in 0..p::MAX_PAUSE {
-            pause::EVENTS[i].store(open_event(format!("Local\\hy_bp_{pid}_{i}")) as usize, Ordering::Release);
+            pause::EVENTS[i].store(open_event(session_name(&format!("bp_{i}"))) as usize, Ordering::Release);
         }
         AddVectoredExceptionHandler(1, Some(watch::veh));
         modules::register();

@@ -353,13 +353,13 @@ fn attempt_of(row: &Value) -> i64 {
 }
 
 pub fn next_attempt(settings: &Settings, lineage_id: &str, cid: &str) -> Result<i64> {
-    let rows = intent_log(settings, lineage_id, cid)?.scan().records;
+    let rows = intent_log(settings, lineage_id, cid)?.scan()?.records;
     Ok(rows.iter().map(attempt_of).max().unwrap_or(0) + 1)
 }
 
 /// The newest attempt of a commit: its number, last step and the data of the steps it passed.
 pub fn last_steps(settings: &Settings, lineage_id: &str, cid: &str) -> Result<Value> {
-    let rows = intent_log(settings, lineage_id, cid)?.scan().records;
+    let rows = intent_log(settings, lineage_id, cid)?.scan()?.records;
     if rows.is_empty() {
         return Ok(json!({"attempt": 0, "step": null, "data": {}}));
     }

@@ -326,12 +326,12 @@ pub fn append_current(settings: &Value, lineage_id: &str, record: &Value, lock_h
     build()
 }
 
-fn torn_corrupt(log: &AppendLog) -> (hy_core::appendlog::Scan, Value, Value) {
-    let scan = log.scan();
+fn torn_corrupt(log: &AppendLog) -> Result<(hy_core::appendlog::Scan, Value, Value)> {
+    let scan = log.scan()?;
     let status = scan.as_status();
     let torn = status["torn_tail"].clone();
     let corrupt = status["corrupt"].clone();
-    (scan, torn, corrupt)
+    Ok((scan, torn, corrupt))
 }
 
 /// The head: the last valid CURRENT.log line, with what the reader saw (`torn_tail`, `corrupt`, `lines`).
@@ -340,7 +340,7 @@ fn torn_corrupt(log: &AppendLog) -> (hy_core::appendlog::Scan, Value, Value) {
 /// line before it and says so (`corrupt`).
 pub fn head(settings: &Value, lineage_id: &str) -> Result<Map<String, Value>> {
     let log = current_log(settings, lineage_id)?;
-    let (scan, torn, corrupt) = torn_corrupt(&log);
+    let (scan, torn, corrupt) = torn_corrupt(&log)?;
     let Some(last) = scan.records.last() else {
         return Err(LineageError::new("no_lineage", format!("lineage {lineage_id} has no valid CURRENT.log line"))
             .with("torn_tail", torn)
@@ -362,7 +362,7 @@ pub fn head(settings: &Value, lineage_id: &str) -> Result<Map<String, Value>> {
 }
 
 pub fn history(settings: &Value, lineage_id: &str) -> Result<Vec<Value>> {
-    Ok(current_log(settings, lineage_id)?.scan().records)
+    Ok(current_log(settings, lineage_id)?.scan()?.records)
 }
 
 /// What `targets.resolve` changes for a target with a lineage: `gpr` is the head, `key` the stored origin key.
@@ -563,7 +563,7 @@ pub fn reserved_generations(settings: &Value, lineage_id: &str) -> Result<BTreeS
     if commits.is_dir() {
         for path in sorted_entries(&commits) {
             if path.file_name().is_some_and(|n| n.to_string_lossy().ends_with(".intent.log")) {
-                for record in AppendLog::new(path).scan().records {
+                for record in AppendLog::new(path).scan()?.records {
                     if let Some(g) = record.get("gen").and_then(Value::as_i64) {
                         taken.insert(g);
                     }

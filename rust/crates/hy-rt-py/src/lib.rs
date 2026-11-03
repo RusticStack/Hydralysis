@@ -1,7 +1,8 @@
 //! `hydralysis_rt`: the Python-facing runtime session. It is a thin layer: every behaviour lives in `hy-runtime`.
 //!
-//! Blocking calls release the GIL. Errors become `RuntimeError`/`OSError`/`ValueError`; nothing here panics on input
-//! (the release profile aborts on panic, so a panic would end the Python process).
+//! Blocking calls release the GIL, including the wait for the session mutex. Errors become
+//! `RuntimeError`/`OSError`/`ValueError`; nothing here panics on input (PyO3 would turn a panic into `PanicException`,
+//! not end the process).
 
 use hy_runtime::memory::{Gate, MemError};
 use hy_runtime::proto;
@@ -79,7 +80,14 @@ struct RtSession {
 }
 
 impl RtSession {
-    fn with<T>(&self, f: impl FnOnce(&mut Session) -> PyResult<T>) -> PyResult<T> {
+    /// Run `f` on the session with the GIL released while waiting for the session mutex and while `f` runs. Other
+    /// methods hold the mutex across a mailbox round trip of up to 30 s; waiting for it with the GIL held would
+    /// freeze every Python thread of the process.
+    fn with<T: Send>(&self, py: Python<'_>, f: impl FnOnce(&mut Session) -> PyResult<T> + Send) -> PyResult<T> {
+        py.detach(|| self.with_locked(f))
+    }
+
+    fn with_locked<T>(&self, f: impl FnOnce(&mut Session) -> PyResult<T>) -> PyResult<T> {
         let mut g = self.inner.lock().map_err(|_| PyRuntimeError::new_err("session lock poisoned"))?;
         match g.as_mut() {
             Some(s) => f(s),
@@ -199,32 +207,32 @@ impl RtSession {
 
     /// Inject the agent library and start it.
     fn inject(&self, py: Python<'_>, dll: String) -> PyResult<()> {
-        py.detach(|| self.with(|s| s.inject(std::path::Path::new(&dll)).map_err(os)))
+        py.detach(|| self.with_locked(|s| s.inject(std::path::Path::new(&dll)).map_err(os)))
     }
 
-    fn resume(&self) -> PyResult<()> {
-        self.with(|s| {
+    fn resume(&self, py: Python<'_>) -> PyResult<()> {
+        self.with(py, |s| {
             s.resume();
             Ok(())
         })
     }
 
-    fn running(&self) -> PyResult<bool> {
-        self.with(|s| Ok(s.running()))
+    fn running(&self, py: Python<'_>) -> PyResult<bool> {
+        self.with(py, |s| Ok(s.running()))
     }
 
-    fn exit_code(&self) -> PyResult<Option<u32>> {
-        self.with(|s| Ok(s.exit_code()))
+    fn exit_code(&self, py: Python<'_>) -> PyResult<Option<u32>> {
+        self.with(py, |s| Ok(s.exit_code()))
     }
 
     /// Wait up to `ms` for the process to exit; true when it has. The session lock is not held while waiting.
     fn wait_exit(&self, py: Python<'_>, ms: u32) -> PyResult<bool> {
-        let h = self.with(|s| Ok(s.process as usize))?;
+        let h = self.with(py, |s| Ok(s.process as usize))?;
         Ok(py.detach(|| unsafe { WaitForSingleObject(h as _, ms) == 0 }))
     }
 
-    fn verify_identity(&self) -> PyResult<()> {
-        self.with(|s| s.verify_identity().map_err(|e| PyRuntimeError::new_err(e.to_string())))
+    fn verify_identity(&self, py: Python<'_>) -> PyResult<()> {
+        self.with(py, |s| s.verify_identity().map_err(|e| PyRuntimeError::new_err(e.to_string())))
     }
 
     /// Arm site `idx` from a spec dict. Returns `(ok, error_code)`.
@@ -233,42 +241,42 @@ impl RtSession {
             return Err(PyValueError::new_err("site index out of range"));
         }
         let spec = site_spec(spec)?;
-        let r = py.detach(|| self.with(|s| s.arm_site(idx, &spec).map_err(os)))?;
+        let r = py.detach(|| self.with_locked(|s| s.arm_site(idx, &spec).map_err(os)))?;
         Ok(code(r))
     }
 
     fn retire_site(&self, py: Python<'_>, idx: usize) -> PyResult<(bool, u32)> {
-        let r = py.detach(|| self.with(|s| s.retire_site(idx).map_err(os)))?;
+        let r = py.detach(|| self.with_locked(|s| s.retire_site(idx).map_err(os)))?;
         Ok(code(r))
     }
 
     fn detach_sites(&self, py: Python<'_>) -> PyResult<()> {
-        py.detach(|| self.with(|s| s.detach_sites().map_err(os)))
+        py.detach(|| self.with_locked(|s| s.detach_sites().map_err(os)))
     }
 
-    fn set_stride(&self, idx: usize, stride: u32) -> PyResult<()> {
+    fn set_stride(&self, py: Python<'_>, idx: usize, stride: u32) -> PyResult<()> {
         if idx >= proto::MAX_SITES {
             return Err(PyValueError::new_err("site index out of range"));
         }
-        self.with(|s| {
+        self.with(py, |s| {
             s.set_stride(idx, stride);
             Ok(())
         })
     }
 
     /// `(state, error)` of a site as the agent last wrote it.
-    fn site_status(&self, idx: usize) -> PyResult<(u32, u32)> {
+    fn site_status(&self, py: Python<'_>, idx: usize) -> PyResult<(u32, u32)> {
         if idx >= proto::MAX_SITES {
             return Err(PyValueError::new_err("site index out of range"));
         }
-        self.with(|s| Ok(s.site_status(idx)))
+        self.with(py, |s| Ok(s.site_status(idx)))
     }
 
     /// Drain the rings into batches in the wire format of `trace_wire.py`, each at most `max_bytes` of records,
     /// numbered from `first_seq`. Empty when nothing was pending. Every header carries the cumulative counters.
     fn drain_wire<'py>(&self, py: Python<'py>, producer_gen: u32, first_seq: u32, max_bytes: usize) -> PyResult<Vec<Bound<'py, PyBytes>>> {
         let batches = py.detach(|| {
-            self.with(|s| {
+            self.with_locked(|s| {
                 self.pull(s)?;
                 let hits = std::mem::take(&mut self.stash.lock().map_err(|_| PyRuntimeError::new_err("stash lock poisoned"))?.trace);
                 if hits.is_empty() {
@@ -324,7 +332,7 @@ impl RtSession {
     /// `site tid args stack ret_addr retval last_error returned buf buf_addr buf_failed t` (`t` in QPC ticks).
     fn drain_hits<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
         let hits = py.detach(|| {
-            self.with(|s| {
+            self.with_locked(|s| {
                 self.pull(s)?;
                 let clock = s.clock;
                 let taken = std::mem::take(&mut self.stash.lock().map_err(|_| PyRuntimeError::new_err("stash lock poisoned"))?.observe);
@@ -381,12 +389,12 @@ impl RtSession {
     }
 
     /// One step of the sampling policy (a no-op until configured). New strides are applied to the agent's sites.
-    fn sampling_tick(&self) -> PyResult<()> {
+    fn sampling_tick(&self, py: Python<'_>) -> PyResult<()> {
         let mut g = self.sampler.lock().map_err(|_| PyRuntimeError::new_err("sampler lock poisoned"))?;
         let Some(sampler) = g.as_mut() else {
             return Ok(());
         };
-        self.with(|s| {
+        self.with(py, |s| {
             s.sampling_tick(sampler);
             Ok(())
         })?;
@@ -395,9 +403,9 @@ impl RtSession {
 
     /// `(policy_changes, effective_budget, [(site, hits, kept, skipped, stride, rate_per_s)])` for every site slot (the
     /// caller picks the armed ones). Sites from `OBSERVE_BASE` up are not the sampler's: stride 1, rate 0.
-    fn sampling_report(&self) -> PyResult<SamplingReport> {
+    fn sampling_report(&self, py: Python<'_>) -> PyResult<SamplingReport> {
         let g = self.sampler.lock().map_err(|_| PyRuntimeError::new_err("sampler lock poisoned"))?;
-        let c = self.with(|s| Ok(s.counters()))?;
+        let c = self.with(py, |s| Ok(s.counters()))?;
         let (changes, effective) = g.as_ref().map_or((0, 0.0), |x| (x.changes, x.effective));
         let rows = c
             .sites
@@ -416,7 +424,7 @@ impl RtSession {
 
     /// Cumulative counters, per-site `(hits, kept)` and per-ring rows.
     fn counters<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        let (c, rows, clock) = self.with(|s| Ok((s.counters(), s.ring_rows(), s.clock)))?;
+        let (c, rows, clock) = self.with(py, |s| Ok((s.counters(), s.ring_rows(), s.clock)))?;
         let freq = clock.freq;
         let d = PyDict::new(py);
         d.set_item("attempted", c.attempted)?;
@@ -447,36 +455,36 @@ impl RtSession {
         Ok(d)
     }
 
-    fn ring_count(&self) -> PyResult<u32> {
-        self.with(|s| Ok(s.ring_count()))
+    fn ring_count(&self, py: Python<'_>) -> PyResult<u32> {
+        self.with(py, |s| Ok(s.ring_count()))
     }
 
     /// Out-of-band events: `(kind, site, tid, slot, data, qpc)`.
     #[allow(clippy::type_complexity)]
-    fn events(&self) -> PyResult<Vec<(u16, u16, u32, u32, Vec<u64>, u64)>> {
-        self.with(|s| {
+    fn events(&self, py: Python<'_>) -> PyResult<Vec<(u16, u16, u32, u32, Vec<u64>, u64)>> {
+        self.with(py, |s| {
             let clock = s.clock;
             Ok(s.events().into_iter().map(|e| (e.kind, e.site, e.tid, e.slot, e.data.to_vec(), clock.to_qpc(e.tsc))).collect())
         })
     }
 
     /// Parked threads: `(slot, tid, site, parked_seconds)`.
-    fn paused(&self) -> PyResult<Vec<(usize, u32, u32, f64)>> {
-        self.with(|s| Ok(s.paused().into_iter().map(|p| (p.slot, p.tid, p.site, p.parked_for.as_secs_f64())).collect()))
+    fn paused(&self, py: Python<'_>) -> PyResult<Vec<(usize, u32, u32, f64)>> {
+        self.with(py, |s| Ok(s.paused().into_iter().map(|p| (p.slot, p.tid, p.site, p.parked_for.as_secs_f64())).collect()))
     }
 
     #[pyo3(signature = (slot, auto=false))]
-    fn continue_breakpoint(&self, slot: usize, auto: bool) -> PyResult<bool> {
-        self.with(|s| Ok(s.continue_breakpoint(slot, auto)))
+    fn continue_breakpoint(&self, py: Python<'_>, slot: usize, auto: bool) -> PyResult<bool> {
+        self.with(py, |s| Ok(s.continue_breakpoint(slot, auto)))
     }
 
     /// Release every thread parked longer than `limit_s`; returns the slots released.
-    fn watchdog(&self, limit_s: f64) -> PyResult<Vec<usize>> {
-        self.with(|s| Ok(s.watchdog(Duration::from_secs_f64(limit_s.max(0.0)))))
+    fn watchdog(&self, py: Python<'_>, limit_s: f64) -> PyResult<Vec<usize>> {
+        self.with(py, |s| Ok(s.watchdog(Duration::from_secs_f64(limit_s.max(0.0)))))
     }
 
     fn modules<'py>(&self, py: Python<'py>) -> PyResult<Vec<Bound<'py, PyDict>>> {
-        let list = self.with(|s| s.modules().map_err(os))?;
+        let list = self.with(py, |s| s.modules().map_err(os))?;
         list.into_iter()
             .map(|m| {
                 let d = PyDict::new(py);
@@ -489,15 +497,15 @@ impl RtSession {
             .collect()
     }
 
-    fn threads(&self) -> PyResult<Vec<u32>> {
-        self.with(|s| Ok(s.threads()))
+    fn threads(&self, py: Python<'_>) -> PyResult<Vec<u32>> {
+        self.with(py, |s| Ok(s.threads()))
     }
 
     /// Every thread as `(tid, state, {register: value})`; the state is Frida's name, the registers are empty for a
     /// thread that could not be stopped for the read.
     #[allow(clippy::type_complexity)]
     fn thread_report<'py>(&self, py: Python<'py>) -> PyResult<Vec<(u32, &'static str, Bound<'py, PyDict>)>> {
-        let report = py.detach(|| self.with(|s| Ok(s.thread_report())))?;
+        let report = py.detach(|| self.with_locked(|s| Ok(s.thread_report())))?;
         report
             .into_iter()
             .map(|t| {
@@ -511,32 +519,40 @@ impl RtSession {
     }
 
     fn read_memory<'py>(&self, py: Python<'py>, address: u64, size: usize) -> PyResult<Bound<'py, PyBytes>> {
-        let v = py.detach(|| self.with(|s| s.read_memory(address, size).map_err(os)))?;
+        let v = py.detach(|| self.with_locked(|s| s.read_memory(address, size).map_err(os)))?;
         Ok(PyBytes::new(py, &v))
     }
 
     /// `(base, size, protect)` of the region holding `address`.
-    fn query(&self, address: u64) -> PyResult<(u64, u64, u32)> {
-        self.with(|s| s.query(address).map_err(os))
+    fn query(&self, py: Python<'_>, address: u64) -> PyResult<(u64, u64, u32)> {
+        self.with(py, |s| s.query(address).map_err(os))
     }
 
     /// Compare-and-swap with the policy gate. `authorization` is the JSON of the build's entry, or None for the
     /// fixture gate. Returns the undo id.
     #[pyo3(signature = (address, expect, value, reason, authorization=None))]
-    fn write_cas(&self, address: u64, expect: Vec<u8>, value: Vec<u8>, reason: String, authorization: Option<String>) -> PyResult<u32> {
+    fn write_cas(
+        &self,
+        py: Python<'_>,
+        address: u64,
+        expect: Vec<u8>,
+        value: Vec<u8>,
+        reason: String,
+        authorization: Option<String>,
+    ) -> PyResult<u32> {
         let gate = gate_of(authorization.as_deref())?;
-        self.with(|s| s.write_cas(&gate, address, &expect, &value, &reason).map_err(mem))
+        self.with(py, |s| s.write_cas(&gate, address, &expect, &value, &reason).map_err(mem))
     }
 
     #[pyo3(signature = (id, authorization=None))]
-    fn undo_write(&self, id: u32, authorization: Option<String>) -> PyResult<()> {
+    fn undo_write(&self, py: Python<'_>, id: u32, authorization: Option<String>) -> PyResult<()> {
         let gate = gate_of(authorization.as_deref())?;
-        self.with(|s| s.undo_write(&gate, id).map_err(mem))
+        self.with(py, |s| s.undo_write(&gate, id).map_err(mem))
     }
 
     /// Arm a hardware watch (`kind` is "write" or "rw"); returns the slot.
     #[pyo3(signature = (address, size, kind, limit, authorization=None))]
-    fn arm_watch(&self, address: u64, size: u32, kind: &str, limit: u32, authorization: Option<String>) -> PyResult<usize> {
+    fn arm_watch(&self, py: Python<'_>, address: u64, size: u32, kind: &str, limit: u32, authorization: Option<String>) -> PyResult<usize> {
         let gate = gate_of(authorization.as_deref())?;
         let kind = match kind {
             "write" => Kind::Write,
@@ -545,13 +561,13 @@ impl RtSession {
                 return Err(PyValueError::new_err(format!("unknown watch kind {other:?}")));
             }
         };
-        self.with(|s| s.arm_watch(&gate, address, size, kind, limit).map_err(mem))
+        self.with(py, |s| s.arm_watch(&gate, address, size, kind, limit).map_err(mem))
     }
 
     /// Disarm and read back; returns the phase name ("clear" or "tainted").
-    fn disarm_watch(&self, slot: usize) -> PyResult<&'static str> {
+    fn disarm_watch(&self, py: Python<'_>, slot: usize) -> PyResult<&'static str> {
         use hy_runtime::watch::Phase::*;
-        self.with(|s| {
+        self.with(py, |s| {
             Ok(match s.disarm_watch(slot).map_err(mem)? {
                 Arming => "arming",
                 Armed => "armed",
@@ -564,31 +580,31 @@ impl RtSession {
 
     /// DR7 of every thread, read now: `([(tid, dr7)], [tid that could not be read])`.
     fn read_dr7(&self, py: Python<'_>) -> PyResult<Dr7Rows> {
-        py.detach(|| self.with(|s| Ok(s.read_dr7())))
+        py.detach(|| self.with_locked(|s| Ok(s.read_dr7())))
     }
 
     /// The threads a watch slot has been programmed into.
-    fn watch_threads(&self, slot: usize) -> PyResult<Vec<u32>> {
-        self.with(|s| Ok(s.watch_threads(slot)))
+    fn watch_threads(&self, py: Python<'_>, slot: usize) -> PyResult<Vec<u32>> {
+        self.with(py, |s| Ok(s.watch_threads(slot)))
     }
 
-    fn watch_hits(&self, slot: usize) -> PyResult<u32> {
-        self.with(|s| Ok(s.watch_hits(slot)))
+    fn watch_hits(&self, py: Python<'_>, slot: usize) -> PyResult<u32> {
+        self.with(py, |s| Ok(s.watch_hits(slot)))
     }
 
-    fn sync_watch_threads(&self) -> PyResult<()> {
-        self.with(|s| {
+    fn sync_watch_threads(&self, py: Python<'_>) -> PyResult<()> {
+        self.with(py, |s| {
             s.sync_watch_threads();
             Ok(())
         })
     }
 
-    fn watch_tainted(&self) -> PyResult<bool> {
-        self.with(|s| Ok(s.watch_tainted()))
+    fn watch_tainted(&self, py: Python<'_>) -> PyResult<bool> {
+        self.with(py, |s| Ok(s.watch_tainted()))
     }
 
-    fn terminate(&self) -> PyResult<()> {
-        self.with(|s| {
+    fn terminate(&self, py: Python<'_>) -> PyResult<()> {
+        self.with(py, |s| {
             s.terminate();
             Ok(())
         })

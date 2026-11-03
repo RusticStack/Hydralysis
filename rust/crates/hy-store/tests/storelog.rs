@@ -192,7 +192,7 @@ fn a_torn_log_tail_is_ignored_and_repaired_by_the_next_append() {
     store = with_edit(&store, 2);
     storelog::save(&path, &store, None, None).unwrap();
     assert_eq!(read_back(&path), store);
-    assert!(AppendLog::new(&log).scan().torn_tail.is_none());
+    assert!(AppendLog::new(&log).scan().unwrap().torn_tail.is_none());
 }
 
 #[test]
