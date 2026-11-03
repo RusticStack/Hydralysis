@@ -26,6 +26,7 @@ from hydralysis import evidence_bundle as bundles
 from hydralysis import proc
 from hydralysis.client import Client
 from hydralysis.pe import Image
+from hydralysis.runtime_device import implementation
 from support import REPOSITORY, workdir
 
 sys.path.insert(0, str(REPOSITORY / "tools" / "scenarios"))
@@ -36,6 +37,12 @@ EXE = Path(sys.executable).resolve()
 ENTRY = Image(EXE).pe.OPTIONAL_HEADER.AddressOfEntryPoint        # code: a prologue can be read from the file here
 PROLOGUE = Image(EXE).read_rva(ENTRY, 5)
 HEAD = EXE.read_bytes()[:5]            # a probe at rva 0 covers no call; the entry point's first bytes may hold one
+
+
+FAKE_HITS = unittest.skipIf(
+    implementation() == "rust",
+    "the fake binding invents the probe's hits (python.exe never runs the hooked bytes); the Rust device runs the real "
+    "probe, covered by test_rust_runtime.ThroughTheAgent and test_runtime_capture.CaptureOverMCP")
 
 
 def spec(**changes) -> dict:
@@ -110,6 +117,7 @@ class Mirror(unittest.TestCase):
         except (OSError, ValueError, KeyError):
             pass
 
+    @FAKE_HITS
     def test_the_steps_run_in_order_and_what_cannot_run_is_a_stated_skip(self):
         result = self.run_one()
         run = result["runs"][0]
@@ -122,6 +130,7 @@ class Mirror(unittest.TestCase):
         self.assertIn("exposes the main module only", run["skipped"]["export_hooks"])
         self.assertEqual(run["silent_drops"], [])
 
+    @FAKE_HITS
     def test_the_program_is_spawned_paused_probed_and_left_alive_with_its_file_untouched(self):
         run = self.run_one()["runs"][0]
         by = {row["step"]: row["detail"] for row in run["steps"]}
@@ -132,6 +141,7 @@ class Mirror(unittest.TestCase):
         self.assertEqual(by["typed_read"]["magic"], 0x5A4D)
         self.assertTrue(by["snapshot"]["compare_equal"])
 
+    @FAKE_HITS
     def test_a_limited_probe_states_the_loss_and_nothing_is_silent(self):
         run = self.run_one()["runs"][0]
         self.assertEqual(run["coverage"]["status"], "partial")
@@ -147,6 +157,7 @@ class Mirror(unittest.TestCase):
         self.assertEqual(run["install_tree"]["before"], run["install_tree"]["after"])
         self.assertEqual(run["install_tree"]["before"], scenario.tree_hash(self.install))
 
+    @FAKE_HITS
     def test_the_bundle_verifies_and_holds_the_runs_claims_without_the_run_specific_ids(self):
         run = self.run_one()["runs"][0]
         loaded = bundles.load_bundle(Path(run["bundle"]))
@@ -162,6 +173,7 @@ class Mirror(unittest.TestCase):
         self.assertEqual(hook["content"]["coverage"]["status"], "partial")
         self.assertEqual(hook["meta"]["provenance"]["capture"], run["capture"])   # the run-specific id lives in the volatile part
 
+    @FAKE_HITS
     def test_two_runs_give_bundles_that_compare_with_no_difference(self):
         result = self.run_one(twice=True)
         first, second = result["runs"]
@@ -172,6 +184,7 @@ class Mirror(unittest.TestCase):
         self.assertEqual(result["compare"]["changes"], [])
         self.assertEqual(first["bundle_id"], second["bundle_id"])
 
+    @FAKE_HITS
     def test_a_different_observation_is_a_difference_the_comparison_reports(self):
         result = self.run_one(twice=True)
         changed = copy.deepcopy(spec())
@@ -194,6 +207,7 @@ class Mirror(unittest.TestCase):
         self.assertEqual({v for k, v in status.items() if k != "verify_sites"}, {"not_run"})
         self.assertIsNone(run["session"])
 
+    @FAKE_HITS
     def test_a_failed_typed_read_ends_the_run_and_still_detaches_the_program(self):
         value = spec()
         value["typed_read"]["expect"] = {"magic": 1}
@@ -214,6 +228,7 @@ class Mirror(unittest.TestCase):
         self.assertEqual({row["step"]: row["status"] for row in run["steps"]}["observe"], "fail")
         self.assertIn("PROLOGUE MISMATCH", [row for row in run["steps"] if row["step"] == "observe"][0]["detail"])
 
+    @FAKE_HITS
     def test_a_skip_the_spec_does_not_allow_makes_the_run_fail(self):
         value = spec(allowed_skips={"export_hooks": "x"})          # writers is skipped but not allowed
         result = self.run_one(value)

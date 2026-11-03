@@ -1,0 +1,21 @@
+[package]
+name = "hy-runtime"
+version = "0.1.0"
+edition = "2024"
+description = "Hydralysis runtime host: spawn/inject/drain without Frida (Rust replacement of runtime*.py)"
+
+[dependencies]
+hy-agent-proto = { path = "../hy-agent-proto" }
+serde_json = "1"
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Performance",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Kernel",
+] }

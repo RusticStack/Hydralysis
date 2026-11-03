@@ -1,0 +1,7 @@
+[package]
+name = "hy-agent-proto"
+version = "0.1.0"
+edition = "2024"
+description = "Shared-memory wire layout between the Hydralysis runtime host and the injected agent"
+
+[dependencies]

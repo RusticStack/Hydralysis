@@ -638,10 +638,30 @@ class CaptureOverMCP(unittest.TestCase):
         cls.root = Path(cls.work.name)
         shutil.copytree(FAKE_FRIDA, cls.root / "runtime-backend" / "frida-17.24.3" / "frida")
         cls.exe = str(Path(sys.executable).resolve())
+        cls.site_rva = "0x0"
+        cls.go = None
+        cls.rust = False
+        from hydralysis.runtime_device import implementation
+        if implementation() == "rust":
+            # The fake binding invents its hits (HYDRALYSIS_FAKE_HITS); the Rust device runs the real probe, so it gets a
+            # real target that calls the hooked function exactly five times once the probe is installed (a file says when).
+            from hydralysis import rust_frida
+            fixture = Path(os.environ.get("HYDRALYSIS_HY_FIXTURE") or rust_frida._RELEASE / "hy-fixture.exe")
+            if not fixture.is_file():
+                raise unittest.SkipTest("the Rust device needs hy-fixture.exe (cargo build --release in rust/)")
+            cls.exe = str(fixture.resolve())
+            info = dict(word.split("=", 1) for word in subprocess.run([cls.exe, "info"], capture_output=True, text=True,
+                                                                      timeout=60).stdout.split())
+            cls.site_rva = "0x" + info["RVA"]
+            cls.head = " ".join(info["BYTES"][i:i + 2].upper() for i in range(0, 10, 2))
+            cls.go = cls.root / "go"
+            cls.target = subprocess.Popen([cls.exe, "hits", "5", str(cls.go)], stdin=subprocess.DEVNULL)
+            cls.rust = True
+        else:
+            cls.head = " ".join("%02X" % byte for byte in Path(cls.exe).read_bytes()[:5])
+            cls.target = subprocess.Popen([cls.exe, "-c", "import time;time.sleep(120)"], stdin=subprocess.DEVNULL)
         cls.digest = hashlib.sha256(Path(cls.exe).read_bytes()).hexdigest()
-        cls.head = " ".join("%02X" % byte for byte in Path(cls.exe).read_bytes()[:5])
         cls.server = Server(cls.root, HYDRALYSIS_FAKE_HITS="5")
-        cls.target = subprocess.Popen([cls.exe, "-c", "import time;time.sleep(120)"], stdin=subprocess.DEVNULL)
         cls.time = time
 
     @classmethod
@@ -666,8 +686,17 @@ class CaptureOverMCP(unittest.TestCase):
         module = Path(self.exe).name
         try:
             self.call("capture", session=session, owner=owner, op="start", name="mcp")
-            probe = self.call("observe", session=session, owner=owner, module=module, rva="0x0", sha256=self.digest,
+            probe = self.call("observe", session=session, owner=owner, module=module, rva=self.site_rva, sha256=self.digest,
                               expect=self.head, limit=3)
+            if self.rust:
+                self.go.write_text("go")             # the target calls the hooked function five times now
+                end = self.time.monotonic() + 30
+                while self.time.monotonic() < end:
+                    seen = self.call("status", session=session, limit=200)["events"]
+                    if sum(1 for e in seen if (e["message"].get("payload") or {}).get("event") == "enter") >= 3:
+                        break
+                    self.time.sleep(0.05)
+                self.time.sleep(0.3)                  # the fourth and fifth hits are counted, not recorded
             region = {"name": "head", "module": module, "rva": "0x0", "size": 16}
             first = self.call("snapshot", session=session, regions=[region])
             second = self.call("snapshot", session=session, regions=[region])
