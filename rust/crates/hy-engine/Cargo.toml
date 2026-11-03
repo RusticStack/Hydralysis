@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 hy-core = { path = "../hy-core" }
 hy-query = { path = "../hy-query" }
+serde = "1"
 serde_json.workspace = true
 sha2.workspace = true
 regex.workspace = true

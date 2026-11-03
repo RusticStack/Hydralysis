@@ -323,3 +323,42 @@ fn a_bounded_shared_read() {
     );
     assert!(matches!(small::read_bytes(dir.path(), 6), Err(Failure::Fallback(_))));
 }
+
+#[test]
+fn the_text_writers_agree_with_the_generic_serialiser_on_awkward_text() {
+    let control = String::from(char::from(1));
+    let delete = String::from(char::from(0x7f));
+    let names = [
+        "plain".to_string(),
+        "café ünï".to_string(),
+        "😀 smile".to_string(),
+        format!("a{control}b"),
+        format!("c{delete}d"),
+        format!("q{}uote{}x", char::from(34), char::from(92)),
+    ];
+    let rows: Vec<Value> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| json!({"name": name, "hash": format!("0x{:x}", i * 77), "rva": format!("rva:0x{:x}", i * 4097), "source": format!("{name} src")}))
+        .collect();
+    let raw = file(Value::Array(rows), DIGEST, "cité 😀");
+    let text = address_map::normalise_text(&raw, DIGEST, r"C:\dir\fichier ü.json").unwrap();
+    let done = normalise(&raw, DIGEST, r"C:\dir\fichier ü.json").unwrap();
+    assert_eq!(text.indent2_bytes, hy_engine::pytext::dumps(&Value::Object(done.record.clone()), hy_engine::pytext::Dumps::Indent2).len());
+    assert_eq!(done.record["record_sha256"], json!(address_map::record_hash(&done.record)));
+    assert_eq!(done.record["entries"][3]["name"], json!(names[3]));
+    assert_eq!(done.record["file"], json!(r"C:\dir\fichier ü.json"));
+}
+
+#[test]
+fn a_record_past_32_mib_is_refused_at_the_byte() {
+    // 100000 rows of twenty emoji (about 11 MB of input, 12 escaped bytes each): past the bound once indented
+    let name = "😀".repeat(20);
+    let rows: Vec<Value> =
+        (0..address_map::MAX_ROWS).map(|i| json!({"name": name, "hash": format!("0x{i:x}"), "rva": "0x10", "source": "s"})).collect();
+    let big = normalise(&file(Value::Array(rows), DIGEST, "s"), DIGEST, "f");
+    assert_eq!(message(big), "normalized address map exceeds 32 MiB");
+    let few: Vec<Value> = (0..10).map(|i| json!({"name": name, "hash": format!("0x{i:x}"), "rva": "0x10", "source": "s"})).collect();
+    let text = address_map::normalise_text(&file(Value::Array(few), DIGEST, "s"), DIGEST, "f").unwrap();
+    assert!(text.indent2_bytes < address_map::MAX_RECORD_BYTES);
+}

@@ -175,12 +175,8 @@ def install_api(module) -> None:
 
     _replace(module, "_hex", hex_bytes)
 
-    def job_listing(records, limit):
-        if not isinstance(records, list) or not _plain_int(limit):
-            return None
-        return records, limit
-
-    _wrap(module, "_job_listing", "job_listing", job_listing)
+    # `_job_listing` stays Python: a list of job dicts crosses the FFI as JSON twice, which costs ten times what the sort and
+    # projection save (measured); the Rust twin is kept and compared by the parity test
     _wrap(module, "_sha256_arg", "prologue_sha256", lambda value: (value,))
 
     def image_base(value):

@@ -419,7 +419,7 @@ def address_map_text(rng, digest=DIGEST):
                  "source": rng.choice(["s", "t"])} for i in range(rng.randrange(1, 6))]
         document = {"sha256": digest, "source": "fixture:%d" % rng.randrange(9), "entries": rows}
         if rng.random() < 0.3:
-            rng.choice(rows)[rng.choice(["name", "hash", "rva", "source"])] = rng.choice(["", 5, "x" * 600, "0x", "café", None])
+            rng.choice(rows)[rng.choice(["name", "hash", "rva", "source"])] = rng.choice(["", 5, "x" * 600, "0x", "caf" + chr(233), None, chr(0x1F600) * 3, "a" + chr(1) + "b", "d" + chr(127) + "e", "q" + chr(34) + "b" + chr(92) + "s"])
         return json.dumps(document, ensure_ascii=rng.random() < 0.5)
     rows = []
     for _ in range(rng.randrange(0, 6)):
@@ -476,6 +476,21 @@ class LeafParity(Parity):
             self.same(want, got, "case %d: %r" % (index, text[:300]))
         self.assertGreater(valid, 30, "the generator must produce some valid maps")
 
+    def test_a_record_past_32_mib_is_refused_the_same_way(self):
+        name = chr(0x1F600) * 20
+        rows = [{"name": name, "hash": "0x%x" % i, "rva": "0x10", "source": "s"} for i in range(address_maps.MAX_ROWS)]
+        raw = json.dumps({"sha256": DIGEST, "source": "bulk", "entries": rows}, ensure_ascii=False).encode()
+        self.assertLess(len(raw), address_maps.MAX_BYTES)
+        source = self.folder / "emoji.json"
+        want = python(address_maps._normalize, raw, DIGEST, source)
+        try:
+            found = native.engine_address_map_rs(raw, DIGEST, str(source.resolve()))
+            got = ("fallback",) if found is None else ("ok", found)
+        except Exception as exc:  # noqa: BLE001
+            got = ("err", type(exc).__name__, str(exc))
+        self.assertEqual(want, ("err", "ValueError", "normalized address map exceeds 32 MiB"))
+        self.assertEqual(got, want)
+
     def test_a_large_map_normalises_to_the_same_record(self):
         rows = [{"name": "n%d" % i, "hash": "0x%x" % (i * 7), "rva": "rva:0x%x" % (i % 65535), "source": "s%d" % (i % 9)} for i in range(20000)]
         raw = json.dumps({"sha256": DIGEST, "source": "bulk", "entries": rows}).encode()
@@ -499,6 +514,9 @@ class LeafParity(Parity):
                     row = row.replace('"symbol": "%s", ' % "Alpha", "")
                 if rng.random() < 0.1:
                     row = row.replace('"hash":', '"hash" :')
+                if rng.random() < 0.3:  # a random edit: the hand-written row scanner must agree with the original's pattern on damaged rows
+                    spot = rng.randrange(len(row))
+                    row = rng.choice([row[:spot] + row[spot + 1:], row[:spot] + rng.choice([" ", "\t", "\n", "\x0b", "\x0c", '"', "{", "}", ":", ",", "a", "G", "9"]) + row[spot:]])
                 lines.append(row)
             body = rng.choice(["\n", ",\n", " "]).join(lines).encode("utf-8")
             path = self.folder / ("t%d.json" % index)

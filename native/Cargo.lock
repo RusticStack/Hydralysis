@@ -346,6 +346,7 @@ dependencies = [
  "hy-query",
  "memchr",
  "regex",
+ "serde",
  "serde_json",
  "sha2",
  "zip",

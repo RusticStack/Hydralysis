@@ -296,13 +296,8 @@ fn engine_address_map_rs(
     file: &str,
 ) -> PyResult<Option<(String, usize, String)>> {
     let result = py.detach(|| {
-        address_map::normalise(raw, digest, file).map(|done| {
-            (
-                done.map_sha256,
-                done.entries,
-                pytext::dumps(&Value::Object(done.record), Dumps::CompactAscii),
-            )
-        })
+        address_map::normalise_text(raw, digest, file)
+            .map(|done| (done.map_sha256, done.entries, done.record_json))
     });
     outcome(result)
 }

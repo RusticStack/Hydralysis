@@ -80,3 +80,20 @@ drives; bounded shared reads; address parsing.
   so `backends.read_json` no longer reaches the patched `localio._kernel`. Fails the same way with this crate's routing disabled.
 * `test_durable` (10 tests in `AppendLogTests`, `AtomicWrite`, `SealedJson`): they patch `os.replace`, `os.fsync` and the
   localio budget, which hy-core's `durable` route does not honour. The same 10 fail with this crate's routing disabled.
+
+## Routing decisions from measurements (Windows x64, release build, fresh process per case)
+
+| Function | Python | Rust | Routed |
+|---|---|---|---|
+| `api._hex` of 64 KiB | 6.0 ms | 0.23 ms | yes |
+| `api.catalog_hash()` | 0.052 ms | under 0.001 ms (constant of this build) | yes |
+| `red4ext.lookup_hashes` over 200k rows | 182 ms, 83 MB peak | 26 ms, 83 MB peak | yes |
+| `address_maps._normalize`, 100k rows, new import | 300 ms, 118 MB peak | 195 ms, 76 MB peak | yes |
+| `address_maps._normalize`, 100k rows, re-import (record not built) | 290 ms, 118 MB peak | 117 ms, 76 MB peak | yes |
+| `hydra.inspect_engine` | 0.42 ms | 0.31 ms | yes |
+| `localio.read_bytes` 4 KiB | 0.037 ms | 0.031 ms | yes (within noise) |
+| `api.tool_table()` | 0.005 ms | 0.005 ms | not routed (nothing to save) |
+| `api._job_listing` of 500 records | 0.23 ms | 2.3 ms | not routed: the records cross the FFI as JSON twice |
+
+The Rust twin of `_job_listing` is kept and compared by the parity test. Process CPU time on Windows ticks at 15.6 ms, so the
+small figures are means over hundreds of calls.
