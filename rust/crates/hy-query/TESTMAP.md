@@ -92,3 +92,65 @@ stay Python-only and are unchanged.
 | `tests/test_backends.py`, `tests/test_doctor.py` | black-box, unchanged | pass under `HYDRALYSIS_IMPL=python` and `rust` (14 + 14 each) |
 
 Not ported (stay Python, they sit on `hydra`, `durable`, `locks`, `urllib`, `zipfile`, daemon probes): `backends.inspect/resolved/_stamp/ensure/_download/_extract/_ignored/_engine_candidates/_client_candidates`, `read_json/write_json`, and all `doctor` sections and `diagnose/handle`. `backends.sha256` is covered by `export::sha256_file`.
+
+## Stage 4: the engine-facing core of query.py (`session.rs`) and `decompile_job.rs`
+
+The engine client is the `session::Engine` trait (`key`, `call(command, fields)`, `supports`), so everything below runs
+against a fake in Rust. The process-wide globals of query.py (`_keys`, `_opening`, `_in_use`, `_held`, `_lanes`) are one
+`session::Registry`; `_holding()` is the RAII guard `Registry::holding()`.
+
+| Python test (tests/test_query.py unless noted) | Rust test (`tests/session.rs`) |
+|---|---|
+| ClientCap.test_a_fifth_view_closes_the_least_recently_used_read_only_program | a_fifth_view_closes_the_least_recently_used_read_only_program |
+| ClientCap.test_a_writable_program_is_never_closed_and_the_refusal_stands_when_nothing_read_only_is_left | same name |
+| ClientCap.test_another_busy_is_not_taken_for_the_cap | another_busy_is_not_taken_for_the_cap |
+| ProgramsInUse.test_a_program_a_read_is_using_is_not_closed_for_the_cap | same name |
+| ProgramsInUse.test_the_marks_end_with_the_read | same name |
+| ProgramsInUse.test_when_every_read_only_program_is_in_use_the_least_recently_used_is_closed_as_before | same name |
+| ProgramsInUse.test_a_read_holds_its_program_from_the_moment_the_open_hands_it_out | same name |
+| ProgramsInUse.test_threads_opening_one_program_send_one_open | same name |
+| ProgramsInUse.test_threads_waiting_on_a_refused_open_take_its_refusal_instead_of_waiting_again | same name |
+| ProgramsInUse.test_a_refresh_opens_again_after_the_gate | same name |
+| test_decompile_e2e.Fallback.test_a_script_failure_is_deferred_to_a_job_unless_inline | same name |
+| test_decompile_e2e.Fallback.test_inline_the_engine_command_runs_with_a_long_timeout_and_is_labelled | same name |
+| test_decompile_e2e.Fallback.test_explicit_options_reach_the_engine_and_a_slow_answer_defers | same name |
+| test_decompile_partial.test_the_command_is_asked_only_when_needed_and_a_refusal_keeps_the_script_answer | same name |
+| test_decompile_e2e.Fallback.test_scripted_* (3) | TODO: they test `QueryRunner._scripted` (QueryRunner is not ported) |
+| test_decompile_e2e.Job.test_the_worker_runs_the_query_inline_and_stores_the_labelled_result | `tests/decompile_job.rs` same name |
+| test_decompile_e2e.Job.test_a_worker_failure_is_recorded | `tests/decompile_job.rs` same name |
+| test_decompile_e2e.Job.test_the_cli_follows_a_job_to_its_result | n/a: tests `cli._await_decompile_job` (CLI lane); runs unchanged |
+| new (no Python test): wrong build message, cache-key spelling, forget/drop_program/forget_role/drop_rows_under, reader_lanes/readers, accepted/public, run_script (last JSON line, quick lane, truncated, large request file), splitlines, `int()` of `max_characters`; job id validation, interrupted worker, log tail, reuse of a running job | `tests/session.rs`, `tests/decompile_job.rs` |
+| new: tests/test_rust_parity_session.py | PAR: `accepted`, `_public`, `reader_lanes`, `engine_decompile` (10 engine behaviours x 10 requests x 9 responses x inline, plus 300 seeded random option mutations), `decompile_job.job_path`, Windows path spelling vs `PureWindowsPath` |
+
+Selection: `HYDRALYSIS_IMPL=rust` routes `query.accepted`, `query._public`, `query.reader_lanes`,
+`query.engine_decompile` and `decompile_job.job_path` through PyO3 (`native/src/session.rs`; the Python engine object is
+adapted to the trait, a non-EngineError exception it raises propagates unchanged). **`open_program` and its cache stay
+Python in both modes**: `query._keys` / `_in_use` / `_opening` are read and cleared by many Python callers and tests
+(`forget`, `_drop_program`, `workcopy`, `views`), so a second copy of the state in Rust would split the cache. The Rust
+`Registry::open_program` is complete and tested, ready for the day those callers move.
+
+Not ported: `QueryRunner` (reader/pool/route/register/lineage/views/commit/queue/status/stop: they sit on `targets`,
+`lineage`, `viewgov`, `views`, `workcopy`, `hydra.Registry` and threads) and the process launch of `decompile_job.start`
+(only its dedupe, record and status/run logic are ported, over `Store`/`Processes` traits), `exporting.start/normalized`
+and `export_worker.run`.
+
+## PORTING note: quirks kept (stage 4)
+
+- `windows_path` is `str(Path(gpr)).lower()` for drive paths and plain `\server\share` UNC. Exotic UNC spellings
+  (`//srv`, `///x`, `//srv//share`) are not modelled (Python keeps odd root forms); no `.gpr` path has them.
+- Cache key `(connection, lowercased project path, program, writable)`; a cache hit moves the row to the end (LRU), a
+  refresh does not move an existing row; a writable row is never evicted.
+- A waiter on an open in flight takes the opener's row or refusal; with `refresh` it opens again itself. An opener that
+  panics wakes its waiters, who then open themselves (Python: an interrupted opener).
+- The `sha256` check lowercases the engine's value but not the caller's.
+- `run_script` takes the last output line starting with `{` using Python `splitlines` boundaries (`py_splitlines`), sends
+  the request through Python `json.dumps` spacing, and a missing `output` reads as `''` while a null one reads as `None`.
+- `engine_decompile`: `int(options["max_characters"])` follows Python `int()`: floats truncate, bools are 0/1, numeric
+  strings parse, `None`/list/dict raise `TypeError`, a malformed string raises `ValueError`; an integer past 64 bits or a
+  non-ASCII digit string is `Unsupported` and the Python original answers. An unchanged answer is returned as the very
+  same object by the Python wrapper (`assertIs` in the tests). `engine_s` is rounded to 0.1 s.
+- `accepted` in Rust mode builds a new dict; the Python original also annotates its argument in place.
+- `decompile_job.run` serialises its record updates with a mutex (the Python worker's tick thread and main thread could
+  interleave a read-modify-write); the stage text and the final states are otherwise identical.
+- Engine errors from Rust-built `EngineError::new` carry a minimal `str()` JSON (`engine_error`, `message`, `command`); the
+  PyO3 adapter passes the Python exception's own `str()`.

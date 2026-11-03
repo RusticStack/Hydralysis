@@ -126,7 +126,7 @@ fn offset_ok(s: &str) -> bool {
 }
 
 /// Python `json.dumps(value, ensure_ascii=False)` (default separators), for the 256 KiB batch bound.
-fn py_dumps(v: &Value, out: &mut String) {
+pub(crate) fn py_dumps(v: &Value, out: &mut String) {
     match v {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
@@ -171,6 +171,13 @@ fn py_dumps(v: &Value, out: &mut String) {
             out.push('}');
         }
     }
+}
+
+/// `json.dumps(value, ensure_ascii=False)` as a new string.
+pub fn py_dumps_string(v: &Value) -> String {
+    let mut s = String::new();
+    py_dumps(v, &mut s);
+    s
 }
 
 fn allowed_for(action: &str, record: bool) -> Option<Vec<&'static str>> {

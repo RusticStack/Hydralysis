@@ -4,9 +4,11 @@ pub mod analysis;
 pub mod client;
 pub mod crossbuild;
 pub mod decompile;
+pub mod decompile_job;
 pub mod export;
 pub mod proc;
 pub mod prologue;
+pub mod session;
 pub mod system;
 pub mod tools;
 
