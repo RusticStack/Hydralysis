@@ -102,3 +102,21 @@ Module lifecycle: recover, in_flight_ids, revert (+ rehydrate from the archive),
 | tests/py_lifecycle.rs | 27 scenarios built on disk in two roots, run by each implementation, results + CURRENT.log + intent logs + store equal: recovery (roll forward, roll back on a tampered generation, unpublished candidate, after PREPARE, backup kept, nothing to do), revert (ok, stale expect, not latest, wrong view, previous generation gone, rehydration from the archive, archive mismatch, revert of a reverted commit, nothing to revert, commit lock busy), heal (rolls forward, closes the intent, finishes a revert, nothing, busy), in-flight ids (dead, live, published, settled), abort (requested, too late). Slow (about 200 s: the Python side) | test_commit.py recover/revert/heal cases |
 
 Not ported: `commits._commit`, `_verify_candidate` (engine-driven candidate build; stays Python, as `views._publish_candidate`).
+
+## Stage 8: PyO3 binding and HYDRALYSIS_IMPL=rust routing
+
+- `native/src/views.rs` exposes `views_call_rs(name, json_args)` (JSON in, JSON out, error kinds view/runtime/value/other).
+  Routed (disk-level only): `views.live_generations, master_ids, editors_since, outstanding, reserve_generation, validate`
+  and `commits.recover, in_flight_ids, request_abort, revert`. Wrapper: `src/hydralysis/viewnative.py` (`routed`).
+- Python stays the default and the fallback: no variable, no native module, or a module without the binding runs the original.
+  The wrapper also runs the original while a Python-side seam is active (HYDRALYSIS_TEST_FAULT, a patched
+  `durable.replace_file`, a patched `workcopy.MAX_OVERLAYS`), because the Rust code cannot see those.
+- Results (Python 3.15, release .pyd from `C:/dev-overflow/claude-tmp/views-pyd`):
+  - default (variable unset): test_views, test_commit, test_view_base, test_viewgov: 248 tests; the two k11 agent-process
+    tests (12 and 24 agents) hit `LockBusy .targets.lock` under heavy machine load; alone (`AgentProcesses`, 7 tests) all pass.
+  - `HYDRALYSIS_IMPL=rust`: the first full run failed 3 tests that rely on the Python seams above; fixed by the guard, those
+    tests then pass in rust mode.
+- Not ported: workcopy sync/edit/overlays, viewpool, userscripts, the in-process leader; engine-bound `_publish_candidate`,
+  `commits._commit`, `_verify_candidate` (they stay Python behind the Host trait); rebase/merge/drain/job are not routed
+  (tested only differentially in Rust).
+- Known defect in Python: `run_publish_job` publish_wait_expired path raises TypeError (csid passed twice).

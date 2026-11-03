@@ -9,6 +9,12 @@ import functools
 import inspect
 import json
 import os
+import sys
+
+from hydralysis import durable
+
+_REPLACE_FILE = durable.replace_file
+_OVERLAY_CAP = 4096
 
 
 def native_views():
@@ -19,7 +25,20 @@ def native_views():
         import hydralysis_native as native
     except ImportError:
         return None
-    return native if hasattr(native, "views_call_rs") else None
+    if not hasattr(native, "views_call_rs"):
+        return None
+    return None if _python_seams_active() else native
+
+
+def _python_seams_active() -> bool:
+    """True while a Python-side seam the Rust code cannot see is in use (fault injection, a patched replace or overlay cap):
+    those calls run the original so the behaviour under the seam stays the specified one."""
+    if os.environ.get("HYDRALYSIS_TEST_FAULT"):
+        return True
+    if durable.replace_file is not _REPLACE_FILE:
+        return True
+    workcopy = sys.modules.get("hydralysis.workcopy")
+    return workcopy is not None and getattr(workcopy, "MAX_OVERLAYS", _OVERLAY_CAP) != _OVERLAY_CAP
 
 
 def routed(name: str, python_function, error, prepare=None, finish=None):
