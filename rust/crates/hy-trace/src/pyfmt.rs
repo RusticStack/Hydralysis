@@ -52,29 +52,40 @@ pub enum IntParse {
 
 /// `int(text.strip(), 0)`.
 pub fn parse_int_base0(text: &str) -> IntParse {
+    parse_with(text, None)
+}
+
+/// `int(text.strip(), radix)` for a radix of 16, where `0x` may still prefix the digits (the other prefixes are digits).
+pub fn parse_int_radix(text: &str, radix: u32) -> IntParse {
+    parse_with(text, Some(radix))
+}
+
+fn parse_with(text: &str, fixed: Option<u32>) -> IntParse {
     let text = text.trim_matches(is_py_space);
     if !text.is_ascii() {
         return IntParse::NotAscii;
     }
-    parse_ascii(text).map_or(IntParse::Invalid, IntParse::Value)
+    parse_ascii(text, fixed).map_or(IntParse::Invalid, IntParse::Value)
 }
 
-fn parse_ascii(text: &str) -> Option<i128> {
+fn parse_ascii(text: &str, fixed: Option<u32>) -> Option<i128> {
     let (negative, rest) = match text.as_bytes().first()? {
         b'-' => (true, &text[1..]),
         b'+' => (false, &text[1..]),
         _ => (false, text),
     };
     let lower = rest.to_ascii_lowercase();
-    let (radix, digits) = match lower.get(..2) {
-        Some("0x") => (16, &lower[2..]),
-        Some("0o") => (8, &lower[2..]),
-        Some("0b") => (2, &lower[2..]),
-        _ => (10, &lower[..]),
+    let (radix, digits) = match (fixed, lower.get(..2)) {
+        (None | Some(16), Some("0x")) => (16, &lower[2..]),
+        (None, Some("0o")) => (8, &lower[2..]),
+        (None, Some("0b")) => (2, &lower[2..]),
+        (Some(radix), _) => (radix, &lower[..]),
+        (None, _) => (10, &lower[..]),
     };
     // Underscores are allowed singly between digits (and right after a radix prefix).
+    let after_prefix = digits.len() != lower.len();
     let mut cleaned = String::with_capacity(digits.len());
-    let mut previous_digit = radix != 10;
+    let mut previous_digit = after_prefix;
     for c in digits.chars() {
         if c == '_' {
             if !previous_digit {
@@ -89,7 +100,7 @@ fn parse_ascii(text: &str) -> Option<i128> {
     if cleaned.is_empty() || !previous_digit {
         return None;
     }
-    if radix == 10 && cleaned.len() > 1 && cleaned.starts_with('0') && cleaned.bytes().any(|b| b != b'0') {
+    if fixed.is_none() && radix == 10 && cleaned.len() > 1 && cleaned.starts_with('0') && cleaned.bytes().any(|b| b != b'0') {
         return None; // base 0 refuses a leading zero in a non-zero decimal
     }
     let value = i128::from_str_radix(&cleaned, radix).ok()?;
@@ -116,6 +127,11 @@ mod tests {
         assert_eq!(parse_int_base0("1.5"), IntParse::Invalid);
         assert_eq!(parse_int_base0(""), IntParse::Invalid);
         assert_eq!(parse_int_base0("\u{0661}"), IntParse::NotAscii);
+        assert_eq!(parse_int_radix("0x2000", 16), IntParse::Value(0x2000));
+        assert_eq!(parse_int_radix("0b1", 16), IntParse::Value(0xb1));
+        assert_eq!(parse_int_radix(" -1F ", 16), IntParse::Value(-31));
+        assert_eq!(parse_int_radix("zz", 16), IntParse::Invalid);
+        assert_eq!(parse_int_radix("", 16), IntParse::Invalid);
     }
 
     #[test]

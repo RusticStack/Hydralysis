@@ -8,6 +8,7 @@
 
 pub mod hashes;
 pub mod pyfmt;
+pub mod reports;
 
 /// Why a call did not produce an answer.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]

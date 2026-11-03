@@ -1558,6 +1558,7 @@ mod hashes;
 mod keys;
 mod port;
 mod pump;
+mod reports;
 mod segment;
 
 pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -1572,5 +1573,6 @@ pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("TraceFallback", module.py().get_type::<port::TraceFallback>())?;
     module.add("TraceHashError", module.py().get_type::<port::TraceHashError>())?;
     hashes::register(module)?;
+    reports::register(module)?;
     Ok(())
 }
