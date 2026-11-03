@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import os
+import sys
 from pathlib import Path
 
 from hydralysis import __version__
@@ -266,7 +268,8 @@ def tool_table() -> list[dict]:
     ]
 
 
-def call(name: str, args: dict | None) -> str:
+def _check_call(name: str, args: dict | None) -> dict:
+    """The arguments of a call as a dict, after the checks that come before any tool runs."""
     if args is not None and not isinstance(args, dict):
         raise ValueError("tool arguments must be an object")
     args = args or {}
@@ -275,6 +278,33 @@ def call(name: str, args: dict | None) -> str:
     for key, maximum in (("limit", 200), ("count", 200), ("size", 65536)):
         if key in args and (isinstance(args[key], bool) or not 1 <= int(args[key]) <= maximum):
             raise ValueError("%s must be 1..%d" % (key, maximum))
+    return args
+
+
+def _hex(data) -> str:
+    return " ".join("%02X" % byte for byte in data)
+
+
+def _sha256_arg(value) -> str:
+    """The `sha256` argument of prologue: a full hexadecimal build hash, lowercased."""
+    import re
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", value):
+        raise ValueError("sha256 must be a full hexadecimal build hash")
+    return value.lower()
+
+
+def _image_base_arg(value) -> int:
+    return int(str(value), 0)
+
+
+def _md_path(text: str) -> bool:
+    """Whether TEXT is an absolute path ending in .md."""
+    out = Path(text)
+    return out.is_absolute() and out.suffix == ".md"
+
+
+def call(name: str, args: dict | None) -> str:
+    args = _check_call(name, args)
     if name == "fingerprint":
         image = _image(args)
         detail = args.get("detail", "header")
@@ -317,7 +347,7 @@ def call(name: str, args: dict | None) -> str:
     if name == "bytes":
         image = _image(args)
         data = image.read_rva(_addr(image, args), int(args.get("size") or 32))
-        return image.header() + "\n" + " ".join("%02X" % byte for byte in data)
+        return image.header() + "\n" + _hex(data)
     if name == "strings":
         return _image(args).find_strings(str(args.get("pattern") or ""), int(args.get("limit") or 30))
     if name == "sigscan":
@@ -326,13 +356,9 @@ def call(name: str, args: dict | None) -> str:
         from hydralysis.prologue import compare_table, parse_expect
         image = _image(args)
         if "sha256" in args:
-            import re
-            expected_hash = args["sha256"]
-            if not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_hash):
-                raise ValueError("sha256 must be a full hexadecimal build hash")
-            if expected_hash.lower() != image.fingerprint()["sha256"]:
+            if _sha256_arg(args["sha256"]) != image.fingerprint()["sha256"]:
                 raise ValueError("prologue table build SHA-256 mismatch; no rows verified")
-        if "image_base" in args and int(str(args["image_base"]), 0) != image.base:
+        if "image_base" in args and _image_base_arg(args["image_base"]) != image.base:
             raise ValueError("prologue table image base mismatch; no rows verified")
         if "checks" in args:
             if "address" in args or "expect" in args:
@@ -374,7 +400,7 @@ def call(name: str, args: dict | None) -> str:
         if args.get("export"):
             from hydralysis.evidence import export
             out = Path(str(args["export"]))
-            if not out.is_absolute() or out.suffix != ".md":
+            if not _md_path(str(args["export"])):
                 raise ValueError("export must be an absolute path ending in .md")
             return json.dumps(export(path, out, target, str(args.get("subsystem") or "")), indent=2)
         return _lazy("list_claims")(path, target, int(args.get("limit") or 50), subsystem=str(args.get("subsystem") or ""),
@@ -551,11 +577,7 @@ def _workflow(name: str, args: dict) -> str:
             overlays = sorted((Path(settings["root"]) / "overlay-jobs").glob("overlay-*/job.json"),
                               key=lambda item: item.stat().st_mtime_ns, reverse=True)[:limit]
             records.extend(overlay_status(settings, item.parent.name) for item in overlays)
-            records.sort(key=lambda item: item.get("created_at", item.get("started_at", 0)), reverse=True)
-            fields = ("id", "job_id", "kind", "component", "state", "stage", "target", "game", "script", "owner",
-                      "created_at", "started_at", "elapsed_s", "duration_s", "completed", "failed", "complete", "log_path")
-            return json.dumps({"jobs": [{key: item[key] for key in fields if key in item} for item in records[:limit]],
-                               "detail": "Pass an id to job status for bounded logs and full metadata."}, indent=2)
+            return _job_listing(records, limit)
         if job_id.startswith("export-"):
             from hydralysis.exporting import status as export_status
             return json.dumps(export_status(settings, job_id), indent=2)
@@ -580,6 +602,15 @@ def _workflow(name: str, args: dict) -> str:
         return json.dumps(start_install(settings, "runtime"), indent=2)
     from hydralysis.runtime import runtime
     return runtime(str(args.get("action") or ""), args.get("options") or {}, settings)
+
+
+def _job_listing(records: list, limit: int) -> str:
+    """The newest LIMIT job records, projected onto the fields every kind of job shares."""
+    records.sort(key=lambda item: item.get("created_at", item.get("started_at", 0)), reverse=True)
+    fields = ("id", "job_id", "kind", "component", "state", "stage", "target", "game", "script", "owner",
+              "created_at", "started_at", "elapsed_s", "duration_s", "completed", "failed", "complete", "log_path")
+    return json.dumps({"jobs": [{key: item[key] for key in fields if key in item} for item in records[:limit]],
+                       "detail": "Pass an id to job status for bounded logs and full metadata."}, indent=2)
 
 
 def _options_bag(args: dict) -> dict:
@@ -693,3 +724,11 @@ def _list(value) -> list:
 def _settings() -> dict:
     from hydralysis.backends import resolved
     return resolved(load())
+
+
+# --- HYDRALYSIS_IMPL=rust ----------------------------------------------------------------------------------------
+# The catalog (hash, not_available), the checks before a tool runs and the pure shaping of answers run in Rust
+# (rust/crates/hy-engine, bound in native/src/hyapi.rs); an input Rust does not model exactly runs the code above.
+if os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() == "rust":
+    from hydralysis import _rust_engine
+    _rust_engine.install_api(sys.modules[__name__])

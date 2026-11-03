@@ -4,6 +4,7 @@
 use pyo3::prelude::*;
 
 mod engine;
+mod hyapi;
 mod pe;
 mod session;
 mod static_plane;
@@ -53,6 +54,7 @@ fn hydralysis_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(frame_lines, module)?)?;
     trace::register(module)?;
     engine::register(module)?;
+    hyapi::register(module)?;
     pe::register(module)?;
     session::register(module)?;
     views::register(module)?;

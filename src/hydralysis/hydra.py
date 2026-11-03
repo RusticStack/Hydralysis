@@ -128,6 +128,32 @@ def _capped(value, name: str, more: dict, cap: int = LIST_CAP):
     return value
 
 
+def _error_text(code, message, details: dict, command: str, queue, held_ms, retry_after_ms, next) -> str:
+    """`str(EngineError)`: the capped payload as JSON (see EngineError)."""
+    payload = {"engine_error": code, "message": message, "command": command}
+    if "output" in details and code == "failed":
+        # A script that failed to compile says why only in its output.
+        payload["output_tail"] = str(details["output"])[-2000:]
+    for key in ("holder", "holderInfo", "suggest", "suggestion", "alternatives", "reason", "program", "project",
+                "current", "running", "ambiguous"):
+        if key in details:
+            payload[key] = details[key]
+    if held_ms is not None:
+        payload["heldMs"] = held_ms
+    if queue is not None:
+        payload["queue"] = queue
+    if retry_after_ms is not None:
+        payload["retryAfterMs"] = retry_after_ms
+    if next is not None:
+        payload["next"] = next
+    more: dict = {}
+    payload = {key: item if key in UNCAPPED else _capped(item, key, more, QUEUE_CAP if key == "queue" else LIST_CAP)
+               for key, item in payload.items()}
+    if more:
+        payload["more"] = more
+    return json.dumps(payload, ensure_ascii=False)
+
+
 class EngineError(RuntimeError):
     """An ok:false answer from the engine. str() is JSON an agent can act on.
 
@@ -158,28 +184,7 @@ class EngineError(RuntimeError):
         if held is None and isinstance(self.holder_info, dict):
             held = self.holder_info.get("heldMs")
         self.held_ms = held
-        payload = {"engine_error": code, "message": message, "command": command}
-        if "output" in self.details and code == "failed":
-            # A script that failed to compile says why only in its output.
-            payload["output_tail"] = str(self.details["output"])[-2000:]
-        for key in ("holder", "holderInfo", "suggest", "suggestion", "alternatives", "reason", "program", "project",
-                    "current", "running", "ambiguous"):
-            if key in self.details:
-                payload[key] = self.details[key]
-        if self.held_ms is not None:
-            payload["heldMs"] = self.held_ms
-        if self.queue is not None:
-            payload["queue"] = self.queue
-        if retry_after_ms is not None:
-            payload["retryAfterMs"] = retry_after_ms
-        if next is not None:
-            payload["next"] = next
-        more: dict = {}
-        payload = {key: item if key in UNCAPPED else _capped(item, key, more, QUEUE_CAP if key == "queue" else LIST_CAP)
-                   for key, item in payload.items()}
-        if more:
-            payload["more"] = more
-        super().__init__(json.dumps(payload, ensure_ascii=False))
+        super().__init__(_error_text(code, message, self.details, command, self.queue, self.held_ms, retry_after_ms, next))
 
     @property
     def ambiguous(self) -> bool:
@@ -250,6 +255,21 @@ def _import_library(path: Path):
     return module
 
 
+def _client_stamps(path: Path, allow_unpinned: bool) -> dict:
+    """The stamps (`PROTOCOL`, `CLIENT_VERSION`, `HYDRA_RELEASE`) of the library at PATH, after the pin checks."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    stamps = {name: (re.search(r'^%s\s*=\s*"?([^"\n]+)"?' % name, text, re.M) or [None, None])[1]
+              for name in ("PROTOCOL", "CLIENT_VERSION", "HYDRA_RELEASE")}
+    wanted = range(PROTOCOL_MIN, PROTOCOL + 1) if allow_unpinned else (PROTOCOL,)
+    if not (stamps["PROTOCOL"] or "").isdigit() or int(stamps["PROTOCOL"]) not in wanted:
+        raise ValueError("Hydra client %s speaks protocol %s; Hydralysis needs %s" % (
+            path, stamps["PROTOCOL"], PROTOCOL if not allow_unpinned else "%d to %d" % (PROTOCOL_MIN, PROTOCOL)))
+    if not allow_unpinned and (stamps["HYDRA_RELEASE"] != RELEASE or stamps["CLIENT_VERSION"] != CLIENT_VERSION):
+        raise ValueError("Hydra client %s is release %s / client %s; this Hydralysis pins %s / %s"
+                         % (path, stamps["HYDRA_RELEASE"], stamps["CLIENT_VERSION"], RELEASE, CLIENT_VERSION))
+    return stamps
+
+
 def load_client(path: str | Path, allow_unpinned: bool = False):
     """The release's client library, after checking its stamps: the native client (`hydralysis.engine_client`, Rust) when the
     extension is built and the library is the 1.1.0 library of protocol 3, else ghidra_session.py imported from the install
@@ -266,16 +286,7 @@ def load_client(path: str | Path, allow_unpinned: bool = False):
     path = Path(path).resolve()
     if not path.is_file():
         raise ValueError("Hydra client missing: %s; run backend install" % path)
-    text = path.read_text(encoding="utf-8", errors="replace")
-    stamps = {name: (re.search(r'^%s\s*=\s*"?([^"\n]+)"?' % name, text, re.M) or [None, None])[1]
-              for name in ("PROTOCOL", "CLIENT_VERSION", "HYDRA_RELEASE")}
-    wanted = range(PROTOCOL_MIN, PROTOCOL + 1) if allow_unpinned else (PROTOCOL,)
-    if not (stamps["PROTOCOL"] or "").isdigit() or int(stamps["PROTOCOL"]) not in wanted:
-        raise ValueError("Hydra client %s speaks protocol %s; Hydralysis needs %s" % (
-            path, stamps["PROTOCOL"], PROTOCOL if not allow_unpinned else "%d to %d" % (PROTOCOL_MIN, PROTOCOL)))
-    if not allow_unpinned and (stamps["HYDRA_RELEASE"] != RELEASE or stamps["CLIENT_VERSION"] != CLIENT_VERSION):
-        raise ValueError("Hydra client %s is release %s / client %s; this Hydralysis pins %s / %s"
-                         % (path, stamps["HYDRA_RELEASE"], stamps["CLIENT_VERSION"], RELEASE, CLIENT_VERSION))
+    stamps = _client_stamps(path, allow_unpinned)
     if engine_client.usable(stamps["PROTOCOL"], stamps["CLIENT_VERSION"], (PROTOCOL, PROTOCOL_MIN, CLIENT_VERSION)):
         module = engine_client.NativeClient(path, _import_library)
     else:
@@ -1676,3 +1687,12 @@ def install(settings: dict, download, extract, cancelled=lambda: False) -> dict:
         raise ValueError("installed Hydra engine did not validate: %s" % report.get("reason"))
     load_client(client_dir / "ghidra_session.py")
     return {"hydra_dir": str(engine), "hydra_client": str(client_dir / "ghidra_session.py")}
+
+
+# --- HYDRALYSIS_IMPL=rust ----------------------------------------------------------------------------------------
+# The pure parts (error text, script action, engine release and inspection, daemon config, client stamps, wedge signal) run
+# in Rust (rust/crates/hy-engine, bound in native/src/hyapi.rs); an input Rust does not model exactly runs the code above.
+if os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() == "rust":
+    from hydralysis import _rust_engine
+    _rust_engine.install_hydra(sys.modules[__name__])
+
