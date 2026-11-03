@@ -268,7 +268,7 @@ pub fn load_store(settings: &Settings, target: &Target) -> Result<Store> {
     let record = hy_store::storelog::read(&path, snapshot, Some(&reread))?;
     let sha = tstr(target, "sha256");
     let binding = lineage_binding(target);
-    let Some(record) = record else {
+    let Some(mut record) = record else {
         let mut fresh = empty_store(sha);
         if let Some(b) = binding {
             fresh.insert("base".into(), b); // a view created after a commit starts on the head generation
@@ -282,13 +282,16 @@ pub fn load_store(settings: &Settings, target: &Target) -> Result<Store> {
             path.display()
         )));
     }
-    let Some(edits) = record.get("edits").and_then(Value::as_array).filter(|e| e.len() <= MAX_OVERLAYS) else {
-        return Err(Error::value(format!("overlay history must contain at most {MAX_OVERLAYS} records")));
+    let too_many = || Error::value(format!("overlay history must contain at most {MAX_OVERLAYS} records"));
+    // The stored records are consumed as they are cleaned, so the two copies of a big history are never alive together.
+    let items = match record.get_mut("edits") {
+        Some(Value::Array(items)) if items.len() <= MAX_OVERLAYS => std::mem::take(items),
+        _ => return Err(too_many()),
     };
-    let mut clean = Vec::with_capacity(edits.len());
+    let mut clean = Vec::with_capacity(items.len());
     let mut previous = 0;
-    for (position, item) in edits.iter().enumerate() {
-        let c = clean_record(item, position, previous)?;
+    for (position, item) in items.into_iter().enumerate() {
+        let c = clean_record(&item, position, previous)?;
         previous = c["seq"].as_i64().unwrap_or(previous);
         clean.push(c);
     }
@@ -378,6 +381,28 @@ pub fn v3(store: &Store, target: &Target, known: &[Value]) -> Result<Value> {
         previous = edit["seq"].as_i64().unwrap_or(previous);
         edits.push(edit);
     }
+    assemble(store, target, edits)
+}
+
+/// [`v3`] for a store the caller gives up: its records are moved, not copied. `same[i]` says record `i` equals the clean
+/// record known at its position (see `hy_store::storelog::known_edits_equal`).
+pub fn v3_owned(mut store: Store, target: &Target, same: &[bool]) -> Result<Value> {
+    let items = match store.remove("edits") {
+        Some(Value::Array(items)) => items,
+        _ => Vec::new(),
+    };
+    let mut edits = Vec::with_capacity(items.len());
+    let mut previous = 0;
+    for (position, item) in items.into_iter().enumerate() {
+        let known = same.get(position).copied().unwrap_or(false) && item.get("seq").and_then(Value::as_i64).is_some_and(|s| s > previous);
+        let edit = if known { item } else { clean_record(&item, position, previous)? };
+        previous = edit["seq"].as_i64().unwrap_or(previous);
+        edits.push(edit);
+    }
+    assemble(&store, target, edits)
+}
+
+fn assemble(store: &Store, target: &Target, edits: Vec<Value>) -> Result<Value> {
     let base = store.get("base").filter(|b| b.is_object()).cloned().unwrap_or_else(default_base);
     let or_empty = |k: &str| store.get(k).filter(|v| truthy(v)).cloned().unwrap_or_else(|| json!([]));
     let sha = store.get("sha256").cloned().unwrap_or_else(|| json!(tstr(target, "sha256")));
@@ -395,13 +420,32 @@ pub fn save_store(settings: &Settings, target: &Target, store: &Store) -> Result
     let known = hy_store::storelog::known_edits(&path);
     let known: &[Value] = known.as_ref().and_then(Value::as_array).map_or(&[], Vec::as_slice);
     let record = v3(store, target, known)?;
+    write_record(&path, &record)
+}
+
+/// [`save_store`] for a store the caller gives up: no copy of its records is made on the way to the log.
+pub fn save_store_owned(settings: &Settings, target: &Target, store: Store) -> Result<()> {
+    let path = store_path(settings, target)?;
+    let same = match store.get("edits") {
+        Some(Value::Array(items)) => hy_store::storelog::known_edits_equal(&path, items),
+        _ => Vec::new(),
+    };
+    let record = v3_owned(store, target, &same)?;
     keep_old_format(&path)?;
-    hy_store::storelog::save(
-        &path,
-        &record,
-        Some(MAX_HISTORY_BYTES as usize),
-        Some("overlay history would exceed 20 MiB; existing history preserved"),
-    )?;
+    hy_store::storelog::save_owned(&path, record, Some(MAX_HISTORY_BYTES as usize), Some(HISTORY_TOO_LARGE))?;
+    Ok(())
+}
+
+/// The clean `edits` of the store at PATH as this process last wrote or read them (its cache), `Null` when unknown.
+pub fn known_edits(path: &Path) -> Value {
+    hy_store::storelog::known_edits(path).unwrap_or(Value::Null)
+}
+
+const HISTORY_TOO_LARGE: &str = "overlay history would exceed 20 MiB; existing history preserved";
+
+fn write_record(path: &Path, record: &Value) -> Result<()> {
+    keep_old_format(path)?;
+    hy_store::storelog::save(path, record, Some(MAX_HISTORY_BYTES as usize), Some(HISTORY_TOO_LARGE))?;
     Ok(())
 }
 

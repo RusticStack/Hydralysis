@@ -33,7 +33,19 @@ fn text(args: &[Value], at: usize) -> Result<&str, Error> {
         .ok_or_else(|| Error::value("expected a string argument"))
 }
 
-fn dispatch(name: &str, args: &[Value]) -> Result<Value, Error> {
+fn dispatch(name: &str, mut args: Vec<Value>) -> Result<Value, Error> {
+    if name == "workcopy_save_store" {
+        // The store is a tree of thousands of records: it is moved into the writer, not copied.
+        let store = match args.get_mut(2).map(std::mem::take) {
+            Some(Value::Object(store)) => store,
+            _ => return Err(Error::value("expected an object")),
+        };
+        let settings = object(args.first().unwrap_or(&Value::Null))?;
+        let target = object(args.get(1).unwrap_or(&Value::Null))?;
+        hy_views::store::save_store_owned(&settings, &target, store)?;
+        return Ok(Value::Null);
+    }
+    let args = args.as_slice();
     let settings: Settings = object(args.first().unwrap_or(&Value::Null))?;
     match name {
         "views_live_generations" => Ok(Value::Array(gens::live_generations(
@@ -86,6 +98,39 @@ fn dispatch(name: &str, args: &[Value]) -> Result<Value, Error> {
         "commits_revert" => {
             let selected = object(args.get(1).unwrap_or(&Value::Null))?;
             lifecycle::revert(&settings, &selected, args.get(2).unwrap_or(&Value::Null))
+        }
+        "workcopy_load_store" => {
+            let target = object(args.get(1).unwrap_or(&Value::Null))?;
+            Ok(Value::Object(hy_views::store::load_store(
+                &settings, &target,
+            )?))
+        }
+        // The clean `edits` this extension's store cache holds for a path (its cache is not the one of `hydralysis_rs`).
+        "storelog_known_edits" => {
+            let path = args.get(1).and_then(Value::as_str).unwrap_or_default();
+            Ok(hy_views::store::known_edits(std::path::Path::new(path)))
+        }
+        "revisions_dependents" => {
+            let ids = |at: usize| -> BTreeSet<String> {
+                args.get(at)
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            let records = args
+                .get(1)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            Ok(json!(hy_views::revisions::dependents(
+                &records,
+                &ids(2),
+                &ids(3)
+            )))
         }
         "workcopy_base_master_gpr" => {
             let (target, store) = (
@@ -197,8 +242,10 @@ fn error_json(error: &Error) -> Value {
 fn views_call_rs(py: Python<'_>, name: &str, args: &str) -> PyResult<String> {
     let parsed: Value =
         serde_json::from_str(args).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let list = parsed.as_array().cloned().unwrap_or_default();
-    let answer = py.detach(|| dispatch(name, &list));
+    let Value::Array(list) = parsed else {
+        return Ok(json!({"err": error_json(&Error::value("expected a JSON array"))}).to_string());
+    };
+    let answer = py.detach(|| dispatch(name, list));
     Ok(match answer {
         Ok(v) => json!({"ok": v}),
         Err(e) => json!({"err": error_json(&e)}),

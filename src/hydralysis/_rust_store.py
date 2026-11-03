@@ -242,7 +242,14 @@ def install_storelog(storelog) -> None:
         return _load(rs.storelog_read(os.fspath(path), None if record is None else _dump(record), again))
 
     def known_edits(path):
-        return _load(rs.storelog_known_edits(os.fspath(path)))
+        known = _load(rs.storelog_known_edits(os.fspath(path)))
+        if known is None:
+            # The whole-store routes of `viewnative` keep their own copy of the Rust store (another extension).
+            from hydralysis import viewnative
+            native = viewnative.native_views()
+            if native is not None:
+                known = viewnative.call(native, "storelog_known_edits", [{}, os.fspath(path)])
+        return known
 
     def diff(old, new):
         return json.loads(rs.storelog_diff(_dump(old), _dump(new)))
@@ -264,6 +271,15 @@ def install_storelog(storelog) -> None:
     storelog.save = guarded(save, python["save"], writing, WRITE_SEAM, *LOG_SEAMS)
     storelog.read = guarded(read, python["read"], reading)
     storelog.known_edits = guarded(known_edits, python["known_edits"], writing)
+    constants = (storelog.SNAPSHOT_EVERY, storelog.SNAPSHOT_LOG_BYTES, storelog.CACHE_ENTRIES)
+
+    def unpatched() -> bool:
+        """True while no seam of the store writer or reader is replaced and its limits are the defaults: the whole-store
+        routes of `viewnative` (load_store, save_store) have their own copy of the Rust store and cannot see a patch."""
+        return (not writing.active() and not reading.active() and not WRITE_SEAM.active() and not any_active(LOG_SEAMS)
+                and (storelog.SNAPSHOT_EVERY, storelog.SNAPSHOT_LOG_BYTES, storelog.CACHE_ENTRIES) == constants)
+
+    storelog.rust_unpatched = unpatched
     storelog._CACHE = Cache()
     storelog.IMPL = "rust"
     assert durable  # the durable module is installed first when HYDRALYSIS_IMPL=rust

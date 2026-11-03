@@ -151,12 +151,12 @@ def layout_values(fields: list[dict], data: bytes) -> list[dict]:
 
 
 # ---- optional Rust implementation (HYDRALYSIS_IMPL=rust) ------------------------------------------------------------------
-# crates/hy-runtime `decode`, bound in crates/hy-rt-py (`hydralysis_rt`). The functions above stay the specification: the Rust
-# ones give the same value for the shapes the worker and the MCP layer produce and raise `Unmodelled` for any other (a float
-# where Python calls int(), a negative struct offset, ...), which runs the Python. A ValueError is Python's own, same text.
-# HELD BACK: measured 0.33x to 0.63x of the Python (benchmarks/bench_runtime_decode.py: the work per call is a few
-# microseconds, the conversion of the arguments and of the answer costs more), so it is routed only when
-# HYDRALYSIS_RUNTIME_HELD=1 is set as well as HYDRALYSIS_IMPL=rust.
+# crates/hy-runtime `decode` (the pure pieces), bound in crates/hy-rt-py (`hydralysis_rt`), which reads the specs and captures
+# straight from the Python objects and builds the answers as Python lists and dicts (no JSON text, no intermediate document).
+# The functions above stay the specification: the Rust ones give the same value, with the same key order, for the shapes the
+# worker and the MCP layer produce and raise `Unmodelled` for any other (a float where Python calls int(), a negative struct
+# offset, a tuple, a subclass, ...), which runs the Python. A ValueError is Python's own, same text.
+# Measured against the Python in benchmarks/bench_runtime_decode.py (see rust/crates/hy-runtime/PORTING.md for the table).
 
 _normalize_py, _decode_py, _decode_event_py, _layout_values_py = normalize, decode, decode_event, layout_values
 
@@ -164,7 +164,7 @@ _normalize_py, _decode_py, _decode_event_py, _layout_values_py = normalize, deco
 def _install_rust() -> None:
     import os
     import sys
-    if os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() != "rust" or os.environ.get("HYDRALYSIS_RUNTIME_HELD") != "1":
+    if os.environ.get("HYDRALYSIS_IMPL", "").strip().lower() != "rust":
         return
     try:
         from hydralysis import rust_frida
@@ -172,29 +172,33 @@ def _install_rust() -> None:
         routines = (rt.decode_normalize, rt.decode_value, rt.decode_event, rt.decode_layout_values, rt.Unmodelled)
     except Exception:  # noqa: BLE001 - no Rust runtime built: the Python stays
         return
-    from hydralysis._seams import Seam, guarded
+    from hydralysis._seams import Seam
     module = sys.modules[__name__]
     seam = Seam((module, "scalar"), (module, "_unpack"), (module, "SCALARS"), (struct, "unpack_from"))
+    patched = seam.active
     unmodelled = rt.Unmodelled
 
     def routed(rust_function, python_function):
+        # One frame per call: the seam check, the Rust call, and the Python function for a patched seam or an unmodelled shape.
         def call(*args):
+            if patched():
+                return python_function(*args)
             try:
                 return rust_function(*args)
             except unmodelled:
                 return python_function(*args)
-        return guarded(call, python_function, seam)
 
-    def decode_bytes(spec, data):
-        return rt.decode_value(spec, bytes(data))
+        call.__name__ = python_function.__name__
+        call.__qualname__ = python_function.__qualname__
+        call.__doc__ = python_function.__doc__
+        call.python_function = python_function
+        call.rust_function = rust_function
+        return call
 
-    def layout_bytes(fields, data):
-        return rt.decode_layout_values(fields, bytes(data))
-
-    module.normalize = routed(rt.decode_normalize, _normalize_py)
-    module.decode = routed(decode_bytes, _decode_py)
-    module.decode_event = routed(rt.decode_event, _decode_event_py)
-    module.layout_values = routed(layout_bytes, _layout_values_py)
+    module.normalize = routed(routines[0], _normalize_py)
+    module.decode = routed(routines[1], _decode_py)
+    module.decode_event = routed(routines[2], _decode_event_py)
+    module.layout_values = routed(routines[3], _layout_values_py)
 
 
 _install_rust()

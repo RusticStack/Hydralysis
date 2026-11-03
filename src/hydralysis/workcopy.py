@@ -622,6 +622,12 @@ def _file_id(path: Path, tail: bool = False, force_tail: bool = False):
     return found.st_ino, found.st_mtime_ns, found.st_size, end
 
 
+def _native_store_text(settings: dict, target: dict) -> str | None:
+    """The store as JSON text from Rust (`HYDRALYSIS_IMPL=rust`, no seam replaced), else None."""
+    from hydralysis import viewnative
+    return viewnative.store_text(settings, target)
+
+
 def load_store(settings: dict, target: dict) -> dict:
     """The store in its version-3 shape. A v1 or v2 file upgrades in memory (its `version` still says what was read)
     and on disk at its first write, which keeps the old file once as `.v1.bak` or `.v2.bak`.
@@ -638,8 +644,12 @@ def load_store(settings: dict, target: dict) -> dict:
         cached = _LOADED.get(key[0])
     if cached is not None and signature[0] is not None and cached[0] == key and cached[1] == signature:
         return json.loads(cached[2])
-    store = _load_store_uncached(settings, target, path)
-    text = json.dumps(store)
+    text = _native_store_text(settings, target)
+    if text is None:
+        store = _load_store_uncached(settings, target, path)
+        text = json.dumps(store)
+    else:
+        store = json.loads(text)
     # The parsed store is plain JSON (dicts, lists and scalars built by _load_store_uncached): a round trip through the
     # text can only give it back, so the serialization is cached without decoding it again here.
     if signature[0] is not None and _file_id(path, True, force_tail=bool(signature[0][3])) == signature[0]:
@@ -756,6 +766,9 @@ def _v3(store: dict, target: dict, known: list | None = None) -> dict:
 
 
 def _save_store(settings: dict, target: dict, store: dict) -> None:
+    from hydralysis import viewnative
+    if viewnative.save_store(settings, target, store):
+        return
     # Version 3, sealed snapshot (previous one kept as .bak) plus an append log, fsynced before return (storelog); a v1
     # or v2 file is kept once as .v1.bak or .v2.bak before it is replaced.
     path = _store_path(settings, target)

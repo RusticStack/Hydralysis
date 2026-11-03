@@ -37,10 +37,9 @@ pub fn dumps_sealed(value: &Value, indent: Option<usize>) -> Result<Vec<u8>> {
         return Err(Error::value("a sealed record cannot carry its own top-level 'seal' key"));
     }
     let seal = seal_of(value);
-    let mut full = body.clone();
-    full.insert("seal".into(), seal);
     let layout = indent.map_or(Layout::Spaced, Layout::Pretty);
-    Ok(json::dumps(&Value::Object(full), Options { layout, sort_keys: false, ensure_ascii: true }))
+    // The seal goes last; the body (thousands of records) is written as it is, not copied to add the key.
+    Ok(json::dumps_object_with(body, "seal", &seal, Options { layout, sort_keys: false, ensure_ascii: true }))
 }
 
 #[derive(Debug, Clone, PartialEq)]

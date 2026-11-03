@@ -179,34 +179,6 @@ fn py_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
-/// `float.__repr__`.
-fn float_repr(x: f64) -> String {
-    if x == 0.0 {
-        return if x.is_sign_negative() { "-0.0".into() } else { "0.0".into() };
-    }
-    let sci = format!("{:e}", x.abs());
-    let (mantissa, exponent) = sci.split_once('e').expect("{:e} always has an exponent");
-    let exponent: i32 = exponent.parse().expect("{:e} exponents are integers");
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    let sign = if x < 0.0 { "-" } else { "" };
-    if (-4..16).contains(&exponent) {
-        if exponent < 0 {
-            format!("{sign}0.{}{digits}", "0".repeat((-exponent - 1) as usize))
-        } else {
-            let point = exponent as usize + 1;
-            if digits.len() <= point {
-                format!("{sign}{digits}{}.0", "0".repeat(point - digits.len()))
-            } else {
-                format!("{sign}{}.{}", &digits[..point], &digits[point..])
-            }
-        }
-    } else {
-        let (head, tail) = digits.split_at(1);
-        let fraction = if tail.is_empty() { String::new() } else { format!(".{tail}") };
-        format!("{sign}{head}{fraction}e{}{:02}", if exponent < 0 { '-' } else { '+' }, exponent.abs())
-    }
-}
-
 /// `json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False)`.
 ///
 /// # Errors
@@ -226,7 +198,7 @@ fn write_canonical(value: &Value, out: &mut String, depth: usize) -> Result<()> 
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Number(n) => match n.as_f64().filter(|_| !(n.is_i64() || n.is_u64())) {
-            Some(f) => out.push_str(&float_repr(f)),
+            Some(f) => out.push_str(&crate::decode::float_repr(f)),
             None => write!(out, "{n}").expect("writing to a String cannot fail"),
         },
         Value::String(s) => write_string(s, out),
@@ -258,10 +230,16 @@ fn write_canonical(value: &Value, out: &mut String, depth: usize) -> Result<()> 
     Ok(())
 }
 
-/// A JSON string with `ensure_ascii=True` escaping.
-fn write_string(text: &str, out: &mut String) {
+/// A JSON string with `ensure_ascii=True` escaping, appended to `out`.
+pub fn write_string(text: &str, out: &mut String) {
     out.push('"');
-    for c in text.chars() {
+    let mut run = 0; // start of the plain text not yet copied
+    for (index, c) in text.char_indices() {
+        if (' '..='~').contains(&c) && c != '"' && c != '\\' {
+            continue;
+        }
+        out.push_str(&text[run..index]);
+        run = index + c.len_utf8();
         match c {
             '"' => out.push_str("\\\""),
             '\\' => out.push_str("\\\\"),
@@ -270,7 +248,6 @@ fn write_string(text: &str, out: &mut String) {
             '\t' => out.push_str("\\t"),
             '\u{8}' => out.push_str("\\b"),
             '\u{c}' => out.push_str("\\f"),
-            c if (' '..='~').contains(&c) => out.push(c),
             c => {
                 let mut units = [0u16; 2];
                 for unit in c.encode_utf16(&mut units) {
@@ -279,10 +256,13 @@ fn write_string(text: &str, out: &mut String) {
             }
         }
     }
+    out.push_str(&text[run..]);
     out.push('"');
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+/// Lower-case hex SHA-256 of `bytes`.
+#[must_use]
+pub fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().fold(String::with_capacity(64), |mut hex, byte| {
         write!(hex, "{byte:02x}").expect("writing to a String cannot fail");
         hex
@@ -497,26 +477,6 @@ pub fn compare(a: &Value, b: &Value, patterns: &[String], volatile: &[String], p
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn float_repr_matches_python() {
-        for (x, want) in [
-            (0.0, "0.0"),
-            (-0.0, "-0.0"),
-            (1.0, "1.0"),
-            (1.5, "1.5"),
-            (0.0001, "0.0001"),
-            (0.00001, "1e-05"),
-            (1e16, "1e+16"),
-            (1234567890123456.0, "1234567890123456.0"),
-            (123456789012345680.0, "1.2345678901234568e+17"),
-            (-2.5e-7, "-2.5e-07"),
-            (1e300, "1e+300"),
-            (0.1 + 0.2, "0.30000000000000004"),
-        ] {
-            assert_eq!(float_repr(x), want);
-        }
-    }
 
     #[test]
     fn canonical_escapes_like_json_dumps() {

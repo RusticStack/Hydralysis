@@ -720,5 +720,6 @@ fn hydralysis_rt(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode::decode_layout_values, m)?)?;
     m.add_function(wrap_pyfunction!(snapshot::snapshot_stable_sha256, m)?)?;
     m.add_function(wrap_pyfunction!(snapshot::snapshot_compare, m)?)?;
+    m.add_function(wrap_pyfunction!(snapshot::snapshot_id, m)?)?;
     Ok(())
 }

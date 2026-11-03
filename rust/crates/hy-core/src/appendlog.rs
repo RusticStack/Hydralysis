@@ -143,6 +143,20 @@ impl Scan {
 /// Scan consecutive chunks starting at byte `base` (a line start). `size` overrides the reported total.
 pub fn scan_chunks<I: IntoIterator<Item = Vec<u8>>>(chunks: I, base: u64, collect: bool, size: Option<u64>) -> Scan {
     let mut records = Vec::new();
+    let mut scan = scan_chunks_with(chunks, base, size, &mut |record| {
+        if collect {
+            records.push(record);
+        }
+    });
+    scan.records = records;
+    scan
+}
+
+/// [`scan_chunks`] handing each valid record to SINK as it is read instead of collecting them (`records` stays empty), so
+/// a reader that applies the records one by one holds one of them at a time. A record is handed over before a later
+/// corrupt line is found: a caller that sees `corrupt` in the answer must discard what it built.
+pub fn scan_chunks_with<I: IntoIterator<Item = Vec<u8>>>(chunks: I, base: u64, size: Option<u64>, sink: &mut dyn FnMut(Value)) -> Scan {
+    let records = Vec::new();
     let mut pending: Vec<u8> = Vec::new();
     let (mut pending_start, mut seen) = (base, base);
     let (mut bad_from, mut bad_line, mut line_no): (Option<u64>, u64, u64) = (None, 0, 0);
@@ -170,9 +184,7 @@ pub fn scan_chunks<I: IntoIterator<Item = Vec<u8>>>(chunks: I, base: u64, collec
                             corrupt: Some(Corrupt { offset, line: bad_line }),
                         };
                     }
-                    if collect {
-                        records.push(record);
-                    }
+                    sink(record);
                 }
             }
             cursor = end + 1;
@@ -260,6 +272,23 @@ pub fn scan_file(path: &Path, start: u64, collect: bool) -> std::io::Result<Scan
     let start = if start > stop { 0 } else { start };
     let mut chunks = FileChunks::new(handle, start, stop);
     let scan = scan_chunks(chunks.by_ref(), start, collect, Some(stop));
+    match chunks.error {
+        Some(e) => Err(e),
+        None => Ok(scan),
+    }
+}
+
+/// [`scan_file`] handing each valid record to SINK (see [`scan_chunks_with`]); a missing file is an empty scan.
+pub fn scan_file_each(path: &Path, sink: &mut dyn FnMut(Value)) -> std::io::Result<Scan> {
+    SCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let handle = match File::open(path) {
+        Ok(handle) => handle,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Scan::default()),
+        Err(e) => return Err(e),
+    };
+    let stop = handle.metadata()?.len();
+    let mut chunks = FileChunks::new(handle, 0, stop);
+    let scan = scan_chunks_with(chunks.by_ref(), 0, Some(stop), sink);
     match chunks.error {
         Some(e) => Err(e),
         None => Ok(scan),
@@ -374,13 +403,18 @@ impl AppendLog {
 
     /// Append one line, fsynced; returns its byte offset.
     pub fn append(&self, record: &Value, lock_held: bool) -> Result<u64> {
-        let line = frame(record);
+        self.append_framed(&frame(record), lock_held)
+    }
+
+    /// [`AppendLog::append`] for a record the caller has already framed (see [`frame`]): lets the caller measure the line
+    /// before it decides to write it, without framing it twice.
+    pub fn append_framed(&self, line: &[u8], lock_held: bool) -> Result<u64> {
         if lock_held {
-            return self.append_locked(&line, false);
+            return self.append_locked(line, false);
         }
         create_parent(&self.path)?;
         let _guard = lock::lock(&self.lock_path, self.lock_timeout_s, &format!("log {}", self.file_name()))?;
-        self.append_locked(&line, true)
+        self.append_locked(line, true)
     }
 
     /// Repair a torn tail (and refuse corruption) without appending.

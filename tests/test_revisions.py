@@ -160,6 +160,16 @@ class SubjectRecord(unittest.TestCase):
         self.assertEqual(revisions.touches(record), {("address:0x10", "name")})
         self.assertEqual(revisions.touches({**record, "effects": None}), {("address:0x10", "name")})
 
+    def test_dependents_answer_the_same_on_both_sides_of_the_native_threshold(self):
+        # Under HYDRALYSIS_IMPL=rust, stores of DEPENDENTS_NATIVE_MIN_RECORDS or more go to Rust and smaller ones stay in
+        # Python; the answer, its order included, is the Python one on both sides.
+        limit = revisions.DEPENDENTS_NATIVE_MIN_RECORDS
+        for size in (limit - 1, limit, limit + 1, 3 * limit):
+            records = [self.record("r%d" % i, i + 1, "0x%x" % (0x10 * (i % 4)), name="N%d" % i) for i in range(size)]
+            for selected in ({"r0"}, {"r1", "r%d" % (size - 1)}, set()):
+                self.assertEqual(revisions.dependents(records, selected, {"r2"}),
+                                 revisions._dependents_py(records, selected, {"r2"}), (size, selected))
+
 
 if __name__ == "__main__":
     unittest.main()
