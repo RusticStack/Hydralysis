@@ -1,0 +1,18 @@
+# Vendored from the Hydra Engine's Rust client (Ghidra/Features/HeadlessSession/rust/crates/hydra-client,
+# engine commit 674636bd9d5b), Apache-2.0. Only the session core is kept (session.rs, error.rs, version.rs); the
+# changes against the original are listed at the top of src/lib.rs. See THIRD_PARTY.md.
+[package]
+name = "hydra-client"
+description = "Session core of the Hydra Engine protocol client (2 and 3): JSON lines over a loopback socket"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "hydra_client"
+path = "src/lib.rs"
+
+[dependencies]
+serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
