@@ -114,16 +114,35 @@ fn canon_write(value: &Value, out: &mut Vec<u8>) -> Result<(), String> {
             out.push(b']');
         }
         Value::Object(map) => {
-            // `serde_json::Map` is a BTreeMap here (no `preserve_order`; `map_iterates_in_sorted_order` pins it), and keys
-            // are ASCII by contract, so its iteration order is Python's sorted() order: no re-sort, no copy.
+            // The canonical order is Python's sorted() order of the keys (code points = UTF-8 byte order). `Map` iterates
+            // in sorted order unless some crate in the build turns on serde_json's `preserve_order` (cargo unifies the
+            // feature across the whole build, and hy-query does), so the order is checked, not assumed: sorted maps
+            // are written in place, any other is sorted first.
             out.push(b'{');
-            for (i, (key, item)) in map.iter().enumerate() {
-                if i > 0 {
-                    out.push(b',');
+            let in_order = map
+                .keys()
+                .zip(map.keys().skip(1))
+                .all(|(a, b)| a.as_bytes() <= b.as_bytes());
+            if in_order {
+                for (i, (key, item)) in map.iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    canon_string(key, out);
+                    out.push(b':');
+                    canon_write(item, out)?;
                 }
-                canon_string(key, out);
-                out.push(b':');
-                canon_write(item, out)?;
+            } else {
+                let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+                entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+                for (i, (key, item)) in entries.into_iter().enumerate() {
+                    if i > 0 {
+                        out.push(b',');
+                    }
+                    canon_string(key, out);
+                    out.push(b':');
+                    canon_write(item, out)?;
+                }
             }
             out.push(b'}');
         }
