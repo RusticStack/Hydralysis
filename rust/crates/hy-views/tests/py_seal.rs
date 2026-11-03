@@ -126,6 +126,7 @@ fn seal_changeset_matches_python() {
             no_effects: false,
             lineage: json!({"id": L}),
             resolved: selected(),
+            mode: "",
         };
         let s = settings(&root_a);
         let mut rust_out = Vec::new();

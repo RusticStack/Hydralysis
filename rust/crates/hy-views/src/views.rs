@@ -54,6 +54,22 @@ pub trait Host: Send + Sync {
     fn jobs(&self) -> &dyn JobLookup {
         &NoJobs
     }
+    /// `workcopy.retire_copies`: close the view's working copies after a finalize (best effort; the default does nothing).
+    fn retire_copies(&self, _settings: &Settings, _target: &Target) -> Result<()> {
+        Ok(())
+    }
+    /// `views._publish_candidate`: the engine-bound half of a publish. Builds the candidate generation for the accepted
+    /// changesets (fork, replay, save, manifest, verification, seal), appends its `CURRENT.log` line and writes the results,
+    /// and pushes what the leader must settle. The default refuses: only a host with an engine can publish.
+    fn publish_candidate(
+        &self,
+        _request: &crate::publish::CandidateRequest<'_>,
+        _settles: &mut Vec<crate::publish::Settle>,
+    ) -> std::result::Result<crate::publish::Built, crate::publish::PublishError> {
+        Err(crate::publish::PublishError::Other(Error::Runtime(
+            "this host has no engine to build a candidate".into(),
+        )))
+    }
 }
 
 fn s_of<'a>(v: &'a Map<String, Value>, k: &str) -> &'a str {

@@ -74,3 +74,23 @@ tests/common/mod.rs holds the shared harness (Python runner, normaliser, the `Fa
 Not ported (was: Still NOT differentially tested: merge, seal_changeset): publish job/drain, commits._commit,
 revert, workcopy, viewpool, userscripts, leader, PyO3 binding / HYDRALYSIS_IMPL=rust.
 Cargo.toml: the only machine-local paths are the hy-core / hy-store lines (marked TODO); switch to ../hy-core, ../hy-store at merge.
+
+## Stage 6 (publish leader and job)
+New modules: generations (tree_files, write/verify_manifest, tampered, reserve_generation, next_generation), publish (count_failure,
+reconcile, build/_build_locked decision half, drain, settle_one, run_publish_job, await_turn, wait_decision, outcome_of);
+locks::LaneLock::queued (Python _QueuedLock); Host gains `publish_candidate`, `retire_copies`.
+
+Seam: `views._publish_candidate` (fork, replay, save, manifest, verification, seal, the CURRENT.log line, warm_base) is the
+engine-bound step and stays behind `Host::publish_candidate`; everything around it is native.
+
+| Rust test | What it proves | Python tests it stands in for (white-box part) |
+|---|---|---|
+| tests/py_drain.rs drain_matches_python | drain with both implementations driving the same queue and the same fake candidate builder: clean batch (2 views, one generation), changeset-wide conflict (declined) beside a published one, all values converged, counted failures until candidate_failed (batch retried alone), corrupt changeset, reconcile of a leader that died after its log line (result resolved from the manifest), tampered generation (rollback line, then `tampered` refusal), lock held (led:false). Drain result, every record under the lineage folder, the log lines, both stores equal; the Rust-written MANIFEST.json is byte-identical to Python's | test_publish*.py queue/leader cases |
+| tests/py_drain.rs publish_job_matches_python | run_publish_job: published (first and second changeset), publish_conflict with its `next`, candidate_failed after MAX_ATTEMPTS, publish_wait_expired | test_publish*.py job cases |
+
+Python defect found: `run_publish_job` raises `ViewError("publish_wait_expired", ..., csid=csid, **pending_info(...))`, and
+pending_info already carries `csid`, so Python raises TypeError ("got multiple values for keyword argument 'csid'") instead of the
+structured error. The port raises the structured error; the test asserts the TypeError on the Python side and compares state only.
+
+Not ported in this stage: tamper cache (`tampered_cache_s` > 0 re-hashes every time, same answer), FaultInjected
+`publish.append_torn` (inside the candidate step), the engine-bound `_publish_candidate`, `_verify_candidate`.

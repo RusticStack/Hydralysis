@@ -288,6 +288,25 @@ impl LaneLock {
     }
 }
 
+impl LaneLock {
+    /// Python `_QueuedLock.wait`: queue in the kernel for the lock; `None` when `timeout_s` ran out or one of the `wake`
+    /// handles (a [`FolderWatch`]) signalled first. Windows only.
+    #[cfg(windows)]
+    pub fn queued(
+        path: impl Into<PathBuf>,
+        timeout_s: f64,
+        wake: &[RawHandle],
+    ) -> std::io::Result<Option<LaneLock>> {
+        let path = path.into();
+        seed(&path)?;
+        let ms = (timeout_s.max(0.0) * 1000.0).min(4_294_967_294.0) as u32;
+        Ok(sys::queued(&path, ms, wake)?.map(|handle| LaneLock {
+            path,
+            handle: Some(handle),
+        }))
+    }
+}
+
 impl Drop for LaneLock {
     fn drop(&mut self) {
         self.release();

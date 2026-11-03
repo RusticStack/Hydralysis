@@ -7,12 +7,14 @@
 pub mod classify;
 pub mod commits;
 pub mod error;
+pub mod generations;
 pub mod gens;
 pub mod jobowner;
 pub mod layout;
 pub mod locks;
 pub mod options;
 pub mod proc;
+pub mod publish;
 pub mod queue;
 pub mod records;
 pub mod revisions;

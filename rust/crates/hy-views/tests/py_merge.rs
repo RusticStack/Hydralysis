@@ -151,6 +151,7 @@ fn merge_matches_python_across_outcomes() {
             no_effects,
             lineage: json!({"id": L}),
             resolved: target(),
+            mode: "",
         };
         let opts = options.as_object().unwrap();
         let mut rust_out =

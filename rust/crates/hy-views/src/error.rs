@@ -47,6 +47,26 @@ pub struct PublishFailure {
 }
 
 impl PublishFailure {
+    pub fn new(code: &str, message: impl Into<String>, counted: bool) -> Self {
+        Self {
+            code: code.into(),
+            message: message.into(),
+            counted,
+            csid: None,
+            detail: Map::new(),
+        }
+    }
+
+    pub fn with_csid(mut self, csid: &str) -> Self {
+        self.csid = Some(csid.into());
+        self
+    }
+
+    pub fn with(mut self, key: &str, value: Value) -> Self {
+        self.detail.insert(key.into(), value);
+        self
+    }
+
     pub fn payload(&self) -> Value {
         let mut out = Map::new();
         out.insert("error".into(), json!(self.code));
