@@ -58,3 +58,12 @@ seal_changeset (needs lineage.ensure, targets.resolve), queue memo, publish_job_
 _verify_candidate, revert, heal, recover, in_flight_ids, workcopy sync/edit/overlays, viewpool, userscripts, the
 PyO3 binding and HYDRALYSIS_IMPL=rust. All black-box classes (RealEngine*, test_view_leak, test_viewpool, test_publish*)
 remain Python-only.
+
+## Stage 4 (third session)
+| Rust test | What it proves | Python tests it stands in for (white-box part) |
+|---|---|---|
+| tests/py_rebase.rs | views.rebase on a lineage with a published generation: clean, converged, unprobed, conflict (unresolved), take_mine, keep, stale expect_revision. Engine calls are the same fake table on both sides (Python monkeypatches workcopy.heal/_sync/probe, query.open_program, _adopt_copy); result JSON and resulting store equal | test_views.py rebase cases |
+
+Still NOT differentially tested: merge, seal_changeset (compile-checked only). Not ported: publish job/drain, commits._commit,
+revert, workcopy, viewpool, userscripts, leader, PyO3 binding / HYDRALYSIS_IMPL=rust.
+Cargo.toml: the only machine-local paths are the hy-core / hy-store lines (marked TODO); switch to ../hy-core, ../hy-store at merge.
