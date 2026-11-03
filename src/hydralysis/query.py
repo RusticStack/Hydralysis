@@ -307,6 +307,14 @@ def forget_role(engine: hydra.Engine) -> None:
             _keys.pop(key, None)
 
 
+# RusticQuery actions whose output depends only on the request and the program's state (not on the overlay files
+# or the clock): the engine caches their output per program state. overlay_state, trace, fingerprints and the
+# writers (apply_overlays, type_edit) are left out.
+PURE_ACTIONS = frozenset({
+    "decompile", "function", "functions", "xrefs", "types", "type", "data", "scan", "variables", "dossier", "blocks",
+    "pcode", "vcalls", "vtables", "writes", "orphans"})
+
+
 def run_script(engine: hydra.Engine, program: dict, request: dict, timeout_s: int, request_dir: Path | None = None,
                wait_ms: int = 0, deadline_s: float | None = None) -> tuple[dict, dict]:
     """One RusticQuery run. Large requests travel as a file, not a command argument.
@@ -325,6 +333,10 @@ def run_script(engine: hydra.Engine, program: dict, request: dict, timeout_s: in
         argument = "@" + str(path)
     try:
         extra = {"lane": "quick"} if hydra.supports(engine, "laneHint") else {}
+        if request.get("action") in PURE_ACTIONS and not path:
+            # the output is a function of the script, the request and the program's state: the engine
+            # may answer a repeat on an unchanged program from the output of an earlier run
+            extra["pure"] = True
         if deadline_s is not None:
             extra["deadline"] = deadline_s
         result = engine.call("script", script="RusticQuery.java", program=program["key"], args=[argument],
