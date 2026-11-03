@@ -215,10 +215,11 @@ def compare(a: dict, b: dict, mask=(), predicates=(), use_default_mask: bool = T
 # crates/hy-runtime `snapshot`, bound in crates/hy-rt-py (`hydralysis_rt`). `compare` (flatten both sides, mask, diff,
 # predicates) and `stable_sha256` run in Rust; the argument checks (`check_mask`, `check_predicates`) stay here and run first,
 # so their ValueErrors are Python's. Input the port does not model raises `Unmodelled` and the Python function answers.
-# The functions above stay the specification. `flatten` and `snapshot_id` are not routed: `snapshot_id` measured 0.3x (json's
-# C encoder beats the conversion) and `flatten` is only called from these two (benchmarks/bench_runtime_decode.py).
+# `snapshot_id` writes the canonical JSON straight from the Python objects into one buffer and hashes it (no intermediate
+# document). The functions above stay the specification. `flatten` is not routed: it is only called from these functions
+# (benchmarks/bench_runtime_decode.py).
 
-_stable_sha256_py, _compare_py = stable_sha256, compare
+_stable_sha256_py, _compare_py, _snapshot_id_py = stable_sha256, compare, snapshot_id
 
 
 def _install_rust() -> None:
@@ -230,7 +231,7 @@ def _install_rust() -> None:
         from hydralysis import rust_frida
         rt = rust_frida._load_rt()
         unmodelled = rt.Unmodelled
-        routines = (rt.snapshot_compare, rt.snapshot_stable_sha256)
+        routines = (rt.snapshot_compare, rt.snapshot_stable_sha256, rt.snapshot_id)
     except Exception:  # noqa: BLE001 - no Rust runtime built: the Python stays
         return
     from hydralysis._seams import Seam, guarded
@@ -259,6 +260,7 @@ def _install_rust() -> None:
 
     module.stable_sha256 = routed(stable, _stable_sha256_py)
     module.compare = routed(compare_checked, _compare_py)
+    module.snapshot_id = routed(rt.snapshot_id, _snapshot_id_py)
 
 
 _install_rust()

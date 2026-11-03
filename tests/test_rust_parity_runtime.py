@@ -189,13 +189,30 @@ class DecodeParity(unittest.TestCase):
             with self.subTest(data=data):
                 self.assertEqual(self.same(RT.decode_value, py._decode_py, text16, data)[0], "ok")
 
-    def test_nonfinite_floats_and_negative_offsets_fall_back(self):
-        [f32] = py._normalize_py([{"arg": 0, "as": "f32"}])
-        self.assertEqual(outcome(RT.decode_value, f32, struct.pack("<f", float("inf")))[0], "unmodelled")
-        [nan] = py._normalize_py([{"arg": 0, "as": "f64"}])
-        self.assertEqual(outcome(RT.decode_value, nan, struct.pack("<d", float("nan")))[0], "unmodelled")
+    def test_nonfinite_floats_decode_like_python_and_negative_offsets_fall_back(self):
+        for kind, packed in (("f32", struct.pack("<f", float("inf"))), ("f32", struct.pack("<f", float("-inf"))),
+                             ("f32", struct.pack("<f", float("nan"))), ("f64", struct.pack("<d", float("nan"))),
+                             ("f64", struct.pack("<d", -0.0)), ("f64", struct.pack("<d", 1e16)), ("f64", struct.pack("<d", 1.5e-7))):
+            [spec] = py._normalize_py([{"arg": 0, "as": kind, "names": {"1": "one"}}])
+            self.assertEqual(self.same(RT.decode_value, py._decode_py, spec, packed)[0], "ok")
+            for names in ({"-0.0": "negzero", "inf": "i", "nan": "n", "1e+16": "big"}, None):
+                field = {"name": "f", "offset": 0, "type": kind, **({"names": names} if names else {})}
+                self.assertEqual(self.same(RT.decode_layout_values, py._layout_values_py, [field], packed)[0], "ok")
         negative = {"arg": 0, "as": "struct", "fields": [{"name": "a", "offset": -4, "type": "u32"}], "names": {}, "label": ""}
         self.assertEqual(outcome(RT.decode_value, negative, b"\1\2\3\4\5\6\7\x08")[0], "unmodelled")
+
+    def test_float_text_is_python_repr_for_random_doubles(self):
+        rng = random.Random(21)
+        for _ in range(3000):
+            if rng.random() < 0.5:
+                packed = struct.pack("<Q", rng.getrandbits(64))
+            else:
+                packed = struct.pack("<d", rng.uniform(-1, 1) * 10 ** rng.randint(-30, 30))
+            value = struct.unpack("<d", packed)[0]
+            if value != value:
+                continue
+            field = {"name": "f", "offset": 0, "type": "f64", "names": {repr(value): "hit"}}
+            self.assertEqual(self.same(RT.decode_layout_values, py._layout_values_py, [field], packed)[0], "ok", repr(value))
 
     def test_decode_event_edge_cases(self):
         [u32] = py._normalize_py([{"arg": 0, "as": "u32", "label": "n"}])
@@ -229,7 +246,7 @@ class DecodeParity(unittest.TestCase):
             with self.subTest(fields=fields):
                 self.same(RT.decode_layout_values, py._layout_values_py, fields, bytes(range(40)))
 
-    def test_the_module_routes_to_rust_only_when_both_variables_are_set_and_not_for_a_patched_seam(self):
+    def test_the_module_routes_to_rust_under_the_variable_and_not_for_a_patched_seam(self):
         import os
         import subprocess
         code = ("import os, sys; sys.path.insert(0, %r)\n"
@@ -242,8 +259,8 @@ class DecodeParity(unittest.TestCase):
                 "    with mock.patch.object(d, '_unpack', lambda *a: calls.append(a) or real(*a)):\n"
                 "        d.decode({'as': 'u32', 'names': {}}, b'\\1\\0\\0\\0')\n"
                 "    print(len(calls))\n") % str(HERE.parent / "src")
-        for impl, held, expected in (("rust", "1", ["True", "1"]), ("rust", "", ["False"]), ("", "1", ["False"])):
-            env = {**os.environ, "HYDRALYSIS_IMPL": impl, "HYDRALYSIS_RUNTIME_HELD": held, "PYTHONPATH": str(HERE.parent / "src")}
+        for impl, expected in (("rust", ["True", "1"]), ("", ["False"]), ("python", ["False"])):
+            env = {**os.environ, "HYDRALYSIS_IMPL": impl, "PYTHONPATH": str(HERE.parent / "src")}
             done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=120)
             self.assertEqual(done.stdout.split(), expected, done.stderr)
 
@@ -310,6 +327,32 @@ class SnapshotParity(unittest.TestCase):
             raise RT.Unmodelled("limit")
         patterns = (snap.DEFAULT_VOLATILE if use_default_mask else ()) + tuple(mask)
         return RT.snapshot_compare(a, b, list(patterns), list(snap.DEFAULT_VOLATILE + tuple(mask)), predicates, limit)
+
+    def test_snapshot_id_on_random_snapshots(self):
+        rng = random.Random(33)
+        modelled = 0
+        for index in range(600):
+            record = snapshot_record(rng, scale=1 + index % 4)
+            if index % 3:
+                record = mutate(rng, record)
+            modelled += self.same(RT.snapshot_id, snap._snapshot_id_py, record)[0] == "ok"
+        self.assertEqual(modelled, 600, "snapshots are all answered by Rust")
+
+    def test_snapshot_id_edge_cases(self):
+        big = {"snapshot": "x", "n": 2 ** 63 + 5, "m": -2 ** 63, "f": [0.1, 1e16, 1e-5, -0.0, 5e-324, 1.7976931348623157e308],
+               "s": "\u00e9\u65e5\U0001F600\x7f\x00\"\\/\n", "k\u00e9": {"b": None, "a": True, "": False}, "": []}
+        for record in (big, {}, {"snapshot": 1}, {"a": {"snapshot": "kept"}}, {"b": 1, "a": 2, "\u00e9": 3, "z": 4, "Z": 5, "10": 6, "9": 7}):
+            with self.subTest(record=record):
+                self.assertEqual(self.same(RT.snapshot_id, snap._snapshot_id_py, record)[0], "ok")
+        for record in ({"a": float("nan")}, {"a": float("inf")}, {1: 2}, {"a": (1, 2)}, {"a": 2 ** 70}, {"a": "\ud800"}, {"a": b"x"},
+                       {"a": {"b": {1, 2}}}, [1], "x", None):
+            with self.subTest(record=record):
+                self.assertEqual(outcome(RT.snapshot_id, record)[0], "unmodelled")
+        deep = current = {}
+        for _ in range(300):
+            current["x"] = {}
+            current = current["x"]
+        self.assertEqual(outcome(RT.snapshot_id, deep)[0], "unmodelled")
 
     def test_stable_hash_on_random_snapshots(self):
         rng = random.Random(21)

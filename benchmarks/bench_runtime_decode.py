@@ -42,7 +42,7 @@ def inputs(function: str, size: int):
                    "names": {"0": "zero", "1": "one"}} for i in range(size)]
         data = rng.randbytes(128)
         return lambda: d.layout_values(fields, data)
-    if function in ("compare", "stable_sha256"):
+    if function in ("compare", "stable_sha256", "snapshot_id"):
         import test_rust_parity_runtime as t
         from hydralysis import runtime_snapshot as snap
         a = t.snapshot_record(rng, scale=1)
@@ -55,6 +55,8 @@ def inputs(function: str, size: int):
             b["regions"][key]["fields"][0]["value"] += 1
         if function == "compare":
             return lambda: snap.compare(a, b)
+        if function == "snapshot_id":
+            return lambda: snap.snapshot_id(a)
         return lambda: snap.stable_sha256(a, ("regions/*/bytes",))
     captures = [[{"arg": i % 8, "deref": [8, 16], "as": "utf8", "size": 64, "label": "n%d" % i},
                  {"arg": 1, "as": "u32", "names": {"0x2a": "answer", "7": "seven"}}] for i in range(size)]
@@ -86,11 +88,11 @@ def main() -> None:
         return
     print("%-14s %8s %8s %10s %10s %9s" % ("function", "size", "impl", "wall ms", "cpu ms", "peak MB"))
     for function, sizes in (("decode_event", (1000, 20000, 200000)), ("layout_values", (100, 2000, 50000)),
-                            ("normalize", (1000, 20000, 200000)), ("compare", (10, 200, 5000)), ("stable_sha256", (10, 200, 5000))):
+                            ("normalize", (1000, 20000, 200000)), ("compare", (10, 200, 5000)), ("stable_sha256", (10, 200, 5000)), ("snapshot_id", (10, 200, 5000))):
         for size in sizes:
             results = {}
             for impl in ("python", "rust"):
-                env = dict(os.environ, HYDRALYSIS_IMPL="rust" if impl == "rust" else "python", HYDRALYSIS_RUNTIME_HELD="1", PYTHONHASHSEED="0")
+                env = dict(os.environ, HYDRALYSIS_IMPL="rust" if impl == "rust" else "python", PYTHONHASHSEED="0")
                 out = subprocess.run([sys.executable, __file__, "--child", function, str(size), "--repeat", str(args.repeat)],
                                      env=env, capture_output=True, text=True, check=True).stdout
                 results[impl] = json.loads(out.strip().splitlines()[-1])
