@@ -21,8 +21,10 @@ pub mod records;
 pub mod revisions;
 pub mod settle;
 pub mod store;
+pub mod userscripts;
 pub mod viewgov;
 pub mod views;
+pub mod workcopy;
 
 pub use error::{Error, PublishFailure, Result, ViewError};
 pub use hy_core;
